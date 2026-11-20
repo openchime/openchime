@@ -6,18 +6,20 @@
  * S3 endpoint costing ~100 ms per operation — was exactly the one never
  * exercised.
  *
- * The test stands up a fake S3 endpoint with a deliberate per-request delay,
- * points the daemon's blob backend at it, and then runs two clients at once:
+ * The test stands up a fake S3 endpoint that hands out a download's body one
+ * segment at a time, each only when the test releases it, points the daemon's
+ * blob backend at it, and then runs two clients at once:
  *
- *   - alice streams a multi-chunk attachment through the slow backend;
- *   - bob sends ordinary messages and times each round-trip.
+ *   - alice streams a multi-chunk attachment through the stalled backend;
+ *   - bob sends ordinary messages while a segment is held.
  *
  * If blob I/O still ran inline on the epoll thread (as it did before ARCH-69),
- * every one of alice's chunk writes would block the loop and bob's round-trips
- * would spike to the backend's latency. So the assertion is about BOB: his
- * messages must stay fast while alice crawls.
+ * the loop would block in the backend read until the test released it, and
+ * bob's messages would not be delivered while the segment is held. So the
+ * assertion is about BOB: his messages go through while alice's transfer is
+ * stalled for as long as the test likes.
  *
- * Hermetic — the "slow S3" is a loopback socket in this process, so the latency
+ * Hermetic — the "slow S3" is a loopback socket in this process, so the stall
  * is injected rather than borrowed from a real network. */
 
 #include "client.h"
@@ -45,8 +47,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SLOW_MS 120        /* per-request delay: roughly a cross-region S3 hop */
-
 /* --- a fake S3 endpoint that is deliberately slow ------------------------- */
 
 typedef struct {
@@ -61,15 +61,18 @@ typedef struct {
      * cleared: the daemon's commit waits on the reply, so the upload cannot
      * finish. `held` counts the PUTs that have reached the gate. */
     atomic_int   gate, held;
+    /* While `step` is set, each segment of a download's body waits to be
+     * released: `holds` counts the segments that have reached the wait,
+     * `released` how many the test has let go, `waiting` is set while one is
+     * held. A stalled backend for as long as the test likes, with no clock. */
+    atomic_int   step, holds, released, waiting;
 } slow_s3;
 
 static slow_s3 g_s3;
 
-/* The fake backend's latency is what it models: time passing, not a wait. */
-static void ms_sleep(int ms) { oc_test_let_time_pass((uint64_t)ms); }
-
-/* Round-trips are measured on the monotonic clock. */
-static uint64_t now_ms_local(void) { return oc_test_mono_ms(); }
+/* How long the fake backend holds a reply at most: past the whole test, so it
+ * is the test that lets it go (or stops the backend), never the clock. */
+#define SB_HOLD_MS 120000
 
 /* The suite's own directory (oc_test_mkdtemp), and `name` under it. */
 static char g_sbdir[512];
@@ -131,7 +134,7 @@ static void *slow_s3_thread(void *arg) {
             f->obj_len = got;
             if (f->gate) {
                 f->held++;
-                while (f->gate && !f->stop) ms_sleep(2);
+                (void)WAIT_UNTIL(!f->gate || f->stop, SB_HOLD_MS);
             }
             const char *ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all_fd(fd, ok, strlen(ok));
@@ -141,9 +144,10 @@ static void *slow_s3_thread(void *arg) {
                              "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                              f->obj_len);
             send_all_fd(fd, head, (size_t)n);
-            /* Dribble the body. Every oc_blob_get_chunk on the daemon side then
-             * blocks waiting for the next piece — which is the stall the
-             * transfer pool exists to keep off the epoll thread.
+            /* Dribble the body, a segment at a time as the test releases each
+             * (`step`). Every oc_blob_get_chunk on the daemon side then blocks
+             * waiting for the next piece — which is the stall the transfer pool
+             * exists to keep off the epoll thread.
              *
              * Downloads rather than uploads, deliberately: making a WRITE block
              * requires exceeding the sender's socket send buffer (~2.5 MB), so
@@ -154,8 +158,13 @@ static void *slow_s3_thread(void *arg) {
             while (sent < f->obj_len && !f->stop) {
                 size_t piece = f->obj_len - sent;
                 if (piece > 16 * 1024) piece = 16 * 1024;
-                ms_sleep(SLOW_MS);
-                f->requests++;                       /* count slow segments */
+                if (f->step) {
+                    int k = ++f->holds;
+                    f->waiting = 1;
+                    (void)WAIT_UNTIL(f->released >= k || !f->step || f->stop, SB_HOLD_MS);
+                    f->waiting = 0;
+                }
+                f->requests++;                       /* count segments served */
                 send_all_fd(fd, (const char *)f->obj + sent, piece);
                 sent += piece;
             }
@@ -256,7 +265,7 @@ static oc_client   *g_alice;
 
 static void *alice_thread(void *unused) {
     (void)unused;
-    while (g_alice_run) { oc_client_tick(g_alice); ms_sleep(2); }
+    (void)WAIT_UNTIL_DO(oc_client_tick(g_alice), !g_alice_run, SB_HOLD_MS);
     return NULL;
 }
 
@@ -274,14 +283,9 @@ static int has_body(const oc_model *m, const char *body) {
     return 0;
 }
 
-static int cmp_u64(const void *a, const void *b) {
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-    return (x > y) - (x < y);
-}
-
 int run_slow_blob_tests(void) {
-    printf("itest_slow_blob: message latency while a %d ms/op blob backend streams "
-           "an upload (the ARCH-69 claim)\n", SLOW_MS);
+    printf("itest_slow_blob: messages delivered while a stalled blob backend holds "
+           "a transfer (the ARCH-69 claim)\n");
 
     if (oc_test_mkdtemp("slow_blob", g_sbdir, sizeof g_sbdir) != 0) {
         printf("  FAIL itest_slow_blob: no directory of its own under $TMPDIR\n");
@@ -348,17 +352,12 @@ int run_slow_blob_tests(void) {
     CHECK(oc_client_model(alice)->storage.avail_bytes == 0);
     CHECK(oc_client_model(alice)->storage.under_pressure == 0);
 
-    /* --- baseline: bob's round-trip with nothing else happening ------------ */
-    uint64_t base[5];
+    /* --- baseline: bob's messages go through with nothing else happening --- */
     for (int i = 0; i < 5; i++) {
         char body[32]; snprintf(body, sizeof body, "base-%d", i);
-        uint64_t t0 = now_ms_local();
         oc_client_send(bob, oc_client_model(bob)->channels[0].channel_id, body);
         CHECK(SB_WAIT(bob, has_body(m, body), 8000));
-        base[i] = now_ms_local() - t0;
     }
-    qsort(base, 5, sizeof base[0], cmp_u64);
-    uint64_t base_median = base[2];
 
     /* --- now: bob sends while alice pushes an upload through the slow S3 --- */
     const char *upath = upath_b;
@@ -372,9 +371,9 @@ int run_slow_blob_tests(void) {
             if (blk) {
                 memset(blk, 0xAB, 64 * 1024);
                 /* 128 KB: the fake backend dribbles a download in 16 KB
-                 * segments, each a slow blob call (the stall is the backend's,
-                 * not a socket's), so this is eight of them -- enough to span
-                 * bob's measurement below, which needs three. */
+                 * segments, each a stalled blob call (the stall is the
+                 * backend's, not a socket's), so this is eight of them --
+                 * enough for bob's rounds below, which hold four. */
                 for (int i = 0; i < 2; i++) fwrite(blk, 1, 64 * 1024, f);
                 free(blk);
             }
@@ -383,7 +382,7 @@ int run_slow_blob_tests(void) {
     }
 
     /* Upload first (fast — the fake backend only dribbles on GET), then let the
-     * SLOW download be what runs concurrently with bob's measurement. */
+     * stalled download be what runs concurrently with bob's messages. */
     uint64_t ch = oc_client_model(alice)->channels[0].channel_id;
     oc_client_upload(alice, ch, upath);
     CHECK(SB_WAIT(alice, g_s3.obj_len > 0, 20000));
@@ -394,6 +393,9 @@ int run_slow_blob_tests(void) {
                       if (m->channels[c2].msgs[j].n_attach)
                           aid = m->channels[c2].msgs[j].attach[0].id;
               aid != 0; }), 4000));
+    g_s3.holds = 0;
+    g_s3.released = 0;
+    g_s3.step = 1;                          /* the download's segments wait on the test */
     if (aid) oc_client_download(alice, aid, dlpath);
 
     g_alice = alice;
@@ -403,53 +405,48 @@ int run_slow_blob_tests(void) {
     int segs_before = g_s3.requests;
     uint64_t loop_ops_before = oc_blobstore_loop_ops();
 
-    /* While that grinds through the slow backend, time bob's round-trips. */
-    uint64_t during[9];
-    int n_during = 0;
-    for (int i = 0; i < 9; i++) {
+    /* Four rounds. In each, the backend holds a segment of alice's download
+     * until the test releases it, so the transfer is stalled in a blob read;
+     * bob sends while it is held, and his message must be delivered then. Were
+     * the read on the event loop's thread, the loop would be blocked in it
+     * until the release, and bob's message would not arrive. */
+    enum { ROUNDS = 4 };
+    int rounds_ok = 0;
+    for (int i = 0; i < ROUNDS; i++) {
+        int held = WAIT_UNTIL(g_s3.holds == i + 1 && g_s3.waiting, 20000);
+        CHECK(held);
+        if (!held) break;
+        CHECK(g_s3.requests - segs_before == i);  /* the earlier segments, each released, were served */
         char body[32]; snprintf(body, sizeof body, "during-%d", i);
-        uint64_t t0 = now_ms_local();
         oc_client_send(bob, oc_client_model(bob)->channels[0].channel_id, body);
         int ok = SB_WAIT(bob, has_body(m, body), 8000);
         CHECK(ok);
-        if (ok) during[n_during++] = now_ms_local() - t0;
+        /* Delivered while the segment was still held: only the test releases it. */
+        CHECK(g_s3.waiting && g_s3.holds == i + 1);
+        if (ok) rounds_ok++;
+        g_s3.released = i + 1;
     }
     int segs_during = g_s3.requests - segs_before;
     uint64_t loop_ops_during = oc_blobstore_loop_ops() - loop_ops_before;
+    g_s3.step = 0;                          /* the rest of the download streams */
     g_alice_run = 0;
     pthread_join(alice_th, NULL);
-    CHECK(n_during > 0);
-    if (n_during == 0) goto done;
-    qsort(during, (size_t)n_during, sizeof during[0], cmp_u64);
-    uint64_t during_median = during[n_during / 2];
-    uint64_t during_max    = during[n_during - 1];
+    CHECK(rounds_ok == ROUNDS);
 
-    printf("  bob round-trip: idle median %llums | during slow-download median %llums, max %llums\n"
-           "  backend %d ms/op, %d slow segment(s) served DURING the measurement "
-           "(= %d ms of backend stall the loop did not absorb)\n",
-           (unsigned long long)base_median, (unsigned long long)during_median,
-           (unsigned long long)during_max,
-           SLOW_MS, segs_during, segs_during * SLOW_MS);
+    printf("  bob: %d message(s) delivered, each while a backend read was held; "
+           "%d segment(s) served during the rounds\n", rounds_ok, segs_during);
 
-    /* THE ASSERTION, by construction: not one blob operation ran on the event
-     * loop's thread while the slow transfer streamed (blobstore.h). Counted,
-     * not timed -- a count of zero does not depend on how loaded the runner is,
-     * and a single operation moved onto the loop makes it non-zero. */
+    /* And the mechanism, by construction: not one blob operation ran on the
+     * event loop's thread while the stalled transfer streamed (blobstore.h).
+     * Counted, not timed -- a single operation moved onto the loop makes it
+     * non-zero. */
     printf("  blob operations on the loop thread during the transfer: %llu\n",
            (unsigned long long)loop_ops_during);
     CHECK(loop_ops_during == 0);
-    /* And the effect, coarsely: with blob I/O inline, a round-trip landing
-     * mid-chunk would absorb a whole SLOW_MS stall and bob's median would rise
-     * by at least that. baseline + SLOW_MS/2 is generous, so this is a sanity
-     * check on the median, never on single samples: one sample is at the mercy
-     * of the runner's scheduler, which is how a spike count here failed a
-     * sanitizer run whose median had FALLEN during the transfer. */
-    CHECK_SPEED(during_median < base_median + (uint64_t)SLOW_MS / 2);
 
-    /* The upload must have been genuinely in flight while bob was measured, or
-     * the comparison proved nothing. Several slow segments inside the window
-     * means the loop had real blocking work available to absorb — and didn't. */
-    CHECK(segs_during >= 3);
+    /* The download was genuinely in flight across bob's rounds, segment after
+     * segment, or the rounds proved nothing. */
+    CHECK(segs_during >= ROUNDS - 1);
 
     /* Cancelling a post of files (REQ-140), by construction rather than by
      * timing. With the gate shut, an upload that has sent its last byte waits on

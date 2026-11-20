@@ -8,8 +8,7 @@
 #
 # In tests/ (*.c, *.h), but tests/manual/, which a person runs by hand:
 #   sleep    usleep, nanosleep, msleep, sleep, SDL_Delay called anywhere but
-#            tests/check.h, whose WAIT_UNTIL / oc_test_let_time_pass are the
-#            one way a test waits. A fake that models a slow peer on purpose
+#            tests/check.h, whose WAIT_UNTIL is the one way a test waits. A fake that models a slow peer on purpose
 #            says so on the line or the line before: /* slow-on-purpose: <why> */
 #   prose    a comparison (strstr, strcmp, strncmp, strcasecmp, strncasecmp,
 #            strcasestr, memcmp, memmem) on a line holding a string literal
@@ -19,6 +18,11 @@
 #            line before: /* contract: <why> */
 #   tmp      a "/tmp/ literal: a path every run, every suite and every checkout
 #            shares. tests/testenv.h's oc_test_mkdtemp gives each its own.
+#   timing   CHECK_SPEED, CHECK_TIMING, oc_test_let_time_pass or OC_TEST_TIMING
+#            in code: a verdict on how fast code runs or on real time passing,
+#            which a loaded machine fails with nothing wrong. A test asserts the
+#            mechanism, moves a clock it injects, or waits on the outcome
+#            (docs/TESTING.md "Speed and time").
 # In .github/workflows/*.yml, and in the scripts under scripts/test/,
 # scripts/release/smoke/ and scripts/build/ that run under pipefail:
 #   pipe     `| grep -q` in a step that runs under pipefail: grep -q exits at
@@ -154,6 +158,8 @@ END {
             }
         if (code ~ /"\/tmp\//)
             printf "%s:%d: tmp: a directory of its own (oc_test_mkdtemp, tests/testenv.h): %s\n", FILENAME, k, raw
+        if (code ~ /(^|[^A-Za-z0-9_])(CHECK_SPEED|CHECK_TIMING|oc_test_let_time_pass|OC_TEST_TIMING)([^A-Za-z0-9_]|$)/)
+            printf "%s:%d: timing: assert the mechanism, move an injected clock or wait on the outcome (docs/TESTING.md \"Speed and time\"): %s\n", FILENAME, k, raw
     }
 }
 AWK
@@ -211,7 +217,7 @@ while IFS= read -r -d '' f; do
 done < <(list scripts/test '*.sh'; list scripts/release/smoke '*.sh'; list scripts/build '*.sh')
 
 if [ $found != 0 ]; then
-    echo "tests_lint: the tests wait on outcomes, compare markers rather than words, and share no paths (docs/TESTING.md \"Brittle tests\")" >&2
+    echo "tests_lint: the tests wait on outcomes, judge no speed, compare markers rather than words, and share no paths (docs/TESTING.md \"Brittle tests\")" >&2
     exit 1
 fi
 echo "tests_lint: tests and workflows clean"

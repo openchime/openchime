@@ -69,6 +69,7 @@ typedef struct {
 typedef struct {
     oc_rec_state state;
     uint32_t     elapsed_ms;
+    uint32_t     frames;             /* camera frames taken into the recording so far */
     uint32_t     cap_ms;
     int          level;              /* microphone peak, 0..32767 */
     int          has_audio;          /* a microphone is recording */

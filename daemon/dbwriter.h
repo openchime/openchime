@@ -1772,6 +1772,11 @@ enum { OC_DBW_HOLD_WRITER = 1, OC_DBW_HOLD_READERS = 2, OC_DBW_HOLD_ALL = 3 };
 void   oc_dbwriter_hold(oc_dbwriter *w, int what);
 /* How long a delete can be taken back (default two minutes); tests shorten it. */
 void   oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms);
+/* A test's clock: from now on every writer's clock reads `ms` further ahead
+ * of the system's, as if that much time had passed at once -- a token ageing,
+ * a window closing -- without a test sitting it out. 0 puts it back, which is
+ * for when no writer runs. Any thread. */
+void   oc_dbwriter_advance_clock_ms(uint64_t ms);
 
 /* A critical failure (REQ-263), from any thread: raise `key` with `message` --
  * again on the same entry while it holds -- or clear it, once it has stopped.

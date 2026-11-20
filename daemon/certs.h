@@ -46,6 +46,10 @@ typedef struct {
     /* Tests: how close to expiry a certificate not yet renewed is raised (0 =
      * seven days). */
     int64_t         expiry_warn_ms;
+    /* Tests: the worker's clock, in ms since the epoch (NULL = the system's),
+     * given `ctx`. A wait for a renewal is at most `check_ms`, so a clock the
+     * test moves is seen within one check. */
+    uint64_t      (*now_ms)(void *ctx);
 } oc_certs_opts;
 
 /* The worker's alerts: a certificate not obtained or renewed (cleared by the next

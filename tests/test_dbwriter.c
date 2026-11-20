@@ -5431,14 +5431,13 @@ static void test_setup_invite(void) {
  * retention window is dropped, so a much-later retry of the same token is no
  * longer deduplicated, while a recent token still is. */
 static void test_idem_pruning(void) {
-    TIMER_ONLY();   /* a token ageing past its window is what is tested */
     const char *path = tdb("prune.db");
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
-    /* Prune on every write. Each step below only gets more certain the slower
-     * the machine: a mapping is aged by waiting after it is written, and the
-     * window is widened again before anything must survive it. */
+    /* Prune on every write. A mapping is aged by advancing the writer's clock
+     * after it is written, and the window is widened again before anything
+     * must survive it. */
     oc_dbwriter_set_idem_retention(w, 3600000 /*ms*/, 0 /*interval*/);
 
     uint64_t uid = reg(w, "pr-user", "pw", OC_ROLE_MEMBER);
@@ -5454,7 +5453,7 @@ static void test_idem_pruning(void) {
     /* Fresh token is still deduplicated. */
     CHECK(send_msg(w, uid, tokA, "first-again") == m1);
 
-    oc_test_let_time_pass(50);    /* tokA is now at least 50 ms old */
+    oc_dbwriter_advance_clock_ms(50);   /* tokA is now 50 ms old */
 
     /* A write under a 20 ms window prunes tokA's aged mapping. */
     oc_dbwriter_set_idem_retention(w, 20, 0);
@@ -5478,6 +5477,7 @@ static void test_idem_pruning(void) {
     CHECK(send_msg(w, uid, tokB, "second-again") == m2);
 
     oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
     cleanup_db(path);
 }
 
@@ -9685,15 +9685,15 @@ static void test_restore(void) {
     CHECK(r && r->type == OC_RES_RESTORE_OK);
     oc_dbres_free(r);
     /* Past the window: gone for good, and nothing of it is kept. The window
-     * closing is a timer's test: the ordinary build only. */
-    if (OC_UNDER_TSAN) { oc_dbwriter_stop(w); cleanup_db(path); return; }
+     * closes on the writer's clock, advanced past it. */
     oc_dbwriter_set_restore_window_ms(w, 50);
     oc_dbres_free(del_or_restore(w, OC_JOB_DELETE, alice, mid));
-    oc_test_let_time_pass(120);   /* the window closing is what is tested */
+    oc_dbwriter_advance_clock_ms(120);   /* the window closing is what is tested */
     r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
     CHECK(r && r->type == OC_RES_RESTORE_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
     oc_dbres_free(r);
     oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
 
     sqlite3 *raw = NULL;
     CHECK(raw_open(path, &raw) == SQLITE_OK);
@@ -9952,13 +9952,14 @@ static void test_actions(void) {
         if (other) { oc_dbwriter_set_restore_window_ms(other, 50); oc_dbwriter_stop(other); }
         cleanup_db(tdb("actions_other.db"));
     }
-    if (!OC_UNDER_TSAN) oc_test_let_time_pass(120);   /* past the other's window: a timer's part */
+    oc_dbwriter_advance_clock_ms(120);   /* past the other's window, well inside this one's */
     r = del_or_restore(w, OC_JOB_RESTORE, alice, act);
     CHECK(r && r->type == OC_RES_RESTORE_OK && live_action(r, act, 6, 7));
     oc_dbres_free(r);
     CHECK(action_row(path, act, &st, &ln, NULL, 0) && st == 6 && ln == 7);
 
     oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
     cleanup_db(path);
 }
 

@@ -2978,9 +2978,8 @@ static void test_revoke_one_session(int port, const uint8_t *pin) {
     CHECK(session_list_read(&a, ids, 8, &mine) == 1 && mine == 0);
     client_close(&b);
 
-    /* In use: last_seen_ms moves once the interval is up; idle: it stays. A
-     * timer's test (the interval passing), so in the ordinary build only. */
-    if (OC_UNDER_TSAN) { client_close(&a); return; }
+    /* In use: last_seen_ms moves once the interval is up; idle: it stays. The
+     * interval passes on the loop's clock, advanced past it. */
     oc_netloop_set_seen_ms(300);
     client idle;
     CHECK(signed_in(&idle, port, pin, "sid", "pw-sid") == 0);
@@ -2989,7 +2988,7 @@ static void test_revoke_one_session(int port, const uint8_t *pin) {
     sqlite3_busy_timeout(db, 5000);
     CHECK(sqlite3_exec(db, "UPDATE sessions SET last_seen_ms=1 WHERE user_id=(SELECT id FROM users WHERE subject='local:sid');",
                        NULL, NULL, NULL) == SQLITE_OK);
-    oc_test_let_time_pass(400);                        /* the 300 ms interval is up: time itself */
+    oc_netloop_advance_clock_ms(400);                  /* the 300 ms interval is up */
     CHECK(session_ids(&a, ids, 8, &mine) == 2);         /* a frame: a is in use */
     CHECK(WAIT_UNTIL(sid_sessions_seen(db) >= 1, 4000));
     CHECK(sid_sessions_seen(db) == 1);                   /* a's, and not the idle one's */
@@ -4304,6 +4303,7 @@ static int dev_daemon_start(struct dev_daemon *d, uint64_t ttl) {
 static void dev_daemon_stop(struct dev_daemon *d) {
     stop_loop(&d->arg, d->th);
     oc_netloop_set_device_ttl_ms(0);
+    oc_netloop_advance_clock_ms(0);   /* the loop is stopped: its clock is put back */
     oc_dbwriter_stop(d->dbw);
     oc_tls_server_free(&d->srv);
     db_unlink("itest_dev.db");
@@ -4539,10 +4539,8 @@ static void test_device_signin(void) {
     CHECK(oc_test_page_error(resp, "device-limited"));
     dev_daemon_stop(&d);
 
-    /* A code's life runs out. It is long against the handshake, the code and
-     * one HTTPS GET it races, however slow the host (WAIT_MS), and then it
-     * passes. */
-    if (OC_UNDER_TSAN) return;   /* the rest is a timer's test: ordinary build only */
+    /* A code's life runs out: alive inside it, then the loop's clock is
+     * advanced past it. */
     const uint64_t life = 3000;
     CHECK(dev_daemon_start(&d, life) == 0);
     port = d.arg.port;
@@ -4552,7 +4550,7 @@ static void test_device_signin(void) {
     snprintf(path, sizeof path, "/device?code=%s", ucode);
     CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
           oc_test_page_is(resp, "device-confirm"));                       /* alive, inside its life */
-    oc_test_let_time_pass(life + 200);                                   /* its life: time itself */
+    oc_netloop_advance_clock_ms(life + 200);                             /* its life passes */
     CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
     CHECK(web_call(port, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
           oc_test_page_error(resp, "device-unknown"));
@@ -6766,12 +6764,21 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
         memcpy(pkt, atok, OC_AUDIO_TOKEN_RAND);
         memset(pkt + OC_AUDIO_TOKEN_RAND + 2, 'm', 1000);
         uint64_t rx0 = __atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE);
+        uint64_t lost = 0;   /* datagrams the kernel dropped, as far as the relay's count tells */
         for (int i = 0; i < FLOOD; i++) {
             uint16_t sq = (uint16_t)(100 + i);
             pkt[OC_AUDIO_TOKEN_RAND] = (uint8_t)(sq >> 8); pkt[OC_AUDIO_TOKEN_RAND + 1] = (uint8_t)sq;
             sendto(sa, pkt, sizeof pkt, 0, (const struct sockaddr *)&relay, sizeof relay);
-            /* paced -- a sender's rate, not a wait: the relay's socket buffer is not under test */
-            if (i % 100 == 99) oc_test_let_time_pass(2);
+            /* Paced by the relay: at most one batch of a hundred is in flight,
+             * the next sent once it has taken in the one before. The relay's
+             * socket buffer is not under test. */
+            if (i % 100 == 99) {
+                uint64_t want = (uint64_t)i + 1 - 100 - lost;
+                if (!WAIT_UNTIL(__atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE) - rx0 >= want, 1000)) {
+                    uint64_t got = __atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE) - rx0;
+                    lost += want > got ? want - got : 0;
+                }
+            }
         }
         /* The flood is the daemon's before the chat follows it: the relay has
          * taken it in (all of it, unless the kernel dropped some of the
@@ -9062,6 +9069,7 @@ int run_netloop_tests(void) {
     }
 
     if (up) stop_loop(&arg, th);
+    oc_netloop_advance_clock_ms(0);   /* the loop is stopped: its clock is put back */
     g_main = NULL;
     oc_netloop_set_ready(NULL, NULL);
     if (had_cap) setenv("OPENCHIME_DEV_CALL_MAX", saved_cap, 1); else unsetenv("OPENCHIME_DEV_CALL_MAX");

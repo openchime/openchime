@@ -6,12 +6,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include "oc_media.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
-int64_t oc_media_clock_us(void) {
+static int64_t system_clock_us(void) {
     static LARGE_INTEGER freq;
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     LARGE_INTEGER now;
@@ -19,14 +20,78 @@ int64_t oc_media_clock_us(void) {
     return (int64_t)(now.QuadPart / freq.QuadPart) * 1000000 +
            (int64_t)(now.QuadPart % freq.QuadPart) * 1000000 / freq.QuadPart;
 }
+static void sleep_us(int64_t us) { Sleep((DWORD)((us + 999) / 1000)); }
 #else
 #include <time.h>
-int64_t oc_media_clock_us(void) {
+static int64_t system_clock_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+static void sleep_us(int64_t us) {
+    struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
+    nanosleep(&ts, NULL);
+}
 #endif
+
+/* A test's hold on the clock (oc_media.h): while held, the clock reads
+ * `g_held_us` and moves only when the test advances it. Otherwise it is the
+ * system's, plus `g_ahead_us`. */
+static atomic_int     g_held;
+static _Atomic int64_t g_held_us, g_ahead_us;
+/* What each thread waiting on the held clock waits for (0: a free slot). */
+#define WAITERS 16
+static _Atomic int64_t g_wait_for[WAITERS];
+
+int64_t oc_media_clock_us(void) {
+    if (atomic_load(&g_held)) return atomic_load(&g_held_us);
+    return system_clock_us() + atomic_load(&g_ahead_us);
+}
+
+void oc_media_clock_hold(void) {
+    if (atomic_load(&g_held)) return;
+    atomic_store(&g_held_us, oc_media_clock_us());
+    atomic_store(&g_held, 1);
+}
+
+void oc_media_clock_advance_us(int64_t us) {
+    if (us <= 0) { atomic_store(&g_held, 0); atomic_store(&g_ahead_us, 0); return; }
+    if (atomic_load(&g_held)) atomic_fetch_add(&g_held_us, us);
+    else                      atomic_fetch_add(&g_ahead_us, us);
+}
+
+int oc_media_clock_wait_until(int64_t at_us, int max_ms) {
+    int64_t now = oc_media_clock_us();
+    if (now >= at_us) return 1;
+    if (!atomic_load(&g_held)) {
+        int64_t d = at_us - now, cap = (int64_t)(max_ms > 0 ? max_ms : 0) * 1000;
+        if (d > cap) { if (cap > 0) sleep_us(cap); return 0; }
+        sleep_us(d);
+        return 1;
+    }
+    /* Held: only the test moves it, so look again a moment at a time, at most
+     * `max_ms` of real time, counted as waiting meanwhile. */
+    int64_t end = system_clock_us() + (int64_t)(max_ms > 0 ? max_ms : 0) * 1000;
+    int slot = -1;
+    for (int i = 0; i < WAITERS && slot < 0; i++) {
+        int64_t free_slot = 0;
+        if (atomic_compare_exchange_strong(&g_wait_for[i], &free_slot, at_us)) slot = i;
+    }
+    int reached;
+    while (!(reached = oc_media_clock_us() >= at_us) && system_clock_us() < end) sleep_us(500);
+    if (slot >= 0) atomic_store(&g_wait_for[slot], 0);
+    return reached;
+}
+
+int oc_media_clock_waiting(void) {
+    int64_t now = oc_media_clock_us();
+    int n = 0;
+    for (int i = 0; i < WAITERS; i++) {
+        int64_t t = atomic_load(&g_wait_for[i]);
+        if (t && t > now) n++;
+    }
+    return n;
+}
 
 int oc_frame_alloc(oc_frame *f, int width, int height) {
     memset(f, 0, sizeof *f);

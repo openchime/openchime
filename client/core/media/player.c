@@ -113,7 +113,15 @@ static int decode_video(worker *w) {
         w->vnext++;
         oc_frame f;
         int rc = oc_vp9dec_decode(w->vdec, p->file + s->offset, s->size, pts, &f);
-        if (w->decode_delay_ms > 0) sleep_ms(w->decode_delay_ms);
+        /* A slow decoder, for tests: the time it takes passes on the media
+         * clock, as the rest of playback's does. */
+        if (w->decode_delay_ms > 0) {
+            int64_t until = oc_media_clock_us() + (int64_t)w->decode_delay_ms * 1000;
+            while (!oc_media_clock_wait_until(until, 10)) {
+                oc_mutex_lock(&p->mu); int quit = p->quit; oc_mutex_unlock(&p->mu);
+                if (quit) break;
+            }
+        }
         if (rc < 0) return -1;
         if (rc == 1) continue;
         /* The decoder's frame is only valid until its next call: keep a copy. */
@@ -285,7 +293,8 @@ static void *player_main(void *arg) {
             continue;
         }
         int64_t wait_ms = w.have_pending ? (w.pending.pts_us - now) / 1000 : 10;
-        sleep_ms(wait_ms < 1 ? 1 : wait_ms > 10 ? 10 : (int)wait_ms);
+        wait_ms = wait_ms < 1 ? 1 : wait_ms > 10 ? 10 : wait_ms;
+        (void)oc_media_clock_wait_until(oc_media_clock_us() + wait_ms * 1000, (int)wait_ms);
     }
 
     if (err) { oc_mutex_lock(&p->mu); p->state = OC_PLAYER_ERROR; oc_mutex_unlock(&p->mu); }

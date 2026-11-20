@@ -258,8 +258,7 @@ several at once, and takes no job count); and what the manual harnesses under
   only (one too slow for the fast suite's budget); `THREADS` marks a suite
   whose code starts threads, which the full suite runs under ThreadSanitizer
   and only there, and `TIMED` one that the full suite also runs plainly, for
-  the speed verdicts the sanitizer does not judge and the timer tests it does
-  not run (§2.4), and `WALK` one that starts threads but which the full suite
+  the timer tests the sanitizer does not run (§2.4), and `WALK` one that starts threads but which the full suite
   runs plainly and not under ThreadSanitizer: an end-to-end walk of the daemon
   or the client, or real-time media, whose sanitizer run would cost minutes. The scripts never
   keep a list of their own: they ask the binary, `build/tests --list fast`,
@@ -638,14 +637,22 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 - Any use of `rand()` seeds it explicitly (e.g. `srand(12345)`).
 - No test asserts an exact wall-clock timestamp. Tests assert *relative* facts —
   ids strictly increase, a timestamp falls inside a window the test itself
-  bounded — never a literal `now()`. **There is no injectable clock or id
-  source**: `dbw_now_ms` calls `clock_gettime` directly with no override seam, so
-  determinism here comes from asserting relative facts rather than from
-  scripting time. What *is* injectable is the interval a periodic job runs at
-  (`oc_dbwriter_set_idem_retention`, `oc_netloop_set_relay_silence_ms`,
+  bounded — never a literal `now()`. **Where time passing is the behaviour
+  under test, the test moves the clock the code reads** rather than sitting the
+  time out: `oc_dbwriter_advance_clock_ms` (the writer's: a token ageing, a
+  restore window closing), `oc_netloop_advance_clock_ms` (the loop's: a
+  session's last-seen interval, a device code's life), the certificate
+  worker's `now_ms` in `oc_certs_opts` (an ARI window), and the media clock
+  (`oc_media_clock_hold` and `oc_media_clock_advance_us`, `oc_media.h`), which
+  the synthetic camera, screen and microphone, the recorder and the player all
+  read and wait on: held, it moves only when the test moves it, so a recording
+  holds every frame the camera made however slow the host, and a test moves it
+  a frame or a step at a time, waiting each time on what the code did
+  (`rec_sweep`, `play_sweep` in `test_media.c`). Each puts the clock back when
+  nothing reads it any more. Also injectable is the interval a periodic job
+  runs at (`oc_dbwriter_set_idem_retention`, `oc_netloop_set_relay_silence_ms`,
   `oc_netloop_set_presence_rate_ms`, `OPENCHIME_DEV_CALL_TIMERS`,
-  `OPENCHIME_DEV_VIDEO_CAP_MS`), which is what lets a suite compress a clock it
-  cannot fake.
+  `OPENCHIME_DEV_VIDEO_CAP_MS`).
 - **A check that something does NOT happen never waits out a timeout to say
   so.** It waits for something that must come *after* the thing it rules out,
   and then looks: the daemon answers a connection's requests in order, so a
@@ -666,8 +673,8 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   (`start_db` in `test_dbwriter.c`) rather than migrating from nothing; the
   other suites start their writers on fresh paths, which migrate on boot.
 - **A real-time rate is reported, not asserted narrowly.** Capture and recording
-  run in real time, so how many frames a second of them yields is a property of
-  the machine: a host that cannot encode 720p at 30 fps produces fewer frames,
+  run in real time unless a test holds the media clock, so how many frames a
+  second of them yields is then a property of the machine: a host that cannot encode 720p at 30 fps produces fewer frames,
   which is the recorder behaving correctly. A narrow band around the nominal count
   therefore tests the host — two such checks in `test_media.c` failed on two
   pinned CPUs and under ThreadSanitizer with nothing wrong in the tree. What a
@@ -677,9 +684,9 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   frame is a stop, which no load explains), and a **generous floor** — a fifth of
   the rate — below which there is nothing to watch. `check_frame_rate` in
   `test_media.c` is that check, and it prints the measured rate, which is the
-  number a benchmark wants and a unit suite cannot assert. The same applies to a
-  recording's *length*: stopping early loses what was being recorded and is a
-  defect, stopping a little late is a busy machine.
+  number a benchmark wants and a unit suite cannot assert. A test that asserts a
+  recording's frame count, its length or how its tracks end holds the media
+  clock instead, and then those are the recorder's.
 - Unit tests touch no network. **Several suites use real files on disk**, not
   `:memory:` — `test_dbwriter`, `test_push`, `test_client_core`, `itest_netloop`
   and `itest_slow_blob` each open a database, because they exercise
@@ -747,9 +754,9 @@ in `tests/` that sleeps:
   client, pump a relay) before each look.
 - `oc_test_deadline(ms)` and `oc_test_pause(deadline)` are the pieces, for a
   loop with more to do than one condition; `oc_test_mono_ms()` measures.
-- `oc_test_let_time_pass(ms)` is for when elapsed time is itself the behaviour
-  under test — a silence that must outlast a window, a timestamp that must move
-  on — never a stand-in for waiting on work.
+- Elapsed time that is itself the behaviour under test — a window that must
+  close, a timestamp that must move on — is the code's clock moved by the test
+  (§2.3), never real time sat out.
 - A fake that models a slow peer on purpose says so:
   `/* slow-on-purpose: <why> */`.
 
@@ -759,22 +766,14 @@ come after the thing ruled out (§2.3), or the positive half asserted first
 (the three jobs were taken in and are counted as waiting; then none came
 back). An absence on its own passes as readily when the code is broken.
 
-**Speed.** A limit on how fast code runs is a `CHECK_SPEED` (§2.4), never a
-`CHECK`; better still, the test asserts the mechanism (the work was batched,
-the cache was hit) rather than the clock.
-
-**Timing.** A verdict that races the wall clock — work that must land inside a
-short real-time window, or a count that depends on where a window's edge falls
-— is a `CHECK_TIMING` (`tests/check.h`), and so is every `CHECK_SPEED`. Both
-suites judge them, the full one on CI's runners too (a `CHECK_SPEED` only
-outside the sanitizer, §2.4); `OC_TEST_TIMING=0`
-leaves them unjudged, an escape hatch for a machine too loaded to judge them,
-which no suite sets. (The web client's checks have none: they wait on the
-client's state, §3.4.)
-The code around them still runs everywhere, ThreadSanitizer included. Each is
-a debt: the fix is an injected clock, an explicit sweep or a wait on the
-outcome, after which it is a `CHECK` again. A new test is written that way
-from the start.
+**Speed and time.** No verdict depends on how fast code runs or on real time
+passing: a loaded machine, or the sanitizer, changes nothing a test asserts.
+A limit on speed is asserted as the mechanism behind it (the work was
+batched, the cache was hit, no blob operation ran on the loop's thread, a
+message was delivered while a backend read was held); a window, a moment or a
+rate is asserted on a clock the test injects and moves (§2.3), or by an
+explicit sweep through it, a step at a time, each waited on. (The web client's
+checks wait on the client's state, §3.4.)
 
 **Isolation.** Each test has its own data, paths and ports (§2.3, §2.4):
 `tests/testenv.h`'s `oc_test_mkdtemp` and `oc_test_rmtree` for files,
@@ -795,7 +794,9 @@ before the suites (in both suites) and fails on: a sleep call in
 `tests/` outside `tests/check.h` (or a `slow-on-purpose` line); a comparison
 (`strstr`, `strcmp`, `memcmp`, …) whose literal argument has a space and
 lowercase words, unless it is the test's own data or marked
-`/* contract: … */`; a `"/tmp/` literal in `tests/`; and, in the workflows,
+`/* contract: … */`; a `"/tmp/` literal in `tests/`; any of the removed
+helpers that judged speed or let real time pass, or the variable that switched
+them off, named anywhere in `tests/` (the lint lists them); and, in the workflows,
 `| grep -q` in a step under `pipefail` — `grep -q` exits at its first match,
 the writer dies on the closed pipe, and pipefail turns the match into a
 failure, so the output is captured first (`grep -q … <<<"$out"`, or a file).
@@ -853,23 +854,21 @@ same machine, the suites marked `THREADS` under ThreadSanitizer
   `THREADS`, and that is checked at run time, not read from the source: the
   plain test binary is linked with `-Wl,--wrap=pthread_create`, and a suite
   that starts a thread and is not marked fails, naming itself and the table
-  (`tests/main.c`), in either suite. The sanitizer run judges races, never
-  speed: a limit on how fast code runs — wall-clock time, or one timing
-  against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in the
-  ordinary build and not under the sanitizer, which slows code five to fifteen
-  times and unevenly. A timeout that must fire, checked with a wide margin, is
-  not a speed limit and stays a `CHECK`. And a test must not read an order the
+  (`tests/main.c`), in either suite. The sanitizer run judges races, and no
+  verdict anywhere depends on speed (§2.3a, "Speed and time"), so the
+  sanitizer's slowing, five to fifteen times and uneven, changes none. A
+  timeout that must fire, checked with a wide margin, is not a speed limit and
+  stays a `CHECK`. And a test must not read an order the
   code does not promise — a count, a status or a flag taken to mean something
   happened before or after another thread's step — since the sanitizer's
   slowing is exactly what brings the other order out.
-- every suite that starts no thread plainly, with its timing verdicts
-  judged. A suite with no thread cannot race, so instrumenting it would only
-  make it slower. A threaded suite is not run plainly as well: everything but
-  its `CHECK_SPEED`s is judged under the sanitizer, and the speed verdicts of
-  a `FAST` one are judged by the fast suite, before every push. The one
+- every suite that starts no thread plainly. A suite with no thread cannot
+  race, so instrumenting it would only make it slower. A threaded suite is not
+  run plainly as well: its checks are judged under the sanitizer, and the
+  timer tests of a `FAST` one by the fast suite, before every push. The one
   end-to-end walks -- netloop, client_core, dbwriter, summary and media -- are
-  marked `WALK`: they run in the plain pass only, with every speed verdict and
-  timer test judged, and not under the sanitizer, whose run of them cost
+  marked `WALK`: they run in the plain pass only, with every timer test
+  judged, and not under the sanitizer, whose run of them cost
   minutes. Their threads' parts are tested under it by the suites of those
   threads (ioloop, authpool, xferpool, the workers).
 
@@ -1274,7 +1273,7 @@ voice").
 A new suite is its declaration and one row in `SUITES[]` in `tests/main.c`
 (§2.1): `FAST` unless it is too slow for the fast suite's budget, and
 `THREADS` if its code starts a thread (either suite fails it otherwise, §2.4)
--- `TIMED` instead if it is also `FULL` and has a `CHECK_SPEED`, `WALK` if it
+-- `TIMED` instead if it is also `FULL` and has a timer test (`TIMER_ONLY`), `WALK` if it
 is an end-to-end walk too slow for the sanitizer pass's 30 seconds.
 
 ---
@@ -1389,14 +1388,16 @@ so without this one, the ~100 ms/op regime the pool exists for would go
 unexercised.
 
 The test points the daemon's S3 backend at a loopback endpoint that dribbles a
-download 16 KB at a time with a 120 ms delay between pieces, with the blob
-cache in front of it given no room (`oc_netloop_set_blob_cache_floor`), so
-every write and read goes to the slow store itself; it then measures one
-client's message round-trips while another client's download crawls through it.
+download 16 KB at a time, each piece held until the test releases it, with the
+blob cache in front of it given no room (`oc_netloop_set_blob_cache_floor`), so
+every write and read goes to the slow store itself. In each of four rounds the
+endpoint holds a piece of one client's download -- the daemon's read of it is
+stalled for as long as the test likes -- and another client sends a message,
+which must be delivered while the piece is still held; then the test releases
+it.
 
 ```
-  bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
-  backend 120 ms/op, 3 slow segment(s) served DURING the measurement (= 360 ms of backend stall the loop did not absorb)
+  bob: 4 message(s) delivered, each while a backend read was held; 3 segment(s) served during the rounds
   blob operations on the loop thread during the transfer: 0
 ```
 
@@ -1405,11 +1406,10 @@ while it serves, and the blob store counts every operation that runs on a marked
 thread (`oc_blobstore_loop_ops`). The test requires that count not to move while
 the slow transfer streams: zero blob operations on the loop, whatever the
 runner's load. A single blob call added to the loop's download path makes it
-count dozens and fail. The round-trips are kept as a coarse check on the
-**median** only (during < idle + half a backend stall). Single samples are left
-alone: they are at the mercy of the runner's scheduler, and a check that allowed
-one spike in nine failed a sanitizer run on CI whose median had *fallen* during
-the transfer.
+count dozens and fail. The effect is checked by construction, not by timing:
+a stall in a blob read on the loop's thread would hold the loop until the test
+released the piece, so the message sent meanwhile would not arrive -- no
+round-trip is timed, and nothing depends on the runner's speed.
 
 **The test discriminates.** Reverting `download_pump` to read inline
 on the epoll thread (the behaviour ARCH-69 forbids) makes the run **time out entirely** —
@@ -1423,8 +1423,8 @@ Two implementation notes worth keeping, both learned by getting it wrong first:
   upload-based version needs a multi-megabyte payload and runs for minutes. A
   slow *reader* blocks trivially — there is no data yet.
 - The concurrent client must run on **its own thread**. Ticking it between the
-  measured client's sends makes the two barely overlap, and the measurement
-  becomes a no-op that passes either way.
+  other client's sends makes the two barely overlap, and the check becomes a
+  no-op that passes either way.
 
 The same endpoint has a **gate**, which proves cancelling a post of files
 (REQ-140) by construction rather than by timing. While it is shut, a PUT is read

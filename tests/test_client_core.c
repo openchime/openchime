@@ -1112,9 +1112,11 @@ static int csum_run(void *h, const char *system, const char *user, const char *g
                     oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
     (void)h; (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&core_sum_calls, 1, __ATOMIC_RELAXED);
+    /* A busy model: it holds until the test lets it go or its gate says stop,
+     * looking at the gate as a real model does between steps. */
     while (__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE)) {
         if (gate && gate(gctx)) return -1;
-        oc_test_let_time_pass(5);   /* a busy model: time goes by while it holds */
+        (void)WAIT_UNTIL(!__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE), 5);
     }
     if (st) memset(st, 0, sizeof *st);
     *out = strdup(grammar && strstr(grammar, "note ::=")   /* contract: the summarizer's grammar rule name */

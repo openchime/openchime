@@ -530,10 +530,17 @@ static void xfer_submit(oc_dbwriter *dbw, const conn_xfer *x, oc_job *j) {
 }
 static int xfer_current(const conn_xfer *x, const oc_dbres *r) { return r->gen == x->gen; }
 
+static uint64_t g_clock_ahead_ms;   /* a test's advance of the loop's clock (netloop.h) */
+void oc_netloop_advance_clock_ms(uint64_t ms) {
+    if (ms) __atomic_add_fetch(&g_clock_ahead_ms, ms, __ATOMIC_RELAXED);
+    else    __atomic_store_n(&g_clock_ahead_ms, 0, __ATOMIC_RELAXED);
+}
+
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u +
+           __atomic_load_n(&g_clock_ahead_ms, __ATOMIC_RELAXED);
 }
 
 /* --- Turn statistics (netloop.h) ------------------------------------------ */
