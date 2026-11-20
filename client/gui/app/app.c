@@ -2263,11 +2263,15 @@ static rectf g_members_btn;       /* header toggle hit-box */
 static rectf g_addppl_btn;
 /* Back and forward (navigation history), at the header's left. */
 static rectf g_hist_back_btn, g_hist_fwd_btn;
-/* The pane's GROUPS subheading's + (REQ-309): add a group to the channel. */
+/* The members pane's heading-row buttons: Add person opens the people picker
+ * in the pane (REQ-229), as the header's Add people does; Add group adds a group
+ * to the channel (REQ-309). */
+static rectf g_mem_addppl;
 static rectf g_grp_plus;
-/* Tooltips for those two icon-only buttons, drawn BELOW them -- the header is
+/* Tooltips for those icon-only buttons, drawn BELOW them -- the header is
  * at the top of the window, where the toolbar's above-the-button tips would
- * have no room -- on the toolbar's dwell. 0 none, 1 Add people, 2 Add a group. */
+ * have no room -- on the toolbar's dwell. 0 none, 1 Add people, 2 Add a group,
+ * 3 Back, 4 Forward, 5 the pane's Add person. */
 static int         g_chtip = 0;
 static uint64_t   g_chtip_since;
 static int         g_chtip_shown;
@@ -12479,7 +12483,8 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         stroke_round(rt, g_addppl_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         float ic = UIS(18), cx = (g_addppl_btn.left + g_addppl_btn.right) / 2,
               cy = (g_addppl_btn.top + g_addppl_btn.bottom) / 2;
-        draw_lucide(rt, OC_ICON_USER_PLUS, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+        /* The same icon as the members pane's Add person: both open the picker. */
+        draw_lucide(rt, OC_ICON_PERSON_ADD, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
                     hot ? OC_COL_TEXT : OC_COL_MUTED);
         statr = g_addppl_btn.left - 12;
     } else {
@@ -13996,7 +14001,7 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg);
 static void mem_hits_clear(void) {
     g_n_memrows = 0;
     g_n_memgrprows = 0;
-    g_memrm.rm = g_grp_plus = rf(0, 0, 0, 0);
+    g_memrm.rm = g_grp_plus = g_mem_addppl = rf(0, 0, 0, 0);
     g_mem_pick_add = g_mem_pick_cancel = rf(0, 0, 0, 0);
     g_memrm.uid = 0;
 }
@@ -14010,6 +14015,15 @@ static void mem_button(gfx *rt, rectf b, const char *label, int danger, int dimm
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_meta, b, dimmed ? OC_COL_FAINT : danger ? OC_COL_DANGER : OC_COL_TEXT);
     g_meta->align = ST_ALIGN_LEFT;
+}
+
+/* An icon-only button in the pane's heading row, hovered as the header's are. */
+static void mem_head_button(gfx *rt, rectf b, int icon) {
+    int hot = in_rect(b, g_mouse_x, g_mouse_y);
+    if (hot) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+    float ic = UIS(14), cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
+    draw_lucide(rt, icon, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+                hot ? OC_COL_TEXT : OC_COL_MUTED);
 }
 
 static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
@@ -14040,9 +14054,19 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                   g_chrome_hover == 5 ? OC_COL_TEXT : OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
     }
-    draw_text(rt, title, g_meta,
-              rf(x0 + (g_rp_mode == RP_MEMBERS ? 16 : 34), 10, W - 34, 34), OC_COL_FAINT);
+    const oc_channel *mch = oc_model_channel((oc_model *)m, g_sel);
+    int named = mch && mch->kind != OC_CHANNEL_KIND_DM;
+    /* Members mode in a channel that takes people: Add person and Add group sit
+     * in this row, left of the close, so what changes the list is beside its
+     * title. A DM takes no one, and the other modes are about something else. */
+    int head_btns = g_rp_mode == RP_MEMBERS && named;
     g_rp_close = rf(W - 30, 8, W - 8, 30);
+    float hb = UIS(22), hcy = (g_rp_close.top + g_rp_close.bottom) / 2;
+    rectf grp_btn = rf(g_rp_close.left - 4 - hb, hcy - hb / 2, g_rp_close.left - 4, hcy + hb / 2);
+    rectf ppl_btn = rf(grp_btn.left - 4 - hb, hcy - hb / 2, grp_btn.left - 4, hcy + hb / 2);
+    draw_text(rt, title, g_meta,
+              rf(x0 + (g_rp_mode == RP_MEMBERS ? 16 : 34), 10,
+                 head_btns ? ppl_btn.left - 4 : W - 34, 34), OC_COL_FAINT);
     /* Hover on the pane's close — pane_header's X already has one; this one
      * lacked it only because the context pane draws its own header. */
     if (g_chrome_hover == 4) fill_round(rt, g_rp_close, OC_R_CONTROL, OC_COL_HOVER);
@@ -14065,6 +14089,12 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
 
     float y = 40;
     mem_hits_clear();
+    if (head_btns) {
+        g_mem_addppl = ppl_btn;
+        g_grp_plus = grp_btn;
+        mem_head_button(rt, g_mem_addppl, OC_ICON_PERSON_ADD);
+        mem_head_button(rt, g_grp_plus, OC_ICON_GROUP_ADD);
+    }
     /* This channel's members (REQ-031) — NOT the tenant roster, which is what
      * this pane used to list. With two users the two are the same set, which is
      * exactly why the bug survived: in any real workspace it showed people who
@@ -14079,13 +14109,12 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
      * arrives after the pane opens and shrinks when somebody leaves, and a clamp
      * that only ran on the wheel would leave the pane scrolled past its end with
      * nothing in it. */
-    /* The channel's groups (REQ-309) head the list, under a GROUPS subheading
-     * whose + adds one, one row each with its own Remove; the people they bring
-     * are listed below with everyone else, marked. Every action is beside what
-     * it acts on: Add people is in the header, beside the count; a person's
-     * Remove is on their row. */
-    const oc_channel *mch = oc_model_channel((oc_model *)m, g_sel);
-    int named = mch && mch->kind != OC_CHANNEL_KIND_DM;
+    /* One list under the pane's one heading: the channel's groups (REQ-309)
+     * first, one row each with its own Remove, then its people, those a group
+     * brings marked. No subheadings -- a group row and a person row already look
+     * different -- and a rule between the two parts when there are groups. Every
+     * action is beside what it acts on: Add person and Add group are in the
+     * heading row; a person's Remove is on their row. */
     uint16_t n_cg = mch ? mch->n_groups : 0;
     /* A mode is the channel's it was started for, and adding is the picker's
      * while the picker is the channel's: New message taking it back ends it. */
@@ -14093,7 +14122,6 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                        (g_mem_mode == MEM_ADDING && g_tgt_host != TGT_HOST_CHANNEL)))
         mem_mode_set(MEM_NORMAL, 0);
     float top = 40, pick_bottom = 0;
-    g_grp_plus = rf(0, 0, 0, 0);
     /* Adding: the people picker (REQ-229), the full width of the pane, with Add
      * (dimmed until someone is chosen) and Cancel under it. Its list floats over
      * the roster, so it is drawn after it. */
@@ -14107,23 +14135,12 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         mem_button(rt, g_mem_pick_cancel, "Cancel", 0, 0);
         top = pick_bottom + 38;
     }
-    /* GROUPS, quiet like the pane's own title, and its + at the right. */
-    float grp_head = 0;
-    if (named) {
-        grp_head = UIS(26);
-        draw_text(rt, "GROUPS", g_meta, rf(x0 + 16, top, W - 44, top + grp_head), OC_COL_FAINT);
-        g_grp_plus = rf(W - 38, top + (grp_head - UIS(22)) / 2, W - 16, top + (grp_head + UIS(22)) / 2);
-        int hot = in_rect(g_grp_plus, g_mouse_x, g_mouse_y);
-        if (hot) fill_round(rt, g_grp_plus, OC_R_CONTROL, OC_COL_HOVER);
-        float ic = UIS(14), cx = (g_grp_plus.left + g_grp_plus.right) / 2,
-              cy = (g_grp_plus.top + g_grp_plus.bottom) / 2;
-        draw_lucide(rt, OC_ICON_PLUS, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
-                    hot ? OC_COL_TEXT : OC_COL_MUTED);
-        top += grp_head;
-    }
+    /* The rule between groups and people: a gap above and below a 1px line,
+     * and no space at all when there are no groups. */
+    float div_gap = UIS(8), div_h = n_cg > 0 ? 2 * div_gap + 1 : 0;
     y = top;
     float view = H - top;
-    float content = (float)(m->n_chanmem + n_cg) * ROW_H;
+    float content = (float)(m->n_chanmem + n_cg) * ROW_H + div_h;
     g_mem_max = content > view ? content - view : 0;
     if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
     if (g_mem_scroll < 0) g_mem_scroll = 0;
@@ -14154,6 +14171,11 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             }
         }
         y += ROW_H;
+    }
+    if (div_h > 0) {
+        float ly = y + div_gap;
+        if (ly >= top && ly < H) fill(rt, rf(x0 + 16, ly, W - 14, ly + 1), OC_COL_BORDER);
+        y += div_h;
     }
     for (size_t i = 0; i < m->n_chanmem; i++) {
         const oc_chan_member *cm = &m->chanmem[i];
@@ -23716,9 +23738,10 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         /* The header's and the pane's icon-only buttons' names, over both. */
         if (g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS) {
             rectf tb = g_chtip == 1 ? g_addppl_btn : g_chtip == 2 ? g_grp_plus :
-                       g_chtip == 3 ? g_hist_back_btn : g_hist_fwd_btn;
+                       g_chtip == 3 ? g_hist_back_btn : g_chtip == 5 ? g_mem_addppl : g_hist_fwd_btn;
             const char *tt = g_chtip == 1 ? "Add people" : g_chtip == 2 ? "Add a group" :
-                             g_chtip == 3 ? "Back (Alt+Left)" : "Forward (Alt+Right)";
+                             g_chtip == 3 ? "Back (Alt+Left)" : g_chtip == 5 ? "Add person" :
+                             "Forward (Alt+Right)";
             if (tb.right > tb.left) draw_tip_below(rt, tb, tt, 0, W);
         }
         /* The summary pane's hover names and citation card, over everything. */
@@ -27209,6 +27232,7 @@ enum {
     AT_ADDPPL,        /* the header's Add people */
     AT_HIST,          /* payload: 0 back, 1 forward */
     AT_GRPPLUS,       /* the members pane's Add a group */
+    AT_MEMADDPPL,     /* the members pane's Add person */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_POLLOPT,       /* payload: poll option hit index -- vote, or take it back (REQ-225) */
@@ -27638,8 +27662,10 @@ static void a11y_publish_scene(const oc_model *m) {
         acc_push(items, &n, OC_ACC_BUTTON, "header.back", "Back", g_hist_back_btn, ATOK(AT_HIST, 0));
     if (g_hist_fwd_btn.right > g_hist_fwd_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.forward", "Forward", g_hist_fwd_btn, ATOK(AT_HIST, 1));
+    if (g_mem_addppl.right > g_mem_addppl.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "members.addperson", "Add person", g_mem_addppl, ATOK(AT_MEMADDPPL, 0));
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
-        acc_push(items, &n, OC_ACC_BUTTON, "members.groups.add", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "members.addgroup", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
     for (int i = 0; i < g_n_call_rows && n < OC_ACC_MAX; i++) {
         const oc_call_view *cv = oc_model_call_in(m, g_call_rows[i].ch);
         char aid[OC_ACC_AID_MAX], nm[160], lbl[96];
@@ -33475,6 +33501,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         if (pm && g_show_members) {
             /* The picker first: its list floats over the rows below. */
             if (chan_pick_click(x, y)) return 1;
+            if (in_rect(g_mem_addppl, x, y)) { members_open(hwnd, g_sel, 1); return 1; }
             if (in_rect(g_grp_plus, x, y)) { channel_group_pick(hwnd, pm, g_sel, 1); return 1; }
             for (int i = 0; i < g_n_memgrprows; i++)
                 if (in_rect(g_memgrprows[i].rm, x, y)) {
@@ -38659,10 +38686,12 @@ static void test_dump(const char *path) {
         fprintf(f, "%s%llu:%.0f,%.0f,%.0f,%.0f", i ? ";" : "", (unsigned long long)g_memgrprows[i].gid,
                 g_memgrprows[i].rm.left, g_memgrprows[i].rm.top, g_memgrprows[i].rm.right, g_memgrprows[i].rm.bottom);
     fprintf(f, "\n");
-    /* The header's Add people, the picker's Add and Cancel while it is open, and
-     * which icon's tooltip is up (0 none, 1 Add people, 2 Add a group). */
-    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f pickcancel=%.0f,%.0f,%.0f,%.0f tip=%d\n",
+    /* The header's Add people, the pane's Add person, the picker's Add and
+     * Cancel while it is open, and which icon's tooltip is up (g_chtip's values:
+     * 0 none, 1 Add people, 2 Add a group, 5 the pane's Add person). */
+    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f paneadd=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f pickcancel=%.0f,%.0f,%.0f,%.0f tip=%d\n",
             g_addppl_btn.left, g_addppl_btn.top, g_addppl_btn.right, g_addppl_btn.bottom,
+            g_mem_addppl.left, g_mem_addppl.top, g_mem_addppl.right, g_mem_addppl.bottom,
             g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom,
             g_mem_pick_cancel.left, g_mem_pick_cancel.top, g_mem_pick_cancel.right, g_mem_pick_cancel.bottom,
             g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS ? g_chtip : 0);
@@ -42888,6 +42917,7 @@ static int on_mouse_move(oc_win *hwnd, int mx, int my) {
             if (!pointer_blocked()) {
                 if (in_rect(g_addppl_btn, (float)mx, (float)my)) ch = 1;
                 else if (in_rect(g_grp_plus, (float)mx, (float)my)) ch = 2;
+                else if (in_rect(g_mem_addppl, (float)mx, (float)my)) ch = 5;
                 else if (in_rect(g_hist_back_btn, (float)mx, (float)my)) ch = 3;
                 else if (in_rect(g_hist_fwd_btn, (float)mx, (float)my)) ch = 4;
             }
@@ -43272,6 +43302,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_ADDPPL:    if (g_sel) members_open(hwnd, g_sel, 1); break;
         case AT_HIST:      hist_go(arg ? 1 : -1); break;
         case AT_GRPPLUS:   if (g_sel && model()) channel_group_pick(hwnd, model(), g_sel, 1); break;
+        case AT_MEMADDPPL: if (g_sel) members_open(hwnd, g_sel, 1); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
             if (arg == 1) dict_freetalk_toggle(hwnd);
