@@ -542,7 +542,7 @@ static void test_camera_sync(void) {
     CHECK(oc_cam_sync(2, 1, 0xFFFFFFFEu, 0) == OC_CAM_HOLD);             /* across the wrap */
     uint8_t buf[64]; static const uint8_t vp9[5] = { 1, 2, 3, 4, 5 };
     size_t n = oc_cam_frame_put(buf, 0xA1B2C3D4u, vp9, sizeof vp9);
-    uint32_t af; const uint8_t *d; size_t dn;
+    uint32_t af = 0; const uint8_t *d = NULL; size_t dn = 0;
     CHECK(n == OC_CAM_PREFIX + 5 && oc_cam_frame_get(buf, n, &af, &d, &dn) == 0);
     CHECK(af == 0xA1B2C3D4u && dn == 5 && memcmp(d, vp9, 5) == 0);
     CHECK(oc_cam_frame_get(buf, OC_CAM_PREFIX, &af, &d, &dn) == -1);
