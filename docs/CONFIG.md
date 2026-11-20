@@ -512,6 +512,7 @@ accepts, and any other stops it with exit status 2.
 | `--config-env` | Prints the packaged environment file (`packaging/openchimed.env`), from the registry. |
 | `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to OUT with the built-in model — a WAV when OUT ends `.wav`, otherwise an MP4 — then exits. Only in a build with read-aloud. |
 | `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. In every build, with read-aloud or not. |
+| `--voice-pack MODEL.onnx VOICES.npz OUT` | Converts the upstream voice model and its voices into `voice.bin` at OUT, the same bytes on every run (VENDORS.md has the pinned inputs; TTSKIT.md §6 the format), then exits. In every build, with read-aloud or not. |
 | `--stt-hear IN.wav` | Prints the text recognized in a 16-bit mono WAV, then exits. Only in a build with voice input. |
 | `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. In every build, with voice input or not. |
 

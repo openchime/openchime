@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Build ONNX Runtime from pinned source as ONE minimal static library, for the
-# read-aloud voice model linked into openchimed (ARCH-111) -- the "fetched at
+# voice input recognizer linked into openchimed (ARCH-112) -- the "fetched at
 # build" vendoring class (docs/VENDORS.md §2).
 #
 #   scripts/build/onnxruntime.sh           the static library, for linking
-#   scripts/build/onnxruntime.sh converter the prebuilt full library too, which
-#                                          only the build uses to convert the model
+#   scripts/build/onnxruntime.sh protoc    the host's protoc alone, for a cross build
 #
 # Minimal means: only the operator kernels (and types) the daemon's models use
 # (daemon/ort.ops.config), the compact .ort model format only (no protobuf
@@ -36,10 +35,6 @@ FLATBUFFERS_WHEEL="flatbuffers-25.12.19-py2.py3-none-any.whl"
 FLATBUFFERS_SHA256="7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4"
 FLATBUFFERS_URL="https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/${FLATBUFFERS_WHEEL}"
 
-# The prebuilt full release, for the converter: SHA-256s as GitHub records them.
-ORT_PREBUILT_SHA256_x64="a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd"
-ORT_PREBUILT_SHA256_aarch64="e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da"
-
 fetch() {
   local url="$1" out="$2" want="$3" got
   if [ ! -f "$out" ] || [ "$(sha256sum "$out" | cut -d" " -f1)" != "$want" ]; then
@@ -63,25 +58,10 @@ mkdir -p third_party
 cd third_party
 
 case "$(uname -m)" in
-  x86_64)        ARCH=x64 ;;
-  aarch64|arm64) ARCH=aarch64 ;;
+  x86_64|aarch64|arm64) ;;
   *) echo "build_onnxruntime: unsupported architecture $(uname -m)" >&2; exit 2 ;;
 esac
 
-# --- the prebuilt full library (converter only) -------------------------------
-if [ "${MODE}" = converter ]; then
-  DEST="onnxruntime-${ORT_VERSION}-prebuilt"
-  if [ ! -f "${DEST}/lib/libonnxruntime.so.1" ]; then
-    sum_var="ORT_PREBUILT_SHA256_${ARCH}"
-    TARBALL="onnxruntime-linux-${ARCH}-${ORT_VERSION}.tgz"
-    fetch "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${TARBALL}" "${TARBALL}" "${!sum_var}"
-    rm -rf "${DEST}" && mkdir -p "${DEST}"
-    tar -xzf "${TARBALL}" -C "${DEST}" --strip-components=1
-    rm -f "${TARBALL}"
-  fi
-  echo "build_onnxruntime: done: third_party/${DEST}"
-  exit 0
-fi
 # --- the host's protoc, for a cross build -----------------------------------
 # The same configure as the static build below, in the host's build directory,
 # but only the protoc target is compiled: protobuf and the abseil it needs. A
@@ -91,7 +71,7 @@ if [ "${MODE}" = protoc ]; then
   MODE=static; PROTOC_ONLY=1
 fi
 PROTOC_ONLY="${PROTOC_ONLY:-0}"
-[ "${MODE}" = static ] || { echo "build_onnxruntime: mode is static, converter or protoc, not ${MODE}" >&2; exit 2; }
+[ "${MODE}" = static ] || { echo "build_onnxruntime: mode is static or protoc, not ${MODE}" >&2; exit 2; }
 
 # --- the minimal static library -----------------------------------------------
 # OC_ARCH (make ARCH=aarch64): a build for another architecture with the CC

@@ -11,9 +11,9 @@
 # own kind of wrong. utf8proc and qrcodegen are in both, the daemon normalizing
 # passwords with one and drawing the setup page's QR code with the other.
 # Read-aloud (ARCH-111), voice input (ARCH-112) and summaries are in the
-# release's daemon, and with them ONNX Runtime, the Kitten voice model,
-# CMUdict-derived data, Moonshine and llama.cpp; for a daemon built without
-# one, run this with TTS=0, STT=0 or SUM=0.
+# release's daemon, and with them the voice model, Opus, CMUdict-derived data,
+# ONNX Runtime, Moonshine and llama.cpp; for a daemon built without one, run
+# this with TTS=0, STT=0 or SUM=0.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
 # program, in the container image only, never linked into openchimed nor in
@@ -98,25 +98,24 @@ in full here, as those licences require.
                    domain
 HEADER
 
-if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
-  header <<'HEADER'
-
-and, for read-aloud and voice input (built into the binary):
-
-  ONNX Runtime 1.30.0  MIT          neural network inference, built minimal and
-                                    static, with the notices of the components
-                                    compiled into it
-HEADER
-fi
 if [ "$TTS" = 1 ]; then
   header <<'HEADER'
-  Kitten TTS mini 0.8  Apache-2.0   the voice model, embedded
+
+and, for read-aloud (built into the binary, its data in tts/):
+
+  The voice model      Apache-2.0   read-aloud's speech, shipped as data in tts/
   Opus 1.6.1           BSD-3-Clause encoding read-aloud's audio
-  CMUdict              BSD-style    source of the embedded pronunciation data
+  CMUdict              BSD-style    source of the pronunciation data
 HEADER
 fi
 if [ "$STT" = 1 ]; then
   header <<'HEADER'
+
+and, for voice input (built into the binary, its data in stt/):
+
+  ONNX Runtime 1.30.0  MIT          neural network inference, built minimal and
+                                    static, with the notices of the components
+                                    compiled into it
   Moonshine Tiny       MIT          the speech recognizer's model and tokenizer,
     Streaming (en)                  shipped as data in stt/
 HEADER
@@ -147,14 +146,14 @@ emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LIC
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
-if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
+if [ "$STT" = 1 ]; then
   # The architecture's own copy (OC_ARCH, as the build scripts take it): a
   # cross build has no host archive to read from, and the texts are the same.
   emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/LICENSE"
   emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/ThirdPartyNotices.txt"
 fi
 if [ "$TTS" = 1 ]; then
-  emit "Kitten TTS mini 0.8 -- Apache License 2.0" "${root}/build/kitten/LICENSE"
+  emit "The voice model -- Apache License 2.0" "${root}/ttskit/data/VOICE-LICENSE"
   emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
   emit "CMU Pronouncing Dictionary -- BSD-style licence" "${root}/ttskit/data/CMUDICT-LICENSE"
 fi

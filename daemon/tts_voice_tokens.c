@@ -1,10 +1,11 @@
-/* IPA to Kitten's token ids (kitten.h). No ONNX Runtime here, so the tests link it. */
-#include "tts_kitten.h"
+/* IPA to the voice model's token ids (tts_voice.h). Plain C with no model, so the
+ * tests link it. */
+#include "tts_voice.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Kitten's symbol table, as its Python TextCleaner builds it: the pad "$", the
+/* The voice model's symbol table, as its upstream Python TextCleaner builds it: the pad "$", the
  * punctuation, the ASCII letters and the IPA letters, each numbered by position,
  * a later duplicate replacing an earlier one. Sorted by code point for bsearch;
  * generated from the upstream string, not typed. */
@@ -49,7 +50,7 @@ static const sym SYMS[] = {
 
 #define PAD   0
 #define SPACE 16
-#define END   10          /* "…", which Kitten appends before the closing pad */
+#define END   10          /* "…", which the upstream code appends before the closing pad */
 
 static int sym_id(uint32_t cp) {
     size_t lo = 0, hi = sizeof SYMS / sizeof SYMS[0];
@@ -91,7 +92,7 @@ static int is_word(uint32_t cp) {
 
 static int is_space(uint32_t cp) { return cp == ' ' || (cp >= '\t' && cp <= '\r') || cp == 0x00A0; }
 
-size_t kitten_tokens(const char *ipa, long long *ids, size_t cap) {
+size_t tts_voice_tokens(const char *ipa, long long *ids, size_t cap) {
     if (cap < 3) return 0;
     size_t n = 0;
     ids[n++] = PAD;

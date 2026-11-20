@@ -93,8 +93,9 @@ LDFLAGS ?= -lpthread -lm   # -lm: SQLite FTS5 ranking (bm25) calls log()
 
 # --- Features -----------------------------------------------------------------
 # What the daemon is built with. All off by default, and always off in `make
-# build`: read-aloud (TTS) and voice input (STT) need ONNX Runtime built from
-# source (about 20 minutes, once) and model downloads; summaries (SUM) need
+# build`: read-aloud (TTS) needs Opus and the voice model's data
+# (ttskit/data/); voice input (STT) needs ONNX Runtime built from source (about
+# 20 minutes, once) and the recognizer's download; summaries (SUM) need
 # llama.cpp; the web client (WEB) needs Emscripten and a wasm build of SDL3 and
 # the codecs. The full build turns them all on.
 #
@@ -245,12 +246,12 @@ run: run-build
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
 	 OPENCHIME_DEV_LOOPBACK=on OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
-# Everything built, except the speech models under build/kitten and
-# build/moonshine: they are downloads, not builds, and cost minutes to fetch
-# again. `distclean` removes those too, and the remembered features.
+# Everything built, except the recognizer's files under build/moonshine: they
+# are a download, not a build, and cost minutes to fetch again. `distclean`
+# removes those too, and the remembered features.
 clean:
 	rm -f $(BIN)
-	find build -mindepth 1 -maxdepth 1 ! -name kitten ! -name moonshine ! -name .features -exec rm -rf {} + 2>/dev/null || true
+	find build -mindepth 1 -maxdepth 1 ! -name moonshine ! -name .features -exec rm -rf {} + 2>/dev/null || true
 
 distclean:
 	rm -f $(BIN)

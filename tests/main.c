@@ -89,6 +89,7 @@ int run_voice_pick_tests(void);
 int run_tts_data_tests(void);
 int run_stt_tests(void);
 int run_voice_tests(void);
+int run_voice_parity_tests(void);
 int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_sdltext_unicode_tests(void);
@@ -339,6 +340,7 @@ static const struct suite {
     S(run_tts_data_tests,        FAST, PLAIN),
     S(run_stt_tests,             FAST, THREADS),
     S(run_voice_tests,           FAST, PLAIN),
+    S(run_voice_parity_tests,    FULL, PLAIN),
     S(run_unfurl_tests,          FAST, PLAIN),
     S(run_sdltext_map_tests,     FAST, PLAIN),
     S(run_sdltext_unicode_tests, FAST, PLAIN),

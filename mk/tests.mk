@@ -146,6 +146,8 @@ build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c d
 	    daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c \
 	    third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
 	@echo "built $@ -- needs OPENCHIME_S3 to run"
-# ttskit's data tool (docs/TTSKIT.md).
-build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build-dir
-	$(CC) $(CFLAGS) $(TTSKIT_INC) $(TTSKIT_SRC) ttskit/tts_pack.c -lm -o $@
+# ttskit's data tool (docs/TTSKIT.md). `say` turns IPA into the voice model's
+# tokens with the daemon's token function, as the daemon does.
+TTS_PACK_SRC := $(TTSKIT_SRC) ttskit/tts_pack.c daemon/tts_voice_tokens.c
+build/tts_pack: $(TTS_PACK_SRC) $(wildcard ttskit/*.h) daemon/tts_voice.h | build-dir
+	$(CC) $(CFLAGS) $(TTSKIT_CFLAGS) $(TTSKIT_INC) -Idaemon $(TTS_PACK_SRC) -lm -o $@

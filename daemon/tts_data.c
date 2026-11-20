@@ -190,9 +190,10 @@ int oc_tts_data_write_manifest_cli(const char *dir, const char *version, const c
 
 /* What each engine's data directory holds, in the order the manifest lists
  * them (tts.h, stt.h). Here, not beside each engine: the manifest is written
- * by a daemon that may carry neither (mk/daemon.mk). */
+ * by a daemon that may carry neither (mk/daemon.mk). The voice model's licence
+ * is listed with its data so that it travels with it, checked like the rest. */
 const char *const OC_TTS_DATA_FILES[] = {
-    "kitten.ort", "voices.npz", OC_TTS_LANG "/lexicon.bin", OC_TTS_LANG "/guesses.bin", NULL,
+    "voice.bin", OC_TTS_LANG "/lexicon.bin", OC_TTS_LANG "/guesses.bin", "VOICE-LICENSE", NULL,
 };
 const char *const OC_STT_DATA_FILES[] = {
     "frontend.model.ort", "frontend.weights.ort", "encoder.ort", "adapter.ort",

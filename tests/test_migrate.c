@@ -143,14 +143,14 @@ static void test_embedded_schema(void) {
      * pair twice is refused (REQ-293, ARCH-111). */
     CHECK(sqlite3_exec(db,
         "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
-        " VALUES(x'0102',    'kitten-1', 'k1', 10, 100, 1, 1),"
-        "       (x'0102',    'kitten-2', 'k2', 10, 100, 1, 1),"
-        "       (x'0203',    'kitten-1', 'k3', 10, 100, 1, 1);",
+        " VALUES(x'0102',    'voice-1', 'k1', 10, 100, 1, 1),"
+        "       (x'0102',    'voice-2', 'k2', 10, 100, 1, 1),"
+        "       (x'0203',    'voice-1', 'k3', 10, 100, 1, 1);",
         NULL, NULL, &err) == SQLITE_OK);
     CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio;") == 3);
     CHECK(sqlite3_exec(db,
         "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
-        " VALUES(x'0102','kitten-1','again',10,100,1,1);",
+        " VALUES(x'0102','voice-1','again',10,100,1,1);",
         NULL, NULL, NULL) != SQLITE_OK);
     /* 0042 also gave users a voice, absent until the daemon picks one. */
     CHECK(scalar(db, "SELECT COUNT(*) FROM users WHERE id=9 AND voice_id IS NULL;") == 1);

@@ -2861,7 +2861,7 @@ static void test_tts_frames(void) {
     {
         oc_tts_info in;
         memset(&in, 0, sizeof in);
-        in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
+        in.model_version = oc_slice_str("voice-1/ttskit-1/rate-1.2");
         /* Three voices, with language tags of DIFFERENT lengths: the language
          * sits inside the repeated voice list, so a field appended in the wrong
          * place, or read as a fixed width, round-trips the first voice and
@@ -2882,7 +2882,7 @@ static void test_tts_frames(void) {
         oc_tts_info out;
         CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
         CHECK(out.count == 3);
-        CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
+        CHECK(slice_eq_str(out.model_version, "voice-1/ttskit-1/rate-1.2"));
         CHECK(slice_eq_str(out.voices[0].lang, "en-US"));
         CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
         CHECK(slice_eq_str(out.voices[1].label, "Kiki"));

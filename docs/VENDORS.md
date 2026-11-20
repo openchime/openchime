@@ -128,8 +128,8 @@ daemon provably does not use.
 **Attribution when shipping binaries.** Building from source never triggered the
 vendored licences' notice requirements; distributing packages does. `openchimed`
 links **mbedTLS** (Apache-2.0), **Argon2**, **jsmn**, **picohttpparser**,
-utf8proc, qrcodegen, SecLists' list, SQLite and the CA roots, and, built with
-read-aloud, voice input or summaries, ONNX Runtime, libopus and llama.cpp
+utf8proc, qrcodegen, SecLists' list, SQLite and the CA roots, and libopus built
+with read-aloud, ONNX Runtime with voice input and llama.cpp with summaries,
 beside the models' data; every channel ships their texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `/usr/share/licenses/openchimed/copyright` on RHEL, `COPYRIGHT` in the tarball.
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
@@ -186,12 +186,12 @@ has moved.
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
-| **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
+| **ONNX Runtime** | 1.30.0 | Neural network inference for the voice-input recognizer, built from source **minimal and static** (only the model's operators and types, `.ort` format only, no exceptions). Read-aloud does not use it | Daemon (voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
-| **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
+| **Kitten TTS mini** (KittenML) | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted by `openchimed --voice-pack` and **committed** as `ttskit/data/voice.bin` (its licence `ttskit/data/VOICE-LICENSE`), run by ttskit in plain C and **shipped beside the daemon** as data. Not fetched at build; the pinned files and the commands that recreate it are below | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: nine files — the frontend (model and weights), encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
-| **libc++** (LLVM, zig's bundled copy) | zig 0.17.1's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with read-aloud, voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
+| **libc++** (LLVM, zig's bundled copy) | zig 0.17.1's | The C++ runtime ONNX Runtime and llama.cpp are compiled against in a release build, linked statically | Daemon (release build, with voice input or summaries) | https://github.com/llvm/llvm-project | Apache-2.0 WITH LLVM-exception (no notice required in binary form) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, its notice in `ttskit/data/CMUDICT-LICENSE`) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
 **SDL3**: `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
@@ -204,8 +204,65 @@ system stays its own business, and this tree's stays make. It is a
 large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
-**Read-aloud's engine and model** (ARCH-111) come the same way, with more to
-say because ONNX Runtime is the one C++ dependency and the model is large:
+**Read-aloud's voice model** (ARCH-111) is **Kitten TTS mini 0.8**, published by
+KittenML under Apache-2.0. ttskit runs it in plain C (TTSKIT.md §5b); nothing of it is
+fetched or built at build time. It is converted once into ttskit's own format and
+**committed**: `ttskit/data/voice.bin` (86,851,136 bytes), with the model's licence beside it
+as `ttskit/data/VOICE-LICENSE` (upstream's `LICENSE`, verbatim). The build copies both into
+`tts/` beside `openchimed`, and `packaging/licenses.sh` puts the licence, with CMUdict's
+notice, in every package that carries read-aloud.
+
+Its source, pinned:
+
+| File | From | SHA-256 |
+|---|---|---|
+| `kitten_tts_mini_v0_8.onnx` | https://huggingface.co/KittenML/kitten-tts-mini-0.8, revision `c02725660cea441db4c383af69f1f26f5cd00947` | `0f5bbae4fc4800c98dbc544a87ecfa79510de2fb8222db30d12e5bfe9177df91` |
+| `voices.npz` | the same repository and revision | `40ad2638952b77b7b2f30127e2608e169fc69dd256b53bd8aaa3409a33193c42` |
+| `LICENSE` | https://github.com/KittenML/KittenTTS, commit `be5758500b731b8fc674acc62ea480d3022b7ebe` | `787aa312b93eee80b636f35652469df29efdb7582239d6a9c088467555a3c7fd` |
+
+**Recreating `voice.bin` byte for byte.** `openchimed --voice-pack` is in every build of the
+daemon, with read-aloud or without; from the repository folder:
+
+```
+make openchimed
+mkdir -p build/voice-src && cd build/voice-src
+HF=https://huggingface.co/KittenML/kitten-tts-mini-0.8/resolve/c02725660cea441db4c383af69f1f26f5cd00947
+GH=https://raw.githubusercontent.com/KittenML/KittenTTS/be5758500b731b8fc674acc62ea480d3022b7ebe
+curl -fsSLO "$HF/kitten_tts_mini_v0_8.onnx"
+curl -fsSLO "$HF/voices.npz"
+curl -fsSLO "$GH/LICENSE"
+sha256sum -c <<'SUMS'
+0f5bbae4fc4800c98dbc544a87ecfa79510de2fb8222db30d12e5bfe9177df91  kitten_tts_mini_v0_8.onnx
+40ad2638952b77b7b2f30127e2608e169fc69dd256b53bd8aaa3409a33193c42  voices.npz
+787aa312b93eee80b636f35652469df29efdb7582239d6a9c088467555a3c7fd  LICENSE
+SUMS
+cd ../..
+./openchimed --voice-pack build/voice-src/kitten_tts_mini_v0_8.onnx build/voice-src/voices.npz build/voice-src/voice.bin
+sha256sum build/voice-src/voice.bin
+cmp build/voice-src/voice.bin ttskit/data/voice.bin
+cmp build/voice-src/LICENSE ttskit/data/VOICE-LICENSE
+```
+
+The `voice.bin` it writes is 86,851,136 bytes with SHA-256
+`088b5443f919c988852e8aa83e27ed072e575fcdc40bd006b37a164dd7438ed7`, the same on every run and
+machine, and both `cmp`s print nothing. The converter (`daemon/voice_pack.c`) reads the ONNX
+file and the stored zip with no library, refuses a model whose tensors are not the ones it
+expects, and records the two inputs' SHA-256s in the file's header. Converting a different
+model or revision is a change to OpenChime (TTSKIT.md §8), not a rebuild.
+
+**The reference renderings** the C forward pass is tested against (`tests/data/voice/`)
+were made by `tests/manual/voice_ref.c` with ONNX Runtime 1.30.0's **prebuilt** full release
+(`onnxruntime-linux-x64-1.30.0.tgz`, SHA-256
+`a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd`;
+`onnxruntime-linux-aarch64-1.30.0.tgz`,
+`e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da`; from ONNX Runtime's GitHub
+releases) and the files above. It is run by hand, its outputs committed; nothing in the
+build or the suites links ONNX Runtime for read-aloud.
+
+**Voice input's recognizer** (ARCH-112) runs on ONNX Runtime, the one C++ dependency of
+the speech builds, built from pinned source; its operator config
+(`daemon/ort.ops.config`) still holds the voice model's operators from when read-aloud ran
+on it, until it is trimmed to the recognizer's:
 
 - `scripts/build/onnxruntime.sh` fetches the v1.30.0 **source** tarball
   (SHA-256-verified) and builds it with its own `tools/ci_build/build.py` as a
@@ -220,20 +277,6 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
   C++17 compiler and Python 3, and takes about 20 minutes. The daemon links its C++
   runtime statically — `-static-libstdc++ -static-libgcc` in a host build, zig's
   libc++ in a release build — so no C++ runtime is required of the host.
-- `scripts/build/kitten.sh` fetches the model at pinned Hugging Face and GitHub
-  revisions (SHA-256-verified) and converts it to `.ort` with `scripts/build/tts_convert.c`
-  linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
-  on the build machine only, `scripts/build/onnxruntime.sh converter`). The converted file is
-  not byte-reproducible, so its input and the converter are what is pinned.
-- `make run TTS=1` (or `make tts/manifest TTS=1`) assembles the converted model, the voices and ttskit's data into
-  `tts/` beside `openchimed` (CONFIG.md "Build switches").
-
-ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
-notices travel with every package through `packaging/licenses.sh`.
-
-**Voice input's recognizer** (ARCH-112) runs on that same ONNX Runtime, whose
-operator config (`daemon/ort.ops.config`) is the union of both models':
-
 - `scripts/build/moonshine.sh` fetches Moonshine's eight published files from its
   dated CDN directory, and its licence from GitHub at a pinned commit, at pinned
   SHA-256s, refusing a mismatch. They load in ONNX
@@ -241,7 +284,8 @@ operator config (`daemon/ort.ops.config`) is the union of both models':
 - `make run STT=1` (or `make stt/manifest STT=1`) assembles them into `stt/` beside `openchimed` with a manifest the
   daemon checks at startup.
 
-Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
+ONNX Runtime's notices (MIT, with its ThirdPartyNotices) and Moonshine's MIT notice travel
+with every package that carries voice input through `packaging/licenses.sh`.
 
 **The summary model's engine** (ARCH-116) is llama.cpp, the second C++
 dependency, built the same way:
@@ -404,7 +448,7 @@ paths ship; nothing is fetched at runtime.
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, qrcodegen, jsmn, picohttpparser, SecLists' common passwords | Vendored, committed |
 | **CC0-1.0 or Apache-2.0** | Argon2 (reference) | Vendored, committed |
-| **MIT** | ONNX Runtime, Moonshine Tiny Streaming, llama.cpp | Fetched at build; ONNX Runtime and llama.cpp static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112/116) |
+| **MIT** | ONNX Runtime, Moonshine Tiny Streaming, llama.cpp | Fetched at build; ONNX Runtime and llama.cpp static-linked and Moonshine shipped as data, **daemon only** (ARCH-112/116) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
@@ -412,7 +456,7 @@ paths ship; nothing is fetched at runtime.
 | **BSD-3-Clause** | libvpx (VP9), libopus | Committed and static-linked: both into the graphical clients, Win32 and web (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the graphical clients, Win32 and web (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **BSD-2-style** | CMUdict (ttskit's pronunciation data) | Generated data, committed with its notice; daemon only |
-| **Apache-2.0** | Kitten TTS mini (data) | Fetched at build, shipped beside the daemon |
+| **Apache-2.0** | Kitten TTS mini (data) | Converted and committed (`ttskit/data/voice.bin`, its licence `ttskit/data/VOICE-LICENSE`), shipped beside the daemon |
 | **zlib** | SDL3 | Fetched at build, static-linked; graphical clients only |
 | **MPL-2.0** | Mozilla CA roots (data) | Generated, compiled in; daemon and every client. File-level copyleft |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |

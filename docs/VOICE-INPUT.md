@@ -117,9 +117,11 @@ each ending at the quietest 20 ms within `OC_STT_CUT_SEARCH_MS` (1.5 s) of its l
 the windows' words are joined with one space (`oc_stt_hear_windowed`,
 `daemon/stt_worker.c`). The daemon's worker and `openchimed --stt-hear` hear the same way.
 
-- **In C, on the runtime read-aloud links** (ARCH-111): the daemon runs the graph chain
-  through ONNX Runtime's C API, as it runs Kitten, sharing one `OrtEnv`; the operator
-  config is the union of both models'. `tokenizer.bin` is read in place; decoding
+- **In C, on ONNX Runtime's minimal static build**, which only voice input links
+  (read-aloud's voice model runs in ttskit without it, TTSKIT.md §5b): the daemon runs
+  the graph chain through ONNX Runtime's C API. The operator config
+  (`daemon/ort.ops.config`) still holds the voice model's operators from when read-aloud
+  ran on it, until it is trimmed to Moonshine's. `tokenizer.bin` is read in place; decoding
   stops at the end token or at Moonshine's tokens-per-second ceiling, its guard
   against a decoder repeating itself.
 - **A worker of its own** beside the render worker: a bounded queue, an eventfd back

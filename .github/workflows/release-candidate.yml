@@ -308,11 +308,11 @@ jobs:
           name: web-client
           path: prebuilt/web
       # --- The amd64 daemon and its packages ----------------------------------------
-      # Read-aloud's engine and model (ARCH-111), built by make with the same
+      # Voice input's engine and model (ARCH-112), built by make with the same
       # toolchain and glibc target as the daemon: ONNX Runtime compiled from
-      # source as one minimal static archive, per architecture; the voice model
-      # converted; and voice input's recognizer files, fetched as published
-      # (ARCH-112). Functions of the files in the key, so a hit skips about 25
+      # source as one minimal static archive, per architecture, and the
+      # recognizer's files, fetched as published; and llama.cpp. Read-aloud's
+      # model and data are in the tree (ARCH-111). Functions of the files in the key, so a hit skips about 25
       # minutes and a change rebuilds. One cache per architecture, both with
       # the same path list (a cache's path list is part of its version): what
       # an architecture never builds is simply absent from what it saves.
@@ -326,9 +326,8 @@ jobs:
             third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
             third_party/llamacpp-0.5.0
             third_party/llamacpp-0.5.0-aarch64
-            build/kitten
             build/moonshine
-          key: &tts-amd64-key tts-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: &tts-amd64-key tts-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/moonshine.sh') }}
       # mbedTLS and libopus as the release builds them: with zig's clang
       # against glibc 2.34 for the binary that ships. CI's copies are
       # gcc-built for the host and cannot stand in, so these have caches of
@@ -452,7 +451,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: *tts-release-path
-          key: &tts-arm64-key tts-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
+          key: &tts-arm64-key tts-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/moonshine.sh') }}
       - id: c-mbedtls-arm64
         name: Restore the arm64 release's mbedTLS
         uses: actions/cache/restore@v6

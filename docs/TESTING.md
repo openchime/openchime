@@ -346,6 +346,22 @@ framework.
   with the microphone hearing only its echo, present once. The canceller that does
   it is measured in the ERLE harness (`tests/test_voice.c`) at 48 kHz on the same
   rooms as voice input's.
+- **Read-aloud's voice** (ARCH-111, TTSKIT.md §9) — `tests/test_ttskit.c`, in
+  the fast suite: each of the voice model's kernels against a naive version of
+  its operator on random inputs, the duration rounding and the token-to-frame
+  alignment, `voice.bin`'s loader on a file built byte by byte (a wrong magic,
+  version or length refused), its converter on a small model built in the
+  upstream formats, and the committed `ttskit/data/voice.bin` loading with every
+  voice and refused when damaged. `voice_parity` in `tests/test_voice.c`, a
+  `FULL` suite: every fixture in `tests/data/voice/` rendered from the committed
+  `voice.bin` with the model's noise off has the reference's sample count and
+  at least 40 dB SNR against ONNX Runtime's noise-off rendering (136–141 dB
+  measured), and with the noise on the noise's variance is within 10% of what
+  the model's operators specify. The fixtures — six sentences in two voices,
+  their token ids and ONNX Runtime's raw output with the noise on and off, and a
+  `manifest` — were made once by `tests/manual/voice_ref.c` against ONNX
+  Runtime's prebuilt release (VENDORS.md) and are committed; no suite runs that
+  program, and nothing a suite builds links ONNX Runtime for read-aloud.
 - **Voice input** (ARCH-112) — `tests/test_voice.c`: the segmenter over
   synthetic voiced sound with known pauses (free talk, the cap, push to talk) and
   the ERLE harness (AUDIO.md §6.4: converged, 100 ppm drift, double-talk);
@@ -793,7 +809,8 @@ The fast suite runs the suites marked `FAST` one after another, in one process
 §1). It ends by printing each suite's time, slowest first; the run takes the
 sum of them, about a minute for the fast list. The suites marked `FULL` (the
 network loop, the client core, the database writer and media, chosen by those
-times) run in the full suite only; a suite that pushes the fast suite well
+times, and the voice model's parity, which renders whole sentences) run in the
+full suite only; a suite that pushes the fast suite well
 past its time (§1) is marked `FULL`. `tests/main.c` can still run suites side
 by side, each in a process of its own (`OC_TEST_JOBS=N`), for a person hunting
 something by hand; neither suite does.
@@ -1250,7 +1267,9 @@ and requires `openchimed --stt-hear` to hear its words, so each speech feature
 checks the other by content, in the full suite: on the full-feature build
 (`PART=plain`), and on the stripped release binary and the installed `.deb`
 (`PART=packages`); the speech suites (`tts_worker`, `stt`, `ttskit`) run in
-both suites with their stub engines.
+both suites with their stub engines, and `voice_parity` holds read-aloud's
+voice model to its reference renderings in the full suite (§2.2, "Read-aloud's
+voice").
 
 A new suite is its declaration and one row in `SUITES[]` in `tests/main.c`
 (§2.1): `FAST` unless it is too slow for the fast suite's budget, and
@@ -1494,8 +1513,12 @@ usable once the kernel takes its share), on the full build's daemon, sampling
 | Heard a 20 s segment, in one piece | 156 MB | 3 MB | 40 s |
 | Heard a 30 s segment, in one piece | 162 MB | 3 MB | 413 s |
 
-Both models are mapped from their files and used in place (`daemon/tts_data.c`,
-`session.use_ort_model_bytes_directly`), so under pressure the kernel drops their
+The read-aloud rows were measured when the voice model ran on ONNX Runtime; it now
+runs in ttskit, where one render peaks at about 156 MB resident on a laptop core,
+about 86 MB of it the model's mapped pages (READ-ALOUD.md §4), not yet measured on the
+256 MB machine. Both models are mapped from their files and used in place
+(`daemon/tts_data.c`; ttskit reads `voice.bin`'s pages where they lie, voice input's
+ONNX Runtime with `session.use_ort_model_bytes_directly`), so under pressure the kernel drops their
 pages and reads them back rather than killing the daemon: memory stays under the
 machine's, and the time goes instead. Nothing was killed in these runs. The
 recognizer's working memory grows with what it hears at once, which is why the

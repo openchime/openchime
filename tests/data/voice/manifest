@@ -1,0 +1,19 @@
+# The voice model's reference renderings, made by tests/manual/voice_ref.c
+# (its header documents this format): run A's raw output, with run B's length
+# and SNR against A, both runs in one ONNX Runtime session on one thread;
+# then, on a #quiet line, the output with the model's random operators
+# producing zeros, and run A's SNR against it.
+# name voice row speed tokens ids-file samples f32-file samples-b snr-db text
+# #quiet name quiet-file samples-quiet snr-a-db
+short-m expr-voice-2-m 4 1.2 9 short-m.ids 27000 short-m.f32 27000 18.37 Yes.
+#quiet short-m short-m.quiet.f32 27000 15.99
+greeting-f expr-voice-2-f 25 1.2 33 greeting-f.ids 70200 greeting-f.f32 70200 18.68 Hello, how are you today?
+#quiet greeting-f greeting-f.quiet.f32 70200 16.54
+numbers-m expr-voice-2-m 43 1.2 76 numbers-m.ids 96600 numbers-m.f32 96600 18.73 It moved to 3:15 on the 2nd, and costs $40.
+#quiet numbers-m numbers-m.quiet.f32 96600 15.24
+punctuation-f expr-voice-2-f 33 1.2 40 punctuation-f.ids 87600 punctuation-f.f32 87600 18.89 Wait... really? Fine; let's talk!
+#quiet punctuation-f punctuation-f.quiet.f32 87600 16.01
+long-m expr-voice-2-m 79 1.2 89 long-m.ids 99000 long-m.f32 99000 17.68 Before the train left, she checked her ticket twice and sat down by the window.
+#quiet long-m long-m.quiet.f32 99000 14.13
+figures-f expr-voice-2-f 26 1.2 65 figures-f.ids 105600 figures-f.f32 105600 19.16 We sold 2,500 on the 21st.
+#quiet figures-f figures-f.quiet.f32 105600 15.76
