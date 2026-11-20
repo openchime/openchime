@@ -12,7 +12,7 @@ Where the model comes from, its licence and how its file is made are in
 
 ## 1. Why it exists
 
-Summaries ran on llama.cpp: a C++ library built from source with CMake for every summary
+Summaries ran on a C++ library built from source with CMake for every summary
 build, a C++ runtime linked into the daemon, an x86-64-v3 requirement, and a model file
 someone else had converted and quantised. sumkit runs the same model in plain C under
 nnkit's rules — one thread, no intrinsics, no library, loops the compiler vectorises on its
@@ -53,8 +53,8 @@ every four layers' mixer is linear attention, the fourth gated attention
    values for 2 heads; query and key RMS-normed per head, rotary positions on their first 64
    values (pairs i and i + 32, base 10,000,000 — the model's multi-axis positions are one
    position for text), attention over the cache, the result multiplied by sigmoid(gate) and
-   projected back. The cache is kept at 8 bits, a scale for each 32 values, as llama.cpp's
-   q8_0 cache was.
+   projected back. The cache is kept at 8 bits, a scale for each 32 values, as the previous
+   engine's cache was.
 
 The vision tower and the multi-token-prediction layer Qwen publishes with it are not used
 and not converted. The output layer is the token embeddings.
@@ -75,8 +75,8 @@ linear attention's small vectors and a, b projections in float32. 1,399,305,116 
 **How it was chosen: the KL divergence** of its next-token distributions from the
 unquantised model's, over held-out text (the daemon's own prompts over two synthetic
 channels, `tests/data/summary/kl.txt`, 4,427 tokens, 8 chunks of 512 scored on their second
-halves as llama.cpp's perplexity tool scores them), held to no more than that of Unsloth's
-`Q4_K_M` — the file the daemon ran on llama.cpp — against the same unquantised weights:
+halves, as perplexity tools score them), held to no more than that of Unsloth's
+`Q4_K_M` — the file the daemon ran on its previous engine — against the same unquantised weights:
 
 | File | Mean KL divergence |
 |---|---|
@@ -106,9 +106,11 @@ answers straight away; the chat format's tokens in it are read as such.
 ## 6. Checked against the reference
 
 `build/sum_check` (`make build/sum_check`) runs these, on this machine, over the references in
-`tests/data/summary/`, which `tests/manual/summary_ref.c` made once with llama.cpp from the
-same unquantised weights (a bfloat16 GGUF from llama.cpp's own converter) and which are
-committed:
+`tests/data/summary/`, which were made once from the same unquantised weights, before the
+engine they were made with was withdrawn. They cannot be made again; the committed files are
+the reference. A changed model is checked without them: by the naive forward pass in the
+tests (`tests/test_sumkit.c`) and by §4's KL divergence against its own unquantised run,
+neither of which needs another engine. Over this model:
 
 - **`sum_check parity tests/data/summary FULL.bin`**, with `FULL.bin` from
   `openchimed --summary-pack --full`: for each of three prompts (notes on a channel, the
@@ -131,13 +133,13 @@ one at a time give the same bits.
 ## 7. Speed and memory
 
 `sum_check bench tests/data/summary SUMMARY.bin`: the notes prompt (1,137 tokens) read, then
-64 tokens written, on one core of the development machine (x86-64, WSL2), against llama.cpp
-on the same core with Unsloth's file (`llama-bench -t 1 -fa 1 -ctk q8_0 -ctv q8_0`):
+64 tokens written, on one core of the development machine (x86-64, WSL2), against the
+previous engine on the same core with Unsloth's file, measured before it was withdrawn:
 
 | | Reading the prompt | Writing the answer | Peak resident |
 |---|---|---|---|
 | sumkit, `summary.bin` | 12.0 tokens/s | 3.05 tokens/s | 1,375 MB |
-| llama.cpp, Unsloth's `Q4_K_M` | 38.9 tokens/s | 9.4 tokens/s | — |
+| the previous engine, Unsloth's `Q4_K_M` | 38.9 tokens/s | 9.4 tokens/s | — |
 
 The quantised products are the cost. Their sums are exact integers, so the kernels can be made
 faster without changing a single result: a token at a time they work straight from a block's

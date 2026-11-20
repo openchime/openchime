@@ -7,7 +7,7 @@
  * (daemon/voice_pack.c) for the weights; the kernels and their layouts in
  * nnkit/nn_ops.c.
  *
- * The arithmetic is the graph's, in the order ONNX Runtime computes it with its
+ * The arithmetic is the graph's, in the order the reference computes it with its
  * graph optimisations on, to the bit, as far as the inverse STFT at the very
  * end. Two places force it. The durations are rounded: a token's frame count is
  * round(sum of 50 sigmoids / speed), and the references' sums come within 0.003
@@ -17,7 +17,7 @@
  * one value across a rounding boundary changes a whole quantisation step, the
  * blocks after it carry that on, and in the generator's 18 residual blocks such
  * steps multiply -- a 1e-7 difference after its first transposed convolution
- * comes out at 25 dB. So every step is the bits ONNX Runtime computes: its
+ * comes out at 25 dB. So every step is the bits the reference computes: its
  * quantisation, its integer products (exact), the scale and bias in its order,
  * its LayerNormalization, SkipLayerNormalization, InstanceNormalization,
  * softmax, FastGelu, sigmoid, tanh, sin and atan (nnkit/nn_ops.c), its float
@@ -25,12 +25,12 @@
  * harmonic source's phase is exact for a third reason: it is a running sum of
  * the pitch, so any difference there grows along the sentence.
  *
- * Where the graph rounds to half precision and ONNX Runtime keeps it: the pitch
+ * Where the graph rounds to half precision and the reference keeps it: the pitch
  * and energy projections' outputs are rounded to half and widened. Every other
  * half-precision step in the graph (the context layer's output bias on three of
  * its passes, the duration projection, the depthwise transposed convolutions of
  * the predictor and the decoder, the generator's two upsampling convolutions)
- * is a cast to half and straight back that ONNX Runtime's optimiser removes,
+ * is a cast to half and straight back that the reference's optimiser removes,
  * computing it in float with the half weights widened, as here.
  *
  * Activations are time-major (tts_priv.h): a sequence is T rows of its channels.
@@ -608,7 +608,7 @@ enum {
 };
 
 /* The decoder's stride-2 convolution of a curve (2F values) to one value per
- * frame: kernel 3, padding 1, one channel, in ONNX Runtime's order (its
+ * frame: kernel 3, padding 1, one channel, in the reference's order (its
  * one-row matrix product: each tap's product added in turn, no fused
  * multiply-add; then the bias). */
 static void curve_conv(const float *c, int F, const float *w, float b, float *y, int ldy) {
@@ -686,7 +686,7 @@ enum {
 #define SRC_NOISE_V 0.003f /* the noise's standard deviation where voiced */
 #define SRC_PI      3.1415927f
 
-/* ONNX Runtime's linear Resize of the graph's [1, 9, n] tensors along their
+/* The reference's linear Resize of the graph's [1, 9, n] tensors along their
  * last axis: it takes them as a trilinear resize of depth 1 and height 9, so
  * each output is the sum, in turn, of eight corners weighted by products of the
  * three axes' weights. The depth's two are 1/2 each; the height's are 1 and 0,
@@ -917,8 +917,8 @@ static int gen_pair(qscratch *s, wctx *w, int first, const float *sty, float *x,
     return 0;
 }
 
-/* A transposed convolution of the generator (the f16 weights widened, as ONNX
- * Runtime runs it): LeakyReLU 0.1 of x (t rows of cin), then the stored
+/* A transposed convolution of the generator (the f16 weights widened, as the
+ * reference runs it): LeakyReLU 0.1 of x (t rows of cin), then the stored
  * [s][k/s][cin][cout] weights over the input with its zero rows. */
 static int gen_up(wctx *w, int i, const float *x, int t, int cin, int t_out, int cout, float *y, int ldy) {
     char name[VOICE_NAME_MAX];

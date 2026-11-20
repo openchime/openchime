@@ -10,8 +10,8 @@
  *     drift, and near-end speech surviving double-talk.
  *
  * And, as the FULL suite voice_parity (run_voice_parity_tests), read-aloud's
- * voice model against its references (tests/data/voice, made by
- * tests/manual/voice_ref.c with ONNX Runtime): with the model's noise off, each
+ * voice model against its references (tests/data/voice, made once and
+ * frozen): with the model's noise off, each
  * fixture renders with the reference's sample count and at least 40 dB SNR
  * against the noise-off reference; with it on, the noise the pitch source adds
  * has the variance the model's operators specify, within 10%. It reads the
@@ -333,7 +333,7 @@ int run_voice_tests(void) {
     return failures;
 }
 
-/* ---- read-aloud's voice model against ONNX Runtime -------------------------- */
+/* ---- read-aloud's voice model against its references -------------------------- */
 
 #define PARITY_DB 40.0        /* noise off: SNR against the reference */
 #define NOISE_TOL 0.10        /* noise on: the noise's variance, relative */
@@ -416,7 +416,7 @@ out:
 }
 
 int run_voice_parity_tests(void) {
-    printf("test_voice: voice_parity -- the voice model against ONNX Runtime's renders, noise off and on\n");
+    printf("test_voice: voice_parity -- the voice model against the frozen reference renders, noise off and on\n");
     char bin[1024], dir[1024], path[1024], line[1024], err[256] = "";
     oc_test_tree_path("ttskit/data/voice.bin", bin, sizeof bin);
     oc_test_tree_path("tests/data/voice", dir, sizeof dir);

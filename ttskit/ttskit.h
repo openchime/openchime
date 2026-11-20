@@ -94,7 +94,7 @@ size_t tts_text(tts *t, const char *text, char *ipa, size_t cap);
 #define VOICE_NAME_MAX  48         /* name bytes, the NUL included */
 #define VOICE_ALIGN     64
 #define VOICE_MAX_DIMS  4
-/* Element types: f32, uint8, int8 (ONNX's codes for the same). */
+/* Element types: f32, uint8, int8 (the model format's codes for the same). */
 enum { VOICE_F32 = 1, VOICE_U8 = 2, VOICE_I8 = 3 };
 
 typedef struct voice voice;

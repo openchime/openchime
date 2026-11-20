@@ -69,7 +69,7 @@ size_t stt_max_tokens(size_t samples);
 #define REC_ALIGN     64
 #define REC_MAX_DIMS  4
 #define REC_SOURCES   8          /* SHA-256s in the header */
-/* Element types: f32, uint8, int32 (ONNX's codes for the same). */
+/* Element types: f32, uint8, int32 (the model format's codes for the same). */
 enum { REC_F32 = 1, REC_U8 = 2, REC_I32 = 6 };
 
 /* The model's dimensions, the int32 tensor "cfg", in this order. */

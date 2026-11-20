@@ -5,6 +5,11 @@
  * No dependencies, no intrinsics, no threads: ordinary loops the compiler's
  * auto-vectoriser turns into vector code, compiled with -ffp-contract=off so
  * every machine computes the same values (docs/TTSKIT.md §5b, docs/STTKIT.md).
+ *
+ * "The reference" below is the engine the voice model's and the recognizer's
+ * committed references were made with, before it was withdrawn: its arithmetic
+ * -- the order of its sums, its approximations -- is what these kernels compute,
+ * to the bit, and the references in tests/data are what holds them to it.
  */
 #ifndef NNKIT_H
 #define NNKIT_H
@@ -25,7 +30,7 @@
  * Quantised activations are int16 rows holding q - zero_point (in -255..255),
  * `cin` values per row with `cin` a multiple of NN_CPAD; the columns past the
  * real channel count are 0. A convolution's input carries its padding as rows of
- * zeros before and after the T rows (ONNX pads ConvInteger's input with its zero
+ * zeros before and after the T rows (the graph pads ConvInteger's input with its zero
  * point, which is 0 here).
  *
  * Weight layouts, as voice.bin stores them (the converter produces these):
@@ -33,7 +38,7 @@
  *                 i at (co * k + j) * cin_pad + i, as the model ships it (not
  *                 offset); padding (channels past cin, rows past cout) is the
  *                 weight zero point. One zero point per tensor.
- *   MatMulInteger int8 [round4(n)][k_pad]: the ONNX B [k][n] transposed, one row
+ *   MatMulInteger int8 [round4(n)][k_pad]: the graph's B [k][n] transposed, one row
  *                 per output column, padding the zero point. One zero point.
  *   LSTM          int8 W [dir][4H][in_pad] and R [dir][4H][H], the contrib op's
  *                 [dir][in][4H] and [dir][H][4H] transposed, gates i, o, f, c;
@@ -41,13 +46,13 @@
  *                 per direction for each of W and R. voice.bin keeps each
  *                 direction's W, R and B as a tensor of its own.
  *   ConvTranspose f32 [s][k/s][cin][round8(cout)]: phase r, window row m,
- *                 input channel i, output channel o holds ONNX W[i][o][r + (k/s
+ *                 input channel i, output channel o holds the graph's W[i][o][r + (k/s
  *                 - 1 - m) * s]; padding 0.
- *   depthwise ConvTranspose  f32 [k][channels]: ONNX W[c][0][j] at
+ *   depthwise ConvTranspose  f32 [k][channels]: the graph's W[c][0][j] at
  *                 j * channels + c.
- *   float MatMul  f32 [k][round8(n)], ONNX B as it is with rows padded with 0.
+ *   float MatMul  f32 [k][round8(n)], the graph's B as it is with rows padded with 0.
  *   Conv on one input channel (the forward STFT's bases)  f32 [k][round8(cout)]:
- *                 ONNX W[o][0][j] at j * round8(cout) + o, a float MatMul over
+ *                 the graph's W[o][0][j] at j * round8(cout) + o, a float MatMul over
  *                 windows `stride` apart.
  *   iSTFT         f32 [bins][nfft] for each of the real and imaginary bases. */
 #define NN_CPAD  16                     /* quantised rows: channels padded to this */
@@ -60,7 +65,7 @@
  * An all-zero tensor gets scale 0 and zero point 0 (every product is then 0). */
 typedef struct { float scale; int zp; } nn_qparam;
 void nn_dql_params(float min, float max, nn_qparam *qp);
-/* ONNX DynamicQuantizeLinear on n floats: q = clamp(round_half_even(x / scale) + zp). */
+/* DynamicQuantizeLinear on n floats: q = clamp(round_half_even(x / scale) + zp). */
 void nn_dql_u8(const float *restrict x, size_t n, uint8_t *restrict q, nn_qparam *qp);
 /* The same over a rows x cols tensor (rows `ldx` apart), written as q - zp into
  * int16 rows `ldq` apart, columns cols..ldq-1 set to 0. */
@@ -80,7 +85,7 @@ void nn_matmul_q(const int16_t *restrict a, int m, int k, const int8_t *restrict
 void nn_dequant(const int32_t *restrict acc, int rows, int cols, int lda, float scale,
                    const float *restrict bias, float *restrict y, int ldy);
 
-/* com.microsoft DynamicQuantizeLSTM (ONNX Runtime's contrib op), batch 1, zero
+/* DynamicQuantizeLSTM (the reference's contrib operator), batch 1, zero
  * initial state, no peepholes, default activations: per direction the whole input
  * is quantised once (one scale) and multiplied by W; each step quantises h(t-1)
  * on its own and multiplies it by R; gates = xW + hR + (Wb + Rb), in the order
@@ -101,7 +106,7 @@ void   nn_lstm_run(const nn_lstm *l, int dirs, const float *x, int t, int in, in
  * multiply-add instruction (x86-64's baseline): the product of two floats is
  * exact in double, so the double sum is rounded once, and rounding that to float
  * can only differ from rounding the exact value when it lands exactly halfway
- * between two floats -- then fmaf settles it. ONNX Runtime's kernels fuse their
+ * between two floats -- then fmaf settles it. The reference's kernels fuse their
  * multiply-adds; this is how the forward pass does the same where it must. */
 static inline float nn_fma(float a, float b, float c) {
     union { double d; uint64_t u; } s;
@@ -110,41 +115,41 @@ static inline float nn_fma(float a, float b, float c) {
     return (float)s.d;
 }
 
-/* ONNX Runtime's sigmoid and tanh (its approximations, the same bits), in place. */
+/* The reference's sigmoid and tanh (its approximations, the same bits), in place. */
 void nn_logistic(float *x, size_t n);
 void nn_tanh(float *x, size_t n);
-/* GELU in ONNX Runtime's fused tanh form (FastGelu), in place. */
+/* GELU in the reference's fused tanh form (FastGelu), in place. */
 void nn_gelu(float *x, size_t n);
-/* LayerNormalization over each row's `cols` values, in place, in ONNX Runtime's
+/* LayerNormalization over each row's `cols` values, in place, in the reference's
  * arithmetic; g, b per column (g NULL: scale 1 and bias 0). */
 void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const float *b, float eps);
-/* SkipLayerNormalization: x = LayerNorm(x + skip) in ONNX Runtime's arithmetic
+/* SkipLayerNormalization: x = LayerNorm(x + skip) in the reference's arithmetic
  * (a different one from LayerNormalization's), in place; skip's rows lds apart. */
 void nn_skip_layernorm(float *x, const float *skip, int rows, int cols, int ld, int lds, const float *g,
                           const float *b, float eps);
-/* InstanceNormalization over time for each channel, in place, in ONNX Runtime's
+/* InstanceNormalization over time for each channel, in place, in the reference's
  * arithmetic (its sums depend on where each channel starts in its channel-major
  * tensor, which is taken to be 16-byte aligned); g, b per channel (NULL: 1 and
- * 0). Population variance, as ONNX. */
+ * 0). Population variance, as the graph defines it. */
 void nn_instnorm(float *x, int t, int c, int ld, const float *g, const float *b, float eps);
-/* ReduceSum of n floats as ONNX Runtime adds them (Eigen's 4-lane vectorised
+/* ReduceSum of n floats as the reference adds them (Eigen's 4-lane vectorised
  * sum), the n starting `start` floats into a 16-byte aligned tensor. */
 float nn_reduce_sum(const float *a, int n, size_t start);
-/* Softmax of n values, in place, in ONNX Runtime's arithmetic. */
+/* Softmax of n values, in place, in the reference's arithmetic. */
 void nn_softmax(float *x, int n);
-/* y = x w (m x k by k x n; rows ldx, ldw, ldy apart) in ONNX Runtime's float
+/* y = x w (m x k by k x n; rows ldx, ldw, ldy apart) in the reference's float
  * matrix product's order: each output a chain of fused multiply-adds over k in
  * blocks of 256. Exact rather than fast: for the small products whose every
  * bit matters. */
 void nn_matmul_fma(const float *x, int m, int k, int ldx, const float *w, int n, int ldw, float *y, int ldy);
-/* The same with blocks of kb (ONNX Runtime's packing chooses 128 or 256 by the
+/* The same with blocks of kb (the reference's packing chooses 128 or 256 by the
  * shapes and whether the weights are read transposed), tiled for speed. */
 void nn_matmul_fma_kb(const float *x, int m, int k, size_t ldx, const float *w, int n, size_t ldw, float *y,
                          size_t ldy, int kb);
 /* Multi-head attention on time-major q, k, v (head h at columns h*dh..), n
  * steps: out = softmax((q * scale) (k * scale)^T + mask) v per head, as the
- * graph has it (q and k each scaled by the root of 1/sqrt(dh)) and in ONNX
- * Runtime's arithmetic; mask (NULL: none) is added per key. scratch:
+ * graph has it (q and k each scaled by the root of 1/sqrt(dh)) and in the
+ * reference's arithmetic; mask (NULL: none) is added per key. scratch:
  * n * (dh + 1) + dh floats. */
 void nn_attention(const float *q, const float *k, const float *v, int ld, int n, int heads, int dh,
                      float scale, const float *mask, float *out, int ldo, float *scratch);
@@ -155,20 +160,20 @@ void nn_matmul_f(const float *restrict x, size_t xstep, int m, int k, const floa
 /* ConvTranspose, 1-D, groups 1, k a multiple of s: x is k/s - 1 zero rows, the
  * t input rows, then k/s zero rows, each cin wide (only the t are read); output
  * row o (o < t_out) is position o + pad_begin of the full transposed
- * convolution, plus bias, in ONNX Runtime's arithmetic. */
+ * convolution, plus bias, in the reference's arithmetic. */
 void nn_convt(const float *x, int t, int cin, int k, int s, int pad_begin, const float *w, const float *bias,
                  int cout, int t_out, float *y, int ldy);
 /* ConvTranspose, 1-D, depthwise (groups = channels), on rows `ld` apart: each
- * output the sum of its products in tap order, then the bias, as ONNX Runtime's
+ * output the sum of its products in tap order, then the bias, as the reference's
  * col2im adds them. */
 void nn_convt_dw(const float *restrict x, int t, int c, int ld, int k, int s, int pad_begin,
                     const float *restrict w, const float *restrict bias, int t_out, float *restrict y, int ldy);
 /* LeakyRelu, in place. */
 void nn_leaky_relu(float *x, size_t n, float alpha);
-/* sin(x) in ONNX Runtime's arithmetic (its Eigen kernel: within 2 ulp, exact
+/* sin(x) in the reference's arithmetic (its Eigen kernel: within 2 ulp, exact
  * reduction past |x| = 25966), vectorisable. */
 void nn_sin(const float *restrict x, float *restrict y, size_t n);
-/* atan(x) of n values in ONNX Runtime's arithmetic (its vectorised rational
+/* atan(x) of n values in the reference's arithmetic (its vectorised rational
  * approximation; the last n mod 4 through the C library's atanf, as it does). */
 void nn_atan(const float *restrict x, float *restrict y, size_t n);
 /* Snake, in place: x + inv_alpha[c] * sin(alpha[c] * x)^2 per channel, sin as
@@ -187,7 +192,7 @@ void nn_istft(const float *spec, int t, int ld, int bins, const float *wr, const
 
 /* ---- for the recognizer (sttkit) --------------------------------------------
  * Its matrix products have uint8 weights with a zero point and a scale per
- * output column (ONNX Runtime's MatMulIntegerToFloat and DynamicQuantizeMatMul),
+ * output column (the reference's MatMulIntegerToFloat and DynamicQuantizeMatMul),
  * stored as one row per output column: b [n][k], k a multiple of NN_CPAD and n
  * of 4. */
 
@@ -198,11 +203,11 @@ void nn_matmul_qc(const int16_t *restrict a, int m, int k, const uint8_t *restri
 /* y[r][c] = acc[r][c] * (ascale * bscale[c]) (+ bias[c]; NULL: none). */
 void nn_dequant_qc(const int32_t *restrict acc, int rows, int cols, int lda, float ascale,
                    const float *restrict bscale, const float *restrict bias, float *restrict y, int ldy);
-/* SiLU in place: x * sigmoid(x), the sigmoid as nn_logistic (ONNX Runtime's
+/* SiLU in place: x * sigmoid(x), the sigmoid as nn_logistic (the reference's
  * QuickGelu with alpha 1). */
 void nn_silu(float *x, size_t n);
 /* GELU in its exact form, in place: x * 0.5 * (1 + erf(x / sqrt 2)), with erf
- * as ONNX Runtime computes it (its approximation, the same bits). */
+ * as the reference computes it (its approximation, the same bits). */
 void nn_gelu_erf(float *x, size_t n);
 /* Rotary positions on adjacent pairs, in place: for i < rot / 2, with
  * f = pos * inv_freq[i], (x[2i], x[2i+1]) becomes
@@ -214,7 +219,7 @@ void nn_rope_pairs(float *x, int rot, const float *inv_freq, float pos);
  * hi - lo floats. */
 void nn_attend(const float *q, const float *k, int ldk, const float *v, int ldv, int lo, int hi, int dh, float scale,
                float *out, float *scratch);
-/* The same in ONNX Runtime's arithmetic, to the bit: the scores of all n keys
+/* The same in the reference's arithmetic, to the bit: the scores of all n keys
  * (each a chain of fused multiply-adds over the head, then times scale), the
  * keys outside lo..hi-1 set to -inf (`add` 1: the graph adds a mask of 0 and
  * -inf to them; 0: it selects -inf in their place), the softmax over all n, and

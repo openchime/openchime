@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Fetch and check the archived inputs of the speech data (docs/VENDORS.md): the
 # published files the read-aloud voice model and the voice-input recognizer are
-# converted from, and the prebuilt ONNX Runtime 1.30.0 the two reference
-# programs (tests/manual/voice_ref.c, tests/manual/recognizer_ref.c) link.
+# converted from.
 #
 #   scripts/build/speech_sources.sh fetch DIR   download, join, check, unpack
 #   scripts/build/speech_sources.sh check DIR   check a copy already in DIR
 #
-# The archive is eight files: two source bundles split under the attachment
-# size limit (voice-src.part*.gz, recognizer-src.part*.gz), the x64 ONNX Runtime
-# release (onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz), and two checksum lists.
+# The archive is seven files: two source bundles split under the attachment
+# size limit (voice-src.part*.gz, recognizer-src.part*.gz) and two checksum
+# lists.
 # `fetch` downloads them into DIR, joins each bundle's parts, and checks every
 # attachment and both bundles against scripts/build/speech_sources.sha256. It
-# then unpacks DIR/voice-src, DIR/recognizer-src and
-# DIR/onnxruntime-linux-x64-1.30.0, and checks every unpacked source file against
+# then unpacks DIR/voice-src and DIR/recognizer-src, and checks every unpacked
+# source file against
 # SHA256SUMS-inputs.txt, itself pinned above; those are the SHA-256s
 # docs/VENDORS.md records. A file that does not match stops it, named. DIR/.checked
 # is written last, only when everything matched, and removed first.
@@ -23,7 +22,7 @@
 # joined from its parts first.
 #
 # A maintainer's tool: not run by make, the suites or CI. OC_SPEECH_ARCHIVE
-# replaces the archive with a directory or URL holding the eight files side by
+# replaces the archive with a directory or URL holding the seven files side by
 # side (a mirror, or the test's stand-in); OC_SPEECH_SUMS replaces the pin file.
 # Needs curl, sha256sum and tar.
 set -euo pipefail
@@ -37,7 +36,6 @@ ATTACHMENTS=(
   "35148175|voice-src.part2.gz"
   "35148176|recognizer-src.part0.gz"
   "35148172|recognizer-src.part1.gz"
-  "35148173|onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz"
   "35148169|SHA256SUMS-archive.txt"
   "35148171|SHA256SUMS-inputs.txt"
 )
@@ -95,10 +93,9 @@ fetch)
   done
   join_parts "$dir"
   check_pins "$dir"
-  rm -rf "$dir/voice-src" "$dir/recognizer-src" "$dir/onnxruntime-linux-x64-1.30.0"
+  rm -rf "$dir/voice-src" "$dir/recognizer-src"
   tar -xzf "$dir/voice-src.tar.gz" -C "$dir"
   tar -xzf "$dir/recognizer-src.tar.gz" -C "$dir"
-  tar -xzf "$dir/onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz" -C "$dir"
   check_inputs "$dir"
   touch "$dir/.checked"
   echo "speech_sources: fetched and checked into $dir"
@@ -108,7 +105,6 @@ check)
   join_parts "$dir" missing
   check_pins "$dir"
   check_inputs "$dir"
-  [ -d "$dir/onnxruntime-linux-x64-1.30.0" ] || die "onnxruntime-linux-x64-1.30.0 is not unpacked in $dir"
   echo "speech_sources: every file in $dir matches"
   ;;
 *) usage ;;

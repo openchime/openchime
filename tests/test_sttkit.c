@@ -7,8 +7,8 @@
  * the published model (daemon/recognizer_pack.c).
  *
  * And, as the FULL suite recognizer_parity (run_recognizer_parity_tests), the
- * recognizer against its references (tests/data/recognizer, made by
- * tests/manual/recognizer_ref.c with ONNX Runtime): for every fixture the same
+ * recognizer against its references (tests/data/recognizer, made once and
+ * frozen): for every fixture the same
  * token ids, and the encoder's output and the first decoding step's logits
  * within 30 dB SNR of the reference's. It reads the committed
  * sttkit/data/recognizer.bin, and fails, saying so, where that is missing. */
@@ -270,7 +270,7 @@ static void test_pack_refuses(void) {
     CHECK(oc_test_mkdtemp("sttkit", dir, sizeof dir) == 0);
     snprintf(out, sizeof out, "%s/recognizer.bin", dir);
     CHECK(oc_recognizer_pack_mem(in, out, NULL, err, sizeof err) != 0);
-    CHECK(strstr(err, "frontend.model.ort: not an ONNX Runtime model file") != NULL);   /* contract: the refusal names the file and why */
+    CHECK(strstr(err, "frontend.model.ort: not an .ort model file") != NULL);   /* contract: the refusal names the file and why */
     /* An .ort header whose root points outside the buffer. */
     unsigned char bad[64] = { 0xF0, 0xFF, 0, 0, 'O', 'R', 'T', 'M' };
     in[RP_FRONTEND].data = bad;
@@ -321,7 +321,7 @@ static void *slurp_fx(const char *dir, const char *name, const char *ext, size_t
 }
 
 int run_recognizer_parity_tests(void) {
-    printf("test_recognizer_parity: every fixture's tokens, encoder output and first logits against ONNX Runtime's\n");
+    printf("test_recognizer_parity: every fixture's tokens, encoder output and first logits against the frozen references\n");
     char data[1024], fixtures[1024], path[1200], err[512] = "";
     oc_test_tree_path("sttkit/data/recognizer.bin", data, sizeof data);
     oc_test_tree_path("tests/data/recognizer", fixtures, sizeof fixtures);

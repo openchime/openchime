@@ -32,7 +32,7 @@ static inline float rint_even(float v) {
     return (v + magic) - magic;
 }
 
-/* ---- ONNX Runtime's activation functions ---------------------------------------
+/* ---- the reference's activation functions ---------------------------------------
  * Its CPU kernels (on x86-64 with FMA) compute these as rational or polynomial
  * approximations with fused multiply-adds, not as the C library does; these are
  * the same steps on the same constants, so the results are the same bits.
@@ -226,7 +226,7 @@ ARRAY_ACT(nn_logistic, logistic16, logistic1)
 ARRAY_ACT(nn_tanh, tanh16, tanh1)
 static ARRAY_ACT(exp_array, exp16, exp1)
 
-/* FastGelu, as ONNX Runtime fuses the graph's tanh form: x (0.0356774 x^2 +
+/* FastGelu, as the reference fuses the graph's tanh form: x (0.0356774 x^2 +
  * 0.7978846), its tanh, then 0.5 x (t + 1). */
 void nn_gelu(float *x, size_t n) {
     float t[AL];
@@ -587,7 +587,7 @@ void nn_lstm_run(const nn_lstm *l, int dirs, const float *x, int t, int in, int 
 
 /* ---- normalisation, attention ------------------------------------------------- */
 
-/* ONNX Runtime's LayerNormalization: the mean from a double sum; the variance
+/* The reference's LayerNormalization: the mean from a double sum; the variance
  * from squared deviations accumulated by fused multiply-adds in 8 lanes, the
  * lanes added in halves; y = fma((x - mean) * inv, g, b). */
 void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const float *b, float eps) {
@@ -617,7 +617,7 @@ void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const fl
     }
 }
 
-/* ONNX Runtime's SkipLayerNormalization: v = x + skip, then Welford's running
+/* The reference's SkipLayerNormalization: v = x + skip, then Welford's running
  * mean and sum of squares in float, y = (v - mean) / sqrt(m2 / n + eps) * g + b. */
 void nn_skip_layernorm(float *x, const float *skip, int rows, int cols, int ld, int lds, const float *g,
                           const float *b, float eps) {
@@ -731,7 +731,7 @@ static void eigen_sum_rows(const float *x, int t, int c, int ld, int ch0, int cs
 }
 #undef ES_VAL
 
-/* ONNX Runtime's InstanceNormalization (Eigen, on channel-major data): channel
+/* The reference's InstanceNormalization (Eigen, on channel-major data): channel
  * c's t values start c * t floats into a 16-byte aligned tensor, so its mean's
  * sum starts its vectors (c * t) mod 4 values in; the sum of squared deviations
  * is over an expression, whose vectors start at 0. Then k = g / sqrt(var + eps),
@@ -760,7 +760,7 @@ void nn_instnorm(float *x, int t, int c, int ld, const float *g, const float *b,
     free(mem);
 }
 
-/* ONNX Runtime's softmax: the exponentials of x - max summed in 8 lanes (the
+/* The reference's softmax: the exponentials of x - max summed in 8 lanes (the
  * last, partial vector into the same lanes), the lanes added in adjacent
  * pairs, and each exponential multiplied by 1 / sum. */
 void nn_softmax(float *x, int n) {
@@ -776,7 +776,7 @@ void nn_softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
-/* y[c] = sum_i a[i] * b[i * ldb + c] for c < n, as ONNX Runtime's float matrix
+/* y[c] = sum_i a[i] * b[i * ldb + c] for c < n, as the reference's float matrix
  * product forms each output: a chain of fused multiply-adds from 0 over each
  * block of 256 of i, the blocks' results added in turn. Sixteen chains at once,
  * in double (exact products, one rounding per step, as nn_fma), noting any
@@ -954,7 +954,7 @@ void nn_matmul_f(const float *restrict x, size_t xstep, int m, int k, const floa
     }
 }
 
-/* As ONNX Runtime's ConvTranspose: for each tap j, the product of the input
+/* As the reference's ConvTranspose: for each tap j, the product of the input
  * rows with that tap's weights (its matrix product: chains of fused
  * multiply-adds in blocks of 128, as its packing has them when the weights are
  * read transposed; fma_tiles without the halfway test); then each output is
@@ -1020,7 +1020,7 @@ void nn_leaky_relu(float *x, size_t n, float alpha) {
     for (; i < n; i++) x[i] = x[i] < 0 ? x[i] * alpha : x[i];
 }
 
-/* sin as ONNX Runtime computes it, to the bit: Eigen's psincos_float as its
+/* sin as the reference computes it, to the bit: Eigen's psincos_float as its
  * build has it (no fused multiply-add). x is reduced by the nearest multiple q
  * of pi/2, pi/2 in four parts, each step a product then a sum; then the sine
  * polynomial for even q and the cosine one for odd, the sign flipped for q mod 4
@@ -1113,7 +1113,7 @@ void nn_sin(const float *restrict x, float *restrict y, size_t n) {
     for (; i < n; i++) y[i] = sin1(x[i]);
 }
 
-/* atan as ONNX Runtime computes it: its vectorised kernel (Eigen's, four lanes
+/* atan as the reference computes it: its vectorised kernel (Eigen's, four lanes
  * of SSE) evaluates, on r = |x| or 1/|x| past 1, r times a rational function of
  * r^2 -- (0.112 r^2 + 0.730) r^2 + 0.811 over ((0.0101 r^2 + 0.283) r^2 + 1)
  * r^2 + 0.811 -- takes pi/2 less that past 1, and gives it x's sign. The
@@ -1219,7 +1219,7 @@ void nn_silu(float *x, size_t n) {
     }
 }
 
-/* erf(x) as ONNX Runtime computes it (its MlasErfKernel, the same bits): odd,
+/* erf(x) as the reference computes it (its MlasErfKernel, the same bits): odd,
  * |x| clamped to 3.925; below 0.921875 an odd polynomial in |x|, above it
  * 1 - exp(-p(|x|)) with its own exp; every multiply-add fused. */
 static float erf1(float v) {

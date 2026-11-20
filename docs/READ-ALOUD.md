@@ -151,7 +151,7 @@ recreate it byte for byte.
 (`OC_TTS_MODEL_VERSION`, `daemon/tts.h`): the language; the voice model, by the first eight
 hex digits of `voice.bin`'s SHA-256; the pronunciation data, likewise; the speaking rate;
 the style row chosen by characters; the quiet-seeking tail trim; and the noise seed.
-Moving the model from ONNX Runtime into ttskit changed the version — the model's part now
+Moving the model from its previous engine into ttskit changed the version — the model's part now
 names the data file's hash, and the seed was added — so every render made before it is a
 cache miss and is made again when next asked for, in ttskit, and the old rows, never hit
 again, are the least recently used and the first reclaimed (§5). The auditions are warmed
@@ -240,6 +240,6 @@ Full layouts in PROTOCOL.md §5.14b.
 | `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release |
 | `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, round trips of the read-aloud frames at the current protocol version, a two-client vertical |
 | Full suite — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
-| Full suite — `voice_parity` | the voice model against ONNX Runtime's reference renderings (`tests/data/voice/`, made by `tests/manual/voice_ref.c`): with the noise off, every fixture's sample count and at least 40 dB SNR; with it on, the noise's variance within 10% (TTSKIT.md §9) |
+| Full suite — `voice_parity` | the voice model against its reference renderings (`tests/data/voice/`, made once and frozen): with the noise off, every fixture's sample count and at least 40 dB SNR; with it on, the noise's variance within 10% (TTSKIT.md §9) |
 | Full suite (`make test-all`, in the release-candidate) | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
 | Win32 harness | no scripted Listen run. The harness's `voicepreview` verb asks for a voice's audition and reports how long it took (`preview wait_ms=`), and `tools/gui/features/voice.sh` has the real daemon render a sentence (`--tts-say`) that the client's synthetic microphone then speaks |

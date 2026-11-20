@@ -1,10 +1,21 @@
-# The voice model's reference renderings, made by tests/manual/voice_ref.c
-# (its header documents this format): run A's raw output, with run B's length
-# and SNR against A, both runs in one ONNX Runtime session on one thread;
-# then, on a #quiet line, the output with the model's random operators
-# producing zeros, and run A's SNR against it.
-# name voice row speed tokens ids-file samples f32-file samples-b snr-db text
-# #quiet name quiet-file samples-quiet snr-a-db
+# The voice model's reference renderings: made once from the published model,
+# before the engine they were made with was withdrawn; they cannot be made
+# again, and these files are the reference (docs/TTSKIT.md §9).
+# Per fixture <name>: <name>.ids, the model's input ids, int64 little-endian;
+# <name>.f32, run A's raw waveform (before the daemon's high pass, tail trim and
+# fade), float32 little-endian, 24,000 a second; <name>.quiet.f32, the same with
+# the model's random operators producing zeros. Run B repeated A in the same
+# session, on one thread.
+# A fixture line is ten fields separated by single spaces, then the text:
+#   name voice row speed tokens ids-file samples f32-file samples-b snr-db text
+# (row the style row, 0..399; speed as strtof reads it; tokens the ids in
+# ids-file; samples those in f32-file; samples-b run B's; snr-db
+# 10 log10(sum A^2 / sum (B - A)^2)); sscanf "%63s %31s %d %f %d %63s %ld %63s
+# %ld %lf %n" reads it and the text starts at %n.
+# A line "#quiet name quiet-file samples-quiet snr-a-db" follows its fixture:
+# the noise-off output, its length, and 10 log10(sum Q^2 / sum (A - Q)^2). A
+# reader that does not want it skips it with these comments. File names are
+# relative to this folder.
 short-m expr-voice-2-m 4 1.2 9 short-m.ids 27000 short-m.f32 27000 18.37 Yes.
 #quiet short-m short-m.quiet.f32 27000 15.99
 greeting-f expr-voice-2-f 25 1.2 33 greeting-f.ids 70200 greeting-f.f32 70200 18.68 Hello, how are you today?

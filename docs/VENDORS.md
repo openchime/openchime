@@ -18,9 +18,8 @@ are four ways a dependency enters the build; each row below says which:
 shipping **daemon** and **TUI** is permissive — MIT, Apache-2.0, Public Domain,
 or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later —
 except Mozilla's CA roots, which are data under MPL-2.0, a file-level copyleft. No
-third-party GPL/AGPL code is linked into any shipped binary (a release build links
-zig's libc++; a host build's libstdc++ and libgcc are GPL-3.0 with the GCC Runtime
-Library Exception), and every one of these is compatible with the AGPL.
+third-party GPL/AGPL code is linked into any shipped binary (a host build's libgcc is GPL-3.0 with the GCC Runtime Library
+Exception), and every one of these is compatible with the AGPL.
 
 ---
 
@@ -253,20 +252,14 @@ cmp build/voice-src/LICENSE ttskit/data/VOICE-LICENSE
 
 The `voice.bin` it writes is 86,851,136 bytes with SHA-256
 `088b5443f919c988852e8aa83e27ed072e575fcdc40bd006b37a164dd7438ed7`, the same on every run and
-machine, and both `cmp`s print nothing. The converter (`daemon/voice_pack.c`) reads the ONNX
+machine, and both `cmp`s print nothing. The converter (`daemon/voice_pack.c`) reads the `.onnx`
 file and the stored zip with no library, refuses a model whose tensors are not the ones it
 expects, and records the two inputs' SHA-256s in the file's header. Converting a different
 model or revision is a change to OpenChime (TTSKIT.md §8), not a rebuild.
 
 **The reference renderings** the C forward pass is tested against (`tests/data/voice/`)
-were made by `tests/manual/voice_ref.c` with ONNX Runtime 1.30.0's **prebuilt** full release
-(`onnxruntime-linux-x64-1.30.0.tgz`, SHA-256
-`a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd`;
-`onnxruntime-linux-aarch64-1.30.0.tgz`,
-`e16a27a8ed330bbc698df7330b0cf56e722f354e3bcc92118682c74ef3c3e3da`) and the files above.
-Neither tarball is published any more; the x64 release is in the archive (below), and no
-arm64 copy is held. It is run by hand, its outputs committed; nothing in the build or the
-suites links ONNX Runtime for read-aloud.
+were made once from the files above, before the engine they were made with was withdrawn.
+They cannot be made again; the committed files are the reference (TTSKIT.md §9).
 
 **Voice input's recognizer** (ARCH-112) is **Moonshine Tiny Streaming (English)**, published
 by Moonshine AI under MIT. sttkit runs it in plain C (STTKIT.md §3–§4); nothing of it is
@@ -339,29 +332,25 @@ the ones it expects, and records the eight inputs' SHA-256s in the file's header
 `openchimed --recognizer-pack --list DIR` prints every graph it reads. Converting a different
 model or revision is a change to OpenChime (STTKIT.md §7), not a rebuild.
 
-**The references** the C forward pass is tested against (`tests/data/recognizer/`) were made by
-`tests/manual/recognizer_ref.c` with the same prebuilt ONNX Runtime 1.30.0 release as the voice
-model's, and the files above. It is run by hand, its outputs committed; nothing in the build or
-the suites links ONNX Runtime.
+**The references** the C forward pass is tested against (`tests/data/recognizer/`) were made
+once from the files above, before the engine they were made with was withdrawn. They cannot be
+made again; the committed files are the reference (STTKIT.md §8).
 
-**The archive.** Every file above, and ONNX Runtime 1.30.0's prebuilt x64 release, is kept as an
-attachment of the project's public tracker, so the speech data and its references can be remade
-when an upstream URL is gone. The two source bundles are split under the attachment size limit.
+**The archive.** Every file above is kept as an attachment of the project's public tracker, so
+the speech data can be remade when an upstream URL is gone. The two source bundles are split under the attachment size limit.
 
 | Attachment | Holds | SHA-256 |
 |---|---|---|
 | [`voice-src.part0.gz`](https://github.com/user-attachments/files/35148170/voice-src.part0.gz), [`.part1.gz`](https://github.com/user-attachments/files/35148174/voice-src.part1.gz), [`.part2.gz`](https://github.com/user-attachments/files/35148175/voice-src.part2.gz) | `voice-src.tar.gz`, joined: the voice model's three files above | the joined bundle `27758cb22f0969cf5440a5f48dd4e158b98963c62446707b49562f08dd0cf5e1` |
 | [`recognizer-src.part0.gz`](https://github.com/user-attachments/files/35148176/recognizer-src.part0.gz), [`.part1.gz`](https://github.com/user-attachments/files/35148172/recognizer-src.part1.gz) | `recognizer-src.tar.gz`, joined: the recognizer's nine files above | the joined bundle `33c6a2062d7f01009942eaf2021d83318ff26258bdb0ebe08a1de8a4079c31c9` |
-| [`onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz`](https://github.com/user-attachments/files/35148173/onnxruntime-linux-x64-1.30.0-prebuilt.tar.gz) | ONNX Runtime 1.30.0's x64 release, unpacked and packed again, file for file (its `VERSION_NUMBER` and `GIT_COMMIT_ID` name the release); not the original tarball, so its SHA-256 is its own | `d3186ee2c508b0ed7cda17ddf3f278c7c93bd38577fe551a443b1032d40524d6` |
 | [`SHA256SUMS-archive.txt`](https://github.com/user-attachments/files/35148169/SHA256SUMS-archive.txt), [`SHA256SUMS-inputs.txt`](https://github.com/user-attachments/files/35148171/SHA256SUMS-inputs.txt) | the SHA-256 of every attachment and bundle, and of every file inside the two bundles (the ones the tables above record) | `b06b80e8…`, `f748d001…` |
 
-`scripts/build/speech_sources.sh fetch DIR` downloads the eight, joins the bundles, checks each
-against `scripts/build/speech_sources.sha256`, unpacks `DIR/voice-src`, `DIR/recognizer-src` and
-`DIR/onnxruntime-linux-x64-1.30.0`, and checks every source file against `SHA256SUMS-inputs.txt`;
+`scripts/build/speech_sources.sh fetch DIR` downloads the seven, joins the bundles, checks each
+against `scripts/build/speech_sources.sha256`, unpacks `DIR/voice-src` and `DIR/recognizer-src`,
+and checks every source file against `SHA256SUMS-inputs.txt`;
 a file that does not match stops it, named. `scripts/build/speech_sources.sh check DIR` repeats the
 checks on a copy, with no network. It is a maintainer's tool: nothing in the build, the suites or
-CI fetches from the archive. No arm64 copy of ONNX Runtime 1.30.0 is held; the references are
-architecture-independent data and are made on x64.
+CI fetches from the archive.
 
 **The summary model** (ARCH-116) is Qwen3.5 2B, from Qwen's repository at commit
 `15852e8c16360a2fea060d615a32b45270f8a8fc`, run by sumkit (SUMKIT.md). Nothing of it is in the
@@ -386,11 +375,10 @@ To recreate `summary.bin` by hand, with `R` the commit:
     openchimed --summary-pack SRC summary.bin && sha256sum summary.bin
 
 `openchimed --summary-pack --full SRC full.bin` writes the same model unquantised, for
-`sum_check` (SUMKIT.md §6). **llama.cpp** is no part of the build or the suites: it is a
-reference tool only, run by hand by `tests/manual/summary_ref.c` to make the committed
-references in `tests/data/summary/`, over a bfloat16 GGUF its own converter makes from the same
-files. Unsloth's `Q4_K_M` conversion, which the daemon ran before sumkit, is the quantisation's
-baseline (SUMKIT.md §4) and nothing more.
+`sum_check` (SUMKIT.md §6). The references in `tests/data/summary/` were made once from the
+same unquantised weights, before the engine they were made with was withdrawn; they cannot be
+made again. Unsloth's `Q4_K_M` conversion, the file the previous engine ran, is the
+quantisation's baseline (SUMKIT.md §4) and nothing more.
 
 **The web client** (`make build/web/openchime.js`) builds its own copies with Emscripten into
 `build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the committed
@@ -547,8 +535,8 @@ paths ship; nothing is fetched at runtime.
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
-| **Apache-2.0 WITH LLVM-exception** | libc++ (zig's), llvm-mingw | Toolchain runtime; static in the release daemon; the exception waives binary attribution |
-| **GPL-3.0 with GCC Runtime Library Exception** | libstdc++, libgcc | Host builds only (without `RELEASE=1`); the exception permits static linking into the daemon. Releases use zig's libc++ instead |
+| **Apache-2.0 WITH LLVM-exception** | compiler-rt (zig's), llvm-mingw | Toolchain runtime; static in the release daemon and the Windows clients; the exception waives binary attribution |
+| **GPL-3.0 with GCC Runtime Library Exception** | libgcc | Host builds only (without `RELEASE=1`); the exception permits linking it into the daemon. Releases use zig's compiler-rt instead |
 
 **Bottom line:** every third-party dependency in the shipped daemon and TUI is
 permissively licensed (MIT, BSD, Apache-2.0, CC0, ISC, zlib, Public Domain, plus

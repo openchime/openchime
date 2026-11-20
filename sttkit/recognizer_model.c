@@ -61,7 +61,7 @@ static void add_rows(float *x, const float *y, size_t n) {
 /* ---- the frontend ------------------------------------------------------------ */
 
 /* A convolution of kernel 5 and stride 2 over `rows` input rows of `cin`
- * channels (4 rows of zeros already before them), as ONNX Runtime computes it
+ * channels (4 rows of zeros already before them), as the reference computes it
  * on one chunk: the windows laid out channel by channel, tap by tap (its
  * im2col), each output a chain of fused multiply-adds in that order in blocks
  * of 1,024 (the stride its matrix product takes for a chunk's few outputs),
@@ -81,8 +81,8 @@ static int conv(const float *x, int t_out, int cin, const float *w, const float 
 }
 
 /* Samples (padded with silence to whole chunks) to feature rows; returns the
- * row count, or -1 out of memory. Every step is the arithmetic of ONNX
- * Runtime's run of the published graph, to the bit: a frame's mean and
+ * row count, or -1 out of memory. Every step is the arithmetic of the
+ * reference's run of the published graph, to the bit: a frame's mean and
  * variance are its sums as Eigen adds them, the linear layer a chain of fused
  * multiply-adds, the convolutions as conv() says. A last-bit difference here
  * would move a value across a rounding step of the encoder's first

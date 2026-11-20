@@ -153,7 +153,7 @@ static int refused(const char *dir, const char *name, const unsigned char *p, si
 
 /* ---- the forward pass's first half: the pieces that need no voice.bin ----------
  * A token's frame count is round(the sum of its 50 duration bins / speed): the
- * sum in ONNX Runtime's order, rounded half to even, at least 1; then each frame
+ * sum in the reference's order, rounded half to even, at least 1; then each frame
  * takes its token's row. Hand-made inputs, expected values worked out here. */
 static int duration_checks(void) {
     static const struct { float raw; int want; } R[] = {
@@ -310,7 +310,7 @@ static void voice_bin_checks(const char *dir) {
     free(p);
 }
 
-/* A protobuf writer, enough for a small ONNX model. */
+/* A protobuf writer, enough for a small .onnx model. */
 typedef struct { uint8_t *p; size_t n, cap; } pbw;
 
 static void pbw_raw(pbw *b, const void *p, size_t n) {

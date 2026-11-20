@@ -410,7 +410,7 @@ spend every answer's cap on that; the API says so in the usage it reports
 (`completion_tokens_details.reasoning_tokens`, OpenAI's shape) or by answering
 nothing. Such a model is asked the prompt again with each of the fields APIs
 have for turning reasoning off -- OpenAI's `reasoning_effort: "none"`,
-OpenRouter's `reasoning: {enabled: false}`, llama.cpp's and vLLM's
+OpenRouter's `reasoning: {enabled: false}`, local servers' and vLLM's
 `chat_template_kwargs: {enable_thinking: false}` -- and the first the API
 honours is sent with every request from then on, logged once. A model that
 reasons only when it finds a prompt worth it answers the one-line prompt plainly;
@@ -509,7 +509,7 @@ form failure here says less than it would locally):
 
 Not tried: Google Gemini, xAI Grok, the larger Anthropic and OpenAI models.
 
-**Local, in the daemon (llama.cpp, before sumkit).** The real daemon built for the model, on a
+**Local, in the daemon (the previous engine, before sumkit).** The real daemon built for the model, on a
 2-vCPU, 4 GB machine, fetching and checking its GGUF at startup and asked for
 the 30 spans over the wire by a client.
 Prompt s15. Times are for the whole span cold, every chunk call included; a

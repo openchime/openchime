@@ -1,7 +1,7 @@
 /* Tests for nnkit, the neural network kernels read-aloud's voice model and
  * voice input's recognizer run on (nnkit/, docs/TTSKIT.md §5b, docs/STTKIT.md):
  * each kernel against a naive version written from the operator's definition,
- * on random inputs from a fixed seed, and the bits ONNX Runtime's own
+ * on random inputs from a fixed seed, and the bits the reference's own
  * approximations give where the models' references depend on them. */
 #include "check.h"
 #include "nnkit.h"
@@ -26,7 +26,7 @@ static uint32_t rnd(void) {
 static int rnd_int(int lo, int hi) { return lo + (int)(rnd() % (uint32_t)(hi - lo + 1)); }
 static float rnd_f(float lo, float hi) { return lo + (hi - lo) * (float)(rnd() >> 8) / 16777216.0f; }
 
-/* ONNX DynamicQuantizeLinear, written from the operator's definition. */
+/* DynamicQuantizeLinear, written from the operator's definition. */
 static void dql_naive(const float *x, size_t n, uint8_t *q, float *scale, int *zp) {
     float mn = 0, mx = 0;
     for (size_t i = 0; i < n; i++) {
@@ -103,7 +103,7 @@ static int dql_checks(void) {
     return ok;
 }
 
-/* ConvInteger from its definition, on the ONNX layout W[co][ci][j]. */
+/* ConvInteger from its definition, on the graph's layout W[co][ci][j]. */
 static int conv_case(int cin, int cout, int k, int stride, int dil, int t_out, int wzp) {
     int cp = NN_ROUND(cin, NN_CPAD), co4 = NN_ROUND(cout, 4);
     int rows = (t_out - 1) * stride + (k - 1) * dil + 1;
@@ -133,7 +133,7 @@ static int conv_case(int cin, int cout, int k, int stride, int dil, int t_out, i
     return ok;
 }
 
-/* MatMulInteger from its definition, on the ONNX layout B[k][n]. */
+/* MatMulInteger from its definition, on the graph's layout B[k][n]. */
 static int matmul_case(int m, int k, int n, int bzp) {
     int kp = NN_ROUND(k, NN_CPAD), n4 = NN_ROUND(n, 4);
     int16_t *a = calloc((size_t)m * kp, sizeof *a);
@@ -161,7 +161,7 @@ static int matmul_case(int m, int k, int n, int bzp) {
 
 static float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-/* DynamicQuantizeLSTM as ONNX Runtime defines it, from the contrib op's layouts
+/* DynamicQuantizeLSTM as the reference defines it, from the contrib op's layouts
  * (W [dir][in][4H], R [dir][H][4H]), one step at a time. */
 static int lstm_case(int t, int in, int hidden, int dirs) {
     int ip = NN_ROUND(in, NN_CPAD), G = 4 * hidden;
@@ -406,7 +406,7 @@ static int elementwise_checks(void) {
     return ok;
 }
 
-/* sin and atan as ONNX Runtime computes them, to the bit: outputs its CPU
+/* sin and atan as the reference computes them, to the bit: outputs its CPU
  * kernels gave for these inputs (where the C library's answer differs, past the
  * huge-argument threshold, and atan both sides of 1). atan leaves the elements
  * past the last whole vector of four to the C library, as its kernel does. */

@@ -7,7 +7,7 @@
  * constants and nodes, which is how the forward pass was checked against the
  * model (STTKIT.md §3).
  *
- * The graphs are ONNX Runtime's .ort files: FlatBuffers, read here with no
+ * The graphs are .ort files: FlatBuffers, read here with no
  * library, bounds-checked at every step. The converter takes exactly the
  * tensors the forward pass needs, names them in sttkit's own terms and writes
  * each in the layout sttkit's kernels read. The same inputs give the same bytes

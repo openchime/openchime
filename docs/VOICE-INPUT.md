@@ -111,7 +111,7 @@ peaks at about 52 MB resident, 40 MB of it the mapped `recognizer.bin`, which th
 may drop. An idle daemon holds 0.1 MB more with voice input built in than without it.
 
 **Long segments are heard in windows.** The working memory grows with what the model
-hears at once: when the recognizer ran on ONNX Runtime, on a 256 MB machine a 20 s segment
+hears at once: when the recognizer ran on its previous engine, on a 256 MB machine a 20 s segment
 left 3 MB free and a 30 s one took 413 s, the kernel re-reading the model from disk
 (TESTING.md, "Speech models' memory"). sttkit needs far less, but the windows stay: they
 bound the work and memory of one pass whatever the segment.
@@ -122,7 +122,7 @@ the windows' words are joined with one space (`oc_stt_hear_windowed`,
 
 - **In C, in sttkit** (STTKIT.md), with read-aloud's kernels (nnkit, shared with
   ttskit): no inference library, one thread, no intrinsics. Its arithmetic is the
-  published graphs' as ONNX Runtime computed them, to the bit, so it hears what the
+  published graphs' as the reference engine computed them, to the bit, so it hears what the
   model was measured to hear (STTKIT.md §4). Decoding stops at the end token or at the
   model's tokens-per-second ceiling, its guard against a decoder repeating itself.
 - **A worker of its own** beside the render worker: a bounded queue, an eventfd back
