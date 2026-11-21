@@ -28,6 +28,9 @@
 #include "audio_dev.h"
 #include "oc_dictate.h"
 #include "oc_mp4.h"
+#include "export_render.h"  /* the export's stub codecs (ARCH-135) */
+#include "export_worker.h"  /* where the daemon keeps a copy */
+#include "blobstore.h"
 #include "oc_call_engine.h"
 #include "oc_capture.h"
 #include "audio.h"        /* the relay, run on a thread for the call test */
@@ -479,6 +482,12 @@ static void test_emoji_aliases(void) {
 static void test_capabilities(void) {
     oc_model m; oc_model_init(&m);
     CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
+    /* Save compatible copy is offered only when the daemon says it exports. */
+    CHECK(oc_model_export_available(&m) == 0);
+    caps_fold(&m, "tts,h264-export");
+    CHECK(oc_model_export_available(&m) == 1);
+    caps_fold(&m, "tts");
+    CHECK(oc_model_export_available(&m) == 0);
     CHECK(caps_fold(&m, "tts") == 1);
     CHECK(caps_fold(&m, "stt") == 0);                       /* replaced, not accumulated */
     CHECK(oc_model_has_capability(&m, OC_CAP_STT) == 1);
@@ -6492,6 +6501,126 @@ static void test_action_pairing(void) {
     oc_queue_destroy(&q);
 }
 
+/* Save compatible copy (ARCH-135). With export on (the stub codecs), dana posts
+ * a video message, erik is offered the copy and saves it under the video's name
+ * with "-compatible", byte for byte what the daemon stored. With export off it
+ * is not offered, a request is refused with the plain sentence, and the
+ * download queued behind it still completes. Its own daemon each time. */
+static void test_export_client(int on) {
+    char data[sizeof g_dir + 40], db[sizeof g_dir + 40];
+    snprintf(data, sizeof data, "%s/export_data_%d", g_dir, on);
+    snprintf(db, sizeof db, "%s/export_%d.db", g_dir, on);
+    mkdir(data, 0700);
+    const char *old_data = getenv("OPENCHIME_DATA_DIR");
+    char saved[1024] = "";
+    if (old_data) snprintf(saved, sizeof saved, "%s", old_data);
+    setenv("OPENCHIME_DATA_DIR", data, 1);
+    setenv("OPENCHIME_H264_EXPORT", on ? "on" : "off", 1);
+    oc_netloop_set_export(on ? &oc_export_stub_codecs : NULL);
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    oc_dbwriter *dbw = oc_dbwriter_start(db);
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "erik", "pw-erik", OC_ROLE_MEMBER, 2048) != 0);
+    struct core_loop_arg arg;
+    memset(&arg, 0, sizeof arg);
+    arg.srv = &srv; arg.dbw = dbw;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+    oc_client *a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+    oc_client *b = start_as(NULL, "127.0.0.1", arg.port, "erik:pw-erik", NULL, NULL, 1, NULL);
+    CHECK(a && b);
+    if (a && b) {
+        CHECK(WAIT_FOR(a, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+        CHECK(WAIT_FOR(b, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+        CHECK(oc_model_export_available(oc_client_model(b)) == on);
+
+        /* A video message in the profile the daemon reads, with a poster. */
+        oc_mp4_writer *mw = oc_mp4_writer_open(320, 240);
+        uint8_t v[64], au[24];
+        memset(v, 0x5A, sizeof v);
+        memset(au, 0x6B, sizeof au);
+        for (int i = 0; i < 12; i++) {
+            oc_mp4_write_video(mw, v, sizeof v, (int64_t)i * 33333, i == 0);
+            oc_mp4_write_audio(mw, au, sizeof au, 960);
+        }
+        uint8_t *video = NULL;
+        size_t vlen = 0;
+        uint32_t ms = 0;
+        CHECK(oc_mp4_writer_finish(mw, &video, &vlen, &ms) == 0);
+        uint8_t *poster = malloc(500);
+        if (poster) memset(poster, 0x33, 500);
+        uint64_t tag = video && poster ? oc_client_post_video(a, 1, 0, video, vlen, poster, 500, ms, 320, 240, "") : 0;
+        video = poster = NULL;                          /* the core owns them */
+        CHECK(tag != 0);
+        CHECK(WAIT_FOR_MS(a, m->media_posted_tag == tag, 30000));
+        const oc_msg *vm = NULL;
+        CHECK(WAIT_FOR(b, (vm = channel_video(m, 1)) != NULL));
+        vm = channel_video(oc_client_model(b), 1);
+        uint64_t vid = vm ? vm->attach[0].id : 0;
+        char name[160];
+        oc_export_copy_name(vm ? vm->attach[0].filename : "", name, sizeof name);
+        CHECK(vm && strlen(name) == strlen(vm->attach[0].filename) + 11 &&
+              strcmp(name + strlen(name) - 15, "-compatible.mp4") == 0);
+        char dst[sizeof g_dir + 200];
+        snprintf(dst, sizeof dst, "%s/%s", g_dir, name);
+        unlink(dst);
+        if (vid && on) {
+            /* The copy arrives whole, as the daemon stored it. */
+            oc_client_export(b, vid, dst);
+            CHECK(WAIT_FOR_MS(b, m->xfer_tag == OC_EXPORT_TAG(vid) && m->xfer_phase == 1, 15000));
+            char blobs[sizeof data + 8], key[OC_EXPORT_KEY_MAX];
+            snprintf(blobs, sizeof blobs, "%s/blobs", data);
+            oc_export_copy_key(&oc_export_stub_codecs, vid, key, sizeof key);
+            oc_blobstore *bs = oc_blobstore_open(blobs, NULL);
+            uint64_t n = 0;
+            oc_blob_reader *rd = bs ? oc_blob_get_begin(bs, key, &n) : NULL;
+            unsigned char *want = n ? malloc(n) : NULL;
+            uint64_t at = 0;
+            long k;
+            while (rd && want && at < n && (k = oc_blob_get_chunk(rd, want + at, n - at)) > 0) at += (uint64_t)k;
+            if (rd) oc_blob_get_close(rd);
+            if (bs) oc_blobstore_close(bs);
+            CHECK(n > 0 && at == n && file_matches(dst, want, n));
+            free(want);
+        } else if (vid) {
+            /* Refused, said plainly, no file left; the download behind it runs. */
+            char after[sizeof g_dir + 40];
+            snprintf(after, sizeof after, "%s/export_after.mp4", g_dir);
+            unlink(after);
+            oc_client_export(b, vid, dst);
+            CHECK(WAIT_FOR_MS(b, m->xfer_tag == OC_EXPORT_TAG(vid) && m->xfer_phase == 2, 15000));
+            /* contract: the sentence the plan gives the refusal (OC_EXPORT_UNAVAILABLE_TEXT) */
+            CHECK(strcmp(oc_client_model(b)->status, OC_EXPORT_UNAVAILABLE_TEXT) == 0);
+            struct stat st;
+            CHECK(stat(dst, &st) != 0);
+            /* Asked again with a download behind it: refused, and the queue moves on. */
+            oc_client_export(b, vid, dst);
+            oc_client_download(b, vid, after);
+            CHECK(WAIT_FOR_MS(b, stat(after, &st) == 0 && (uint64_t)st.st_size == vlen &&
+                                 m->xfer_tag == vid && m->xfer_phase == 1, 15000));
+            const oc_xfer_state *xs = oc_model_xfer(oc_client_model(b), OC_EXPORT_TAG(vid));
+            CHECK(xs && xs->phase == 2);
+            CHECK(stat(dst, &st) != 0);
+            unlink(after);
+        }
+        unlink(dst);
+    }
+    if (a) oc_client_stop(a);
+    if (b) oc_client_stop(b);
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_netloop_set_export(NULL);
+    unsetenv("OPENCHIME_H264_EXPORT");
+    if (old_data) setenv("OPENCHIME_DATA_DIR", saved, 1); else unsetenv("OPENCHIME_DATA_DIR");
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, .well-known metadata, a published fingerprint, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
     if (oc_test_mkdtemp("client_core", g_dir, sizeof g_dir) != 0) {
@@ -7982,6 +8111,8 @@ int run_client_core_tests(void) {
     test_out_of_office();
     test_local_browser();
     test_device_client();
+    test_export_client(1);
+    test_export_client(0);
     oc_test_rmtree(g_dir);
     return failures;
 }

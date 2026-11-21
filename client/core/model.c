@@ -836,6 +836,7 @@ int oc_model_has_capability(const oc_model *m, const char *name) {
     return 0;
 }
 uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
+uint8_t     oc_model_export_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_H264_EXPORT); }
 uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
 uint8_t     oc_model_calls_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_CALLS); }
 uint8_t     oc_model_summarize_available(const oc_model *m) {

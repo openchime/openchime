@@ -227,7 +227,16 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   what has merely been sent. The model keeps each recent transfer's latest
   notice by tag (`oc_model_xfer`), because a frame drains every event before it
   draws: a small file that finished between two frames would otherwise never be
-  seen to finish.
+  seen to finish. **Save compatible copy** (`oc_client_export`, ARCH-135) is a
+  queued transfer like a download: `EXPORT_GET`, then the daemon's
+  `EXPORT_INFO`/`EXPORT_CHUNK`/`EXPORT_END` written to the file the person chose,
+  tagged `OC_EXPORT_TAG(attachment id)` so it is never taken for a download of the
+  same video. A copy that does not arrive whole leaves no file. Refused, its notice
+  says why -- `OC_EXPORT_UNAVAILABLE_TEXT`, "Export is not available right now",
+  for `EXPORT_UNAVAILABLE` -- and the queue moves on. A frontend offers it only
+  when `oc_model_export_available` says the daemon lists `h264-export`, under the
+  name `oc_export_copy_name` gives: the video's own with `-compatible` before
+  `.mp4`.
 - **Video messages** (`client/core/media/`, ARCH-110). The media library —
   capture, the audio device layer, VP9 and Opus, the restricted MP4 writer and
   reader, the recorder and the player — is kept out of `CORE_SRC`, so a frontend
@@ -520,7 +529,9 @@ model; translate input to intents }, stop.
   - **attachments** — the launcher's "Upload a file" streams a local file through
     the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
     links it into a message; the message menu's "Download file" saves an
-    attachment by id. The net thread runs one transfer at a time as a state
+    attachment by id, and on a video message, where the daemon exports,
+    "Save compatible copy" saves its H.264 + MP3 copy as
+    `<name>-compatible.mp4` in the working directory (ARCH-135). The net thread runs one transfer at a time as a state
     machine over the frame stream; received messages carry attachment metadata
     (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).

@@ -24,6 +24,13 @@
 /* What an OC_EV_ERROR is about, beside its sentence: the stable kind a frontend
  * (or a test) acts on, since the words are for a person and may change. A
  * refusal from the daemon also carries its OC_ERR_* code. */
+/* What the client says when the daemon refuses an export (EXPORT_UNAVAILABLE,
+ * ARCH-135): the notice on OC_EV_XFER that ends an OC_CMD_EXPORT. */
+#define OC_EXPORT_UNAVAILABLE_TEXT "Export is not available right now"
+/* An export's transfer tag: its attachment id with the top bit set, so it is
+ * never taken for a download or fetch of the same video, whose tag is the id. */
+#define OC_EXPORT_TAG(attachment_id) ((uint64_t)(attachment_id) | (1ull << 63))
+
 typedef enum {
     OC_CERR_OTHER = 0,          /* anything not named below */
     OC_CERR_REFUSED,            /* the daemon refused a request (err_code says which) */
@@ -732,6 +739,10 @@ enum {
     /* Out of office (REQ-122): start_ms/end_ms, body = the message; an end of
      * 0 clears it. */
     OC_CMD_SET_OUT_OF_OFFICE,
+    /* The playable copy of a video message (ARCH-135), saved to a file the
+     * person chose: message_id = the video's attachment id, body = dest path.
+     * A queued transfer, as OC_CMD_DOWNLOAD is. */
+    OC_CMD_EXPORT,
     OC_CMD_QUIT
 };
 

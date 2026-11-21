@@ -557,6 +557,8 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             oc_model_format_duration(a->duration_ms, d, sizeof d);
             snprintf(al, sizeof al, "    [video message %s, open in the desktop client] #%llu",
                      d, (unsigned long long)a->id);
+            /* Its actions (Enter) are Download file, and Save compatible copy
+             * where the daemon makes one (ARCH-135). */
         } else {
             /* 📎 filename (12.3 KB) #id — download with /download <id> */
             double kb = (double)a->size / 1024.0;
@@ -1346,7 +1348,7 @@ typedef oc_completion ac_cand;
  * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
  * commands. One generic menu holds {label,id} items; the SELECT handler
  * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
-enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_UNREAD,
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_EXPORT, ACT_UNREAD,
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
@@ -1394,6 +1396,9 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
+/* The selected message holds a video message the daemon will export (ARCH-135):
+ * its menu offers Save compatible copy beside Download. Set before menu_build_msg. */
+static int g_menu_can_export;
 static int      g_nmenu;
 static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
 static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
@@ -1425,6 +1430,7 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
     if (poll && own && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
         g_menu[g_nmenu++] = (menuitem){ "Close poll now", ACT_POLL_CLOSE };
     if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
+    if (has_attach && g_menu_can_export) g_menu[g_nmenu++] = (menuitem){ "Save compatible copy", ACT_EXPORT };
     if (may_edit) g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
     if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
@@ -4679,6 +4685,21 @@ int main(int argc, char **argv) {
                                 clen = strlen(composer); panel = 0; break;
                             }
                     }
+                    else if (id == ACT_EXPORT) {     /* the video's playable copy -> "<name>-compatible.mp4" in cwd */
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                for (uint8_t ak = 0; ak < ec->msgs[k].n_attach; ak++)
+                                    if (ec->msgs[k].attach[ak].media_kind == OC_MEDIA_VIDEO_MESSAGE &&
+                                        !ec->msgs[k].attach[ak].reclaimed) {
+                                        char name[160];
+                                        oc_export_copy_name(ec->msgs[k].attach[ak].filename, name, sizeof name);
+                                        oc_client_export(cl, ec->msgs[k].attach[ak].id, name);
+                                        break;
+                                    }
+                                break;
+                            }
+                    }
                     else if (id == ACT_DOWNLOAD) {   /* first live attachment -> its filename in cwd */
                         const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
                         if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
@@ -4922,6 +4943,11 @@ int main(int argc, char **argv) {
                         if (sel->author_id && sel->author_id != mm->user_id &&
                             !oc_model_is_workspace_sender(mm, sel->author_id))
                             blk = oc_model_is_blocked(mm, sel->author_id) ? 2 : 1;
+                        g_menu_can_export = 0;
+                        if (oc_model_export_available(mm))
+                            for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                                if (sel->attach[ak].media_kind == OC_MEDIA_VIDEO_MESSAGE && !sel->attach[ak].reclaimed)
+                                    g_menu_can_export = 1;
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
                                        has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
                                        sel->saved && sel->remind_at);

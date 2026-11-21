@@ -1719,7 +1719,7 @@ static int g_vm_away;
 /* The recording quality, as a height: 360, 720 or 1080. Synced with the prefs. */
 static int g_vm_quality = 720;
 enum { VMC_OPEN = 1, VMC_RECORD, VMC_STOP, VMC_DISCARD, VMC_RETAKE, VMC_SEND,
-       VMC_PRIVACY, VMC_PLAYPAUSE, VMC_MUTE, VMC_DOWNLOAD, VMC_CLOSE, VMC_CAMERA, VMC_MIC,
+       VMC_PRIVACY, VMC_PLAYPAUSE, VMC_MUTE, VMC_DOWNLOAD, VMC_EXPORT, VMC_CLOSE, VMC_CAMERA, VMC_MIC,
        VMC_QUALITY, VMC_SOURCE, VMC_CORNER, VMC_SOUND };
 static rectf g_video_btn;                 /* composer: record a video message */
 /* Voice input (REQ-296-300, ARCH-112): the microphone button (hold to talk), the
@@ -28994,6 +28994,7 @@ static void palette_accept(oc_win *hwnd) {
 
 
 static void download_attachment(oc_win *hwnd, const oc_attachment *a);   /* fwd */
+static void export_video(oc_win *hwnd, uint64_t attachment_id, const char *filename);   /* fwd */
 
 /* ---- video messages (REQ-162–166, ARCH-110, docs/VIDEO-MESSAGES.md §9) -------
  *
@@ -29916,6 +29917,9 @@ static void vm_command(oc_win *hwnd, int cmd) {
         g_vm_muted = !g_vm_muted;
         if (g_vplayer) oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume);
         break;
+    case VMC_EXPORT:
+        if (g_vplay_aid) export_video(hwnd, g_vplay_aid, g_vplay_name[0] ? g_vplay_name : "video.mp4");
+        break;
     case VMC_DOWNLOAD:
         if (g_vplay_aid) {
             oc_attachment at; memset(&at, 0, sizeof at);
@@ -30279,8 +30283,21 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
         snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "%s", ps.state == OC_PLAYER_PLAYING ? "Pause" : "Play");
         g_n_vm_btns++; }
     rectf dlr = rf(bb.right - isz, icy - isz / 2, bb.right, icy + isz / 2);
-    rectf mur = rf(dlr.left - UIS(8) - isz, dlr.top, dlr.left - UIS(8), dlr.bottom);
+    /* Save compatible copy (ARCH-135): beside Download, only when the daemon
+     * exports and this is a posted video message, not a take under review. */
+    int can_export = g_vplay_aid && model() && oc_model_export_available(model());
+    rectf exr = rf(dlr.left - UIS(8) - isz, dlr.top, dlr.left - UIS(8), dlr.bottom);
+    rectf mur = can_export ? rf(exr.left - UIS(8) - isz, dlr.top, exr.left - UIS(8), dlr.bottom)
+                           : rf(dlr.left - UIS(8) - isz, dlr.top, dlr.left - UIS(8), dlr.bottom);
     draw_lucide(rt, OC_ICON_DOWNLOAD, rf(dlr.left + 4, dlr.top + 4, dlr.right - 4, dlr.bottom - 4), 0xFFFFFF);
+    if (can_export) {
+        draw_lucide(rt, OC_ICON_FILE, rf(exr.left + 4, exr.top + 4, exr.right - 4, exr.bottom - 4), 0xFFFFFF);
+        if (g_n_vm_btns < VM_MAX_BTNS) {
+            g_vm_btns[g_n_vm_btns].r = exr; g_vm_btns[g_n_vm_btns].cmd = VMC_EXPORT;
+            snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "Save compatible copy");
+            g_n_vm_btns++;
+        }
+    }
     draw_lucide(rt, g_vm_muted ? OC_ICON_MUTE : OC_ICON_VOLUME, rf(mur.left + 4, mur.top + 4, mur.right - 4, mur.bottom - 4), 0xFFFFFF);
     if (g_n_vm_btns + 1 < VM_MAX_BTNS) {
         g_vm_btns[g_n_vm_btns].r = mur; g_vm_btns[g_n_vm_btns].cmd = VMC_MUTE;
@@ -30893,6 +30910,25 @@ static void download_attachment(oc_win *hwnd, const oc_attachment *a) {
         if (!g_dl[i].tag) { g_dl[i].tag = a->id; snprintf(g_dl[i].path, sizeof g_dl[i].path, "%s", path); break; }
 }
 
+/* Save compatible copy (ARCH-135): the daemon's H.264 + MP3 copy of a video
+ * message, offered under the video's name with "-compatible". It is queued
+ * and tracked as a download, so the web client hands the finished file to the
+ * browser's download the same way (oc_plat_file_saved). */
+static void export_video(oc_win *hwnd, uint64_t attachment_id, const char *filename) {
+    if (!g_client || !attachment_id) return;
+    char name[160], path[1024];
+    oc_export_copy_name(filename, name, sizeof name);
+    if (!oc_plat_pick_save(hwnd->sdl, name, path, sizeof path)) return;
+    oc_client_export(g_client, attachment_id, path);
+    for (int i = 0; i < 8; i++)
+        if (!g_dl[i].tag) {
+            g_dl[i].tag = OC_EXPORT_TAG(attachment_id);
+            snprintf(g_dl[i].path, sizeof g_dl[i].path, "%s", path);
+            break;
+        }
+    fb_confirm("Making a compatible copy…");
+}
+
 static void downloads_tick(const oc_model *m) {
     if (!m) return;
     for (int i = 0; i < 8; i++) {
@@ -30900,6 +30936,9 @@ static void downloads_tick(const oc_model *m) {
         for (int k = 0; k < OC_MODEL_XFERS; k++)
             if (m->xfers[k].tag == g_dl[i].tag && m->xfers[k].phase) {
                 if (m->xfers[k].phase == 1) oc_plat_file_saved(g_dl[i].path);
+                /* An export the daemon refused or could not make says why. */
+                else if (g_dl[i].tag & (1ull << 63))
+                    fb_failed(m->status[0] ? m->status : OC_EXPORT_UNAVAILABLE_TEXT);
                 g_dl[i].tag = 0;
                 break;
             }
@@ -30951,6 +30990,12 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         if (msg->attach[i].reclaimed) snprintf(lbl, sizeof lbl, "%s (no longer stored)",
                                                msg->attach[i].filename);
         mi_item(msg->attach[i].reclaimed ? 0 : 30 + i, lbl);
+        /* A video message's playable copy (ARCH-135), when the daemon makes one. */
+        if (msg->attach[i].media_kind == OC_MEDIA_VIDEO_MESSAGE && !msg->attach[i].reclaimed &&
+            oc_model_export_available(m)) {
+            snprintf(lbl, sizeof lbl, "Save compatible copy of %s", msg->attach[i].filename);
+            mi_item(50 + i, lbl);
+        }
     }
     if (msg->n_attach) mi_sep();
     /* No nested threads (REQ-060), so a reply offers no thread item. */
@@ -31282,6 +31327,8 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
         download_attachment(hwnd, &msg->attach[cmd - 30]);
+    } else if (cmd >= 50 && cmd - 50 < msg->n_attach) {
+        export_video(hwnd, msg->attach[cmd - 50].id, msg->attach[cmd - 50].filename);
     }
 }
 

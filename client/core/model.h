@@ -1482,6 +1482,9 @@ const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64
 const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id);
 /* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
+/* The export of a video message is offered: the "h264-export" capability
+ * (ARCH-135). A frontend offers Save compatible copy only then. */
+uint8_t         oc_model_export_available(const oc_model *m);
 /* Voice input is offered on this connection (the "stt" capability). */
 uint8_t         oc_model_stt_available(const oc_model *m);
 /* The daemon offers calls: its relay is up (REQ-150). */

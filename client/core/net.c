@@ -337,7 +337,10 @@ static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
 typedef struct {
     int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK,
                            * 4 a message's speech (ARCH-111): the download shape over
-                           * AUDIO_* frames, keyed by message id rather than attachment */
+                           * AUDIO_* frames, keyed by message id rather than attachment;
+                           * 5 a voice's audition; 6 a video message's playable copy
+                           * (ARCH-135): the download shape over EXPORT_* frames, into
+                           * the file the person chose */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
     /* An in-memory download: `fp` is NULL and chunks accumulate here
@@ -362,6 +365,7 @@ typedef struct {
     uint8_t  purpose;
     char     ename[48];   /* purpose 2: the shortcode to claim it as (REQ-072) */
     char     name[128];   /* filename (upload src basename / download dest label) */
+    char    *path;        /* mode 6: the file being written, removed if the copy fails */
 } oc_xfer;
 
 /* Per-channel high-water the net thread tracks (from every BROADCAST) so a
@@ -571,6 +575,9 @@ static const char *mime_for(const char *name) {
 
 static void xfer_reset(oc_xfer *x) {
     if (x->fp) fclose(x->fp);
+    /* A copy that did not arrive whole leaves no file (mode 6 clears `path`
+     * once it has). */
+    if (x->path) { remove(x->path); free(x->path); }
     free(x->buf);
     memset(x, 0, sizeof *x);
 }
@@ -692,6 +699,28 @@ static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max
         if (label) { char msg[200]; snprintf(msg, sizeof msg, "downloading to %s…", x->name); xfer_notice(ctx, 0, msg); }
     } else {
         if (label) xfer_notice(ctx, 2, "download: begin failed");
+        xfer_reset(x);
+    }
+}
+
+/* The playable copy of a video message (ARCH-135), into `fp` at `path`. */
+static void begin_export(disp_ctx *ctx, uint64_t aid, FILE *fp, const char *path) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 6; x->fp = fp; x->id = aid;
+    x->path = strdup(path);
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    snprintf(x->name, sizeof x->name, "%s", slash ? slash + 1 : path);
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_export_get eg = { aid };
+    if (oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &eg) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        char msg[200]; snprintf(msg, sizeof msg, "making a compatible copy for %s…", x->name);
+        xfer_notice(ctx, 0, msg);
+    } else {
+        xfer_notice(ctx, 2, "export: request failed");
         xfer_reset(x);
     }
 }
@@ -839,6 +868,10 @@ static void xq_start(disp_ctx *ctx) {
         if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
         const char *slash = strrchr(c->body, '/');
         begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
+    } else if (c->type == OC_CMD_EXPORT) {
+        FILE *fp = fopen(c->body, "wb");
+        if (!fp) { xfer_notice(ctx, 2, "export: cannot create file"); return; }
+        begin_export(ctx, c->message_id, fp, c->body);
     } else if (c->type == OC_CMD_LISTEN_FETCH) {
         begin_listen(ctx, c->message_id);
     } else if (c->type == OC_CMD_VOICE_PREVIEW) {
@@ -2424,6 +2457,41 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     xfer_reset(x);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_EXPORT_INFO) {
+            oc_export_info ei;
+            if (oc_decode_export_info(&p, &ei) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ei.attachment_id == ctx->xfer->id)
+                ctx->xfer->total = ei.total_size;
+        } else if (hdr.msg_type == OC_MSG_EXPORT_CHUNK) {
+            oc_export_chunk ec;
+            if (oc_decode_export_chunk(&p, &ec) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ec.attachment_id == ctx->xfer->id && ec.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                if (ec.data.len && fwrite(ec.data.ptr, 1, ec.data.len, x->fp) != ec.data.len) {
+                    xfer_notice(ctx, 2, "export: write error");
+                    xfer_reset(x);
+                } else { x->done += ec.data.len; x->next_seq++; xfer_progress(ctx); }
+            }
+        } else if (hdr.msg_type == OC_MSG_EXPORT_END) {
+            oc_export_end ee;
+            if (oc_decode_export_end(&p, &ee) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ee.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                int whole = !x->total || x->done == x->total;
+                int closed = x->fp && fclose(x->fp) == 0;
+                x->fp = NULL;
+                char msg[256];
+                if (whole && closed) {
+                    free(x->path);              /* kept: it arrived whole */
+                    x->path = NULL;
+                    snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
+                } else {
+                    snprintf(msg, sizeof msg, "export: size mismatch (%llu/%llu)",
+                             (unsigned long long)x->done, (unsigned long long)x->total);
+                }
+                xfer_notice(ctx, whole && closed ? 1 : 2, msg);
+                xfer_reset(x);
+            }
         } else if (hdr.msg_type == OC_MSG_AUDIO_INFO) {
             oc_audio_info ai;
             if (oc_decode_audio_info(&p, &ai) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
@@ -2794,11 +2862,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                      * message has nothing to say, or read-aloud is off or busy. */
                     (ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                      (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
-                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE)) ||
+                    /* A copy the daemon will not make (ARCH-135): export off or
+                     * busy, not a video message, not the caller's to read, or
+                     * the transcode failed. */
+                    (ctx && ctx->xfer->mode == 6 &&
+                     (err.code == OC_ERR_EXPORT_UNAVAILABLE || err.code == OC_ERR_MEDIA_INVALID ||
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_INTERNAL));
                 /* An upload the daemon gave up on is a failure for its job, which
                  * a frontend following the tag must see. The status line above
                  * already says why, so the notice carries no text of its own. */
                 if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
+                /* The export says plainly why, and the queue moves on. */
+                if (ctx && ctx->xfer->mode == 6 && about_transfer)
+                    xfer_notice(ctx, 2, err.code == OC_ERR_EXPORT_UNAVAILABLE ? OC_EXPORT_UNAVAILABLE_TEXT
+                                        : err.code == OC_ERR_MEDIA_INVALID ? "That isn't a video message that can be exported"
+                                        : err.code == OC_ERR_ATTACHMENT_GONE ? "That video is no longer available"
+                                        : "The copy could not be made");
                 if (ctx && ctx->xfer->mode == 3 && about_transfer) {
                     int snip = ctx->xq->active && ctx->xq->active->type == OC_CMD_POST_SNIPPET;
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
@@ -4417,7 +4497,7 @@ static int run_connection(oc_net *n, int reconnecting,
             if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
                 (c->type == OC_CMD_POST_FILES && c->n_paths) ||
-                (c->type == OC_CMD_DOWNLOAD && c->body) ||
+                (c->type == OC_CMD_DOWNLOAD && c->body) || (c->type == OC_CMD_EXPORT && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2) ||
                 (c->type == OC_CMD_POST_SNIPPET && c->blob && c->blob_len)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */

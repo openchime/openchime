@@ -503,7 +503,10 @@ int oc_plat_releasenotes_poll(void *out) {
 
 /* Saving: the application writes to a path on the page's filesystem, and
  * tells the platform when it has (oc_plat_file_saved); the browser then
- * downloads it, which is the only "save as" a page has. */
+ * downloads it, which is the only "save as" a page has. A download and the
+ * playable copy of a video message (ARCH-135) both arrive this way. Once the
+ * browser holds the bytes the file is removed from the page's filesystem,
+ * which is memory: a copy of a long video is tens of megabytes. */
 int oc_plat_pick_save(SDL_Window *owner, const char *suggested, char *out, size_t cap) {
     (void)owner;
     EM_ASM({ try { FS.mkdir("/downloads"); } catch (e) {} });
@@ -521,6 +524,7 @@ void oc_plat_file_saved(const char *path) {
             const data = FS.readFile(path);
             const a = document.createElement("a");
             a.href = URL.createObjectURL(new Blob([data]));
+            try { FS.unlink(path); } catch (e) {}                 /* the Blob holds it now */
             a.download = path.split("/").pop();
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(() => URL.revokeObjectURL(a.href), 10000);

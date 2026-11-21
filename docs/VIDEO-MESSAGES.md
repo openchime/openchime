@@ -313,7 +313,19 @@ A video message is fetched into memory like any attachment, but under its own
 ceiling (the daemon's video cap, not the inline-attachment one) and with progress
 reported. The client keeps the most recently played videos, up to 256 MiB, and drops
 the oldest past that; nothing is written to disk (ARCH-88). **Download** in the
-player is the one place bytes reach a file, and only one the user chose.
+player is the one place bytes reach a file, and only one the user chose — with
+**Save compatible copy** beside it where the daemon exports (§7.3).
+
+### 7.3 Save compatible copy
+
+Where the daemon lists `h264-export` (§10a), the client core asks for a video
+message's H.264 + MP3 copy with `EXPORT_GET` and writes what comes back to the
+file the person chose (`oc_client_export`), queued like any transfer and under
+its own tag (`OC_EXPORT_TAG`). The name offered is the video's with `-compatible`
+before `.mp4` (`oc_export_copy_name`). A refusal is said in a sentence — "Export
+is not available right now" for `EXPORT_UNAVAILABLE` — and leaves no file, and
+the queue moves on. The web client saves it through the browser's download, as
+any saved file, and then lets the page's copy go.
 
 ## 8. Playback
 
@@ -357,7 +369,10 @@ player is the one place bytes reach a file, and only one the user chose.
   fetches the video with a progress bar, then opens the player. The most recently
   played videos stay in memory, up to 256 MiB.
 - **Player:** a full-window overlay — the video fitted to the window, a control bar
-  with play and pause, a seek bar, time and volume, mute and download, and close.
+  with play and pause, a seek bar, time and volume, mute and download, and close;
+  where the daemon exports, **Save compatible copy** beside download, which the
+  message's menu also offers ("Save compatible copy of <name>"). The text-only
+  client offers it in a video message's actions, beside Download file.
   Keys: Space, ← and → by 5 s, ↑ and ↓ for volume, M, Esc.
 - **Elsewhere:** a VID badge and a Video filter in the Files view; "🎥 Video
   message (m:ss)" in the sidebar and the notification when there is no caption.

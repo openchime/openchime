@@ -640,6 +640,16 @@ typedef struct {
 uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               const oc_post_item *items, size_t n_items, const char *text);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
+/* Save the playable copy of video message `attachment_id` -- H.264 and MP3,
+ * made by the daemon (ARCH-135) -- to `dest_path`. Queued as a download is,
+ * tagged OC_EXPORT_TAG(attachment_id); its progress and outcome arrive as
+ * OC_EV_XFER, a refusal's notice saying OC_EXPORT_UNAVAILABLE_TEXT.
+ * Offer it only when oc_model_export_available says so. */
+void oc_client_export(oc_client *c, uint64_t attachment_id, const char *dest_path);
+/* The name a saved copy is offered under: the video's own with "-compatible"
+ * before ".mp4" ("clip.mp4" -> "clip-compatible.mp4"; a name without ".mp4"
+ * gains the whole suffix). */
+void oc_export_copy_name(const char *video_name, char *out, size_t cap);
 
 /* Fetch an attachment INTO MEMORY: the bytes arrive as an
  * OC_EV_ATTACHMENT_DATA the frontend consumes, with no file written anywhere

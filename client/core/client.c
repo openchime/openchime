@@ -1769,6 +1769,25 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_export(oc_client *c, uint64_t attachment_id, const char *dest_path) {
+    if (!c || !attachment_id || !dest_path || !dest_path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_EXPORT);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;   /* reused as the attachment id */
+    cmd->xfer_tag = OC_EXPORT_TAG(attachment_id);
+    cmd->body = strdup(dest_path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_export_copy_name(const char *video_name, char *out, size_t cap) {
+    if (!out || !cap) return;
+    const char *n = video_name && video_name[0] ? video_name : "video.mp4";
+    size_t len = strlen(n);
+    int has_ext = len >= 4 && n[len - 4] == '.' && (n[len - 3] | 0x20) == 'm' &&
+                  (n[len - 2] | 0x20) == 'p' && n[len - 1] == '4';
+    snprintf(out, cap, "%.*s-compatible.mp4", (int)(has_ext ? len - 4 : len), n);
+}
+
 void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
     if (!c || !attachment_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
