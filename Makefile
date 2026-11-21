@@ -246,7 +246,10 @@ run: run-build
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
 	 OPENCHIME_DEV_LOOPBACK=on OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
-# Everything built. `distclean` removes the remembered features too.
+# Everything built. `distclean` removes the remembered features too, and what
+# summaries were once built with, when a checkout still holds it: llama.cpp's
+# build (third_party/llamacpp-*) and its source tarball. Nothing else under
+# third_party/ is touched.
 clean:
 	rm -f $(BIN)
 	find build -mindepth 1 -maxdepth 1 ! -name .features -exec rm -rf {} + 2>/dev/null || true
@@ -254,5 +257,8 @@ clean:
 distclean:
 	rm -f $(BIN)
 	rm -rf build
+	@for p in third_party/llamacpp-* third_party/llama.cpp-*.tar.gz; do \
+	   [ -e "$$p" ] || continue; echo "distclean: removing $$p (llama.cpp, no longer built)"; rm -rf "$$p"; \
+	 done
 
 endif   # the goals, inside a run of scripts/test/lib/clean_run.sh (the top of this file)
