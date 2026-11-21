@@ -73,8 +73,8 @@ $(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build-dir
 # The portable application layer (client/gui/app: SDL3 + oc_gfx + sdltext) over
 # the Windows platform (client/gui/platform/win32) and the same shared app-core.
 # SDL supplies the entry point (SDL_main.h); -mwindows selects the GUI subsystem
-# (no console). SDL3 is the "fetched at build" vendoring class (docs/VENDORS.md
-# §2), pinned + cross-built by scripts/build/sdl3_windows.sh, statically linked.
+# (no console). SDL3 is committed in third_party/SDL3 (docs/VENDORS.md §1) and
+# cross-built from it by scripts/build/sdl3_windows.sh, statically linked.
 SDL3_VERSION := 3.4.14
 SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
 SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a

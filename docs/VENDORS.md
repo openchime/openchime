@@ -26,7 +26,7 @@ Exception), and every one of these is compatible with the AGPL.
 ## 1. Vendored source — committed under `third_party/`
 
 Libraries committed directly to the repo, from single headers to whole release
-tarballs (libvpx, opus, speexdsp, Mbed TLS), so local and
+tarballs (libvpx, opus, speexdsp, Mbed TLS, SDL3), so local and
 CI builds share byte-identical sources with zero transitive dependencies
 (ARCH-75). "Pinning" = the file is frozen in git; bumping means replacing it.
 
@@ -48,6 +48,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73); the daemon, to encode read-aloud (ARCH-111) | https://opus-codec.org | BSD-3-Clause |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
+| **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx), Windows and web | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
 tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
@@ -160,6 +161,20 @@ unit, `audio_ma.c`, with only device I/O enabled. `.gitignore` ignores
 (see below). Everything else under
 `third_party/` — the build directories and what the build fetches — stays ignored.
 
+**SDL3** is committed in `third_party/SDL3/`: the 3.4.14 release tarball (SHA-256
+`30d4aa2b3037718142b32dffd4e72f917ebb6cc5227150e7bb9c45efb2153aeb`) unpacked, without its
+`test/`, `examples/`, `docs/` and IDE project folders (`Xcode/`, `VisualC/`, `VisualC-GDK/`,
+`android-project/`). Every platform's sources stay, so a Linux client builds the same tree.
+`scripts/build/sdl3_windows.sh` cross-builds a **static-only** `libSDL3.a` from it with
+llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and `make build` links it;
+`scripts/build/sdl3_wasm.sh` builds the web client's copy into `build/wasm/sdl3/`. Both run
+SDL's own CMake out of tree, so the committed source is only read -- the same arrangement as
+invoking mbedTLS's make: the dependency's build system stays its own business, and this
+tree's stays make. Nothing is downloaded; `scripts/test/fast/vendored.sh` holds the tree, the
+makefile and both scripts to one version. Bumping it is replacing the tree in one pull
+request. zlib-licensed: no notice needs to travel with a shipped binary, so
+`packaging/licenses.sh` (daemon-only regardless) is untouched.
+
 ## 2. Fetched at build time — `scripts/build/*.sh` (gitignored output)
 
 **Toolchains** come this way too (`mk/toolchains.mk`): make fetches each on
@@ -187,22 +202,11 @@ has moved.
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
-| **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **Qwen3.5 2B** (Qwen) | commit `15852e8c` | The summary model: its configuration, tokenizer, licence and weights, **fetched by the daemon on first start** at the pinned commit, each checked against a pinned SHA-256, converted by `openchimed --summary-pack` into `summary.bin` (its SHA-256 pinned too) and run by sumkit in plain C. Never shipped; not fetched at build. The pinned files and the commands that recreate it are below | Daemon (summaries, ARCH-116) | https://huggingface.co/Qwen/Qwen3.5-2B | Apache-2.0 |
 | **Kitten TTS mini** (KittenML) | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted by `openchimed --voice-pack` and **committed** as `ttskit/data/voice.bin` (its licence `ttskit/data/VOICE-LICENSE`), run by ttskit in plain C and **shipped beside the daemon** as data. Not fetched at build; the pinned files and the commands that recreate it are below | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** (Moonshine AI) | CDN directory `quantized_26_08_21` | The voice-input recognizer: its six published int8 graphs, `tokenizer.bin` and `streaming_config.json`, converted by `openchimed --recognizer-pack` and **committed** as `sttkit/data/recognizer.bin` (its licence `sttkit/data/RECOGNIZER-LICENSE`), run by sttkit in plain C and **shipped beside the daemon** as data in `stt/`. Not fetched at build; the pinned files and the commands that recreate it are below | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, its notice in `ttskit/data/CMUDICT-LICENSE`) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
-
-**SDL3**: `scripts/build/sdl3_windows.sh` fetches the pinned release tarball
-(SHA-256-verified before it is unpacked; a bump without a matching sum is
-refused), cross-builds a **static-only**
-`libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
-`make build` links it. SDL's own build is CMake; the script invoking
-it is the same arrangement as invoking mbedTLS's make — the dependency's build
-system stays its own business, and this tree's stays make. It is a
-large dependency, fetched pinned rather than committed. zlib-licensed: no notice needs to travel with a shipped
-binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
 **Read-aloud's voice model** (ARCH-111) is **Kitten TTS mini 0.8**, published by
 KittenML under Apache-2.0. ttskit runs it in plain C (TTSKIT.md §5b); nothing of it is
@@ -386,8 +390,8 @@ quantisation's baseline (SUMKIT.md §4) and nothing more.
 
 **The web client** (`make build/web/openchime.js`) builds its own copies with Emscripten into
 `build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the committed
-mbedTLS (`third_party/mbedtls/`), `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
-SDL3 release, and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp from
+mbedTLS (`third_party/mbedtls/`), `scripts/build/sdl3_wasm.sh` from the committed
+SDL3 (`third_party/SDL3/`), and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp from
 `third_party/libvpx/`, `third_party/opus/` and `third_party/speexdsp/`.
 
 ## 3. System / OS packages (linked at build)
@@ -535,7 +539,7 @@ paths ship; nothing is fetched at runtime.
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the graphical clients, Win32 and web (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **BSD-2-style** | CMUdict (ttskit's pronunciation data) | Generated data, committed with its notice; daemon only |
 | **Apache-2.0** | Kitten TTS mini (data) | Converted and committed (`ttskit/data/voice.bin`, its licence `ttskit/data/VOICE-LICENSE`), shipped beside the daemon |
-| **zlib** | SDL3 | Fetched at build, static-linked; graphical clients only |
+| **zlib** | SDL3 | Vendored, committed; static-linked; graphical clients only |
 | **MPL-2.0** | Mozilla CA roots (data) | Generated, compiled in; daemon and every client. File-level copyleft |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
