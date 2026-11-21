@@ -41,9 +41,9 @@
 # compiler runs after this workflow, and what was verified here is what ships.
 #
 # ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
-# image. It is built with `zig cc` targeting glibc 2.34, the oldest supported
-# target, on a bare ubuntu-24.04 runner with toolchains make fetches pinned
-# (mk/toolchains.mk); the arm64 daemon is cross-built on the same runner;
+# image. It is built with Ubuntu 22.04's gcc 12 on an ubuntu-22.04 runner, so it
+# needs glibc 2.35 at most, the oldest supported (ARCH-20); the arm64 daemon is
+# cross-built on the same runner with Ubuntu's cross gcc (mk/toolchains.mk);
 # the images are the packaged tree laid onto a glibc base with buildah (no
 # compile inside, so no emulation); the Windows clients cross-compile with
 # llvm-mingw. NOTHING HERE USES DOCKER. The Linux packages are built under the
@@ -100,7 +100,8 @@ jobs:
   stage:
     name: stage
     needs: test
-    runs-on: ubuntu-24.04
+    # Ubuntu 22.04: the release binary's glibc floor is the runner's own.
+    runs-on: ubuntu-22.04
     # With both of the runner's CPUs compiling, a warm run took about 15
     # minutes.
     # One file at a time, on one CPU, is allowed twice that.
@@ -273,64 +274,53 @@ jobs:
           set -euo pipefail
           # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
           # and retried, so a stall fails the step instead of holding the job.
+          # gcc-12 and g++-12 compile the release (gcc 12, not the default
+          # gcc 11, which leaves read-aloud's kernels unvectorised);
+          # gcc-12-aarch64-linux-gnu, g++-12-aarch64-linux-gnu and
+          # libc6-dev-arm64-cross cross-compile the arm64 daemon against
+          # Ubuntu 22.04's glibc for arm64 (mk/toolchains.mk).
           # nasm for libvpx's assembly; xz-utils
           # for the toolchain tarballs; rpm supplies rpmbuild; nsis and
           # python3-pefile for the Windows installer and its check; buildah for
           # the images; gnupg to sign the build. apt.sh fetches only what the
           # runner lacks; rclone, to store the build, comes pinned.
-          # apt: nasm, nsis and python3-pefile are not on the runner image
-          scripts/build/apt.sh bzip2 rpm nasm xz-utils nsis python3-pefile buildah gnupg
+          # apt: gcc 12, the arm64 cross packages, nasm, nsis and python3-pefile are not on the runner image
+          scripts/build/apt.sh gcc-12 g++-12 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu libc6-dev-arm64-cross \
+            bzip2 rpm nasm xz-utils nsis python3-pefile buildah gnupg
           scripts/build/rclone.sh
           buildah version
 
       # Every cache is restored once and saved, only when it missed, as soon
       # as the step that builds it has run: a cache saved at the end of the
-      # job would be lost to any later failure.
-      #
-      # The toolchain make fetches pinned (mk/toolchains.mk): zig, whose
-      # bundled clang ships glibc stub libraries for every version back to 2.17
-      # and links against whichever one it is asked for, regardless of the
-      # host's own glibc -- so a 2.34 binary comes off a runner carrying 2.39
-      # with no container in the picture, and an arm64 one off an x86 runner.
-      # Keyed by the script, which pins the version and the checksum. No
-      # Emscripten: the web client the daemon embeds is the test job's
-      # (WEB_PREBUILT, above).
-      - id: c-toolchains
-        name: Restore the toolchains
-        uses: actions/cache/restore@v6
-        with:
-          path: &toolchains-path |
-            third_party/zig-0.17.1
-          key: &toolchains-key zig-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh') }}
+      # job would be lost to any later failure. No toolchain is fetched: the
+      # compilers are the runner's and Ubuntu's (above), and the web client
+      # the daemon embeds is the test job's (WEB_PREBUILT, above).
       - uses: actions/download-artifact@v8
         with:
           name: web-client
           path: prebuilt/web
       # --- The amd64 daemon and its packages ----------------------------------------
-      # mbedTLS and libopus as the release builds them: with zig's clang
-      # against glibc 2.34 for the binary that ships. CI's copies are
-      # gcc-built for the host and cannot stand in, so these have caches of
-      # their own, one per library and architecture, keyed by the version, the
-      # script that builds it and the compiler wrapper and toolchain it builds
-      # with. A hit is a no-op build: each script returns at once when its
-      # archive already exists.
+      # mbedTLS and libopus as the release builds them: with this runner's
+      # gcc, for the binary that ships. test-all.yml's copies are built on
+      # Ubuntu 24.04 and cannot stand in, so these have caches of their own,
+      # one per library and architecture, keyed by the version, the runner
+      # and the script that builds it. A hit is a no-op build: each script
+      # returns at once when its archive already exists.
       - id: c-mbedtls-amd64
         name: Restore the amd64 release's mbedTLS
         uses: actions/cache/restore@v6
         with:
           path: &mbedtls-amd64-path third_party/mbedtls-3.6.7
-          key: &mbedtls-amd64-key mbedtls-3.6.7-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          key: &mbedtls-amd64-key mbedtls-3.6.7-release-amd64-${{ runner.os }}-22.04-gcc12-${{ hashFiles('scripts/build/mbedtls.sh') }}
       - id: c-opus-amd64
         name: Restore the amd64 release's opus
         uses: actions/cache/restore@v6
         with:
           path: &opus-amd64-path third_party/opus-1.6.1
-          key: &opus-amd64-key opus-1.6.1-release-amd64-zig0.17.1-${{ hashFiles('scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
-      # RELEASE=1: zig's clang against glibc 2.34 for the host's architecture,
-      # every vendored library built the same way, the binary stripped at the
-      # link. No header comes from the host: libc's are zig's (the runner's
-      # glibc 2.39 headers would redirect strtol to __isoc23_strtol, a 2.38
-      # symbol the 2.34 stubs do not have), and SQLite is vendored. One binary
+          key: &opus-amd64-key opus-1.6.1-release-amd64-${{ runner.os }}-22.04-gcc12-${{ hashFiles('scripts/build/opus.sh') }}
+      # RELEASE=1: gcc 12 against the runner's glibc 2.35 for the host's
+      # architecture, every vendored library built the same way, the binary
+      # stripped at the link. One binary
       # per architecture; everything downstream consumes this exact file,
       # copied with its read-aloud and voice-input data and the web client's
       # wasm into DIST, and packaged there: the .rpm, the .deb and the tarball,
@@ -354,12 +344,6 @@ jobs:
         with:
           path: *opus-amd64-path
           key: *opus-amd64-key
-      - name: Save the toolchains
-        if: steps.c-toolchains.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: *toolchains-path
-          key: *toolchains-key
       # What the release ships, checked (scripts/test/full/, docs/TESTING.md):
       # the glibc floor, one binary in all three packages, speech on the
       # release binary, the .deb installed and speaking, and its unit file.
@@ -395,42 +379,24 @@ jobs:
           ls -l "candidate/$PLATFORM" "candidate/$PLATFORM/packages"
 
       # --- The arm64 daemon and its packages ----------------------------------------
-      # Cross-built with zig on this x86 runner (make ARCH=aarch64), into
-      # directories of its own (third_party/<name>-aarch64, build/aarch64).
-      # Build only: the binary is packaged and shipped, never run here; what
-      # runs (the render, the install) runs for amd64 alone. It writes its data
-      # manifests with a featureless HOST daemon, built with the runner's gcc
-      # (mk/daemon.mk), which links the host's mbedTLS from
-      # third_party/mbedtls-3.6.7 -- where the amd64 release's zig-built copy
-      # is now. So the amd64 release's own libraries are set aside first, and
-      # the gcc-built host mbedTLS restored in their place, from the cache
-      # test-all.yml saves under the same key: the arm64 build then sees
-      # exactly what it saw on a runner of its own.
-      - name: Set the amd64 release's libraries aside
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/amd64"
-          for d in mbedtls-3.6.7; do
-            if [ -e "third_party/$d" ]; then mv "third_party/$d" "$RUNNER_TEMP/amd64/"; fi
-          done
+      # Cross-built with Ubuntu's aarch64-linux-gnu-gcc-12 on this x86 runner
+      # (make ARCH=aarch64), into directories of its own
+      # (third_party/<name>-aarch64, build/aarch64). Build only: the binary is
+      # packaged and shipped, never run here; what runs (the render, the
+      # install) runs for amd64 alone. Its data manifests are written by the
+      # amd64 release binary built above (MANIFEST_HOST_BIN, mk/daemon.mk).
       - id: c-mbedtls-arm64
         name: Restore the arm64 release's mbedTLS
         uses: actions/cache/restore@v6
         with:
           path: &mbedtls-arm64-path third_party/mbedtls-3.6.7-aarch64
-          key: &mbedtls-arm64-key mbedtls-3.6.7-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
+          key: &mbedtls-arm64-key mbedtls-3.6.7-release-arm64-${{ runner.os }}-22.04-gcc12-${{ hashFiles('scripts/build/mbedtls.sh') }}
       - id: c-opus-arm64
         name: Restore the arm64 release's opus
         uses: actions/cache/restore@v6
         with:
           path: &opus-arm64-path third_party/opus-1.6.1-aarch64
-          key: &opus-arm64-key opus-1.6.1-release-arm64-zig0.17.1-${{ hashFiles('scripts/build/opus.sh', 'scripts/release/zig_cc.sh', 'scripts/build/zig.sh') }}
-      - id: c-mbedtls-host
-        name: Restore the host's mbedTLS
-        uses: actions/cache/restore@v6
-        with:
-          path: &mbedtls-host-path third_party/mbedtls-3.6.7
-          key: &mbedtls-host-key mbedtls-3.6.7-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh') }}
+          key: &opus-arm64-key opus-1.6.1-release-arm64-${{ runner.os }}-22.04-gcc12-${{ hashFiles('scripts/build/opus.sh') }}
       - id: build-arm64
         name: make build-all PART=packages (arm64)
         env:
@@ -452,12 +418,6 @@ jobs:
         with:
           path: *opus-arm64-path
           key: *opus-arm64-key
-      - name: Save the host's mbedTLS
-        if: steps.c-mbedtls-host.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: *mbedtls-host-path
-          key: *mbedtls-host-key
       # On arm64, built on this x86 runner, the checks that run the binary say
       # so and skip.
       - name: make test-all PART=packages (arm64)
@@ -591,37 +551,37 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: &mingw-path third_party/llvm-mingw-20261020
-          key: &mingw-key toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
+          key: &mingw-key toolchain-mingw-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
       - id: c-win-mbedtls
         name: Restore mbedTLS for Windows
         uses: actions/cache/restore@v6
         with:
           path: &win-mbedtls-path third_party/mbedtls-3.6.7-win
-          key: &win-mbedtls-key mbedtls-3.6.7-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/mbedtls_windows.sh', 'scripts/build/llvm_mingw.sh') }}
+          key: &win-mbedtls-key mbedtls-3.6.7-win-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/mbedtls_windows.sh', 'scripts/build/llvm_mingw.sh') }}
       - id: c-win-libvpx
         name: Restore libvpx for Windows
         uses: actions/cache/restore@v6
         with:
           path: &win-libvpx-path third_party/libvpx-1.17.0-win
-          key: &win-libvpx-key libvpx-1.17.0-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/libvpx.sh', 'scripts/build/llvm_mingw.sh') }}
+          key: &win-libvpx-key libvpx-1.17.0-win-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/libvpx.sh', 'scripts/build/llvm_mingw.sh') }}
       - id: c-win-opus
         name: Restore opus for Windows
         uses: actions/cache/restore@v6
         with:
           path: &win-opus-path third_party/opus-1.6.1-win
-          key: &win-opus-key opus-1.6.1-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/opus.sh', 'scripts/build/llvm_mingw.sh') }}
+          key: &win-opus-key opus-1.6.1-win-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/opus.sh', 'scripts/build/llvm_mingw.sh') }}
       - id: c-win-speexdsp
         name: Restore speexdsp for Windows
         uses: actions/cache/restore@v6
         with:
           path: &win-speexdsp-path third_party/speexdsp-1.2.1-win
-          key: &win-speexdsp-key speexdsp-1.2.1-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/speexdsp.sh', 'scripts/build/llvm_mingw.sh') }}
+          key: &win-speexdsp-key speexdsp-1.2.1-win-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/speexdsp.sh', 'scripts/build/llvm_mingw.sh') }}
       - id: c-win-sdl3
         name: Restore SDL3 for Windows
         uses: actions/cache/restore@v6
         with:
           path: &win-sdl3-path third_party/sdl3-3.4.14-win
-          key: &win-sdl3-key sdl3-3.4.14-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/sdl3_windows.sh', 'scripts/build/llvm_mingw.sh') }}
+          key: &win-sdl3-key sdl3-3.4.14-win-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/sdl3_windows.sh', 'scripts/build/llvm_mingw.sh') }}
       # makemsix is built from pinned source on first use (scripts/build/
       # makemsix.sh), and kept by that script's hash; release.yml restores it
       # under the same key.
@@ -630,7 +590,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: &makemsix-path third_party/makemsix-*
-          key: &makemsix-key makemsix-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/makemsix.sh') }}
+          key: &makemsix-key makemsix-${{ runner.os }}-22.04-${{ hashFiles('scripts/build/makemsix.sh') }}
       - name: make build-all PART=windows
         env:
           DIST: dist/windows-x64

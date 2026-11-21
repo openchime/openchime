@@ -3,7 +3,7 @@
 # upstream for its latest release, and prints a table; exits 1 when any is
 # behind, with the new tarball's SHA-256 already computed for the bump. Run
 # by hand; nothing runs it on a schedule. Nothing is changed here: a bump is a
-# version and a sum in scripts/build/{zig,emsdk,llvm_mingw}.sh and a pull
+# version and a sum in scripts/build/{emsdk,llvm_mingw}.sh and a pull
 # request, built with by the next release-candidate, which is the whole point
 # of pinning. Needs curl and python3.
 set -uo pipefail
@@ -13,13 +13,6 @@ row() { printf '| %s | %s | %s | %s |\n' "$@"; }
 sha() { curl -fsSL --retry 3 "$1" | sha256sum | cut -d" " -f1; }
 echo "| Toolchain | Pinned | Latest | SHA-256 of the latest (Linux x86_64) |"
 echo "|---|---|---|---|"
-
-pin=$(sed -n 's/^ZIG_VERSION="${ZIG_VERSION:-\(.*\)}"/\1/p' scripts/build/zig.sh)
-# zig's index carries each release's tarball and its sum; the tarball's name
-# changed shape after 0.13, so the index is the only place to read it from.
-read -r latest zsum < <(curl -fsSL https://ziglang.org/download/index.json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=max((k for k in d if k!="master"), key=lambda v: tuple(int(x) for x in v.split("."))); print(v, d[v]["x86_64-linux"]["shasum"])' 2>/dev/null)
-if [ -n "${latest:-}" ] && [ "$latest" != "$pin" ]; then row zig "$pin" "$latest" "$zsum (its tarball name is in the index: zig.sh's URL changes with it)"; behind=1
-else row zig "$pin" "${latest:-?}" "-"; fi
 
 pin=$(sed -n 's/^EMSDK_VERSION="${EMSDK_VERSION:-\(.*\)}"/\1/p' scripts/build/emsdk.sh)
 latest=$(curl -fsSL https://api.github.com/repos/emscripten-core/emsdk/tags?per_page=5 | python3 -c 'import json,sys; t=[x["name"] for x in json.load(sys.stdin) if x["name"][0].isdigit()]; print(t[0] if t else "")' 2>/dev/null)

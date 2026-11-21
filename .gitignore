@@ -30,6 +30,7 @@ dist/
 !/third_party/opus/
 !/third_party/libvpx/
 !/third_party/mbedtls/
+!/third_party/SDL3/
 *.o
 *.db
 *.db-shm

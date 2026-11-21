@@ -150,19 +150,28 @@ static void test_address_and_nonce(void) {
     CHECK(!oc_enroll_nonce_ok("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", 44));
     CHECK(!oc_enroll_nonce_ok("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdH+8", 43));
 
+    /* The address report's body (AUTH.md §3.6), byte for byte: a name, a name
+     * on another port, the managed address over the TLS names, an empty managed
+     * address falling back to them, and no name at all, which reports {} --
+     * with no port, whatever the daemon's own. */
     char a[300];
-    CHECK(oc_enroll_address(NULL, "Chat.Acme.Example,other.example", 443, a, sizeof a) == 0 &&
-          strcmp(a, "chat.acme.example") == 0);
-    CHECK(oc_enroll_address(NULL, "chat.acme.example", 8443, a, sizeof a) == 0 &&
-          strcmp(a, "chat.acme.example:8443") == 0);
-    CHECK(oc_enroll_address("moved.acme.example", "chat.acme.example", 443, a, sizeof a) == 0 &&
-          strcmp(a, "moved.acme.example") == 0);
-    CHECK(oc_enroll_address("", "chat.acme.example", 443, a, sizeof a) == 0 &&
-          strcmp(a, "chat.acme.example") == 0);
-    CHECK(oc_enroll_address(NULL, NULL, 443, a, sizeof a) != 0);
-    CHECK(oc_enroll_address(NULL, "localhost", 443, a, sizeof a) != 0);
-    CHECK(oc_enroll_address(NULL, "-bad.example", 443, a, sizeof a) != 0);
-    CHECK(oc_enroll_address(NULL, "bad_name.example", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address_body(NULL, "Chat.Acme.Example,other.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "{\"address\":\"chat.acme.example\"}") == 0);
+    CHECK(oc_enroll_address_body(NULL, "chat.acme.example", 8443, a, sizeof a) == 0 &&
+          strcmp(a, "{\"address\":\"chat.acme.example:8443\"}") == 0);
+    CHECK(oc_enroll_address_body("moved.acme.example", "chat.acme.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "{\"address\":\"moved.acme.example\"}") == 0);
+    CHECK(oc_enroll_address_body("", "chat.acme.example", 443, a, sizeof a) == 0 &&
+          strcmp(a, "{\"address\":\"chat.acme.example\"}") == 0);
+    CHECK(oc_enroll_address_body(NULL, NULL, 443, a, sizeof a) == 0 && strcmp(a, "{}") == 0);
+    CHECK(oc_enroll_address_body(NULL, NULL, 8443, a, sizeof a) == 0 && strcmp(a, "{}") == 0);
+    CHECK(oc_enroll_address_body("", "", 8443, a, sizeof a) == 0 && strcmp(a, "{}") == 0);
+    /* A name that is set but unusable reports nothing, and so does a buffer too small. */
+    CHECK(oc_enroll_address_body(NULL, "localhost", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address_body(NULL, "-bad.example", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address_body(NULL, "bad_name.example", 443, a, sizeof a) != 0);
+    CHECK(oc_enroll_address_body(NULL, "chat.acme.example", 443, a, 20) != 0);
+    CHECK(oc_enroll_address_body(NULL, NULL, 443, a, 2) != 0);
 }
 
 /* A managed box's claim (AUTH.md §8.7): the signature covers the audience and the

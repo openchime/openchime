@@ -85,6 +85,25 @@ uint64_t oc_certs_retry_ms(int n, uint64_t base, uint64_t max);
  * re-issues at boot when its kept certificate does not name it. */
 int oc_certs_names_include(const char *names, const char *name);
 
+/* The name a self-hosted daemon takes as its address from a certificate central
+ * issued (TLS.md, the `central` source): the first of its comma-separated
+ * `names`, lower-cased -- central lists the workspace's own name first. 0 with
+ * it in `out`, or -1 for none (NULL, empty, or an `out` too small). */
+int oc_certs_adopted_name(const char *names, char *out, size_t cap);
+
+/* The names central says this workspace may have (POST /api/machine/tls/names,
+ * a signed machine request, AUTH.md §8.9). 0 when central answered, with the
+ * status in *status and, on a 200, the comma-separated names in `names` ("" if
+ * it gave none); -1 with `err` when no answer came back. */
+int oc_central_names(const char *central_url, const char *audience, const char *enroll_key_pem,
+                     char *names, size_t cap, int *status, char *err, size_t errcap);
+
+/* What central's answer to the names request means for an adopted name: a 200
+ * listing it keeps it; a 200 without it, or a 404, drops it; anything else (a
+ * 503, another status, no answer: `status` 0) says nothing about it. */
+typedef enum { OC_NAME_KEEP, OC_NAME_DROP, OC_NAME_UNKNOWN } oc_name_listed;
+oc_name_listed oc_certs_name_listed(int status, const char *names, const char *name);
+
 /* One certificate through central (AUTH.md §8.9): a CSR for a new key, sent as
  * a signed machine request; the names are central's to say. 0 with `out`
  * filled; 1 if central is still working on it (`*retry_ms` how long to wait);

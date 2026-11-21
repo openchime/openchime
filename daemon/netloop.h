@@ -105,9 +105,15 @@ void oc_netloop_advance_clock_ms(uint64_t ms);
 
 /* The names a passkey may be made for (AUTH.md §8.6): the workspace's own,
  * comma-separated, when its certificate is one a CA vouches for -- never a
- * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Before
- * serving. */
+ * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Safe to
+ * call while serving: published as an immutable copy, swapped atomically. */
 void oc_netloop_set_passkey_names(const char *names);
+/* The name a self-hosted daemon adopted from central's certificate as its
+ * address (TLS.md, the `central` source), or NULL for none: sent to clients in
+ * WORKSPACE_ADDRESS and linked from the landing page, when no
+ * OPENCHIME_MANAGED_ADDRESS is set. Safe to call while serving: published as an
+ * immutable copy, swapped atomically. */
+void oc_netloop_set_adopted_address(const char *name);
 /* The direct connections (AUTH.md §8.5): offered as sources oidc-1 to oidc-<n>
  * in the order configured, begun here and exchanged by `rp`. Before serving. */
 struct oc_oidcrp;

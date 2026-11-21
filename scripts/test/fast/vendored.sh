@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # scripts/test/fast/vendored.sh
 #
-# mbedTLS is committed in third_party/mbedtls (docs/VENDORS.md §1) and built
-# from there with nothing downloaded. Its version is written in six places
+# mbedTLS and SDL3 are committed in third_party/mbedtls and third_party/SDL3
+# (docs/VENDORS.md §1) and built from there with nothing downloaded.
+#
+# mbedTLS: Its version is written in six places
 # that must agree: the tree's own include/mbedtls/build_info.h, the build
 # directories the makefiles name (MBEDTLS_DIR, MBEDTLS_WIN) and the three
 # scripts that build it. A tree replaced without the rest following it, or a
@@ -50,3 +52,35 @@ for s in "${scripts[@]}"; do
 done
 [ "$bad" = 0 ] || exit 1
 ok "mbedTLS $tree is built from $tree_dir, by the makefiles and its three scripts, with nothing downloaded"
+
+# SDL3: its version is written in four places that must agree: the tree's own
+# include/SDL3/SDL_version.h (three numbers), the build directory the makefile
+# names (SDL3_VERSION and SDL3_WIN in mk/windows.mk) and the two scripts that
+# build it. Neither script may download.
+sdl_dir=third_party/SDL3
+sdl_scripts=(scripts/build/sdl3_windows.sh scripts/build/sdl3_wasm.sh)
+sdl_header_version() { sed -n 's/^#define SDL_\(MAJOR\|MINOR\|MICRO\)_VERSION  *\([0-9]*\)$/\2/p' "$@" | paste -sd.; }
+sdl_script_version() { sed -n 's/^SDL3_VERSION=\([0-9][0-9.]*\)$/\1/p' "$@"; }
+
+[ "$(sdl_header_version <<<$'#define SDL_MAJOR_VERSION   1\n#define SDL_MINOR_VERSION   2\n#define SDL_MICRO_VERSION   3')" = 1.2.3 ] ||
+    fail "SDL's version lines are no longer read"
+[ "$(sdl_script_version <<<'SDL3_VERSION=1.2.3')" = 1.2.3 ] || fail "an SDL3 script's version line is no longer read"
+grep -qE "$download" <<<'curl -fsSL -o "$TARBALL" "https://github.com/libsdl-org/SDL/releases/download/x"' ||
+    fail "the pattern no longer matches a planted SDL3 download"
+
+[ -f "$sdl_dir/include/SDL3/SDL_version.h" ] || fail "$sdl_dir is missing: SDL3 is committed there (docs/VENDORS.md)"
+sdl=$(sdl_header_version "$sdl_dir/include/SDL3/SDL_version.h")
+[ -n "$sdl" ] || fail "$sdl_dir/include/SDL3/SDL_version.h names no version"
+bad=0
+got=$(sed -n 's/^SDL3_VERSION := //p' <<<"$vars" | head -1)
+[ "$got" = "$sdl" ] || { error "SDL3_VERSION is '$got' and the committed SDL3 is $sdl"; bad=1; }
+got=$(sed -n 's/^SDL3_WIN := //p' <<<"$vars" | head -1)
+[ "$got" = "third_party/sdl3-$sdl-win" ] || { error "SDL3_WIN is '$got' and the committed SDL3 is $sdl: it should be third_party/sdl3-$sdl-win"; bad=1; }
+for s in "${sdl_scripts[@]}"; do
+    got=$(sdl_script_version "$s")
+    [ "$got" = "$sdl" ] || { error "$s builds SDL3 '$got' and the committed tree is $sdl"; bad=1; }
+    hit=$(grep -nE "$download" "$s" || true)
+    [ -z "$hit" ] || { error "$s downloads, and SDL3 is built from $sdl_dir alone: $hit"; bad=1; }
+done
+[ "$bad" = 0 ] || exit 1
+ok "SDL3 $sdl is built from $sdl_dir, by the makefile and its two scripts, with nothing downloaded"

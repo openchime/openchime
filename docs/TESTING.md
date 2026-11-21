@@ -59,16 +59,14 @@ steps CI runs one after another (`mk/full.mk`):
   source checks and actionlint; every suite that starts no thread, the `FULL`
   ones included, and `media`, plainly with timing judged (§2.4); the
   static-link check; the end-to-end run against a natively-run daemon (§3.2);
-  the client and test sources through the release's compiler under `-Werror`
-  (the daemon's are compiled with it by the release build in `stage`); the
-  speech round trip; the web client's objects' header dependencies (§3.4);
+  the speech round trip; the web client's objects' header dependencies (§3.4);
   and each fuzzing harness
   for its fixed inputs, one at a time, inside 20 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
   run in the full suite (§2.4), in one process, one after another, nothing
   beside it, about 30 seconds in CI; the end-to-end walks marked `WALK` run
   in the plain pass instead;
-- `packages` — the release's daemon for each architecture (zig, glibc 2.34)
+- `packages` — the release's daemon for each architecture (gcc 12, glibc 2.35)
   and its `.deb`, `.rpm` and tarball; then the glibc floor, one binary in all
   three, speech on the release binary, the `.deb` installed and speaking, and
   its unit file;
@@ -204,9 +202,7 @@ build is measured.
 
 `scripts/test/fast/clean_run.sh` tests the wrapper with stub commands, in both
 suites. What is not held: threads inside one process (a suite's own, a
-compiler's, a linker's); the compiles one compiler command starts itself
-(`zig cc`, on its first use for a target, compiles its own startup files
-several at once, and takes no job count); and what the manual harnesses under
+compiler's, a linker's); and what the manual harnesses under
 `tools/` start besides the `make` they run.
 
 ---
@@ -1253,17 +1249,18 @@ what each job covers are CONTRIBUTING.md "CI".
 
 Nothing is checked twice: each suite runs once, plainly or, if it starts
 threads, under the sanitizer, which judges races and not speed (§2.4);
-one clang compile is both the release-compiler and the second-compiler check,
-and the daemon's release compile is `stage`'s alone;
-and the end-to-end run (§3.2) is the one thing the in-process suites cannot
+the release compiles with the same gcc as the fast build, so there is no
+second release-compiler pass, and the daemon's release compile is `stage`'s
+alone; and the end-to-end run (§3.2) is the one thing the in-process suites cannot
 show, since they link the daemon's code without its `main()`. No GUI or
 browser test runs in either suite or in CI: they are run by hand ("The GUI and
 browser tests", below).
 
-All run on `ubuntu-24.04`, the image the release builds on too. The native
-build and the tests use the runner's gcc; zig (the release's clang), Emscripten
-and llvm-mingw are fetched pinned by make (VENDORS.md §2, "Toolchains"), never
-installed from the runner's packages. Everything runs non-interactively and
+The tests run on `ubuntu-24.04`; the release builds on `ubuntu-22.04`
+(`stage`), whose glibc 2.35 is the release binary's floor. The native build,
+the tests use the runner's gcc, the release Ubuntu 22.04's gcc 12 and the
+arm64 release its gcc 12 cross compiler, installed from the runner's packages; Emscripten and llvm-mingw are
+fetched pinned by make (VENDORS.md §2, "Toolchains"). Everything runs non-interactively and
 communicates pass/fail purely through exit codes.
 
 **Audio.** `tests/test_audio.c` covers the **call relay** (`daemon/relay.c`),

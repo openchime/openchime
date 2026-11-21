@@ -220,8 +220,9 @@ back; where the arithmetic needs a fused multiply-add it is spelled out (`nn_fma
 in double, settled by `fmaf` only on an exact tie). The samples are then the order the
 source writes, the same on x86-64 and arm64 whatever the compiler. Measured on one core of
 an i5-1335U, a render takes 0.81× its length in time built with GCC (`tts_pack bench`),
-0.83–0.87× through `openchimed --tts-say`, and about 0.99× in a release build compiled with
-zig's clang. One render peaks at about 156 MB resident, about 86 MB of it `voice.bin`'s
+and 0.83–0.87× through `openchimed --tts-say`. The release builds with GCC 12 on Ubuntu 22.04
+(about 1.0× there); that release's default GCC 11 does not vectorise the quantised dot
+products and renders at about 4.9×, so the release does not use it. One render peaks at about 156 MB resident, about 86 MB of it `voice.bin`'s
 mapped pages, which the kernel may drop.
 
 **The same numbers as the reference.** The forward pass does the arithmetic of the

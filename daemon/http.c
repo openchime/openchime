@@ -419,7 +419,10 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
             return rt;
     }
     if (named) { *status = 405; return NULL; }
-    if (site && site->fallback) return site->fallback;
+    /* Loaded atomically: the daemon swaps a site's fallback while serving (the
+     * landing page, netloop.c), and a published route is never written. */
+    const oc_http_route *fb = site ? __atomic_load_n(&site->fallback, __ATOMIC_ACQUIRE) : NULL;
+    if (fb) return fb;
     *status = 404;
     return NULL;
 }

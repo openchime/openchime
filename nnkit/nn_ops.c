@@ -341,8 +341,8 @@ static void widen_s8(int16_t *restrict d, const int8_t *restrict s, int zp, size
  *
  * The two vectorisers find their multiply-add-pairs instruction in different
  * sources, and each runs the other's at a third of the speed: GCC in a plain
- * dot-product reduction over a block of fixed length, clang (and so zig cc, the
- * release compiler) in sums of adjacent pairs kept in 4 lanes per output. Both
+ * dot-product reduction over a block of fixed length (the release builds with
+ * gcc), clang in sums of adjacent pairs kept in 4 lanes per output. Both
  * compute the same exact int32 sums; only the speed depends on the choice. */
 #if defined(__clang__)
 static void qdot42(const int16_t *restrict a, const int16_t *restrict b, const int16_t *restrict w, size_t wl,

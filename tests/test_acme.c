@@ -391,6 +391,8 @@ static struct {
     char     central_pub[1024];             /* the enrollment key, to check signatures with */
     int      central_pending;               /* 202s still to answer */
     int      central_refuse;                /* answer 403 */
+    int      central_names_status;          /* the names request's answer, when not 200 */
+    const char *central_names;              /* the names it lists, when not the default */
     int      central_bad_sigs;
     /* ARI (RFC 9773): offered at all; a window already open, for the first ask
      * only (a replacement is not due at once); else a window of these absolute
@@ -579,7 +581,13 @@ static void central_request(int fd, const char *path, const char *head, const ch
              mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, hh, 32, sig, sl) == 0;
     mbedtls_pk_free(&kp);
     if (!ok) { g_fake.central_bad_sigs++; reply(fd, 401, NULL, NULL, NULL); return; }
-    if (!strcmp(path, "/api/machine/tls/names")) { reply(fd, 200, NULL, "application/json", "{\"names\":\"acme.workspace.test\"}"); return; }
+    if (!strcmp(path, "/api/machine/tls/names")) {
+        if (g_fake.central_names_status) { reply(fd, g_fake.central_names_status, NULL, NULL, NULL); return; }
+        char js[256];
+        snprintf(js, sizeof js, "{\"names\":\"%s\"}", g_fake.central_names ? g_fake.central_names : "acme.workspace.test");
+        reply(fd, 200, NULL, "application/json", js);
+        return;
+    }
     if (g_fake.central_refuse) { reply(fd, 403, NULL, NULL, NULL); return; }
     if (g_fake.central_pending > 0) { g_fake.central_pending--; reply(fd, 202, "Retry-After: 0\r\n", NULL, NULL); return; }
     jsmn_parser p; jsmntok_t t[8]; jsmn_init(&p);
@@ -828,6 +836,25 @@ static void test_units(void) {
     CHECK(oc_certs_names_include("acme.workspace.openchime.io", "acme.workspace.openchime") == 0);
     CHECK(oc_certs_names_include(NULL, "acme.workspace.openchime.io") == 0);
     CHECK(oc_certs_names_include("acme.workspace.openchime.io", "") == 0);
+    /* The name a self-hosted box takes from central's certificate: its first, lower-cased. */
+    {
+        char a[256];
+        CHECK(oc_certs_adopted_name("acme.example.net,old.example.net", a, sizeof a) == 0 && !strcmp(a, "acme.example.net"));
+        CHECK(oc_certs_adopted_name("Acme.Example.NET", a, sizeof a) == 0 && !strcmp(a, "acme.example.net"));
+        CHECK(oc_certs_adopted_name("", a, sizeof a) == -1);
+        CHECK(oc_certs_adopted_name(",old.example.net", a, sizeof a) == -1);
+        CHECK(oc_certs_adopted_name(NULL, a, sizeof a) == -1);
+        CHECK(oc_certs_adopted_name("acme.example.net", a, 4) == -1);
+    }
+    /* What central's names answer means for the adopted name. */
+    CHECK(oc_certs_name_listed(200, "acme.example.net,old.example.net", "acme.example.net") == OC_NAME_KEEP);
+    CHECK(oc_certs_name_listed(200, "old.example.net,ACME.example.net", "acme.example.net") == OC_NAME_KEEP);
+    CHECK(oc_certs_name_listed(200, "new.example.net", "acme.example.net") == OC_NAME_DROP);
+    CHECK(oc_certs_name_listed(200, "", "acme.example.net") == OC_NAME_DROP);
+    CHECK(oc_certs_name_listed(404, "", "acme.example.net") == OC_NAME_DROP);
+    CHECK(oc_certs_name_listed(503, "", "acme.example.net") == OC_NAME_UNKNOWN);
+    CHECK(oc_certs_name_listed(401, "", "acme.example.net") == OC_NAME_UNKNOWN);
+    CHECK(oc_certs_name_listed(0, "", "acme.example.net") == OC_NAME_UNKNOWN);   /* no answer */
     CHECK(oc_certs_retry_ms(0, 60000, 86400000) == 60000 && oc_certs_retry_ms(1, 60000, 86400000) == 600000 &&
           oc_certs_retry_ms(2, 60000, 86400000) == 6000000 && oc_certs_retry_ms(3, 60000, 86400000) == 86400000 &&
           oc_certs_retry_ms(9, 60000, 86400000) == 86400000);
@@ -1184,6 +1211,24 @@ static void test_central(void) {
     int bad = g_fake.central_bad_sigs;
     CHECK(oc_central_issue(url, aud, pk2, &got, &retry, &final, err, sizeof err) == -1);
     CHECK(g_fake.central_bad_sigs > bad);
+    /* The names alone, as the two-hourly check asks for them: listed, none, and a 404. */
+    char names[256]; int status = 0;
+    CHECK(oc_central_names(url, aud, pk, names, sizeof names, &status, err, sizeof err) == 0 && status == 200 &&
+          !strcmp(names, "acme.workspace.test"));
+    g_fake.central_names = "new.workspace.test,acme.workspace.test";
+    CHECK(oc_central_names(url, aud, pk, names, sizeof names, &status, err, sizeof err) == 0 && status == 200 &&
+          oc_certs_name_listed(status, names, "acme.workspace.test") == OC_NAME_KEEP);
+    g_fake.central_names = NULL;
+    g_fake.central_names_status = 404;
+    CHECK(oc_central_names(url, aud, pk, names, sizeof names, &status, err, sizeof err) == 0 && status == 404 &&
+          !names[0] && oc_certs_name_listed(status, names, "acme.workspace.test") == OC_NAME_DROP);
+    g_fake.central_names_status = 503;
+    CHECK(oc_central_names(url, aud, pk, names, sizeof names, &status, err, sizeof err) == 0 && status == 503 &&
+          oc_certs_name_listed(status, names, "acme.workspace.test") == OC_NAME_UNKNOWN);
+    g_fake.central_names_status = 0;
+    /* No answer at all: nowhere to connect. */
+    CHECK(oc_central_names("http://127.0.0.1:1", aud, pk, names, sizeof names, &status, err, sizeof err) == -1 &&
+          status == 0);
 }
 
 int run_acme_tests(void) {

@@ -396,8 +396,14 @@ daemon is serving, it reports the address in a signed machine request (§8.7's
 scheme), `POST /api/machine/address` `{"address": "<host>[:<port>]"}`. The
 address is `OPENCHIME_MANAGED_ADDRESS` when set, otherwise the first name in
 `OPENCHIME_TLS=acme:<names>`, lower-cased, with `:<port>` unless the daemon
-serves on 443; a box with neither reports nothing, and a managed box reports
-nothing (its address is central's own). Central then POSTs
+serves on 443. A server with neither, one reached only at a public IP address,
+reports `{}`: central takes the address the report came from and checks it on
+port 443, so 443 must reach the daemon, directly or forwarded (TLS.md), and the
+daemon sends no port. A server whose outgoing traffic leaves from a different
+address than the one it is reached at (a second uplink, carrier-grade NAT)
+needs a DNS name of its own. A managed box reports nothing (its address is
+central's own). Either way the address is proved, never taken on trust:
+central POSTs
 `{"nonce": "<base64url of 32 bytes>"}` to `https://<address>/enroll-proof`, and
 the daemon answers `{"signature": "<base64>"}`: the enrollment key's ASN.1 DER
 ECDSA signature over SHA-256 of `openchime-address-proof-v1|<aud>|<nonce>`. The
@@ -406,9 +412,12 @@ nothing else, and the handshake's `openchime-enroll-v1` signature does not pass
 for it. `/enroll-proof` answers `404` until the binding is active, `400` for a
 nonce of any other shape, and `429` past five a minute from one address. This
 is the one connection central makes to the daemon, and the daemon asks for it.
-The report is tried again while central cannot be reached, asks it to wait
-(`429`), could not check the address (`422`) or fails (`5xx`), for up to fifteen
-minutes; any other answer ends it, and the next start reports again.
+The report is made at each start and again every two hours while the daemon
+runs, so a server whose address changes is proved at the new one within two
+hours (`daemon/address_report.c`). Each round is tried again while central
+cannot be reached, asks it to wait (`429`), could not check the address (`422`)
+or fails (`5xx`), for up to fifteen minutes; any other answer ends reporting,
+and the next start reports again.
 
 **The daemon's push emitter (ARCH-85).** An enrolled box with
 `OPENCHIME_PUSH=on` (central's push gateway at the connection's origin, or

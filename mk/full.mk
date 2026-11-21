@@ -16,13 +16,13 @@
 #             test binary, the e2e and demo clients and the fuzzing harnesses;
 #             then the source checks, actionlint, the suites that start no
 #             thread, and media, plainly with their timing judged, the
-#             static-link check, the end-to-end run, the release's compiler,
-#             the speech round trip, the web client's objects' header
-#             dependencies, and each fuzzing harness for its fixed inputs, one
-#             at a time, inside FUZZ_SECONDS (20) in all
+#             static-link check, the end-to-end run, the speech round trip,
+#             the web client's objects' header dependencies, and each fuzzing
+#             harness for its fixed inputs, one at a time, inside FUZZ_SECONDS
+#             (20) in all
 #   threads   the test binary under ThreadSanitizer; then the suites that start
 #             threads, under it, their one run in the full suite
-#   packages  the release's daemon for ARCH (zig against glibc 2.34) with its
+#   packages  the release's daemon for ARCH (gcc 12, glibc 2.35) with its
 #             data, and the .deb, .rpm and tarball from it under PKG_VERSION, in
 #             DIST; then the glibc floor, one binary in all three, speech, the
 #             .deb installed and speaking, and its unit file
@@ -65,7 +65,6 @@ test-all-plain:
 	scripts/test/full/suites.sh
 	scripts/test/full/static_link.sh $(BIN)
 	scripts/test/full/e2e.sh
-	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/release_cc.sh
 	scripts/test/full/speech.sh ./$(BIN)
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/web_deps.sh
 	FUZZ_HARNESSES="$(foreach h,$(FUZZ_HARNESSES),$(h):$(FUZZ_DICT_$(h)):$(FUZZ_RUNS_$(h)))" scripts/test/full/fuzz.sh

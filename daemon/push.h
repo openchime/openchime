@@ -58,6 +58,11 @@ oc_machine_http *oc_machine_http_open(const char *url);
  * the HTTP status in *status, or -1 when no HTTP answer came back at all. */
 int  oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
                           const char *privkey_pem, const char *body, int *status);
+/* The same, with central's answer body, de-chunked and NUL-terminated, in `resp`
+ * (at most resp_cap - 1 bytes of it). */
+int  oc_machine_http_post_read(oc_machine_http *h, const char *path, const char *audience,
+                               const char *privkey_pem, const char *body, int *status,
+                               char *resp, size_t resp_cap);
 void oc_machine_http_close(oc_machine_http *h);
 
 /* ---- exposed for testing ---- */

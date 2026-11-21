@@ -412,6 +412,8 @@ static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's si
  * AUTH; the post-auth pushes drained, so the stream is positional after. */
 /* The last sign-in's WORKSPACE_SETTINGS: up to 8 key/value pairs. */
 static char g_auth_settings[OC_WS_SETTINGS_MAX][2][128];
+/* The WORKSPACE_ADDRESS the last do_auth was sent, or "" when none was. */
+static char g_auth_address[256];
 static int  g_auth_settings_n;
 
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
@@ -450,8 +452,19 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
             g_auth_settings_n++;
         }
     }
+    /* Then where the workspace is now, when it has an address: a managed
+     * address, or a name adopted from central (TLS.md) -- kept for its test. */
+    g_auth_address[0] = '\0';
+    if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_WORKSPACE_ADDRESS) {
+        oc_workspace_address wa;
+        if (oc_decode_workspace_address(&p, &wa) != OC_OK || wa.address.len >= sizeof g_auth_address) return -1;
+        memcpy(g_auth_address, wa.address.ptr, wa.address.len);
+        g_auth_address[wa.address.len] = '\0';
+        if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+    }
     /* Then which build the daemon is (About in a client): always, and never empty. */
-    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SERVER_BUILD) return -1;
+    if (hdr.msg_type != OC_MSG_SERVER_BUILD) return -1;
     {
         oc_server_build sb;
         if (oc_decode_server_build(&p, &sb) != OC_OK || sb.build.len == 0) return -1;
@@ -2131,6 +2144,23 @@ static void test_read_aloud_store_window(int port, const uint8_t *pin, oc_dbwrit
     CHECK(fetch_audio(&a, mids[N - 1], NULL, &code) > 0 && code == 0);
     CHECK(g_stub_says == rendered);                                   /* and from its row after */
     client_close(&a);
+}
+
+/* A self-hosted daemon's name adopted from central (TLS.md, the `central`
+ * source) is where the workspace is now: sent at sign-in right after the
+ * settings, changed and dropped while serving, each seen by the next sign-in. */
+static void test_adopted_address(int port, const uint8_t *pin) {
+    static const char *const NAMES[] = { "acme.example.net", "acme-new.example.net", NULL };
+    for (int i = 0; i < 3; i++) {
+        oc_netloop_set_adopted_address(NAMES[i]);
+        client a;
+        CHECK(client_open(&a, port, pin) == 0);
+        CHECK(do_handshake(&a) == 0);
+        uint64_t ua = 0;
+        CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+        CHECK(!strcmp(g_auth_address, NAMES[i] ? NAMES[i] : ""));
+        client_close(&a);
+    }
 }
 
 static void test_read_aloud_vertical(int port, const uint8_t *pin) {
@@ -4066,6 +4096,11 @@ static void test_web_signin(void) {
             CHECK(sqlite3_exec(db, "UPDATE webauthn_credentials SET rp_id='web.test';", NULL, NULL, NULL) == SQLITE_OK);
             sqlite3_close(db);
         }
+        /* Changed while serving, the names are read whole: with an adopted name
+         * listed first, the one asked at still offers its passkey. */
+        oc_netloop_set_passkey_names("acme.example.net,web.test");
+        CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") != NULL);
         /* Another trusted name than the one asked at: none is offered. */
         oc_netloop_set_passkey_names("other.test");
         CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
@@ -8432,6 +8467,15 @@ static void test_http_stack(void) {
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "data-oc-page=\"landing\""));
     /* With a web client beside the daemon, the page says where it is. */
     CHECK(strstr(resp, "&mdash;") == NULL && (!oc_webapp_loaded() || strstr(resp, "/app/") != NULL));
+    /* At the name adopted from central, from the next request on, and not once it is dropped. */
+    CHECK(strstr(resp, "https://acme.example.net") == NULL);
+    oc_netloop_set_adopted_address("acme.example.net");
+    CHECK(plain_exchange(hport, "GET / HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "data-oc-page=\"landing\""));
+    CHECK(!oc_webapp_loaded() || strstr(resp, "https://acme.example.net") != NULL);
+    oc_netloop_set_adopted_address(NULL);
+    CHECK(plain_exchange(hport, "GET / HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strstr(resp, "data-oc-page=\"landing\"") && strstr(resp, "https://acme.example.net") == NULL);
     CHECK(plain_exchange(hport, "POST /anything/else HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
                          resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "data-oc-page=\"landing\""));
@@ -9016,6 +9060,7 @@ int run_netloop_tests(void) {
         test_fanout_limits(arg.port, pin);
         test_presence_dnd(arg.port, pin);
         test_read_receipts(arg.port, pin);
+        test_adopted_address(arg.port, pin);
         test_read_aloud_vertical(arg.port, pin);
         test_read_aloud_store_window(arg.port, pin, dbw);
         test_voice_input_vertical(arg.port, pin);

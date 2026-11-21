@@ -739,8 +739,9 @@ and a certificate the person trusted still is — it is not a secret, and withou
 they would be asked about the same certificate every time (ARCH-10).
 
 **A workspace that moved is re-filed.** A managed workspace can change its address,
-and answers at the former one for a while. Its daemon says where it is now
-(`WORKSPACE_ADDRESS`); when that is another key, the net thread moves what is kept
+and answers at the former one for a while; a self-hosted workspace first added by
+its IP address is given a name by central, and answers at both. Its daemon says
+where it is now (`WORKSPACE_ADDRESS`); when that is another key, the net thread moves what is kept
 to it (`oc_workspace_move`, which adopts as above), shows the new address in the
 book, and names it on the next connection. `OC_EV_WORKSPACE_MOVED` carries the new
 key, and the model says so in the status line.

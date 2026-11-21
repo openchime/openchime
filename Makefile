@@ -24,13 +24,13 @@
 # openchimed` or `make run` builds the same daemon, until `make distclean`.
 # `make build` and `make test` neither read it nor change it. With
 # ARCH=aarch64, the daemon cross-built for arm64 into build/aarch64/; with
-# RELEASE=1, the host's as the release builds it (zig, glibc 2.34). Neither is
+# RELEASE=1, the host's as the release builds it (gcc 12, stripped). Neither is
 # remembered.
 #
-# Every toolchain the clients need -- Emscripten, llvm-mingw for Windows, zig
-# for the release's compiler -- is fetched pinned on first use (mk/toolchains.mk),
-# so the full build needs only cc, cmake, python3, git, curl, xz, bzip2 and nasm
-# installed.
+# Every toolchain the clients need -- Emscripten, llvm-mingw for Windows -- is
+# fetched pinned on first use (mk/toolchains.mk), so the full build needs only
+# cc, cmake, python3, git, curl, xz, bzip2 and nasm installed, and for the arm64
+# daemon Ubuntu's cross compiler.
 #
 # Tool binaries are built by their path (make build/demo_client,
 # build/bench_load, build/tts_pack, build/s3_smoke, build/e2e_client,
@@ -38,7 +38,7 @@
 # mk/, one file per concern; scripts/test/fast/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := build test build-all test-all run clean distclean
-INTERNAL := daemon fast-build fast-test build-dir linux windows web check-release-cc FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
+INTERNAL := daemon fast-build fast-test build-dir linux windows web FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
 
 # --- One build at a time (docs/TESTING.md, "One build at a time") --------------
 # One recipe at a time, in this make and every make it starts, whatever -j or
@@ -123,8 +123,8 @@ SUM ?= 0
 WEB ?= 0
 # The architecture and the release compiler are NOT remembered: `make
 # ARCH=aarch64` cross-builds the daemon for arm64 (build only: nothing here can
-# run it) with zig into build/aarch64/, and `make RELEASE=1` builds the host's
-# with zig against glibc 2.34 as the release does; both are a choice made per
+# run it) with aarch64-linux-gnu-gcc-12 into build/aarch64/, and `make RELEASE=1`
+# builds the host's with gcc-12 as the release does; both are a choice made per
 # invocation, and a plain `make openchimed` is the host's daemon again
 # (mk/toolchains.mk).
 HOST_ARCH := $(shell uname -m)
@@ -246,7 +246,10 @@ run: run-build
 	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
 	 OPENCHIME_DEV_LOOPBACK=on OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" $(if $(filter 1,$(LEAN)),$(LEAN_SCOPE) -- )./$(BIN)
 
-# Everything built. `distclean` removes the remembered features too.
+# Everything built. `distclean` removes the remembered features too, and what
+# summaries were once built with, when a checkout still holds it: llama.cpp's
+# build (third_party/llamacpp-*) and its source tarball. Nothing else under
+# third_party/ is touched.
 clean:
 	rm -f $(BIN)
 	find build -mindepth 1 -maxdepth 1 ! -name .features -exec rm -rf {} + 2>/dev/null || true
@@ -254,5 +257,8 @@ clean:
 distclean:
 	rm -f $(BIN)
 	rm -rf build
+	@for p in third_party/llamacpp-* third_party/llama.cpp-*.tar.gz; do \
+	   [ -e "$$p" ] || continue; echo "distclean: removing $$p (llama.cpp, no longer built)"; rm -rf "$$p"; \
+	 done
 
 endif   # the goals, inside a run of scripts/test/lib/clean_run.sh (the top of this file)

@@ -42,6 +42,8 @@ if [ ! -f "${DEST}/lib/libvpx.a" ]; then
   (
     cd "${DEST}/build"
     [ "${TARGET}" = windows ] && export CROSS=x86_64-w64-mingw32-
+    # Another architecture: Ubuntu's cross binutils (ar, strip) beside make's CC.
+    [ "${TARGET}" = native ] && [ -n "${OC_ARCH:-}" ] && export CROSS="${OC_ARCH}-linux-gnu-"
     # Out of tree: the committed sources are only read. VP9 only: VP8 is not
     # used anywhere (ARCH-87 ships VP9 alone). Real-time only: nothing here
     # encodes offline, and it drops the two-pass paths.

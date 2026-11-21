@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -128,6 +129,36 @@ int oc_certs_names_include(const char *names, const char *name) {
     return 0;
 }
 
+int oc_certs_adopted_name(const char *names, char *out, size_t cap) {
+    if (!names || !out || cap == 0) return -1;
+    while (*names == ' ') names++;
+    size_t n = strcspn(names, ", ");
+    if (n == 0 || n >= cap) return -1;
+    for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)names[i]);
+    out[n] = '\0';
+    return 0;
+}
+
+int oc_central_names(const char *central_url, const char *audience, const char *enroll_key_pem,
+                     char *names, size_t cap, int *status, char *err, size_t errcap) {
+    if (cap) names[0] = '\0';
+    *status = 0;
+    char origin[512];
+    origin_of(central_url, origin, sizeof origin);
+    oc_https_resp r;
+    if (signed_post(origin, "/api/machine/tls/names", audience, enroll_key_pem, "{}", &r, err, errcap) != 0) return -1;
+    *status = r.status;
+    if (r.status == 200 && json_str(r.body, r.body_len, "names", names, cap) != 0 && cap) names[0] = '\0';
+    oc_https_resp_free(&r);
+    return 0;
+}
+
+oc_name_listed oc_certs_name_listed(int status, const char *names, const char *name) {
+    if (status == 200) return oc_certs_names_include(names, name) ? OC_NAME_KEEP : OC_NAME_DROP;
+    if (status == 404) return OC_NAME_DROP;
+    return OC_NAME_UNKNOWN;
+}
+
 int oc_central_issue(const char *central_url, const char *audience, const char *enroll_key_pem,
                      oc_cert_issued *out, int *retry_ms, int *final, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
@@ -137,14 +168,14 @@ int oc_central_issue(const char *central_url, const char *audience, const char *
     oc_https_resp r;
 
     /* The names this workspace may have: central's to say. */
-    if (signed_post(origin, "/api/machine/tls/names", audience, enroll_key_pem, "{}", &r, err, errcap) != 0) return -1;
     char names[1024] = "";
-    if (r.status != 200 || json_str(r.body, r.body_len, "names", names, sizeof names) != 0 || !names[0]) {
-        snprintf(err, errcap, "central gave no names (HTTP %d)", r.status);
-        *final = r.status >= 400 && r.status < 500;
-        oc_https_resp_free(&r); return -1;
+    int status = 0;
+    if (oc_central_names(central_url, audience, enroll_key_pem, names, sizeof names, &status, err, errcap) != 0) return -1;
+    if (status != 200 || !names[0]) {
+        snprintf(err, errcap, "central gave no names (HTTP %d)", status);
+        *final = status >= 400 && status < 500;
+        return -1;
     }
-    oc_https_resp_free(&r);
 
     uint8_t *der = NULL; size_t dlen = 0; char *key_pem = NULL;
     if (oc_acme_csr(names, &der, &dlen, &key_pem) != 0) { snprintf(err, errcap, "could not make the CSR"); return -1; }
