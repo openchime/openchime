@@ -84,6 +84,7 @@ int run_speakable_tests(void);
 int run_action_tests(void);
 int run_ttskit_tests(void);
 int run_nnkit_tests(void);
+int run_sumkit_tests(void);
 int run_sttkit_tests(void);
 int run_recognizer_parity_tests(void);
 int run_tts_worker_tests(void);
@@ -336,6 +337,7 @@ static const struct suite {
     S(run_speakable_tests,       FAST, PLAIN),
     S(run_action_tests,          FAST, PLAIN),
     S(run_nnkit_tests,           FAST, PLAIN),
+    S(run_sumkit_tests,          FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),
     S(run_tts_worker_tests,      FAST, THREADS),
     S(run_summary_tests,         FAST, WALK),

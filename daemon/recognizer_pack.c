@@ -1,7 +1,7 @@
 /*
  * OpenChime — recognizer.bin from the published recognizer (recognizer_pack.h).
  *
- * An .ort file is a FlatBuffers buffer whose root is ONNX Runtime's
+ * An .ort file is a FlatBuffers buffer whose root is the format's
  * InferenceSession table, file identifier "ORTM". Only the part of its schema
  * the converter reads is spelled out below, by field number (a field's number
  * is its slot in the table's vtable):
@@ -20,7 +20,7 @@
  *                     4 i: int64, 5 s: string, 6 t: Tensor, 7 g: Graph,
  *                     8 floats: [float], 9 ints: [int64], 10 strings: [string]
  *   Tensor            0 name: string, 1 doc_string, 2 dims: [int64],
- *                     3 data_type: int32 (ONNX's codes), 4 raw_data: [uint8]
+ *                     3 data_type: int32 (the format's codes), 4 raw_data: [uint8]
  *
  * Every offset is checked against the buffer before it is followed: a damaged
  * or hostile file is refused, never read past.
@@ -163,7 +163,7 @@ static int64_t fb_elem(const ftab *t, size_t data, uint32_t k) {
 
 typedef struct {
     span name;
-    int dtype;              /* ONNX's codes */
+    int dtype;              /* the format's codes */
     int ndim;
     int64_t dims[MAX_DIM];
     span data;              /* raw_data */
@@ -246,7 +246,7 @@ static int graph_parse(const uint8_t *b, size_t n, ograph *g, char *err, size_t 
     memset(g, 0, sizeof *g);
     ftab root, model, graph;
     int64_t at;
-    if (n < 8 || memcmp(b + 4, "ORTM", 4) != 0) { seterr(err, cap, "not an ONNX Runtime model file"); return -1; }
+    if (n < 8 || memcmp(b + 4, "ORTM", 4) != 0) { seterr(err, cap, "not an .ort model file"); return -1; }
     if (fb_table(b, n, le32(b), &root) != 0 || fb_string(&root, 0, &g->version) != 0 ||
         (at = fb_ref(&root, 1)) <= 0 || fb_table(b, n, (size_t)at, &model) != 0 ||
         fb_string(&model, 2, &g->producer) != 0 || (at = fb_ref(&model, 7)) <= 0 ||

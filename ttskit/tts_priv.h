@@ -155,7 +155,7 @@ float    voice_rng_normal(voice_rng *r);        /* mean 0, variance 1 */
  * harmonics of the pitch (where it is above 10 Hz, silence elsewhere) through a
  * linear layer and tanh, sampled at 24 kHz, and its STFT (n_fft 20, hop 5):
  * har, 120F + 1 rows of 11 magnitudes then 11 phases. The phases' arithmetic
- * is ONNX Runtime's to the bit, since its running sum carries any difference
+ * is the reference's to the bit, since its running sum carries any difference
  * into every later sample. With noise on (the model's own behaviour), the
  * random operators it replaces draw from voice_rng seeded with `seed`: each
  * sample and harmonic gets normal noise of standard deviation 0.003 where

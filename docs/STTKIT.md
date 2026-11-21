@@ -11,8 +11,8 @@ Where the model comes from, its licence and how its data file is made are in
 
 ## 1. Why it exists
 
-The recognizer is published as ONNX Runtime graphs. Running them took ONNX Runtime: a large
-C++ library built from source for every voice-input build, whose source is no longer
+The recognizer is published as `.ort` graphs. Running them took the engine they were made
+for: a large C++ library built from source for every voice-input build, whose source is no longer
 published where the build fetched it. sttkit runs the same model, with the same int8 weights,
 in plain C under ttskit's rules: one thread, no intrinsics, no library, loops the compiler
 vectorises on its own, and `-ffp-contract=off`.
@@ -85,16 +85,16 @@ output layer against the uint8 embedding table.
 range, so a last-bit difference anywhere upstream can move one value across a rounding
 step, and through the encoder's six layers such steps spread over the utterance: with the
 frontend computed in an ordinary order (120 dB from the reference) the encoder's output
-came out only 20 dB from ONNX Runtime's, though the words were the same. So the frontend
-and the encoder do the arithmetic of the published graphs in the order ONNX Runtime
+came out only 20 dB from the reference engine's, though the words were the same. So the frontend
+and the encoder do the arithmetic of the published graphs in the order the reference engine
 computes it, to the bit: a frame's mean and variance as Eigen sums them (`nn_reduce_sum`);
 the linear layer as a chain of fused multiply-adds; each convolution as its im2col and
 matrix product compute it for one chunk — the window laid out channel by channel, tap by
 tap, summed in blocks of 1,024, then the bias; the quantised products exactly; the
 attention scores over every key with the masked ones at minus infinity, its softmax and its
-weighted sum as ONNX Runtime's float matrix product adds them (`nn_attend_exact`); erf as its
+weighted sum as the reference engine's float matrix product adds them (`nn_attend_exact`); erf as its
 own approximation (`nn_gelu_erf`); and the last norm as SkipLayerNormalization's. Over the
-reference fixtures the encoder's output is then identical to ONNX Runtime's, and the first
+reference fixtures the encoder's output is then identical to the reference engine's, and the first
 step's logits are 129–137 dB from it (the decoder's one-row products are summed in another
 order); every token is the same (§8).
 
@@ -159,8 +159,9 @@ read-only once open, so one may serve several threads.
 `recognizer.bin` changes only when the model does. The published files are pinned by
 SHA-256 (VENDORS.md); `openchimed --recognizer-pack` refuses any file whose graphs are not
 the ones it expects, naming the first difference. A newer model is a change to sttkit:
-list its graphs with `--recognizer-pack --list`, follow them in `recognizer_model.c`, make
-new references with `tests/manual/recognizer_ref.c`, and change `OC_STT_MODEL_VERSION`
+list its graphs with `--recognizer-pack --list`, follow them in `recognizer_model.c`, check
+it with the kernels' naive versions and by what it hears (its references cannot be made: the
+committed ones are this model's, made once and frozen, §8), and change `OC_STT_MODEL_VERSION`
 (`daemon/stt.h`) so clients see a new model.
 
 ## 8. Tests
@@ -173,10 +174,9 @@ new references with `tests/manual/recognizer_ref.c`, and change `OC_STT_MODEL_VE
   refusing what is not the published model.
 - `recognizer_parity` in `tests/test_sttkit.c` (full suite): every fixture in
   `tests/data/recognizer/` heard from the committed file gives the reference's token ids,
-  with its encoder output and first logits within 30 dB SNR of ONNX Runtime's. The
+  with its encoder output and first logits within 30 dB SNR of the reference engine's. The
   fixtures — seven utterances spoken by read-aloud's own voice, one of them fast enough to
-  reach the token ceiling, and silence — were made once by `tests/manual/recognizer_ref.c`
-  with ONNX Runtime's prebuilt release, which no suite links.
+  reach the token ceiling, and silence — were made once, before the engine they were made with was withdrawn; they cannot be made again.
 - `build/stt_check parity sttkit/data tests/data/recognizer` prints the same check as a
   table; `build/stt_check bench sttkit/data tests/data/recognizer` the real-time factor and
   peak memory.

@@ -20,6 +20,7 @@
 #define QB 64      /* integer dot products: block length */
 #define QT 16      /* ... and the tail step (rows are multiples of NN_CPAD) */
 #define FL 16      /* float lanes */
+#define KT 16      /* quantised products: weight rows taken together */
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 
@@ -31,7 +32,7 @@ static inline float rint_even(float v) {
     return (v + magic) - magic;
 }
 
-/* ---- ONNX Runtime's activation functions ---------------------------------------
+/* ---- the reference's activation functions ---------------------------------------
  * Its CPU kernels (on x86-64 with FMA) compute these as rational or polynomial
  * approximations with fused multiply-adds, not as the C library does; these are
  * the same steps on the same constants, so the results are the same bits.
@@ -225,7 +226,7 @@ ARRAY_ACT(nn_logistic, logistic16, logistic1)
 ARRAY_ACT(nn_tanh, tanh16, tanh1)
 static ARRAY_ACT(exp_array, exp16, exp1)
 
-/* FastGelu, as ONNX Runtime fuses the graph's tanh form: x (0.0356774 x^2 +
+/* FastGelu, as the reference fuses the graph's tanh form: x (0.0356774 x^2 +
  * 0.7978846), its tanh, then 0.5 x (t + 1). */
 void nn_gelu(float *x, size_t n) {
     float t[AL];
@@ -586,7 +587,7 @@ void nn_lstm_run(const nn_lstm *l, int dirs, const float *x, int t, int in, int 
 
 /* ---- normalisation, attention ------------------------------------------------- */
 
-/* ONNX Runtime's LayerNormalization: the mean from a double sum; the variance
+/* The reference's LayerNormalization: the mean from a double sum; the variance
  * from squared deviations accumulated by fused multiply-adds in 8 lanes, the
  * lanes added in halves; y = fma((x - mean) * inv, g, b). */
 void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const float *b, float eps) {
@@ -616,7 +617,7 @@ void nn_layernorm(float *x, int rows, int cols, int ld, const float *g, const fl
     }
 }
 
-/* ONNX Runtime's SkipLayerNormalization: v = x + skip, then Welford's running
+/* The reference's SkipLayerNormalization: v = x + skip, then Welford's running
  * mean and sum of squares in float, y = (v - mean) / sqrt(m2 / n + eps) * g + b. */
 void nn_skip_layernorm(float *x, const float *skip, int rows, int cols, int ld, int lds, const float *g,
                           const float *b, float eps) {
@@ -730,7 +731,7 @@ static void eigen_sum_rows(const float *x, int t, int c, int ld, int ch0, int cs
 }
 #undef ES_VAL
 
-/* ONNX Runtime's InstanceNormalization (Eigen, on channel-major data): channel
+/* The reference's InstanceNormalization (Eigen, on channel-major data): channel
  * c's t values start c * t floats into a 16-byte aligned tensor, so its mean's
  * sum starts its vectors (c * t) mod 4 values in; the sum of squared deviations
  * is over an expression, whose vectors start at 0. Then k = g / sqrt(var + eps),
@@ -759,7 +760,7 @@ void nn_instnorm(float *x, int t, int c, int ld, const float *g, const float *b,
     free(mem);
 }
 
-/* ONNX Runtime's softmax: the exponentials of x - max summed in 8 lanes (the
+/* The reference's softmax: the exponentials of x - max summed in 8 lanes (the
  * last, partial vector into the same lanes), the lanes added in adjacent
  * pairs, and each exponential multiplied by 1 / sum. */
 void nn_softmax(float *x, int n) {
@@ -775,7 +776,7 @@ void nn_softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
-/* y[c] = sum_i a[i] * b[i * ldb + c] for c < n, as ONNX Runtime's float matrix
+/* y[c] = sum_i a[i] * b[i * ldb + c] for c < n, as the reference's float matrix
  * product forms each output: a chain of fused multiply-adds from 0 over each
  * block of 256 of i, the blocks' results added in turn. Sixteen chains at once,
  * in double (exact products, one rounding per step, as nn_fma), noting any
@@ -953,7 +954,7 @@ void nn_matmul_f(const float *restrict x, size_t xstep, int m, int k, const floa
     }
 }
 
-/* As ONNX Runtime's ConvTranspose: for each tap j, the product of the input
+/* As the reference's ConvTranspose: for each tap j, the product of the input
  * rows with that tap's weights (its matrix product: chains of fused
  * multiply-adds in blocks of 128, as its packing has them when the weights are
  * read transposed; fma_tiles without the halfway test); then each output is
@@ -1019,7 +1020,7 @@ void nn_leaky_relu(float *x, size_t n, float alpha) {
     for (; i < n; i++) x[i] = x[i] < 0 ? x[i] * alpha : x[i];
 }
 
-/* sin as ONNX Runtime computes it, to the bit: Eigen's psincos_float as its
+/* sin as the reference computes it, to the bit: Eigen's psincos_float as its
  * build has it (no fused multiply-add). x is reduced by the nearest multiple q
  * of pi/2, pi/2 in four parts, each step a product then a sum; then the sine
  * polynomial for even q and the cosine one for odd, the sign flipped for q mod 4
@@ -1112,7 +1113,7 @@ void nn_sin(const float *restrict x, float *restrict y, size_t n) {
     for (; i < n; i++) y[i] = sin1(x[i]);
 }
 
-/* atan as ONNX Runtime computes it: its vectorised kernel (Eigen's, four lanes
+/* atan as the reference computes it: its vectorised kernel (Eigen's, four lanes
  * of SSE) evaluates, on r = |x| or 1/|x| past 1, r times a rational function of
  * r^2 -- (0.112 r^2 + 0.730) r^2 + 0.811 over ((0.0101 r^2 + 0.283) r^2 + 1)
  * r^2 + 0.811 -- takes pi/2 less that past 1, and gives it x's sign. The
@@ -1218,7 +1219,7 @@ void nn_silu(float *x, size_t n) {
     }
 }
 
-/* erf(x) as ONNX Runtime computes it (its MlasErfKernel, the same bits): odd,
+/* erf(x) as the reference computes it (its MlasErfKernel, the same bits): odd,
  * |x| clamped to 3.925; below 0.921875 an odd polynomial in |x|, above it
  * 1 - exp(-p(|x|)) with its own exp; every multiply-add fused. */
 static float erf1(float v) {
@@ -1364,5 +1365,460 @@ void nn_matvec_u8(const float *restrict x, int k, const uint8_t *restrict e, int
         for (int l = 0; l < FL; l++) s += acc[l];
         for (; i < k; i++) s += x[i] * ((float)(row[i] - zp) * scale);
         out[r] = s;
+    }
+}
+
+
+/* ---- the summary model's kernels ---------------------------------------------
+ * The quantised blocks are ggml's Q4_K and Q6_K (nnkit.h). A block's values are
+ * unpacked to int8 once and multiplied by every activation row; the products of
+ * a block are summed exactly in int32, sub-block scales included, and only the
+ * block's integers become float. */
+
+float nn_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1f, man = h & 0x3ff, u;
+    if (exp == 0) {
+        if (man == 0) u = sign;
+        else {                                     /* subnormal: normalise */
+            exp = 127 - 15 + 1;
+            while (!(man & 0x400)) { man <<= 1; exp--; }
+            man &= 0x3ff;
+            u = sign | exp << 23 | man << 13;
+        }
+    } else if (exp == 31) u = sign | 0x7f800000u | man << 13;
+    else u = sign | (exp + 127 - 15) << 23 | man << 13;
+    union { uint32_t u; float f; } v = { .u = u };
+    return v.f;
+}
+
+uint16_t nn_f32_to_f16(float f) {
+    union { float f; uint32_t u; } v = { .f = f };
+    uint32_t u = v.u, sign = (u >> 16) & 0x8000;
+    int32_t exp = (int32_t)((u >> 23) & 0xff) - 127 + 15;
+    uint32_t man = u & 0x7fffff;
+    if (((u >> 23) & 0xff) == 0xff) return (uint16_t)(sign | 0x7c00 | (man ? 0x200 : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
+    if (exp <= 0) {                                /* subnormal or zero */
+        if (exp < -10) return (uint16_t)sign;
+        man |= 0x800000;
+        uint32_t shift = (uint32_t)(14 - exp), h = man >> shift, rem = man & ((1u << shift) - 1),
+                 half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (h & 1))) h++;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = (uint32_t)exp << 10 | man >> 13, rem = man & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;   /* may carry into the exponent: right */
+    return (uint16_t)(sign | h);
+}
+
+size_t nn_row_bytes(nn_wtype t, int k) {
+    switch (t) {
+    case NN_W_F32:  return (size_t)k * 4;
+    case NN_W_BF16: return (size_t)k * 2;
+    case NN_W_Q4K:  return (size_t)(k / NN_QK) * NN_Q4K_BYTES;
+    case NN_W_Q6K:  return (size_t)(k / NN_QK) * NN_Q6K_BYTES;
+    }
+    return 0;
+}
+
+static inline uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+
+/* A Q4_K block's 6-bit scale and min of sub-block j (ggml's get_scale_min_k4). */
+static inline void q4k_scale_min(int j, const uint8_t *q, int *sc, int *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+/* A block unpacked: its 256 values as integers and its integer sub-block
+ * scales (Q4_K: 8 of 32, with mins; Q6_K: 16 of 16). */
+typedef struct {
+    int8_t  q[NN_QK];
+    int16_t q16[NN_QK];        /* each value times its sub-block's scale (at most 945 or 4064 in size) */
+    int     sc[16], mn[8];
+    float   d, dmin;
+} kblock;
+
+static void unpack_q4k(const uint8_t *b, kblock *u) {
+    u->d = nn_f16_to_f32(rd16(b));
+    u->dmin = nn_f16_to_f32(rd16(b + 2));
+    const uint8_t *scales = b + 4, *qs = b + 16;
+    for (int s = 0; s < 8; s++) q4k_scale_min(s, scales, &u->sc[s], &u->mn[s]);
+    for (int c = 0; c < 4; c++)
+        for (int l = 0; l < 32; l++) {
+            u->q[64 * c + l] = (int8_t)(qs[32 * c + l] & 0xF);
+            u->q[64 * c + 32 + l] = (int8_t)(qs[32 * c + l] >> 4);
+        }
+    for (int e = 0; e < NN_QK; e++) u->q16[e] = (int16_t)(u->q[e] * u->sc[e / 32]);
+}
+
+static void unpack_q6k(const uint8_t *b, kblock *u) {
+    const uint8_t *ql = b, *qh = b + 128;
+    const int8_t *sc = (const int8_t *)(b + 192);
+    u->d = nn_f16_to_f32(rd16(b + 208));
+    u->dmin = 0;
+    for (int s = 0; s < 16; s++) u->sc[s] = sc[s];
+    for (int h = 0; h < 2; h++) {
+        const uint8_t *l0 = ql + 64 * h, *hh = qh + 32 * h;
+        int8_t *y = u->q + 128 * h;
+        for (int l = 0; l < 32; l++) {
+            y[l]      = (int8_t)(((l0[l] & 0xF) | ((hh[l] >> 0 & 3) << 4)) - 32);
+            y[l + 32] = (int8_t)(((l0[l + 32] & 0xF) | ((hh[l] >> 2 & 3) << 4)) - 32);
+            y[l + 64] = (int8_t)(((l0[l] >> 4) | ((hh[l] >> 4 & 3) << 4)) - 32);
+            y[l + 96] = (int8_t)(((l0[l + 32] >> 4) | ((hh[l] >> 6 & 3) << 4)) - 32);
+        }
+    }
+    for (int e = 0; e < NN_QK; e++) u->q16[e] = (int16_t)(u->q[e] * u->sc[e / 16]);
+}
+
+void nn_dequant_row(nn_wtype t, const void *w, int k, int r, float *out) {
+    const uint8_t *row = (const uint8_t *)w + (size_t)r * nn_row_bytes(t, k);
+    if (t == NN_W_F32) { memcpy(out, row, (size_t)k * 4); return; }
+    if (t == NN_W_BF16) {
+        for (int i = 0; i < k; i++) out[i] = nn_bf16_to_f32(rd16(row + 2 * i));
+        return;
+    }
+    kblock u;
+    for (int b = 0; b < k / NN_QK; b++) {
+        float *o = out + b * NN_QK;
+        if (t == NN_W_Q4K) {
+            unpack_q4k(row + (size_t)b * NN_Q4K_BYTES, &u);
+            for (int e = 0; e < NN_QK; e++)
+                o[e] = u.d * (float)u.sc[e / 32] * (float)u.q[e] - u.dmin * (float)u.mn[e / 32];
+        } else {
+            unpack_q6k(row + (size_t)b * NN_Q6K_BYTES, &u);
+            for (int e = 0; e < NN_QK; e++) o[e] = u.d * (float)u.sc[e / 16] * (float)u.q[e];
+        }
+    }
+}
+
+void nn_q8k_quantize(const float *restrict x, int k, nn_q8k *restrict out) {
+    for (int b = 0; b < k / NN_QK; b++) {
+        const float *v = x + b * NN_QK;
+        nn_q8k *o = out + b;
+        float amax = 0;
+        for (int i = 0; i < NN_QK; i++) amax = fmaxf(amax, fabsf(v[i]));
+        if (amax == 0) {
+            memset(o, 0, sizeof *o);
+            continue;
+        }
+        float id = 127.0f / amax;
+        o->d = amax / 127.0f;
+        for (int i = 0; i < NN_QK; i++) {
+            float r = rint_even(v[i] * id);
+            o->q[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
+        }
+        for (int s = 0; s < NN_QK / 32; s++) {
+            int sum = 0;
+            for (int i = 0; i < 32; i++) sum += o->q[32 * s + i];
+            o->bsum[s] = (int16_t)sum;
+        }
+    }
+}
+
+size_t nn_matmul_w_scratch(nn_wtype t, int k, int m) {
+    if (t == NN_W_Q4K || t == NN_W_Q6K)
+        return (size_t)m * (size_t)(k / NN_QK) * sizeof(nn_q8k) + (size_t)m * (size_t)k * sizeof(int16_t) +
+               (size_t)m * KT * sizeof(float) + KT * sizeof(kblock) + 128;
+    return (size_t)k * sizeof(float) + 64;
+}
+
+/* The exact integer products of one unpacked block with one activation block:
+ * Q4_K's sum of sc * (q . a) and of mn * sum(a) per sub-block; Q6_K's sum of
+ * sc * (q . a) per 16. */
+static inline void kdot(const kblock *u, int q6, const int16_t *x16, const int16_t *bsum, int32_t *isum, int32_t *imin) {
+    /* sum of sc * (q . x) over the sub-blocks, as one sum of (sc q) . x */
+    int32_t s = 0, mn = 0;
+    for (int i = 0; i < NN_QK; i++) s += (int32_t)u->q16[i] * (int32_t)x16[i];
+    if (!q6)
+        for (int sb = 0; sb < 8; sb++) mn += u->mn[sb] * (int32_t)bsum[sb];
+    *isum = s;
+    *imin = mn;
+}
+
+/* The same integers straight from a block's bytes, for one activation block:
+ * no unpacking, the loops the vectoriser turns into multiply-add-pairs. */
+static inline void q4k_dot(const uint8_t *b, const nn_q8k *a, const int16_t *x16, int32_t *isum, int32_t *imin) {
+    const uint8_t *scales = b + 4, *qs = b + 16;
+    int32_t s = 0, mn = 0;
+    for (int c = 0; c < 4; c++) {
+        const uint8_t *q = qs + 32 * c;
+        const int16_t *x = x16 + 64 * c;
+        int32_t lo = 0, hi = 0;
+        for (int l = 0; l < 32; l++) {
+            lo += (int32_t)(int16_t)(q[l] & 0xF) * x[l];
+            hi += (int32_t)(int16_t)(q[l] >> 4) * x[l + 32];
+        }
+        int sc0, m0, sc1, m1;
+        q4k_scale_min(2 * c, scales, &sc0, &m0);
+        q4k_scale_min(2 * c + 1, scales, &sc1, &m1);
+        s += sc0 * lo + sc1 * hi;
+        mn += m0 * (int32_t)a->bsum[2 * c] + m1 * (int32_t)a->bsum[2 * c + 1];
+    }
+    *isum = s;
+    *imin = mn;
+}
+
+static inline int32_t q6k_dot(const uint8_t *b, const int16_t *x16) {
+    const int8_t *sc = (const int8_t *)(b + 192);
+    int32_t s = 0;
+    for (int h = 0; h < 2; h++) {
+        const uint8_t *ql = b + 64 * h, *qh = b + 128 + 32 * h;
+        const int16_t *x = x16 + 128 * h;
+        for (int half = 0; half < 2; half++) {
+            int32_t p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+            for (int l = 16 * half; l < 16 * half + 16; l++) {
+                p1 += (int32_t)(int16_t)(((ql[l] & 0xF) | ((qh[l] & 3) << 4)) - 32) * x[l];
+                p2 += (int32_t)(int16_t)(((ql[l + 32] & 0xF) | ((qh[l] >> 2 & 3) << 4)) - 32) * x[l + 32];
+                p3 += (int32_t)(int16_t)(((ql[l] >> 4) | ((qh[l] >> 4 & 3) << 4)) - 32) * x[l + 64];
+                p4 += (int32_t)(int16_t)(((ql[l + 32] >> 4) | ((qh[l] >> 6 & 3) << 4)) - 32) * x[l + 96];
+            }
+            int is = 8 * h + half;
+            s += sc[is] * p1 + sc[is + 2] * p2 + sc[is + 4] * p3 + sc[is + 6] * p4;
+        }
+    }
+    return s;
+}
+
+void nn_matmul_w(nn_wtype t, const void *w, int n, int k, const float *x, int m, size_t ldx, float *y,
+                 size_t ldy, void *scratch) {
+    size_t rb = nn_row_bytes(t, k);
+    uintptr_t sp = ((uintptr_t)scratch + 63) & ~(uintptr_t)63;
+    if (t == NN_W_Q4K || t == NN_W_Q6K) {
+        int nb = k / NN_QK, q6 = t == NN_W_Q6K;
+        size_t bb = q6 ? NN_Q6K_BYTES : NN_Q4K_BYTES;
+        nn_q8k *a = (nn_q8k *)sp;
+        int16_t *a16 = (int16_t *)(a + (size_t)m * nb);
+        kblock *u = (kblock *)(((uintptr_t)(a16 + (size_t)m * k) + 63) & ~(uintptr_t)63);   /* KT of them */
+        float *acc = (float *)(u + KT);                                                        /* m x KT */
+        for (int r = 0; r < m; r++) {
+            nn_q8k_quantize(x + (size_t)r * ldx, k, a + (size_t)r * nb);
+            for (int i = 0; i < k; i++) a16[(size_t)r * k + i] = a[(size_t)r * nb + i / NN_QK].q[i % NN_QK];
+        }
+        if (m <= 2) {
+            /* a token at a time: straight from the bytes */
+            for (int c = 0; c < n; c++) {
+                const uint8_t *row = (const uint8_t *)w + (size_t)c * rb;
+                for (int r = 0; r < m; r++) acc[r] = 0;
+                for (int b = 0; b < nb; b++) {
+                    const uint8_t *blk = row + (size_t)b * bb;
+                    float d = nn_f16_to_f32(rd16(q6 ? blk + 208 : blk)), dmin = q6 ? 0.0f : nn_f16_to_f32(rd16(blk + 2));
+                    for (int r = 0; r < m; r++) {
+                        const nn_q8k *ab = a + (size_t)r * nb + b;
+                        int32_t is, im = 0;
+                        const int16_t *x16 = a16 + (size_t)r * k + (size_t)b * NN_QK;
+                        if (q6) is = q6k_dot(blk, x16);
+                        else q4k_dot(blk, ab, x16, &is, &im);
+                        acc[r] += d * ab->d * (float)is - dmin * ab->d * (float)im;
+                    }
+                }
+                for (int r = 0; r < m; r++) y[(size_t)r * ldy + c] = acc[r];
+            }
+            return;
+        }
+        /* Several tokens: KT weight rows at a time, each block unpacked once and
+         * every token's activations read once for all KT of them. Each output
+         * is still its blocks' terms added in order. */
+        for (int c0 = 0; c0 < n; c0 += KT) {
+            int kt = n - c0 < KT ? n - c0 : KT;
+            for (size_t i = 0; i < (size_t)m * KT; i++) acc[i] = 0;
+            for (int b = 0; b < nb; b++) {
+                for (int cc = 0; cc < kt; cc++) {
+                    const uint8_t *blk = (const uint8_t *)w + (size_t)(c0 + cc) * rb + (size_t)b * bb;
+                    if (q6) unpack_q6k(blk, &u[cc]);
+                    else unpack_q4k(blk, &u[cc]);
+                }
+                for (int r = 0; r < m; r++) {
+                    const nn_q8k *ab = a + (size_t)r * nb + b;
+                    const int16_t *x16 = a16 + (size_t)r * k + (size_t)b * NN_QK;
+                    float *ar = acc + (size_t)r * KT;
+                    for (int cc = 0; cc < kt; cc++) {
+                        int32_t is, im;
+                        kdot(&u[cc], q6, x16, ab->bsum, &is, &im);
+                        ar[cc] += u[cc].d * ab->d * (float)is - u[cc].dmin * ab->d * (float)im;
+                    }
+                }
+            }
+            for (int r = 0; r < m; r++)
+                for (int cc = 0; cc < kt; cc++) y[(size_t)r * ldy + c0 + cc] = acc[(size_t)r * KT + cc];
+        }
+        return;
+    }
+    float *wr = (float *)sp;
+    for (int c = 0; c < n; c++) {
+        nn_dequant_row(t, w, k, c, wr);
+        for (int r = 0; r < m; r++) {
+            const float *xr = x + (size_t)r * ldx;
+            float p[FL] = { 0 };
+            int i = 0;
+            for (; i + FL <= k; i += FL)
+                for (int l = 0; l < FL; l++) p[l] += xr[i + l] * wr[i + l];
+            float s = 0;
+            for (int l = 0; l < FL; l++) s += p[l];
+            for (; i < k; i++) s += xr[i] * wr[i];
+            y[(size_t)r * ldy + c] = s;
+        }
+    }
+}
+
+static float sumsq(const float *x, int n) {
+    float p[FL] = { 0 };
+    int i = 0;
+    for (; i + FL <= n; i += FL)
+        for (int l = 0; l < FL; l++) p[l] += x[i + l] * x[i + l];
+    float s = 0;
+    for (int l = 0; l < FL; l++) s += p[l];
+    for (; i < n; i++) s += x[i] * x[i];
+    return s;
+}
+
+void nn_rmsnorm(float *x, int rows, int n, int ld, const float *g, float eps) {
+    for (int r = 0; r < rows; r++) {
+        float *v = x + (size_t)r * ld;
+        float sc = 1.0f / sqrtf(sumsq(v, n) / (float)n + eps);
+        for (int i = 0; i < n; i++) v[i] = v[i] * sc * g[i];
+    }
+}
+
+void nn_l2norm(float *x, int rows, int n, int ld, float eps) {
+    for (int r = 0; r < rows; r++) {
+        float *v = x + (size_t)r * ld;
+        float sc = 1.0f / fmaxf(sqrtf(sumsq(v, n)), eps);
+        for (int i = 0; i < n; i++) v[i] *= sc;
+    }
+}
+
+void nn_mul_sigmoid(float *restrict x, const float *restrict g, size_t n) {
+    float t[64];
+    for (size_t i = 0; i < n; i += 64) {
+        size_t m = n - i < 64 ? n - i : 64;
+        memcpy(t, g + i, m * sizeof *t);
+        nn_logistic(t, m);
+        for (size_t l = 0; l < m; l++) x[i + l] *= t[l];
+    }
+}
+
+void nn_mul_silu(float *restrict x, const float *restrict g, size_t n) {
+    float t[64];
+    for (size_t i = 0; i < n; i += 64) {
+        size_t m = n - i < 64 ? n - i : 64;
+        memcpy(t, g + i, m * sizeof *t);
+        nn_silu(t, m);
+        for (size_t l = 0; l < m; l++) x[i + l] *= t[l];
+    }
+}
+
+void nn_conv_causal(const float *x, int t, int c, size_t ldx, float *state, int k, const float *w, float *y,
+                    size_t ldy) {
+    /* in[i] is state row i for i < k - 1, else x row i - (k - 1). Each output row
+     * is computed from rows already read before it is written, so y may be x:
+     * the window is held in `win`, k rows of c, refreshed one row a step. */
+    float *win = malloc((size_t)k * (size_t)c * sizeof *win);
+    if (!win) return;
+    memcpy(win, state, (size_t)(k - 1) * (size_t)c * sizeof *win);
+    for (int i = 0; i < t; i++) {
+        memcpy(win + (size_t)(k - 1) * c, x + (size_t)i * ldx, (size_t)c * sizeof *win);
+        float *o = y + (size_t)i * ldy;
+        for (int ch = 0; ch < c; ch++) o[ch] = win[ch] * w[ch];
+        for (int j = 1; j < k; j++) {
+            const float *wi = win + (size_t)j * c, *wj = w + (size_t)j * c;
+            for (int ch = 0; ch < c; ch++) o[ch] += wi[ch] * wj[ch];
+        }
+        memmove(win, win + c, (size_t)(k - 1) * (size_t)c * sizeof *win);
+    }
+    memcpy(state, win, (size_t)(k - 1) * (size_t)c * sizeof *win);
+    free(win);
+}
+
+void nn_gated_delta(const float *q, const float *k, size_t ldq, const float *v, size_t ldv, const float *g,
+                    const float *beta, int t, int hk, int hv, int dk, int dv, float qscale, float *state,
+                    float *o, size_t ldo) {
+    int per = hv / hk;
+    float *u = malloc((size_t)dv * 2 * sizeof *u);
+    if (!u) return;
+    float *ov = u + dv;
+    for (int s = 0; s < t; s++)
+        for (int h = 0; h < hv; h++) {
+            const float *qh = q + (size_t)s * ldq + (size_t)(h / per) * dk;
+            const float *kh = k + (size_t)s * ldq + (size_t)(h / per) * dk;
+            const float *vh = v + (size_t)s * ldv + (size_t)h * dv;
+            float *S = state + (size_t)h * dk * dv;
+            float decay = expf(g[(size_t)s * hv + h]), b = beta[(size_t)s * hv + h];
+            /* S *= decay; u = v - S^T k */
+            for (int j = 0; j < dv; j++) u[j] = 0;
+            for (int i = 0; i < dk; i++) {
+                float *Si = S + (size_t)i * dv, ki = kh[i];
+                for (int j = 0; j < dv; j++) {
+                    Si[j] *= decay;
+                    u[j] += Si[j] * ki;
+                }
+            }
+            for (int j = 0; j < dv; j++) u[j] = (vh[j] - u[j]) * b;
+            /* S += k u^T; o = S^T q */
+            for (int j = 0; j < dv; j++) ov[j] = 0;
+            for (int i = 0; i < dk; i++) {
+                float *Si = S + (size_t)i * dv, ki = kh[i], qi = qh[i] * qscale;
+                for (int j = 0; j < dv; j++) {
+                    Si[j] += ki * u[j];
+                    ov[j] += Si[j] * qi;
+                }
+            }
+            memcpy(o + (size_t)s * ldo + (size_t)h * dv, ov, (size_t)dv * sizeof *ov);
+        }
+    free(u);
+}
+
+void nn_rope_half(float *x, int rot, const float *inv_freq, float pos) {
+    int half = rot / 2;
+    for (int i = 0; i < half; i++) {
+        float f = pos * inv_freq[i], c = cosf(f), s = sinf(f), a = x[i], b = x[i + half];
+        x[i] = a * c - b * s;
+        x[i + half] = b * c + a * s;
+    }
+}
+
+void nn_q8_0_quantize(const float *restrict x, int n, nn_q8_0 *restrict out) {
+    for (int b = 0; b < n / NN_Q8_0; b++) {
+        const float *v = x + b * NN_Q8_0;
+        float amax = 0;
+        for (int i = 0; i < NN_Q8_0; i++) amax = fmaxf(amax, fabsf(v[i]));
+        out[b].d = amax / 127.0f;
+        float id = amax > 0 ? 127.0f / amax : 0.0f;
+        for (int i = 0; i < NN_Q8_0; i++) out[b].q[i] = (int8_t)rint_even(v[i] * id);
+    }
+}
+
+void nn_attend_q8(const float *q, const nn_q8_0 *k, const nn_q8_0 *v, size_t ld, int n, int dh, float scale,
+                  float *out, float *scratch) {
+    int nb = dh / NN_Q8_0;
+    float mx = -INFINITY;
+    for (int j = 0; j < n; j++) {
+        const nn_q8_0 *kj = k + (size_t)j * ld;
+        float s = 0;
+        for (int b = 0; b < nb; b++) {
+            float p = 0;
+            for (int i = 0; i < NN_Q8_0; i++) p += q[b * NN_Q8_0 + i] * (float)kj[b].q[i];
+            s += p * kj[b].d;
+        }
+        scratch[j] = s * scale;
+        if (scratch[j] > mx) mx = scratch[j];
+    }
+    float sum = 0;
+    for (int j = 0; j < n; j++) {
+        scratch[j] = expf(scratch[j] - mx);
+        sum += scratch[j];
+    }
+    for (int i = 0; i < dh; i++) out[i] = 0;
+    for (int j = 0; j < n; j++) {
+        const nn_q8_0 *vj = v + (size_t)j * ld;
+        float p = scratch[j] / sum;
+        for (int b = 0; b < nb; b++) {
+            float pd = p * vj[b].d;
+            for (int i = 0; i < NN_Q8_0; i++) out[b * NN_Q8_0 + i] += pd * (float)vj[b].q[i];
+        }
     }
 }

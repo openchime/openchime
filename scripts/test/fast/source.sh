@@ -22,6 +22,6 @@
 . "$(dirname "$0")/../lib/common.sh"
 scripts/test/fast/opcodes.sh shared/protocol.h
 scripts/policy/refs.sh
-for check in make_targets config release_lint tests_lint notices shipped_issues workflow_rules words vendored clean_run; do
+for check in make_targets config release_lint tests_lint notices shipped_issues speech_sources workflow_rules words vendored clean_run; do
     scripts/test/fast/$check.sh
 done

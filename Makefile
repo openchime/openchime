@@ -96,7 +96,7 @@ LDFLAGS ?= -lpthread -lm   # -lm: SQLite FTS5 ranking (bm25) calls log()
 # build`: read-aloud (TTS) needs Opus and the voice model's data
 # (ttskit/data/); voice input (STT) needs the recognizer's data
 # (sttkit/data/); summaries (SUM) need
-# llama.cpp; the web client (WEB) needs Emscripten and a wasm build of SDL3 and
+# nothing beyond the tree; the web client (WEB) needs Emscripten and a wasm build of SDL3 and
 # the codecs. The full build turns them all on.
 #
 # The switches are remembered: build/.features holds the values of the last

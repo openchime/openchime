@@ -225,7 +225,7 @@ zig's clang. One render peaks at about 156 MB resident, about 86 MB of it `voice
 mapped pages, which the kernel may drop.
 
 **The same numbers as the reference.** The forward pass does the arithmetic of the
-model's graph in the order ONNX Runtime computes it, to the bit, up to the inverse STFT at
+model's graph in the order the reference engine computes it, to the bit, up to the inverse STFT at
 the very end: its quantisation and rounding, its integer products, its scale and bias in
 its order, its norms, softmax, GELU, sigmoid, tanh, sin and atan approximations, its fused
 multiply-adds and its vectorised sums. Anything less is not enough, for three reasons. A
@@ -237,7 +237,7 @@ and through the generator's residual blocks such steps multiply — a 1e-7 diffe
 its first upsampling comes out at 25 dB. And the harmonic source's phase is a running sum
 of the pitch, so any difference there grows along the sentence. With the noise off on both
 sides, ttskit's renders of the reference sentences have a signal-to-noise ratio of 136–141 dB
-against ONNX Runtime's (the test requires 40 dB, §9).
+against the reference engine's (the test requires 40 dB, §9).
 
 **The noise and its seed.** The model mixes random noise into its harmonic source: normal
 noise on every sample of every harmonic, of standard deviation 0.003 where the pitch is
@@ -246,7 +246,7 @@ harmonics 2 to 9. ttskit draws both from its own generator, SplitMix64 (`voice_r
 normal values by the Box–Muller transform in double: `noise` 1 with a `seed`, and the same
 seed gives the same audio, every time and on every machine. `noise` 0 leaves both out,
 which is how parity is checked: the reference's two random operators cannot be reproduced,
-and two of ONNX Runtime's own renders of one input agree to only 17–20 dB. The daemon
+and two of the reference engine's own renders of one input agree to only 17–20 dB. The daemon
 renders with the noise on and one fixed seed, `TTS_VOICE_SEED` (1, `daemon/tts_voice.h`),
 so a message rendered again sounds the same as the first time; the seed is part of the
 model version renders are cached under.
@@ -514,8 +514,9 @@ refuses inputs whose tensors are not the ones it expects, naming the first; and 
 same bytes on every run and machine. [VENDORS.md](./VENDORS.md) gives the pinned inputs, the
 commands and the SHA-256 the result must have. After converting a different model, update
 the `voice-` part of `OC_TTS_MODEL_VERSION` in `daemon/tts.h` (the first eight hex digits of
-the new file's SHA-256), remake the references (`tests/manual/voice_ref.c`, §9) and listen,
-as above.
+the new file's SHA-256) and listen, as above. Its references cannot be made: the committed
+ones are this model's, made once and frozen (§9), so a new model is checked by the kernels'
+naive versions in the tests and by ear.
 
 ## 9. Tests
 
@@ -546,17 +547,17 @@ as above.
 `tests/main.c`) renders each fixture in `tests/data/voice/` — six sentences, in
 `expr-voice-2-m` and `expr-voice-2-f`, with numbers, punctuation and a long one — from the
 committed `voice.bin`. With the noise off, each has the reference's sample count and at least
-40 dB SNR against ONNX Runtime's noise-off rendering (measured: 136–141 dB); with it on, the
+40 dB SNR against the reference engine's noise-off rendering (measured: 136–141 dB); with it on, the
 variance of the noise the harmonic source adds is within 10% of what the model's operators
 specify for the same input. `build/tts_pack parity ttskit/data tests/data/voice` prints the
 same as a table.
 
-The references were made once by `tests/manual/voice_ref.c`, which runs the upstream model
-file with ONNX Runtime 1.30.0's prebuilt release on one thread (VENDORS.md has the files),
-and are committed: per fixture the token ids (`.ids`), the raw output with the noise on
+The references were made once from the upstream model file, on one thread, before the
+engine they were made with was withdrawn; they cannot be made again, and the committed files
+are the reference: per fixture the token ids (`.ids`), the raw output with the noise on
 (`.f32`) and with the model's two random operators replaced by zeros (`.quiet.f32`), and one
 `manifest` with the voice, style row, speed, sample counts and the SNR between two noisy
-runs, kept as a record (17–20 dB). No suite runs that program; rerun it only to remake them.
+runs, kept as a record (17–20 dB).
 
 ## 10. Limits
 
@@ -576,5 +577,5 @@ runs, kept as a record (17–20 dB). No suite runs that program; rerun it only t
   by choice: renders are cached, and the render worker is one thread.
 - **No streaming:** a sentence is rendered whole before any of it is returned.
 - **Bit-exact only with the noise off,** and only to the inverse STFT's last roundings: with
-  the noise on, ttskit's generator is not ONNX Runtime's, so a render matches the
+  the noise on, ttskit's generator is not the reference engine's, so a render matches the
   reference's sound, not its samples.

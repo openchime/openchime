@@ -20,6 +20,11 @@
 #include "sum_core.h"
 #include "sum_engine.h"
 #include "sum_fetch.h"
+#include "summary_pack.h"
+#include "sumkit_fixture.h"
+#include "testenv.h"
+#include <mbedtls/sha256.h>
+#include <sys/stat.h>
 #include "sum_load.h"
 #include "sum_store.h"
 #include "sum_worker.h"
@@ -492,21 +497,167 @@ static void test_split(void) {
     oc_sum_parts_free(parts, n);
 }
 
-/* The CPU check: local summaries only where the model's instructions exist. */
-static int has_all(const char *f) { (void)f; return 1; }
-static int no_avx2(const char *f) { return strcmp(f, "avx2") != 0; }
-static void test_cpu(void) {
-    char err[128] = "";
-    CHECK(oc_sum_cpu_ok(has_all, err, sizeof err) == 1);
-#if defined(__x86_64__)
-    CHECK(oc_sum_cpu_ok(no_avx2, err, sizeof err) == 0 && strstr(err, "avx2"));
-    /* The daemon's own detection (cpuid, since the release link has no
-     * __cpu_model) agrees with the compiler's about this machine. */
-    __builtin_cpu_init();
-    int builtin = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
-                  __builtin_cpu_supports("f16c") && __builtin_cpu_supports("bmi2");
-    CHECK(oc_sum_cpu_ok(NULL, err, sizeof err) == builtin);
-#endif
+/* The model made on first use (sum_fetch.h): a loopback server holds a small
+ * model of the family as Qwen publishes one; it is fetched, each file checked,
+ * converted, the result checked, the sources deleted and the licence kept; a
+ * second start fetches nothing; a wrong file, a wrong result and a stop each
+ * leave nothing behind. */
+typedef struct {
+    int  fd;
+    char dir[512];
+    int  served;
+    volatile int quit;
+} filesrv;
+
+static void *filesrv_run(void *arg) {
+    filesrv *s = arg;
+    for (;;) {
+        int c = accept(s->fd, NULL, NULL);
+        if (c < 0 || s->quit) { if (c >= 0) close(c); break; }
+        char req[2048];
+        size_t n = 0;
+        while (n < sizeof req - 1) {
+            ssize_t r = recv(c, req + n, sizeof req - 1 - n, 0);
+            if (r <= 0) break;
+            n += (size_t)r;
+            req[n] = 0;
+            if (strstr(req, "\r\n\r\n")) break;
+        }
+        req[n] = 0;
+        char name[256] = "", path[1200];
+        sscanf(req, "GET /m/%255s", name);
+        snprintf(path, sizeof path, "%s/%s", s->dir, name);
+        FILE *f = name[0] ? fopen(path, "rb") : NULL;
+        if (!f) {
+            const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)!send(c, nf, strlen(nf), 0);
+        } else {
+            fseek(f, 0, SEEK_END);
+            long len = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char head[256], buf[65536];
+            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", len);
+            (void)!send(c, head, strlen(head), 0);
+            size_t r;
+            while ((r = fread(buf, 1, sizeof buf, f)) > 0) (void)!send(c, buf, r, 0);
+            fclose(f);
+            s->served++;
+        }
+        close(c);
+    }
+    return NULL;
+}
+
+static void hex_sha_file(const char *path, char hex[65]) {
+    unsigned char sha[32];
+    FILE *f = fopen(path, "rb");
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    unsigned char buf[65536];
+    size_t r;
+    while (f && (r = fread(buf, 1, sizeof buf, f)) > 0) mbedtls_sha256_update(&c, buf, r);
+    if (f) fclose(f);
+    mbedtls_sha256_finish(&c, sha);
+    mbedtls_sha256_free(&c);
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", sha[i]);
+}
+
+static int exists(const char *dir, const char *name) {
+    char p[1200];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    struct stat st;
+    return stat(p, &st) == 0;
+}
+
+static int pause_never(void *ctx) { (void)ctx; return 0; }
+static int pause_stop(void *ctx) { (void)ctx; return 1; }
+
+static void test_model_fetch(void) {
+    char srv_dir[512], tmp[512];
+    CHECK(oc_test_mkdtemp("sumfetch-src", srv_dir, sizeof srv_dir) == 0);
+    CHECK(oc_test_sumkit_model(srv_dir, SKF_NONE) == 0);
+    /* What the conversion must give: the fixture converted here. */
+    char pack[1200], pack_hex[65];
+    snprintf(pack, sizeof pack, "%s/expected.bin", srv_dir);
+    char err[512] = "";
+    CHECK(oc_summary_pack(srv_dir, pack, 0, NULL, NULL, NULL, NULL, err, sizeof err) == 0);
+    hex_sha_file(pack, pack_hex);
+    unlink(pack);
+    static const char *const names[4] = { "config.json", "tokenizer.json", "LICENSE", "model.safetensors" };
+    char hex[4][65], path[1200];
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "%s/%s", srv_dir, names[i]);
+        hex_sha_file(path, hex[i]);
+    }
+    filesrv s;
+    memset(&s, 0, sizeof s);
+    snprintf(s.dir, sizeof s.dir, "%s", srv_dir);
+    s.fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    CHECK(bind(s.fd, (struct sockaddr *)&a, sizeof a) == 0 && listen(s.fd, 8) == 0 &&
+          getsockname(s.fd, (struct sockaddr *)&a, &al) == 0);
+    pthread_t t;
+    pthread_create(&t, NULL, filesrv_run, &s);
+    char base[128];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d/m/", ntohs(a.sin_port));
+    oc_sum_source_file files[4];
+    for (int i = 0; i < 4; i++) files[i] = (oc_sum_source_file){ names[i], names[i], hex[i], 64u << 20 };
+    oc_sum_source src = { base, files, 4, pack_hex };
+    volatile int stop = 0;
+    char out[1200];
+
+    /* Made, checked, the sources gone and the licence kept. */
+    CHECK(oc_test_mkdtemp("sumfetch", tmp, sizeof tmp) == 0);
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_never, NULL, out, sizeof out, err, sizeof err) == 0);
+    CHECK(s.served == 4 && exists(tmp, "summary.bin") && exists(tmp, "summary.bin.ok") && exists(tmp, "LICENSE") &&
+          !exists(tmp, "source"));
+    char got[65];
+    hex_sha_file(out, got);
+    CHECK(strcmp(got, pack_hex) == 0);
+    /* A second start fetches nothing. */
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_never, NULL, out, sizeof out, err, sizeof err) == 0 && s.served == 4);
+    oc_test_rmtree(tmp);
+
+    /* A source that is not the one pinned. */
+    files[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    CHECK(oc_test_mkdtemp("sumfetch", tmp, sizeof tmp) == 0);
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_never, NULL, out, sizeof out, err, sizeof err) == -1 &&
+          strstr(err, "config.json is not the one expected")); /* contract: the log names the file that failed */
+    CHECK(!exists(tmp, "summary.bin") && !exists(tmp, "source"));
+    oc_test_rmtree(tmp);
+    files[0].sha256 = hex[0];
+    /* A conversion whose result is not the one pinned. */
+    src.pack_sha256 = "1111111111111111111111111111111111111111111111111111111111111111";
+    CHECK(oc_test_mkdtemp("sumfetch", tmp, sizeof tmp) == 0);
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_never, NULL, out, sizeof out, err, sizeof err) == -1 &&
+          strstr(err, "converted model is not the one expected")); /* contract: the log says the conversion failed its check */
+    CHECK(!exists(tmp, "summary.bin") && !exists(tmp, "summary.bin.new") && !exists(tmp, "source"));
+    oc_test_rmtree(tmp);
+    src.pack_sha256 = pack_hex;
+    /* Stopped: while fetching, and between the conversion's tensors. */
+    stop = 1;
+    CHECK(oc_test_mkdtemp("sumfetch", tmp, sizeof tmp) == 0);
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_never, NULL, out, sizeof out, err, sizeof err) == -1 &&
+          strstr(err, "stopped"));
+    CHECK(!exists(tmp, "summary.bin") && !exists(tmp, "source"));
+    stop = 0;
+    CHECK(oc_sum_model_ensure(tmp, &src, &stop, pause_stop, NULL, out, sizeof out, err, sizeof err) == -1 &&
+          strstr(err, "stopped"));
+    CHECK(!exists(tmp, "summary.bin") && !exists(tmp, "summary.bin.new") && !exists(tmp, "source"));
+    oc_test_rmtree(tmp);
+
+    s.quit = 1;
+    int c = socket(AF_INET, SOCK_STREAM, 0);          /* wake the accept */
+    (void)!connect(c, (struct sockaddr *)&a, sizeof a);
+    close(c);
+    pthread_join(t, NULL);
+    close(s.fd);
+    oc_test_rmtree(srv_dir);
 }
 
 /* --- the store, its guard and the purge ---------------------------------------- */
@@ -1637,7 +1788,7 @@ int run_summary_tests(void) {
     test_cut();
     test_parse();
     test_split();
-    test_cpu();
+    test_model_fetch();
     test_store();
     test_gate();
     test_build();

@@ -1,0 +1,34 @@
+# Synthetic: written for the tests, about no real people or company. Held out: used only for the quantisation measure.
+Yusuf Demir: Planning for the next quarter. We have room for three large projects and a few small ones.
+Clara Jensen: My vote is search first. It's the top complaint in every customer survey since last spring.
+Mateo Alvarez: Search is big though. The last estimate was eight weeks for two people.
+Clara Jensen: Even so. Half of the support tickets about finding old messages would go away.
+Yusuf Demir: Let's put search on the list. What else?
+Nadia Petrova: Offline mode for the mobile app. Field teams in construction and shipping keep asking for it.
+  Mateo Alvarez: How offline? Reading only, or writing too?
+  Nadia Petrova: Reading first. Writing can come later, it needs conflict handling.
+  Mateo Alvarez: Reading only is maybe four weeks.
+Yusuf Demir: That's a good size. Offline reading goes on the list.
+Oliver Grant: We should also pay down some debt. The notification service is still on the old framework and every change takes twice as long.
+Clara Jensen: Is that a large project or a small one?
+Oliver Grant: Large. Six weeks to move it properly, with tests.
+Yusuf Demir: So search, offline reading and the notification service. That fills the three large slots.
+Nadia Petrova: For small ones: dark mode on the web app, and fixing the time zones in exported reports.
+Mateo Alvarez: The time zone bug affects every customer with teams in more than one country. It should be first.
+Clara Jensen: Agreed. Dark mode is nice but nobody is blocked by it.
+Yusuf Demir: Who leads search?
+  Clara Jensen: I can, with Mateo.
+  Mateo Alvarez: Yes, but I can only start in the second week, I'm finishing the billing changes.
+  Yusuf Demir: That's fine. Search starts in week two.
+Oliver Grant: I'll lead the notification service move. I'd like one more person for the last two weeks.
+Nadia Petrova: I can join for those two weeks after offline reading is done.
+Yusuf Demir: Good. Nadia leads offline reading, then helps Oliver.
+Clara Jensen: Do we have design time for search? The results page needs a new layout.
+Yusuf Demir: Design has about 40 percent of one person for us. Search gets most of it.
+Mateo Alvarez: What about the customer who asked for single sign-on with their own provider?
+Yusuf Demir: That's a sales request for one account. Let's look at it again when a second customer asks.
+Oliver Grant: Can we agree to review progress every two weeks?
+Yusuf Demir: Yes, every other Tuesday at 14:00. I'll send the invite.
+Nadia Petrova: One risk: the app store review for offline mode might take longer because of the new storage permission.
+Yusuf Demir: Let's submit a test build early, in week three, to find out.
+Clara Jensen: I'll write the plan up and share it by Friday.

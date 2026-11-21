@@ -1,0 +1,36 @@
+# Synthetic: written for the tests, about no real people or company. Held out: used only for the quantisation measure.
+Hana Kowalski: The disk on db-replica-3 is at 91 percent. It was 78 percent last week.
+  Omar Haddad: The slow query log is the culprit, it's 120 GB. Logging was left at debug after the incident on the 2nd.
+  Hana Kowalski: Can you set it back to warning and rotate the old logs?
+  Omar Haddad: Done. Disk is at 64 percent now.
+Ines Moreau: We're getting about 300 errors an hour from the image resizer since the last deploy.
+Ines Moreau: They're all for WebP files with transparency. The new library version doesn't handle the alpha channel.
+Omar Haddad: Should we roll back the resizer only, or the whole deploy?
+Hana Kowalski: Only the resizer, the rest of the deploy has the billing fix we need.
+Ines Moreau: Rolled back the resizer to 4.2.1. Errors stopped at 11:05.
+Kwame Asante: I'd like to move the staging cluster to the cheaper instance type. It would save about 1,800 a month.
+  Hana Kowalski: What happens to the load tests? They run on staging.
+  Kwame Asante: They would take about 30 percent longer. I think that's acceptable.
+  Ines Moreau: Fine by me as long as the nightly run still finishes before 06:00.
+  Kwame Asante: It would finish around 04:30. I'll make the change on Monday.
+Omar Haddad: Certificates for the three regional domains expire on the 28th. Renewal is automatic but I'd like someone to watch it.
+Hana Kowalski: I'll check on the 27th.
+Ines Moreau: The status page didn't update during yesterday's outage. People only saw it on social media.
+Omar Haddad: The status page update depends on the same queue that was down. That's a design problem.
+Kwame Asante: We could post updates from a separate small server in another region.
+Hana Kowalski: Let's do that. Kwame, can you estimate the work?
+Kwame Asante: About three days. I'll start after the instance change.
+Ines Moreau: Postmortem for yesterday is drafted. Root cause: a config change to the queue's memory limit was applied to all regions at once.
+Omar Haddad: We need staged rollouts for config, not just for code.
+Hana Kowalski: Agreed. Let's discuss the process at Thursday's ops meeting.
+Ines Moreau: Who owns the postmortem action items?
+Hana Kowalski: Omar for staged config rollouts, Kwame for the status page, me for alert thresholds.
+Omar Haddad: Is anyone else seeing the dashboard graphs lag by ten minutes?
+  Kwame Asante: Yes, since this morning. The metrics collector is behind.
+  Omar Haddad: It's backed up on one partition. I restarted it and it's catching up.
+  Kwame Asante: Graphs are current again.
+Ines Moreau: Reminder that the on-call rotation changes on Monday. I'm primary next week, Kwame secondary.
+Hana Kowalski: Budget question: do we renew the log search contract at 24,000 a year or move to the open-source stack?
+Omar Haddad: The open-source stack would need about two weeks of setup and some ongoing care.
+Kwame Asante: The contract renews on the 15th of next month, so we have time to decide.
+Hana Kowalski: Let's get numbers for both and decide by the 5th.

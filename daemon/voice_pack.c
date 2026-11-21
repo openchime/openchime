@@ -618,7 +618,7 @@ static int pb_next(const uint8_t **p, const uint8_t *end, uint32_t *field, int *
 static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
-/* ---- the ONNX graph -------------------------------------------------------- */
+/* ---- the .onnx graph -------------------------------------------------------- */
 
 #define MAX_IN  16
 #define MAX_OUT 8
@@ -745,7 +745,7 @@ static int graph_parse(const uint8_t *p, size_t n, graph *g, char *err, size_t c
     span s;
     while ((r = pb_next(&p, end, &f, &wt, &v, &s)) == 1)
         if (f == 7 && wt == 2) { gp = s.p; gn = s.n; }
-    if (r < 0 || !gp) { seterr(err, cap, "the model is not an ONNX file"); return -1; }
+    if (r < 0 || !gp) { seterr(err, cap, "the model is not an .onnx file"); return -1; }
     /* Two passes over the graph: count, then fill. */
     for (int pass = 0; pass < 2; pass++) {
         const uint8_t *q = gp, *qe = gp + gn;

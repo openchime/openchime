@@ -16,6 +16,7 @@
 #include "certs.h"
 #include "config.h"
 #include "sum_fetch.h"
+#include "sum_load.h"
 #include "sum_worker.h"
 #include "dbwriter.h"
 #include "enroll.h"
@@ -32,6 +33,7 @@
 #include "tts_data.h"   /* the beside-the-binary data lookup: speech data and the web client's wasm */
 #include "voice_pack.h"  /* --voice-pack: the voice model's data file */
 #include "recognizer_pack.h"  /* --recognizer-pack: the recognizer's data file */
+#include "summary_pack.h"  /* --summary-pack: the summary model's data file */
 #include "webapp.h"
 /* The engines' headers come in whether or not the engines do: the data
  * manifests below name each model's version, and a daemon built with
@@ -49,12 +51,15 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -399,6 +404,16 @@ static void *sum_start(sum_up *u, const oc_sum_engine *e, const char *what) {
     return NULL;
 }
 
+#ifdef OC_SUM
+/* Asked between the conversion's tensors: waits while the machine is busy;
+ * non-zero once the daemon is stopping. */
+static int sum_convert_pause(void *ctx) {
+    oc_sum_load *gate = ctx;
+    while (!g_stop && oc_sum_load_busy(gate)) usleep(1000000);
+    return g_stop != 0;
+}
+#endif
+
 static void *sum_bring_up(void *arg) {
     sum_up *u = arg;
     char err[300] = "";
@@ -415,12 +430,20 @@ static void *sum_bring_up(void *arg) {
     }
 #ifdef OC_SUM
     char dir[1024], path[1200];
-    if (!oc_sum_cpu_ok(NULL, err, sizeof err)) return sum_off("openchimed: summaries are off: %s\n", err);
+    /* Fetching and converting the model is idle-time work, as summarizing is:
+     * this thread at idle priority, the conversion paused while the machine
+     * is busy. */
+    struct sched_param sp;
+    memset(&sp, 0, sizeof sp);
+    sched_setscheduler(0, SCHED_IDLE, &sp);
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+    oc_sum_load gate;
+    oc_sum_load_init(&gate, oc_sum_probe_system());
     oc_sum_model_dir(u->db_path, dir, sizeof dir);
-    if (oc_sum_model_ensure(dir, OC_SUM_MODEL_FILE, OC_SUM_MODEL_URL, OC_SUM_MODEL_SHA256, OC_SUM_MODEL_BYTES,
-                            (const volatile int *)&g_stop, path, sizeof path, err, sizeof err) != 0)
-        return sum_off("openchimed: summaries are off: %s\n", err);
-    e = oc_sum_llama_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
+    if (oc_sum_model_ensure(dir, &OC_SUM_SOURCE, (const volatile int *)&g_stop, sum_convert_pause, &gate, path,
+                            sizeof path, err, sizeof err) != 0)
+        return g_stop ? NULL : sum_off("openchimed: summaries are off: %s\n", err);
+    e = oc_sum_local_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
     /* The model must load; the worker loads it again when first needed. */
     void *h = g_stop ? NULL : e->open(e->ctx, err, sizeof err);
     if (!h) {
@@ -472,6 +495,9 @@ int main(int argc, char **argv) {
      * published, and the listing of its graphs: in every build, voice input or
      * not, for the same reason. */
     if (argc >= 2 && strcmp(argv[1], "--recognizer-pack") == 0) return oc_recognizer_pack_cli(argc, argv);
+    /* The summary model's data file (summary_pack.h), from Qwen's published
+     * files, quantised or (--full) not: in every build, summaries or not. */
+    if (argc >= 2 && strcmp(argv[1], "--summary-pack") == 0) return oc_summary_pack_cli(argc, argv);
     /* The registry's views (config.h): the reference CONFIG.md carries, the
      * packaged environment file, and a check of this environment -- or of a
      * file, applied over it -- through the same loader the daemon starts with. */

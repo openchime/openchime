@@ -1,5 +1,14 @@
-# Voice input's recognizer as ONNX Runtime 1.30.0 runs it (tests/manual/recognizer_ref.c).
+# Voice input's recognizer references: made once from the published model,
+# before the engine they were made with was withdrawn; they cannot be made
+# again, and these files are the reference (docs/STTKIT.md §8).
+# Each fixture is speech the read-aloud voice rendered, brought to 16 kHz as
+# `openchimed --stt-hear` brings a file (silence: 1.5 s of zeros); no recording
+# of a person. Per fixture <name>: <name>.s16, the 16 kHz input, int16
+# little-endian; <name>.enc.f32, the encoder's output, frames x 320 float32;
+# <name>.logits.f32, the first decoding step's logits, 32,768 float32.
 # <name> <samples> <frames> <tokens> <ids> <text...>
+# <ids> the decoded token ids joined by commas ("-" for none); <text> what the
+# tokenizer makes of them.
 greeting-m 54400 172 11 7197,7250,29892,14332,29889,450,2048,338,7933,1449,29889 Good morning, everyone. The build is green again.
 numbers-f 72400 228 16 2191,300,592,472,2211,25020,373,323,1041,3250,297,5716,1023,6893,3023,29889 Meet me at three fifteen on Tuesday in room two hundred four.
 names-m 55200 176 12 26579,8289,3761,304,3638,278,12616,368,3461,304,27390,29889 Ask Priya to send the quarterly report to Marcus.

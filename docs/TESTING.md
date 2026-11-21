@@ -41,8 +41,10 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
   Makefile's targets are the ones its header names; the configuration
   registry is the one source of every `OPENCHIME_*` name; nothing that ships
   runs in development mode; the tests' own rules (§2.3a); every linked
-  component has its licence notice; and what a release lists, closes and
-  sends as shipped;
+  component has its licence notice; what a release lists, closes and
+  sends as shipped; and the speech data's archive tool checking, joining and
+  unpacking a stand-in archive offline, refusing a changed file by name
+  (`scripts/test/fast/speech_sources.sh`);
 - actionlint on the workflows (`scripts/test/fast/actionlint.sh`, fetched
   pinned on first use);
 - the suites `tests/main.c` marks `FAST`, one after another (§2.4), timing judged;
@@ -139,8 +141,8 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 **`make build` and `make test`** (Linux, x86-64 or arm64): a C compiler
 (`cc`), `make`, `nasm` (libvpx's assembly), `curl` and `xz` (the pinned
 llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
-use (`scripts/build/*.sh`, `mk/toolchains.mk`); no llama.cpp or
-Emscripten is needed. actionlint is fetched once into
+use (`scripts/build/*.sh`, `mk/toolchains.mk`); no Emscripten is
+needed. actionlint is fetched once into
 `~/.cache/openchime/`. Four things are checked only where present, and a
 missing one is a `SKIP` (a failure where `CI` is set): `ffprobe` (package
 `ffmpeg`, the media suite's recording check, a full-suite suite), an IPv6
@@ -150,8 +152,8 @@ pending (`test_sock`'s connect bound, skipped when the kernel answers every
 SYN). `gdb` is optional and makes a crash print every thread's stack.
 
 **`make build-all` and `make test-all`** run in CI only and refuse anywhere
-else. What they need is installed by the workflows: `cmake` 3.28+ and a C++17
-compiler for the speech and summary builds, `setarch` for the
+else. What they need is installed by the workflows: `cmake` 3.28+ for SDL3's own
+builds, `setarch` for the
 ThreadSanitizer part, a clang with libFuzzer for the fuzzing harnesses,
 `ffmpeg`, and for the release's artifacts
 `podman`, `buildah`, `rpm`, `cpio`, `nsis`, `python3-pefile`, and clang and
@@ -356,13 +358,12 @@ framework.
   voice and refused when damaged. `voice_parity` in `tests/test_voice.c`, a
   `FULL` suite: every fixture in `tests/data/voice/` rendered from the committed
   `voice.bin` with the model's noise off has the reference's sample count and
-  at least 40 dB SNR against ONNX Runtime's noise-off rendering (136–141 dB
+  at least 40 dB SNR against the reference's noise-off rendering (136–141 dB
   measured), and with the noise on the noise's variance is within 10% of what
   the model's operators specify. The fixtures — six sentences in two voices,
-  their token ids and ONNX Runtime's raw output with the noise on and off, and a
-  `manifest` — were made once by `tests/manual/voice_ref.c` against ONNX
-  Runtime's prebuilt release (VENDORS.md) and are committed; no suite runs that
-  program, and nothing a suite builds links ONNX Runtime.
+  their token ids and the reference's raw output with the noise on and off, and a
+  `manifest` — were made once, before the engine they were made with was withdrawn; they cannot be made again;
+  the committed files are the reference.
 - **Voice input** (ARCH-112) — `tests/test_voice.c`: the segmenter over
   synthetic voiced sound with known pauses (free talk, the cap, push to talk) and
   the ERLE harness (AUDIO.md §6.4: converged, 100 ppm drift, double-talk);
@@ -374,11 +375,10 @@ framework.
   refusing what is not the published model; `recognizer_parity` in the same file,
   a `FULL` suite: every fixture in `tests/data/recognizer/` heard from the
   committed `recognizer.bin` gives the reference's token ids, with its encoder
-  output and first decoding step's logits within 30 dB SNR of ONNX Runtime's
+  output and first decoding step's logits within 30 dB SNR of the reference's
   (measured: the encoder output identical, the logits 129–137 dB). The fixtures —
-  seven utterances spoken by read-aloud's voice and silence, with ONNX Runtime's
-  tokens, encoder output and first logits — were made once by
-  `tests/manual/recognizer_ref.c` (VENDORS.md) and are committed;
+  seven utterances spoken by read-aloud's voice and silence, with the reference's
+  tokens, encoder output and first logits — were made once, before the engine they were made with was withdrawn; they cannot be made again;
   `tests/test_protocol.c` round-trips the `STT_*` frames; `itest_netloop` drives
   the daemon's vertical — the capability and cap at auth; push to talk answered to
   the speaker only; free talk posted through the send path, in order, idempotently,
@@ -1526,7 +1526,7 @@ usable once the kernel takes its share), on the full build's daemon, sampling
 | Heard a 20 s segment, in one piece | 156 MB | 3 MB | 40 s |
 | Heard a 30 s segment, in one piece | 162 MB | 3 MB | 413 s |
 
-These rows were measured when both models ran on ONNX Runtime. They now run in plain
+These rows were measured when both models ran on their previous engine. They now run in plain
 C: in ttskit one render peaks at about 156 MB resident on a laptop core, about 86 MB of
 it the model's mapped pages (READ-ALOUD.md §4), and in sttkit hearing a 6 s segment
 peaks at about 53 MB, 40 MB of it the recognizer's mapped pages (VOICE-INPUT.md §6);

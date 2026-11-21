@@ -1,0 +1,42 @@
+Messages from #launch, oldest first. Indented lines are replies in a thread.
+
+[1] Marta Silva: Launch check-in. We're still aiming for the 2.0 release on Thursday the 9th.
+[2] Jonas Becker: The migration ran on the staging copy in 47 minutes. On production data it should be about 70.
+[3] Marta Silva: 70 minutes of downtime is too long. Can we run it in two parts?
+  [4] Jonas Becker: Yes. The index rebuild can run before the switch while users are still on 1.9. That leaves about 25 minutes of downtime.
+  [5] Marta Silva: Let's do that. Please update the plan.
+  [6] Jonas Becker: Updated. The index part starts at 18:00 the day before.
+[7] Lena Hoffmann: Marketing needs the final screenshots by Monday for the announcement post.
+[8] Felix Nguyen: The new dashboard still has the old icons. I'll replace them tomorrow and send screenshots on Monday morning.
+[9] Lena Hoffmann: Monday morning works, the post goes out Thursday at 10:00.
+[10] Sam Adeyemi: Security review found one issue: the export endpoint doesn't check the workspace on the file id.
+[11] Sam Adeyemi: A user who guesses an id could download another workspace's export. Severity high.
+[12] Marta Silva: That has to be fixed before we launch. Who can take it?
+  [13] Jonas Becker: I can, it's a two-line check plus a test. I'll have a pull request today.
+  [14] Sam Adeyemi: I'll review it as soon as it's up.
+  [15] Jonas Becker: Pull request is up, number 2214.
+  [16] Sam Adeyemi: Reviewed and approved, merged at 16:20.
+[17] Felix Nguyen: Question for everyone: do we keep the old dashboard available for a while, or switch everyone at once?
+[18] Lena Hoffmann: Customers asked for a way back last time.
+[19] Marta Silva: We keep the old one for 30 days behind a setting, then remove it. Felix, can you add the setting?
+[20] Felix Nguyen: Yes, I'll have it by Wednesday.
+[21] Jonas Becker: Load test results: 2,400 requests a second at p99 of 180 ms. The target was 2,000 at 250 ms.
+[22] Marta Silva: Good, that's well inside the target.
+[23] Sam Adeyemi: Who is on call during the launch window?
+[24] Marta Silva: Jonas and me from 18:00 to midnight, Sam after that.
+[25] Lena Hoffmann: Do we have a rollback plan written down anywhere?
+[26] Jonas Becker: Not yet. I'll write it tonight and link it here.
+[27] Felix Nguyen: The mobile apps need a store review. Apple usually takes two days, so I submitted today.
+[28] Marta Silva: Thanks Felix. Final go or no-go meeting is Wednesday at 15:00.
+
+Summarize these lines for someone catching up, in exactly this form:
+
+Overview: [line number] <the most important outcome or change>
+## <what a topic is about>
+[line number] <what happened in it, and where it stands now>
+- [line number] <one detail: who did or said what>
+Needs attention:
+- [line number] action: <who has to do what, and by when if it was said>
+- [line number] question: <a question that was asked and not answered>
+
+Write 0 to 2 topics, the most important first, each titled in 2 to 6 words, with what happened in it in one to three sentences and 0 to 3 details of one sentence each. The overview is one sentence. Write "Needs attention" only for actions and unanswered questions, at most 5, one sentence each, and leave it out when there are none. Every line starts with the numbers of the lines it comes from, at most 3, each in square brackets, as [12] or [12][15]. Write only what the lines say, with their particulars, and name a person only for what their own lines say. Do not comment on, interpret or characterize what happened.

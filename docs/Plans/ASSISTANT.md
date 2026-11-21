@@ -64,7 +64,7 @@ No hits: the answer is "Nothing you can read mentions that." and no model runs.
 
 ## 3. The model
 
-**Proposed.** The summary runtime (ARCH-116): llama.cpp in the daemon, the
+**Proposed.** The summary runtime (ARCH-116): sumkit in the daemon, the
 same worker thread, the same load gate, the same grammar machinery.
 
 - **The model file.** Where summaries are on with the local engine, the

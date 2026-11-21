@@ -529,6 +529,6 @@ are remembered in `build/.features` until changed or `make distclean`.
 |---|---|---|
 | `TTS` | `0` | `1` builds read-aloud in; without it `OPENCHIME_TTS` is accepted and has no effect. The full build sets it, and the three below. |
 | `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT`. |
-| `SUM` | `0` | `1` builds llama.cpp in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
+| `SUM` | `0` | `1` builds sumkit, the summary inference engine, in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
 | `WEB` | `0` | `1` compiles the web client's loader into the daemon, which then serves it at `/app/`. |
 | `OC_BUILD_ID` | *(unset: `dev`)* | The build id `--version` prints: the short commit the release-candidate compiled (ARCH-20, UPGRADING.md). A release number is assigned to a build afterwards and is not compiled in. |

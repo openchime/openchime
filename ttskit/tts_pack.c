@@ -434,7 +434,7 @@ static voice *open_voice(const char *dir) {
     return v;
 }
 
-/* One fixture of a manifest (tests/manual/voice_ref.c documents the format),
+/* One fixture of a manifest (tests/data/voice/manifest documents the format),
  * with its noise-off reference from the #quiet line after it. */
 typedef struct {
     char name[64], voice[32], ids_file[64], quiet_file[64];

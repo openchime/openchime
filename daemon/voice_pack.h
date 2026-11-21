@@ -3,7 +3,7 @@
  * published (READ-ALOUD.md, TTSKIT.md): `openchimed --voice-pack <model.onnx>
  * <voices.npz> <out>` writes voice.bin (ttskit.h has the format).
  *
- * It reads the ONNX file (protobuf) and the stored zip of the voices with no
+ * It reads the .onnx file (protobuf) and the stored zip of the voices with no
  * library, takes exactly the tensors the forward pass needs, names them in
  * ttskit's own terms and writes each in the layout ttskit's kernels read
  * (ttskit/tts_priv.h). The same inputs give the same bytes on every run and
@@ -32,7 +32,7 @@ enum {
     VK_CONVT_DW,     /* depthwise ConvTranspose W: f32 [k][channels] */
     VK_NORM1         /* a norm with scale 1 and bias 0: checked, not stored */
 };
-/* The source tensor's type, as ONNX numbers them. */
+/* The source tensor's type, as the model format numbers them. */
 enum { OT_F32 = 1, OT_U8 = 2, OT_I8 = 3, OT_F16 = 10 };
 
 /* One tensor of voice.bin and where it comes from: input `input` of the node

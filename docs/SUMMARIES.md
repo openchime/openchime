@@ -85,7 +85,7 @@ held by code, never by the token cap:
   words" cost a fifth, and the sentence counts alone wrote as much as before;
   a model that overshoots ignored the figure either way. The total is held
   below, by code;
-- a grammar (llama.cpp GBNF) bounds every answer: how many lines of each part,
+- a grammar (GBNF, held by the engine, SUMKIT.md §5) bounds every answer: how many lines of each part,
   how long each line is in characters, and that every line starts with the
   numbers of lines that exist. The words are the model's;
 - every answer has a rail in tokens, sized to what its shape can hold at most
@@ -342,11 +342,9 @@ machine, so only stopping and a waiting request hold its calls.
 
 Which models have been run, and how each did, is §7.1.
 
-**Engine.** llama.cpp, from pinned source, CPU only, one static archive
-(`scripts/build/llamacpp.sh`; VENDORS.md). On x86-64 it targets x86-64-v3
-(AVX2, FMA, F16C, BMI2); before anything from llama.cpp runs, the daemon checks
-the CPU has them (`oc_sum_cpu_ok`), and on one that does not, local summaries
-are off with the reason logged. The model file is memory-mapped.
+**Engine.** sumkit, the summary inference engine (SUMKIT.md): plain C on nnkit,
+one thread, no intrinsics, in every build with `SUM=1`, on any 64-bit CPU. The
+model file is memory-mapped.
 
 **Context.** `SUM_CTX_TOKENS` (8,192): a call's lines take at most
 `SUM_INPUT_TOKENS` (6,000), the rest holds the instructions and the answer. Every
@@ -361,26 +359,33 @@ memory budget (§7).
 
 **Decoding.** Greedy, inside each call's grammar: for summarizing, the most
 likely word is the most faithful choice, and sampling raises what a model invents. Greedy decoding on its own can
-repeat itself, so llama.cpp's DRY sampler runs before the choice at its published
+repeat itself, so a DRY sampler runs before the choice at its published
 defaults (multiplier 0.8, base 1.75, allowed length 2): a token that would extend
 a sequence already written is penalized, more steeply the longer the sequence.
 It does not penalize single tokens a summary must repeat — names, line numbers,
 headings. Colons, quotes and asterisks end a sequence; a line break does not, so
 a line repeated in a list is penalized.
 
-**Prompt format.** The model's own chat format, as llama.cpp knows it. For a
+**Prompt format.** The model's own chat format, ChatML, written by sumkit. For a
 model that thinks before answering, the prompt ends with the empty thought its
 own template writes when thinking is not asked for, so it answers straight away;
 thinking lowers what small models write in dialogue summaries and in exact
 formats, and the grammar would not let it start anyway.
 
-**The model** (`daemon/sum_fetch.h`). Qwen3.5 2B, 4-bit (`Q4_K_M`), Apache-2.0:
-about 1.3 GB on disk. On the first start with summaries on, the daemon fetches it
-from its Hugging Face address into `summary/` beside the database, checks it against
-the pinned SHA-256 (the address names a branch, `resolve/main`, not a revision, so
-the hash is what pins the file), and writes a marker; later starts check the marker and the
-size, then load the model. Any failure leaves summaries off with a line in the
-log saying why.
+**The model** (`daemon/sum_fetch.h`). Qwen3.5 2B, Apache-2.0, from Qwen's own
+repository at one pinned commit, converted by the daemon (`summary_pack.c`,
+SUMKIT.md §4): 4 bits for the feed-forward gate and up projections, 6 for the
+other matrices, 1.4 GB on disk. On the first start with summaries on, the
+daemon fetches the release's configuration, tokenizer, licence and weights
+(4.5 GB) into `summary/source/` beside the database, checks each against its
+pinned SHA-256, converts them into `summary/summary.bin` at idle priority,
+pausing between tensors while the load gate (§5) says the machine is busy, and
+checks the result against its pinned SHA-256 too: the conversion gives the
+same bytes on every machine. It then deletes the sources, keeps the licence as
+`summary/LICENSE` and writes a marker; later starts check the marker and the
+size, then load the model. About 6 GB of disk is used while converting, 1.4 GB
+after. Any failure leaves summaries off with a line in the log saying why, and
+nothing partial behind.
 
 **While they come up.** Fetching, checking and loading the model (or the hosted
 model's first answer) can take minutes, and the daemon serves meanwhile.
@@ -405,7 +410,7 @@ spend every answer's cap on that; the API says so in the usage it reports
 (`completion_tokens_details.reasoning_tokens`, OpenAI's shape) or by answering
 nothing. Such a model is asked the prompt again with each of the fields APIs
 have for turning reasoning off -- OpenAI's `reasoning_effort: "none"`,
-OpenRouter's `reasoning: {enabled: false}`, llama.cpp's and vLLM's
+OpenRouter's `reasoning: {enabled: false}`, local servers' and vLLM's
 `chat_template_kwargs: {enable_thinking: false}` -- and the first the API
 honours is sent with every request from then on, logged once. A model that
 reasons only when it finds a prompt worth it answers the one-line prompt plainly;
@@ -504,7 +509,7 @@ form failure here says less than it would locally):
 
 Not tried: Google Gemini, xAI Grok, the larger Anthropic and OpenAI models.
 
-**Local, in the daemon (llama.cpp).** The real daemon built for the model, on a
+**Local, in the daemon (the previous engine, before sumkit).** The real daemon built for the model, on a
 2-vCPU, 4 GB machine, fetching and checking its GGUF at startup and asked for
 the 30 spans over the wire by a client.
 Prompt s15. Times are for the whole span cold, every chunk call included; a
@@ -554,8 +559,9 @@ the form is §7.2.
 
 The method recorded for teaching a model too small to infer the form from its
 prompt (§2) to write it anyway, so that it can run in the daemon on a smaller
-box (§6). Nothing in the daemon changes: the result is one GGUF, pinned in
-`daemon/sum_fetch.h` like the current model, and the prompts, the grammar and
+box (§6). Nothing in the daemon changes: the result is one model in Qwen's
+format, converted by `--summary-pack` and pinned in `daemon/sum_fetch.h` like
+the current model, and the prompts, the grammar and
 the checks stay as they are. The tools it used were removed with the
 others above.
 
@@ -572,8 +578,8 @@ than the 2B on large ones.
 
 The method: synthetic workspaces summarized by a verified teacher model, each
 call kept as a (prompt, answer, kept) pair; a LoRA adapter trained on them by
-supervised fine-tuning at 8,192 tokens of context; the merged model quantized to
-GGUF and pinned in `daemon/sum_fetch.h`; and the same 30 spans graded on a
+supervised fine-tuning at 8,192 tokens of context; the merged model converted by
+`--summary-pack` and pinned in `daemon/sum_fetch.h`; and the same 30 spans graded on a
 2-vCPU, 4 GB machine.
 
 **What to watch for.** The 30-span set must not be among the training
@@ -593,4 +599,4 @@ tuned file (Qwen3.5 is Apache 2.0).
 Everything else — the chunk size, the gap, the standard's caps, the gate's
 thresholds, the hosted engine's retries — is a constant in the code
 (`daemon/sum_core.h`, `daemon/sum_load.h`, `daemon/sum_worker.h`,
-`daemon/sum_llama.c`, `daemon/sum_cloud.c`).
+`daemon/sum_sumkit.c`, `daemon/sum_cloud.c`).
