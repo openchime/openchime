@@ -5150,18 +5150,33 @@ static const oc_http_route HEALTH_ROUTES[] = {
      * from the same box in development; a deployment fronts both with TLS. */
     { "GET", WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
 };
+/* The workspace's address now: OPENCHIME_MANAGED_ADDRESS when set, else the name
+ * a self-hosted daemon adopted from central's certificate (TLS.md, the `central`
+ * source), else none. The adopted name is published as the passkey names are:
+ * an immutable copy swapped atomically, replaced copies kept until exit. */
+static const char *g_adopted;
+static const char *workspace_address_now(const oc_config *cfg) {
+    if (cfg->workspace_address && cfg->workspace_address[0]) return cfg->workspace_address;
+    return __atomic_load_n(&g_adopted, __ATOMIC_ACQUIRE);
+}
+
 /* LANDING_BODY with its one variable part: where the web client is, when this
  * daemon serves one (webapp.h) -- on the TLS port, at the workspace's address
- * when it has one, else at this host's -- or nothing. */
-static char g_landing[sizeof LANDING_BODY + 640];
-static oc_http_route g_health_landing = {
+ * when it has one, else at this host's -- or nothing. Each page is a route of
+ * its own, built whole and then published as the plaintext site's fallback by
+ * an atomic swap (http.c loads it so); a published page is never written, and
+ * is kept until exit, since two I/O threads may be answering from it. */
+static const oc_http_route LANDING_ROUTE = {
     NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8", NULL, 0, NULL, NULL, 0, NULL, NULL
 };
-static void landing_init(void) {
+static oc_http_site  g_tls_site, g_health_site;
+static pthread_mutex_t g_landing_mu = PTHREAD_MUTEX_INITIALIZER;
+static void landing_publish(void) {
+    pthread_mutex_lock(&g_landing_mu);   /* built from the address read inside, so the last published is the latest */
     char app[600] = ".";
     if (oc_webapp_loaded()) {
         const oc_config *cfg = oc_config_get();
-        const char *addr = cfg->workspace_address && cfg->workspace_address[0] ? cfg->workspace_address : NULL;
+        const char *addr = workspace_address_now(cfg);
         int ok = 1;
         for (const char *a = addr; a && *a; a++)
             if (!(isalnum((unsigned char)*a) || *a == '.' || *a == '-')) ok = 0;
@@ -5173,9 +5188,26 @@ static void landing_init(void) {
         else
             snprintf(app, sizeof app, ", or use the web client at <code>/app/</code> on port %d over HTTPS.", cfg->proto_port);
     }
-    int n = snprintf(g_landing, sizeof g_landing, LANDING_BODY, app);
-    g_health_landing.body = g_landing;
-    g_health_landing.body_len = n > 0 && (size_t)n < sizeof g_landing ? (size_t)n : 0;
+    size_t cap = sizeof LANDING_BODY + 640;
+    char *body = malloc(cap);
+    oc_http_route *rt = malloc(sizeof *rt);
+    if (body && rt) {
+        int n = snprintf(body, cap, LANDING_BODY, app);
+        *rt = LANDING_ROUTE;
+        rt->body = body;
+        rt->body_len = n > 0 && (size_t)n < cap ? (size_t)n : 0;
+        __atomic_store_n(&g_health_site.fallback, rt, __ATOMIC_RELEASE);
+    } else {
+        free(body); free(rt);            /* out of memory: the page stays as it was */
+    }
+    pthread_mutex_unlock(&g_landing_mu);
+}
+
+void oc_netloop_set_adopted_address(const char *name) {
+    const char *copy = name && *name ? strdup(name) : NULL;
+    if (name && *name && !copy) return;   /* out of memory: the address stays as it was */
+    __atomic_store_n(&g_adopted, copy, __ATOMIC_RELEASE);
+    landing_publish();
 }
 
 /* The sites as served: the fixed routes above, then the web client's when its
@@ -5183,7 +5215,6 @@ static void landing_init(void) {
  * sign-in pages it chains to live; the health port stays health and the
  * harness's WebSocket, nothing a person signs in through in the clear. */
 static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 8];
-static oc_http_site  g_tls_site, g_health_site;
 static void sites_init(void) {
     size_t na = 0;
     const oc_http_route *app = oc_webapp_routes(&na);
@@ -5192,8 +5223,7 @@ static void sites_init(void) {
     for (size_t i = 0; i < na && i < 8; i++) g_tls_routes[nt + i] = app[i];
     g_tls_site.routes = g_tls_routes; g_tls_site.n = nt + (na < 8 ? na : 8); g_tls_site.fallback = NULL;
     g_health_site.routes = HEALTH_ROUTES; g_health_site.n = sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0];
-    landing_init();
-    g_health_site.fallback = &g_health_landing;
+    landing_publish();
 }
 
 /* Dispatch one webhook post, routed here by the I/O thread (POST under
@@ -5380,18 +5410,24 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);  
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
 
 /* The names a passkey may be made for, and the one this request came to: set
- * per request by on_web_page, read by the page handlers it calls. */
-static char g_pk_names[1024];
+ * per request by on_web_page, read by the page handlers it calls. The names
+ * change while the daemon runs (a name adopted from central or dropped), so
+ * they are published as an immutable copy, swapped atomically; a replaced copy
+ * is kept until exit, so a request reading it never reads freed memory. */
+static const char *g_pk_names;
 static __thread char g_req_rp[256], g_req_origin[300], g_req_host[260];
 void oc_netloop_set_passkey_names(const char *names) {
-    snprintf(g_pk_names, sizeof g_pk_names, "%s", names ? names : "");
+    const char *copy = names && *names ? strdup(names) : NULL;
+    if (names && *names && !copy) return;   /* out of memory: the names stay as they were */
+    __atomic_store_n(&g_pk_names, copy, __ATOMIC_RELEASE);
 }
 
 /* Whether `req` came to one of the passkey names: its Host's name, and the
  * origin a browser there names (https, and the port unless 443). */
 static int passkey_rp(const oc_http_req *req, char rp[256], char origin[300]) {
     rp[0] = origin[0] = '\0';
-    if (!req->host || !req->host_len || req->host_len >= 255 || !g_pk_names[0]) return 0;
+    const char *names = __atomic_load_n(&g_pk_names, __ATOMIC_ACQUIRE);
+    if (!req->host || !req->host_len || req->host_len >= 255 || !names) return 0;
     char host[256];
     memcpy(host, req->host, req->host_len); host[req->host_len] = '\0';
     for (char *h = host; *h; h++) if (*h >= 'A' && *h <= 'Z') *h = (char)(*h - 'A' + 'a');
@@ -5399,7 +5435,7 @@ static int passkey_rp(const oc_http_req *req, char rp[256], char origin[300]) {
     snprintf(name, sizeof name, "%s", host);
     char *colon = strrchr(name, ':');
     if (colon && !strchr(name, ']')) *colon = '\0';
-    const char *p = g_pk_names;
+    const char *p = names;
     while (*p) {
         const char *e = strchr(p, ',');
         size_t n = e ? (size_t)(e - p) : strlen(p);
@@ -6616,11 +6652,13 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 if (!conns[fd]) break;
             }
 
-            /* Where the workspace is now, when the deployment says: a client that
-             * dialled a former address files its workspace under this one. */
-            if (cfg->workspace_address && cfg->workspace_address[0]) {
+            /* Where the workspace is now, when the deployment says or the daemon
+             * took a name from central: a client that dialled a former address,
+             * or an IP address, files its workspace under this one. */
+            const char *now_at = workspace_address_now(cfg);
+            if (now_at && now_at[0]) {
                 oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
-                oc_workspace_address wa = { oc_slice_str(cfg->workspace_address) };
+                oc_workspace_address wa = { oc_slice_str(now_at) };
                 oc_encode_workspace_address(&w, OC_PROTOCOL_VERSION, &wa);
                 send_bytes(ep, conns, fd, g_enc, w.len);
                 if (!conns[fd]) break;

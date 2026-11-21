@@ -12,7 +12,9 @@
  * In a round, a 2xx ends the round; no answer, 422 (central could not check the
  * address), 429 or 5xx is tried again, the wait doubling from the first retry up
  * to the maximum, until the round's time is up; any other answer is a refusal,
- * and reporting stops until the next start.
+ * and reporting stops until the next start. A round hook, when given, is called
+ * after each round, on the worker; after a refusal the rounds go on for it alone,
+ * with no request (main.c's check that central still lists an adopted name).
  */
 #ifndef OPENCHIME_ADDRESS_REPORT_H
 #define OPENCHIME_ADDRESS_REPORT_H
@@ -38,10 +40,12 @@ typedef struct oc_address_report oc_address_report;
 
 /* Start reporting `body`. `enroll_url` is OPENCHIME_ENROLL_URL (only its origin
  * is used); audience and privkey_pem are the enrollment identity; all three and
- * the body are copied. `timing` NULL is production's. NULL on failure. */
+ * the body are copied. `timing` NULL is production's. `on_round` (NULL for none)
+ * is called with `ctx` after each round. NULL on failure. */
 oc_address_report *oc_address_report_start(const char *enroll_url, const char *audience,
                                            const char *privkey_pem, const char *body,
-                                           const oc_address_report_timing *timing);
+                                           const oc_address_report_timing *timing,
+                                           void (*on_round)(void *ctx), void *ctx);
 
 /* Stop: a request under way finishes, and a wait ends at once. A no-op for NULL. */
 void oc_address_report_stop(oc_address_report *r);

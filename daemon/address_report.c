@@ -20,6 +20,8 @@ struct oc_address_report {
     oc_machine_http          *http;
     char                     *audience, *privkey, *body;
     oc_address_report_timing  t;
+    void                    (*on_round)(void *ctx);
+    void                     *ctx;
 
     pthread_t                 thread;
     pthread_mutex_t           mu;
@@ -78,7 +80,7 @@ static int wait_ms(oc_address_report *r, unsigned long long ms) {
     return r->stopping;
 }
 
-/* One round: 1 when it ended in a refusal (or a stop), 0 otherwise. */
+/* One round: -1 when stopping, 1 when it ended in a refusal, 0 otherwise. */
 static int round_once(oc_address_report *r) {
     unsigned long long end = mono_ms() + r->t.round_ms;
     unsigned long long pause = r->t.first_retry_ms;
@@ -109,16 +111,27 @@ static int round_once(oc_address_report *r) {
                             "trying again in %u minutes\n", r->t.repeat_ms / 60000u);
             return 0;
         }
-        if (wait_ms(r, pause)) return 1;
+        if (wait_ms(r, pause)) return -1;
         pause = pause * 2 > r->t.retry_max_ms ? r->t.retry_max_ms : pause * 2;
     }
 }
 
 static void *worker(void *arg) {
     oc_address_report *r = arg;
+    int refused = 0;
     pthread_mutex_lock(&r->mu);
     while (!r->stopping) {
-        if (round_once(r)) break;
+        if (!refused) {
+            int rc = round_once(r);
+            if (rc < 0) break;
+            refused = rc == 1;
+        }
+        if (r->on_round) {
+            pthread_mutex_unlock(&r->mu);
+            r->on_round(r->ctx);
+            pthread_mutex_lock(&r->mu);
+        }
+        if (refused && !r->on_round) break;   /* nothing left to do until the next start */
         if (wait_ms(r, r->t.repeat_ms)) break;
     }
     pthread_mutex_unlock(&r->mu);
@@ -127,11 +140,14 @@ static void *worker(void *arg) {
 
 oc_address_report *oc_address_report_start(const char *enroll_url, const char *audience,
                                            const char *privkey_pem, const char *body,
-                                           const oc_address_report_timing *timing) {
+                                           const oc_address_report_timing *timing,
+                                           void (*on_round)(void *ctx), void *ctx) {
     if (!enroll_url || !*enroll_url || !audience || !privkey_pem || !body) return NULL;
     oc_address_report *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->t = timing ? *timing : PRODUCTION;
+    r->on_round = on_round;
+    r->ctx = ctx;
     if (r->t.first_retry_ms == 0) r->t.first_retry_ms = 1;
     if (r->t.retry_max_ms < r->t.first_retry_ms) r->t.retry_max_ms = r->t.first_retry_ms;
     r->audience = strdup(audience);

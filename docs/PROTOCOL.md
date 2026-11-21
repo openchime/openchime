@@ -492,11 +492,14 @@ a bare host address. Clients that don't recognize the frame ignore it.
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
-Pushed right after `WORKSPACE_INFO`, and only where the deployment names the
-workspace's canonical address (`OPENCHIME_MANAGED_ADDRESS`). A managed workspace
-that moved to a new address still answers at its former one for a while; a client
-that connected by it files the workspace under the new one (CLIENT.md
-§5) and dials that next time. A new frame, so no version bump.
+Pushed right after `WORKSPACE_INFO` (and `WORKSPACE_SETTINGS`), and only where
+the workspace has a canonical address: the deployment's
+(`OPENCHIME_MANAGED_ADDRESS`), or, on a self-hosted daemon bound to central, the
+name it took from the certificate central issued it (TLS.md, the `central`
+source). A managed workspace that moved to a new address still answers at its
+former one for a while, and a self-hosted one keeps answering at its IP address;
+a client that connected by either files the workspace under the address it is
+sent (CLIENT.md §5) and dials that next time. A new frame, so no version bump.
 
 | Field     | Type | Notes                                             |
 |-----------|------|---------------------------------------------------|

@@ -3749,6 +3749,15 @@ static void test_workspace_move(void) {
     oc_store_workspace_each(s, moved_label_cb, &m);
     CHECK(strcmp(m.label, "Acme-New.workspace.openchime.io") == 0);
 
+    /* Connected by an IP address, then told the name its daemon took from
+     * central (TLS.md, the `central` source): everything moves to the name. */
+    oc_store_save_session(s, "203.0.113.7", tok, 0, "dana");
+    oc_store_workspace_remember(s, "203.0.113.7", "acme", "dana", 5);
+    CHECK(oc_workspace_move(s, "203.0.113.7", "acme.example.net", key, sizeof key) == 1);
+    CHECK(strcmp(key, "acme.example.net") == 0);
+    CHECK(oc_store_load_session(s, key, got, NULL, 0) == 1 && memcmp(got, tok, sizeof tok) == 0);
+    CHECK(mock_len_of("203.0.113.7") == 0);
+
     /* Nothing kept (Remember-me off): only the key moves. */
     CHECK(oc_workspace_move(NULL, "beta.workspace.openchime.io", "gamma.workspace.openchime.io", key, sizeof key) == 1);
     CHECK(strcmp(key, "gamma.workspace.openchime.io") == 0);

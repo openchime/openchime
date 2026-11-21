@@ -152,7 +152,88 @@ typedef struct {
     oc_certs       *certs;
     oc_tls_state    kept;
     int             active;
+    /* The name a self-hosted box took from central's certificate as its address
+     * (TLS.md, the `central` source), "" for none, and when that certificate
+     * runs out. Set at start, by the certificate worker and by the address
+     * report's round, so under its own lock. */
+    pthread_mutex_t adopt_mu;
+    char            adopted[256];
+    uint64_t        adopted_until_ms;
 } services;
+
+static uint64_t wall_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* The names a passkey may be made for (AUTH.md §8.6): only where a CA vouches
+ * for the name -- a self-signed daemon is reached through the loopback tunnel,
+ * where a passkey would bind to 127.0.0.1 -- the managed address, the names it
+ * is certified for, and a name adopted from central. */
+static void publish_passkey_names(const oc_config *cfg, const char *adopted) {
+    if (cfg->tls_src.source == OC_TLS_SRC_SELF) return;
+    char names[1024];
+    const char *parts[3] = { cfg->workspace_address, cfg->tls_src.names, adopted };
+    size_t o = 0;
+    names[0] = '\0';
+    for (int i = 0; i < 3; i++) {
+        if (!parts[i] || !parts[i][0]) continue;
+        int w = snprintf(names + o, sizeof names - o, "%s%s", o ? "," : "", parts[i]);
+        if (w < 0 || (size_t)w >= sizeof names - o) break;
+        o += (size_t)w;
+    }
+    oc_netloop_set_passkey_names(names);
+}
+
+/* Only a self-hosted box bound to central adopts a name: a managed box's address
+ * is OPENCHIME_MANAGED_ADDRESS alone, and any other source's names are its own. */
+static int adopts_names(const oc_config *cfg) {
+    return cfg->deployment_mode != OC_DEPLOY_MANAGED && cfg->tls_src.source == OC_TLS_SRC_CENTRAL;
+}
+
+/* Take, or drop (names NULL), the name central's certificate gives: sent to
+ * clients as where the workspace is now, linked from the landing page, and
+ * among the passkey names (netloop.h). */
+static void set_adopted(services *f, const char *names, uint64_t until_ms) {
+    char name[256] = "";
+    if (names && oc_certs_adopted_name(names, name, sizeof name) != 0) name[0] = '\0';
+    pthread_mutex_lock(&f->adopt_mu);
+    int changed = strcmp(name, f->adopted) != 0;
+    snprintf(f->adopted, sizeof f->adopted, "%s", name);
+    f->adopted_until_ms = name[0] ? until_ms : 0;
+    if (changed) {
+        oc_netloop_set_adopted_address(name[0] ? name : NULL);
+        publish_passkey_names(f->cfg, name);
+        if (name[0]) fprintf(stderr, "openchimed: this workspace's address is %s (from central)\n", name);
+    }
+    pthread_mutex_unlock(&f->adopt_mu);
+}
+
+/* After each round of the address report (every two hours): the adopted name
+ * stands while central still lists it and its certificate has not run out. */
+static void check_adopted(void *ctx) {
+    services *f = ctx;
+    char name[256];
+    uint64_t until;
+    pthread_mutex_lock(&f->adopt_mu);
+    snprintf(name, sizeof name, "%s", f->adopted);
+    until = f->adopted_until_ms;
+    pthread_mutex_unlock(&f->adopt_mu);
+    if (!name[0]) return;
+    if (until && wall_ms() >= until) {
+        fprintf(stderr, "openchimed: the certificate for %s ran out unrenewed; no longer using it as the address\n", name);
+        set_adopted(f, NULL, 0);
+        return;
+    }
+    char names[1024], err[256] = "";
+    int status = 0;
+    if (oc_central_names(f->cfg->enroll.url, f->audience, f->privkey, names, sizeof names, &status, err, sizeof err) != 0)
+        status = 0;
+    if (oc_certs_name_listed(status, names, name) == OC_NAME_DROP) {
+        fprintf(stderr, "openchimed: central no longer lists %s; no longer using it as the address\n", name);
+        set_adopted(f, NULL, 0);
+    }
+}
 
 static void keep_account(void *ctx, const char *key_pem, const char *url) {
     services *f = ctx;
@@ -163,6 +244,7 @@ static void keep_cert(void *ctx, const oc_cert_issued *c) {
     services *f = ctx;
     oc_dbwriter_store_tls_cert(f->db, f->cfg->tls_src.source == OC_TLS_SRC_ACME ? "acme" : "central",
                                c->names, c->chain_pem, c->key_pem, c->not_before_ms, c->not_after_ms);
+    if (adopts_names(f->cfg)) set_adopted(f, c->names, c->not_after_ms);
 }
 
 /* What the certificate worker cannot fix alone, for owners and admins (REQ-263). */
@@ -296,7 +378,8 @@ static void start_address_report(services *f) {
         fprintf(stderr, "openchimed: this server's name is not a usable DNS name; no address is reported to central\n");
         return;
     }
-    f->addr = oc_address_report_start(cfg->enroll.url, f->audience, f->privkey, body, NULL);
+    f->addr = oc_address_report_start(cfg->enroll.url, f->audience, f->privkey, body, NULL,
+                                      adopts_names(cfg) ? check_adopted : NULL, f);
     if (!f->addr) fprintf(stderr, "openchimed: could not start the address report\n");
 }
 
@@ -700,17 +783,9 @@ int main(int argc, char **argv) {
     int want_local = cfg->auth_local, want_relay = cfg->auth_relay;
     oc_dbwriter_set_local_enabled(db, want_local);
     oc_dbwriter_set_local_mfa(db, cfg->local_mfa);
-    /* Passkeys only where a CA vouches for the name (AUTH.md §8.6): a
-     * self-signed daemon is reached through the loopback tunnel, where a
-     * passkey would bind to 127.0.0.1. */
-    if (cfg->tls_src.source != OC_TLS_SRC_SELF) {
-        char names[1024];
-        snprintf(names, sizeof names, "%s%s%s",
-                 cfg->workspace_address ? cfg->workspace_address : "",
-                 cfg->workspace_address && cfg->workspace_address[0] && cfg->tls_src.names && cfg->tls_src.names[0] ? "," : "",
-                 cfg->tls_src.names ? cfg->tls_src.names : "");
-        oc_netloop_set_passkey_names(names);
-    }
+    /* Passkeys only where a CA vouches for the name (publish_passkey_names);
+     * a name adopted from central joins them when it is taken, below. */
+    publish_passkey_names(cfg, NULL);
     /* A demo's visitors sign in for a day (AUTH.md §8.12); everyone else for
      * the constant's thirty. */
     oc_dbwriter_set_session_policy(db, cfg->mode == OC_MODE_DEMO ? OC_DEMO_SESSION_TTL_MS : OC_SESSION_TTL_MS,
@@ -797,6 +872,7 @@ int main(int argc, char **argv) {
      * that is not enrolled has neither. */
     services svc;
     memset(&svc, 0, sizeof svc);
+    pthread_mutex_init(&svc.adopt_mu, NULL);
     svc.db = db;
     svc.cfg = cfg;
     svc.privkey = enroll_privkey;
@@ -893,6 +969,7 @@ int main(int argc, char **argv) {
                       oc_certs_names_include(k->names, cfg->workspace_address));
         if (usable && oc_tls_server_use(&tls, k->chain_pem, strlen(k->chain_pem), k->key_pem, strlen(k->key_pem)) == 0) {
             fprintf(stderr, "openchimed: TLS certificate for %s (kept)\n", k->names);
+            if (adopts_names(cfg)) set_adopted(&svc, k->names, k->not_after_ms);
         } else {
             svc.kept.issued_ms = svc.kept.not_after_ms = 0;    /* nothing to renew: obtain one */
         }
@@ -964,6 +1041,7 @@ int main(int argc, char **argv) {
     oc_netloop_set_enrollment(NULL, NULL);
     oc_certs_stop(svc.certs);
     oc_tls_state_free(&svc.kept);
+    pthread_mutex_destroy(&svc.adopt_mu);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
     oc_push_stop(svc.push);

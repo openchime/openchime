@@ -174,7 +174,21 @@ comes from:
   §8.9) — the default on a managed box, and refused without an enrollment. A
   self-hosted server with no DNS name of its own is proved at the address its
   address report comes from, on port 443 (AUTH.md §3.6): 443 must reach the
-  daemon, directly (`OPENCHIME_PORT=443`) or forwarded to its port.
+  daemon, directly (`OPENCHIME_PORT=443`) or forwarded to its port. Once central
+  issues it a certificate for a name under the service suffix, a self-hosted
+  daemon takes that name, the certificate's first, as its address: it sends it
+  at each sign-in (`WORKSPACE_ADDRESS`, PROTOCOL.md §4.3b), so a client that
+  connected by the IP address files the workspace under the name and dials the
+  name from then on, on a certificate that matches it; the landing page links to
+  the web client there; and passkeys can be made on it. Its address report
+  still sends `{}`: the name is central's own record of the proved address, and
+  reporting it would leave that record unable to follow a new IP. Every two
+  hours, with the report, the daemon asks central for its names, and stops
+  using the name as soon as central no longer lists it, or its certificate runs
+  out unrenewed. Clients that already moved to a released name stay on it;
+  releasing a name in the dashboard says they must add the server again by its
+  IP address. A managed box keeps `OPENCHIME_MANAGED_ADDRESS` as its one
+  address.
 
 Until a CA-issued certificate is obtained the daemon presents its self-signed
 one; once one is, it is kept (migration 0049, in the identity since 0064) and
