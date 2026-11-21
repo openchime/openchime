@@ -379,6 +379,33 @@ player is the one place bytes reach a file, and only one the user chose.
 - Nothing is uploaded before Send; a recording never touches the disk, so a
   discarded or interrupted one leaves nothing behind (§4).
 
+## 10a. Export
+
+A video message's VP9 and Opus play only where a VP9 decoder is: in OpenChime,
+in browsers, not in Apple's frameworks or many other players. So the daemon makes
+a **copy that they open**, on request, when its operator has turned it on
+(ARCH-135, REQ-382–384): H.264 Constrained Baseline at the recording's size and
+frame rate, MP3 at 48 kHz mono and 96 kbit/s, in an MP4.
+
+- **Off unless turned on.** A daemon built with `EXPORT=1` carries the codecs;
+  `OPENCHIME_H264_EXPORT=on` turns export on, and needs the operator's own H.264
+  patent licence. Otherwise `EXPORT_GET` is refused `EXPORT_UNAVAILABLE` and the
+  client offers nothing (`CAPABILITIES` lacks `h264-export`).
+- **How the copy is made.** `daemon/export_render.c` reads the video from the
+  blob store front to back — `oc_mp4_parse_head` on its index, then each sample in
+  the order it lies in `mdat` — and hands each to the codecs (`daemon/export_engine.c`):
+  libvpx and libopus decode, as the player does (`shared/oc_vp9dec.c`,
+  `shared/oc_opusdec.c`); libavc encodes the pictures, an IDR every two seconds;
+  LAME encodes the sound after the Opus pre-skip. `oc_mp4_export_*` writes the file
+  as it goes, `ftyp · mdat · moov`, with an edit list that skips the MP3 encoder's
+  and decoder's delay so the sound starts with the picture.
+- **What it costs.** One transcode at a time on the export worker
+  (`daemon/export_worker.c`), below the daemon's other work and never while
+  read-aloud renders; ten seconds of 1080p take about two on a desktop core, and
+  the transcode peaks under 96 MB. The copy is stored as a blob and recorded in
+  `exported_video`, so the next request is served from it; it is reclaimed first
+  under storage pressure and deleted with its video.
+
 ## 11. Tests
 
 | Where | What it proves |
@@ -387,6 +414,8 @@ player is the one place bytes reach a file, and only one the user chose.
 | `make test` — daemon | every `ATTACH_MEDIA_SET` refusal; the poster survives the orphan sweep while its video is live, is collected once the video's message is deleted or the video was never sent, and is reclaimed in the same pass as its video; the media row on SEND, backfill and the Files listing; `has:video`; the media fields on `BROADCAST`, `THREAD_REPLY` and `FILE_ENTRY` and the new frames round-trip; two clients over the wire — one posts, the other receives the fields and fetches the poster |
 | Full suite — client core | a video post completes through the queue while a thumbnail fetch is in flight; progress, cancel, a video download above the inline limit, preview text |
 | `make test` — screen recording | a frame view and the camera box's geometry in every corner; the screen front end delivering 30 fps from a screen that changes five times a second, all one size, fitted; a synthetic screen recorded with the camera boxed into each corner, found there by colour in a decoded frame and absent from the opposite corner; a window with no camera and no box; the window going away mid-take (kept) and before the first frame (refused as gone); the capture refused; the computer's sound mixed with the microphone, and — the microphone hearing only the echo — present once, not twice |
+| `make test` — export | the H.264 + MP3 writer; the render and worker with stub codecs; the cache; a daemon with export off, on without codecs, and on (§10a) |
+| Full suite — `export_media` | a 1080p recording exported with the real codecs: H.264 Constrained Baseline and MP3 at its size and duration, picture and sound within a frame, peak memory under 96 MB |
 | `make test` — canceller | the ERLE harness at 48 kHz on the 16 kHz band, on the same rooms as voice input's (§4.2) |
 | Win32 harness (synthetic camera) | record, review, send; a second client shows the card and plays it; the Files view and previews; the denied path; the cap |
 | Win32 harness, `tools/gui/features/screenrec.sh` | real Windows.Graphics.Capture with a synthetic camera and sound: screens and windows listed; the box in the chosen corner of the preview; the card stepping aside for the recording bar, which is kept out of the capture and read and pressed through UI Automation; Stop ending the take at the fitted size; the file the daemon stores being VP9 and Opus at that size, with the microphone and the computer's sound in it; a window closed mid-take keeping what came before |

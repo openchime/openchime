@@ -258,8 +258,12 @@
  * 47: camera video in calls (REQ-160). CALL_MEDIA carries `stream` (u8) after
  * `seq` both ways, as the relay's datagrams now do; a participant's flags byte
  * gains OC_CALL_PART_CAMERA; CALL_CAMERA and CALL_VIDEO_SUB (0x00AC, 0x00AD) are
- * new. A field inserted in a fixed layout. */
-#define OC_PROTOCOL_VERSION 47u
+ * new. A field inserted in a fixed layout.
+ *
+ * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
+ * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
+ * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
+#define OC_PROTOCOL_VERSION 48u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -687,6 +691,12 @@ typedef enum {
     OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
     OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
     OC_MSG_RENAME_EMOJI         = 0x013D, /* C->S, a custom emoji's new name; the old one stays as an alias */
+    /* The export of a video message (ARCH-135): an H.264 + MP3 copy, made by the
+     * daemon when its operator turned it on, and downloaded as an attachment is. */
+    OC_MSG_EXPORT_GET           = 0x013E, /* C->S, the playable copy of a video message */
+    OC_MSG_EXPORT_INFO          = 0x013F, /* S->C, its duration and size */
+    OC_MSG_EXPORT_CHUNK         = 0x0140, /* S->C, a slice of the copy */
+    OC_MSG_EXPORT_END           = 0x0141, /* S->C, the whole copy is sent */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -807,6 +817,7 @@ typedef enum {
     OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
     OC_ERR_INVALID_OUT_OF_OFFICE = 3072, /* an out-of-office ending before it starts, or its message too long */
     OC_ERR_EMOJI_ALIAS_LIMIT   = 3073, /* a rename past the old names an emoji, or the workspace, may keep */
+    OC_ERR_EXPORT_UNAVAILABLE  = 3074, /* no export here: not built in or turned off, or the person's or the daemon's queue is full (ARCH-135) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1956,6 +1967,7 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_SUMMARIZE "summarize" /* summaries of a channel or DM (REQ-310) */
 #define OC_CAP_PDM "pdm" /* private DMs, end to end between two devices (PRIVATE-DM.md) */
 #define OC_CAP_POLLS "polls" /* post a poll and vote in one (REQ-225) */
+#define OC_CAP_H264_EXPORT "h264-export" /* an H.264 + MP3 copy of a video message (ARCH-135) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 /* The workspace's settings as clients are told them, read-only: each a key and
  * its effective value. They are the daemon's configuration (CONFIG.md, the
@@ -1976,6 +1988,15 @@ typedef struct { oc_slice voice_id; } oc_voice_preview_get;
 typedef struct { uint64_t message_id; uint32_t duration_ms; uint64_t total_size; } oc_audio_info;
 typedef struct { uint64_t message_id; uint32_t seq; oc_slice data; } oc_audio_chunk;
 typedef struct { uint64_t message_id; } oc_audio_end;
+
+/* The export of a video message (ARCH-135). EXPORT_GET asks for the H.264 + MP3
+ * copy of attachment `attachment_id`, which must be a video message the caller
+ * may read; it is answered as a download is, by EXPORT_INFO, EXPORT_CHUNKs and
+ * EXPORT_END, or by an ERROR naming the attachment. */
+typedef struct { uint64_t attachment_id; } oc_export_get;
+typedef struct { uint64_t attachment_id; uint32_t duration_ms; uint64_t total_size; } oc_export_info;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_export_chunk;
+typedef struct { uint64_t attachment_id; } oc_export_end;
 
 /* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
  * little-endian PCM, at most max_segment_ms long. */
@@ -2427,6 +2448,10 @@ oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *
 oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info *m);
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
+oc_result oc_encode_export_get(oc_wbuf *w, uint16_t version, const oc_export_get *m);
+oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
+oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
+oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
 oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
 oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m);
 oc_result oc_encode_read_receipts(oc_wbuf *w, uint16_t version, const oc_read_receipts *m);
@@ -2659,6 +2684,10 @@ oc_result oc_decode_audio_get(oc_rbuf *p, oc_audio_get *m);
 oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
+oc_result oc_decode_export_get(oc_rbuf *p, oc_export_get *m);
+oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
+oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
+oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);
 oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
 oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m);
 oc_result oc_decode_read_receipts(oc_rbuf *p, oc_read_receipts *m);

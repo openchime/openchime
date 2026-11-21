@@ -1351,6 +1351,20 @@ where one exists.
   own controls out of the picture where the system allows, recorded the computer's
   sound only when that was chosen, and ended, keeping what it had, when the window
   it recorded closed.
+- **REQ-382.** A video message has been **exportable as a copy other players
+  open**: H.264 video and MP3 audio in MP4, made by the workspace's own daemon on
+  request, at the source's picture size, with picture and sound within a frame of
+  each other, and saved by the client as a file (ARCH-135).
+- **REQ-383.** Export has been **off unless the operator turned it on**
+  (`OPENCHIME_H264_EXPORT`), in a build that carries it. Off, a request has been
+  refused by name and nothing else on the connection has changed. The setting has
+  said that turning it on needs the operator's own H.264 patent licence (ARCH-135).
+- **REQ-384.** Export has been **bounded**: the gate has been the download's; one
+  transcode has run at a time, below the daemon's other work, and none while
+  read-aloud renders; a person has had at most three requests in hand; a 1080p
+  export has peaked under 96 MB; a copy has been cached, reclaimed before any
+  attachment and deleted with its video; and no temporary file has outlived its
+  export (ARCH-135).
 
 ### 6.4 Read-aloud
 

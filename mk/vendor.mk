@@ -44,6 +44,10 @@ $(OPUS_A):
 	scripts/build/opus.sh native
 $(SPEEXDSP_A):
 	scripts/build/speexdsp.sh native
+$(LIBAVC_A):
+	scripts/build/libavc.sh
+$(LAME_A):
+	scripts/build/lame.sh
 
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py

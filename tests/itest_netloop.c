@@ -31,6 +31,10 @@
 #include "oidcrp.h"        /* a direct connection's worker */
 #include "jwt.h"
 #include "json.h"          /* a summary's document, parsed */
+#include "export_render.h" /* the export's stub codecs (ARCH-135) */
+#include "export_worker.h" /* where a copy is stored */
+#include "blobstore.h"
+#include "oc_mp4.h"
 #include <poll.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/sha256.h>
@@ -407,6 +411,7 @@ static _Atomic uint32_t g_auth_stt_max_ms;
 
 static _Atomic int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
 static _Atomic int g_auth_polls;       /* ... and "polls" (REQ-225) */
+static _Atomic int g_auth_export;      /* ... and "h264-export" (ARCH-135) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 /* Sign `c` in as a person does (AUTH.md §8.10): the page, then the token on
  * AUTH; the post-auth pushes drained, so the stream is positional after. */
@@ -477,7 +482,10 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         g_auth_stt = 0;
         g_auth_summarize = 0;
         g_auth_polls = 0;
+        g_auth_export = 0;
         for (uint8_t k = 0; k < cp.count; k++) {
+            if (cp.names[k].len == strlen(OC_CAP_H264_EXPORT) &&
+                memcmp(cp.names[k].ptr, OC_CAP_H264_EXPORT, cp.names[k].len) == 0) g_auth_export = 1;
             if (cp.names[k].len == strlen(OC_CAP_POLLS) &&
                 memcmp(cp.names[k].ptr, OC_CAP_POLLS, cp.names[k].len) == 0) g_auth_polls = 1;
             if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, OC_CAP_STT, 3) == 0) g_auth_stt = 1;
@@ -4719,6 +4727,183 @@ static void test_read_aloud_absent(void) {
     oc_tls_server_free(&srv2);
     oc_netloop_set_tts(&STUB_TTS);
     db_unlink("itest_tts_off.db");
+}
+
+/* The export of a video message over the wire (ARCH-135). Off -- the setting
+ * off, or on in a daemon without the codecs, which is how the test build stands
+ * in for one built without EXPORT=1 -- it is not offered and EXPORT_GET is
+ * refused EXPORT_UNAVAILABLE, naming the attachment, with the connection kept.
+ * On, with the stub codecs: EXPORT_INFO, EXPORT_CHUNKs and EXPORT_END carry
+ * exactly the copy the worker stored, and asked again it is served from the
+ * cache. Its own daemon and database each time. */
+static uint64_t read_export(client *c, uint64_t aid, uint8_t **bytes, uint16_t *code) {
+    oc_header hdr;
+    oc_rbuf p;
+    *code = 0;
+    if (bytes) *bytes = NULL;
+    do {
+        if (read_frame(c, &hdr, &p) != 0) return 0;
+    } while (hdr.msg_type == OC_MSG_BROADCAST);
+    if (hdr.msg_type == OC_MSG_ERROR) {
+        oc_error e;
+        CHECK(oc_decode_error(&p, &e) == OC_OK);
+        CHECK(!e.fatal && e.context.len == 8);
+        uint64_t named = 0;
+        for (size_t i = 0; e.context.len == 8 && i < 8; i++) named = named << 8 | e.context.ptr[i];
+        CHECK(named == aid);
+        *code = e.code;
+        return 0;
+    }
+    CHECK(hdr.msg_type == OC_MSG_EXPORT_INFO);
+    oc_export_info ei;
+    CHECK(oc_decode_export_info(&p, &ei) == OC_OK && ei.attachment_id == aid);
+    uint8_t *all = malloc(ei.total_size ? ei.total_size : 1);
+    uint64_t got = 0;
+    uint32_t seq = 0;
+    for (;;) {
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_EXPORT_END) {
+            oc_export_end ee;
+            CHECK(oc_decode_export_end(&p, &ee) == OC_OK && ee.attachment_id == aid);
+            break;
+        }
+        CHECK(hdr.msg_type == OC_MSG_EXPORT_CHUNK);
+        oc_export_chunk ec;
+        CHECK(oc_decode_export_chunk(&p, &ec) == OC_OK && ec.attachment_id == aid && ec.seq == seq++);
+        if (all && got + ec.data.len <= ei.total_size) memcpy(all + got, ec.data.ptr, ec.data.len);
+        got += ec.data.len;
+    }
+    CHECK(got == ei.total_size);
+    if (bytes) *bytes = all; else free(all);
+    return got;
+}
+
+/* The copies the daemon has recorded. */
+static int export_rows(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int rows = -1;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM exported_video;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return rows;
+}
+
+static uint64_t fetch_export(client *c, uint64_t aid, uint8_t **bytes, uint16_t *code) {
+    uint8_t buf[64];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_export_get eg = { aid };
+    CHECK(oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &eg) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    return read_export(c, aid, bytes, code);
+}
+
+/* mode 0: setting off; 1: setting on, no codecs; 2: on, the stub codecs. */
+static void test_export_wire(int mode) {
+    setenv("OPENCHIME_H264_EXPORT", mode ? "on" : "off", 1);
+    oc_netloop_set_export(mode == 2 ? &oc_export_stub_codecs : NULL);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_export.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_export.db"));
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw2 != NULL);
+    uint64_t alice_id = oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048);
+    CHECK(alice_id != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_export == (mode == 2));
+    uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "A clip.", 0x75);
+    CHECK(mid != 0);
+
+    /* A video message: its row, its media row and its bytes, put in place. */
+    const uint64_t aid = 0x5150;
+    size_t len = 0;
+    uint8_t *src = NULL;
+    {
+        oc_mp4_writer *mw = oc_mp4_writer_open(320, 240);
+        uint8_t v[64], au[24];
+        memset(v, 0x5A, sizeof v);
+        memset(au, 0x6B, sizeof au);
+        for (int i = 0; i < 12; i++) {
+            oc_mp4_write_video(mw, v, sizeof v, (int64_t)i * 33333, i == 0);
+            oc_mp4_write_audio(mw, au, sizeof au, 960);
+        }
+        uint32_t ms;
+        CHECK(oc_mp4_writer_finish(mw, &src, &len, &ms) == 0);
+    }
+    char blobs[700];
+    snprintf(blobs, sizeof blobs, "%s/blobs", tpath("data"));
+    oc_blobstore *bs = oc_blobstore_open(blobs, NULL);
+    CHECK(bs != NULL);
+    if (bs && src) {
+        oc_blob_writer *bw = oc_blob_put_begin(bs, "0000000000005150", len);
+        CHECK(bw && oc_blob_put_chunk(bw, src, len) == 0 && oc_blob_put_commit(bw) == 0);
+    }
+    free(src);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(tpath("itest_export.db"), &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char sql[600];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO attachments(id, channel_id, message_id, uploader_id, storage_key, filename, mime, size,"
+             " sha256, created_at_ms) VALUES(%llu, %d, %llu, %llu, '0000000000005150', 'v.mp4', 'video/mp4', %zu, x'00', 1);"
+             "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, created_at_ms)"
+             " VALUES(%llu, 1, 400, 320, 240, NULL, 1);",
+             (unsigned long long)aid, OC_DEFAULT_CHANNEL, (unsigned long long)mid, (unsigned long long)alice_id, len,
+             (unsigned long long)aid);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+
+    uint16_t code = 0;
+    if (mode != 2) {
+        /* Refused by name, and the connection kept: the next request is answered. */
+        CHECK(fetch_export(&a, aid, NULL, &code) == 0 && code == OC_ERR_EXPORT_UNAVAILABLE);
+        CHECK(say_something(&a, OC_DEFAULT_CHANNEL, "Still here.", 0x76) != 0);
+    } else {
+        uint8_t *got = NULL;
+        uint64_t n = fetch_export(&a, aid, &got, &code);
+        CHECK(n > 0 && code == 0);
+        /* The bytes are the copy the worker stored, under its key. */
+        char key[OC_EXPORT_KEY_MAX];
+        oc_export_copy_key(&oc_export_stub_codecs, aid, key, sizeof key);
+        uint64_t stored = 0;
+        oc_blob_reader *rd = bs ? oc_blob_get_begin(bs, key, &stored) : NULL;
+        CHECK(rd && stored == n);
+        uint8_t *want = malloc(n ? n : 1);
+        uint64_t at = 0;
+        long k;
+        while (rd && want && at < n && (k = oc_blob_get_chunk(rd, want + at, n - at)) > 0) at += (uint64_t)k;
+        if (rd) oc_blob_get_close(rd);
+        CHECK(got && want && at == n && memcmp(got, want, n) == 0);
+        free(want);
+        /* Asked again, the same copy, from the cache once its row is written. */
+        CHECK(WAIT_UNTIL(export_rows(db) == 1, 5000));
+        uint8_t *again = NULL;
+        CHECK(fetch_export(&a, aid, &again, &code) == n && code == 0 && again && memcmp(again, got, n) == 0);
+        free(again);
+        free(got);
+        /* A message that is not a video, and one that does not exist. */
+        CHECK(fetch_export(&a, 0x9999, NULL, &code) == 0 && code == OC_ERR_UNKNOWN_ATTACHMENT);
+    }
+    sqlite3_close(db);
+    if (bs) oc_blobstore_close(bs);
+    client_close(&a);
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    oc_netloop_set_export(NULL);
+    unsetenv("OPENCHIME_H264_EXPORT");
+    db_unlink("itest_export.db");
 }
 
 /* Summaries over the wire (REQ-310, ARCH-116): the "summarize" capability is
@@ -9141,4 +9326,30 @@ int run_netloop_tests(void) {
     g_dir[0] = '\0';
 
     return failures;
+}
+
+/* The export of a video message over the wire (ARCH-135), in the fast suite:
+ * three daemons of its own, in a directory of its own. */
+int run_export_wire_tests(void) {
+    printf("itest_export_wire: export off, on without codecs, and on -- capability, refusal by name, the copy streamed byte for byte, the cache\n");
+    int before = failures;
+    if (oc_test_mkdtemp("export-wire", g_dir, sizeof g_dir) != 0) {
+        printf("  FAIL itest_export_wire: no directory of its own under $TMPDIR\n");
+        return 1;
+    }
+    char data_dir[600];
+    snprintf(data_dir, sizeof data_dir, "%s", tpath("data"));
+    mkdir(data_dir, 0700);
+    const char *old_data = getenv("OPENCHIME_DATA_DIR");
+    char saved_data[600] = "";
+    int had_data = old_data != NULL;
+    if (old_data) snprintf(saved_data, sizeof saved_data, "%s", old_data);
+    setenv("OPENCHIME_DATA_DIR", data_dir, 1);
+    test_export_wire(0);
+    test_export_wire(1);
+    test_export_wire(2);
+    if (had_data) setenv("OPENCHIME_DATA_DIR", saved_data, 1); else unsetenv("OPENCHIME_DATA_DIR");
+    oc_test_rmtree(g_dir);
+    g_dir[0] = '\0';
+    return failures - before;
 }

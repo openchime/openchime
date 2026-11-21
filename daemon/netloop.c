@@ -46,12 +46,14 @@
 #include "srccount.h"
 #include "relay.h"
 #include "ioloop.h"
+#include "export_worker.h"   /* the export of a video message (ARCH-135) */
 
 #include <mbedtls/sha256.h>
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -158,7 +160,11 @@ typedef enum {
      * backpressure, over a rendering the daemon made rather than a file someone
      * uploaded. `audio` on the transfer says which frames the pump writes.
      * AWAIT_RENDER is the state with no blob yet: the worker is synthesizing. */
-    XFER_AUDIO_AWAIT_RENDER
+    XFER_AUDIO_AWAIT_RENDER,
+    /* The export of a video message (ARCH-135) reuses it as read-aloud does:
+     * `export` on the transfer says which frames the pump writes, and
+     * EXPORT_AWAIT_RENDER is the state with no copy yet. */
+    XFER_EXPORT_AWAIT_RENDER
 } xfer_state;
 
 typedef struct {
@@ -186,6 +192,9 @@ typedef struct {
     int              audio;
     uint64_t         audio_message_id;
     uint32_t         audio_duration_ms;
+    /* The export of a video message: this transfer is its playable copy. */
+    int              export;
+    uint32_t         export_duration_ms;
     /* Which transfer this is: advanced whenever one ends (xfer_reset), stamped
      * on each database job the transfer submits and echoed on its result, so a
      * result is acted on only by the transfer that asked for it. A cancelled
@@ -338,6 +347,25 @@ static __thread oc_blobstore *g_blobs;
 static __thread oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
 /* The summary worker (ARCH-116): NULL when summaries are off. */
 static oc_sum_worker *g_sum;
+/* The export of a video message (ARCH-135): the codecs, injected before the
+ * loop starts (a daemon built with EXPORT=1 passes the real ones, a test a
+ * stub), and the worker, which exists only when the operator turned export on.
+ * A request whose video is being exported waits here for the worker's answer;
+ * a copy just made is kept a while, by key, so a request between the worker's
+ * answer and its cache row is served rather than exported again. */
+static const oc_export_codecs *g_export_codecs;
+static __thread oc_export_worker *g_export;
+typedef struct export_wait { uint64_t req_id, conn_id, attachment_id; struct export_wait *next; } export_wait;
+static __thread export_wait *g_export_waits;
+static __thread uint64_t g_export_req_seq;
+#define EXPORT_FRESH_MS 60000u
+typedef struct export_fresh {
+    uint64_t attachment_id, bytes, at_ms;
+    uint32_t duration_ms;
+    char     key[OC_EXPORT_KEY_MAX];
+    struct export_fresh *next;
+} export_fresh;
+static __thread export_fresh *g_export_fresh;
 #ifdef OC_TTS
 /* Read-aloud (ARCH-111): the render worker and the engine it runs. The engine is
  * injected before the loop starts (a daemon built with read-aloud passes the
@@ -407,6 +435,7 @@ static void tts_lookup_answered(uint64_t seq) {
 }
 static void tts_drop_waiters(uint64_t conn_id);
 #endif
+static void export_drop_waiters(uint64_t conn_id);
 #ifdef OC_STT
 /* Voice input (ARCH-112): the recognizer and its worker, injected as read-aloud's
  * are. A segment, once wholly received, is checked (STT_PREP, a read job), then
@@ -1006,6 +1035,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     uint64_t cid = c->conn_id;
     int was_authed = c->authed;
     xfer_reset(&c->xfer);
+    export_drop_waiters(cid);
 #ifdef OC_TTS
     tts_drop_waiters(cid);
 #endif
@@ -1401,6 +1431,8 @@ static void sum_conn_closed(uint64_t conn_id) {
     oc_job *j = oc_job_new(OC_JOB_SUMMARY_DROP, conn_id);
     if (j) oc_dbwriter_submit(g_call_dbw, j);
 }
+
+void oc_netloop_set_export(const struct oc_export_codecs *codecs) { g_export_codecs = codecs; }
 
 void oc_netloop_set_tts(const struct oc_tts_engine *engine) {
 #ifdef OC_TTS
@@ -2720,6 +2752,57 @@ static int tts_refuse(conn *c, uint64_t message_id) {
     return out_append(c, tmp, w.len);
 }
 
+/* The export of a video message is refused by name and the connection stays
+ * open: not built in, turned off, or busy (ARCH-135). Nothing was started, so a
+ * download already running on the connection is left alone, as tts_refuse. */
+static int export_refuse(conn *c, uint64_t attachment_id, uint16_t code) {
+    uint8_t ctxb[8];
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(attachment_id >> (56 - 8 * i));
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { code, 0, { ctxb, 8 }, oc_slice_str("transfer error") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
+/* Start streaming a stored copy: open the blob, then EXPORT_INFO and the pump,
+ * exactly as an attachment download does (ARCH-69). -1 if the connection was
+ * told about a failure instead. */
+static int export_open_blob(int ep, conn **conns, conn *c, const char *key, uint64_t bytes, uint32_t duration_ms) {
+    conn_xfer *x = &c->xfer;
+    oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_R, c->conn_id);
+    if (!j || !key || !(j->key = strdup(key))) {
+        oc_xfer_job_free(j);
+        int fd = c->fd;
+        send_transfer_error(c, x->attachment_id, OC_ERR_INTERNAL);
+        if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        return -1;
+    }
+    j->attachment_id = x->attachment_id;
+    x->export_duration_ms = duration_ms;
+    x->remaining = bytes;
+    x->next_seq = 0;
+    x->state = XFER_DOWN_AWAIT_OPEN;
+    x->in_flight = 1;
+    oc_xferpool_submit(g_xfers, j);
+    update_interest(ep, c);
+    return 0;
+}
+
+/* A copy the worker just made, if one is held for `attachment_id`; the stale
+ * ones are let go on the way. */
+static const export_fresh *export_fresh_find(uint64_t attachment_id) {
+    uint64_t now = now_ms();
+    export_fresh **link = &g_export_fresh;
+    const export_fresh *hit = NULL;
+    while (*link) {
+        export_fresh *f = *link;
+        if (now - f->at_ms > EXPORT_FRESH_MS) { *link = f->next; free(f); continue; }
+        if (f->attachment_id == attachment_id && !hit) hit = f;
+        link = &f->next;
+    }
+    return hit;
+}
+
 /* Ask the pool for the next slice of the blob, if the output buffer has room.
  * The read completes asynchronously; xfer_read_done appends the chunk and calls
  * back in here, so the loop is driven by completions rather than by a blocking
@@ -2735,6 +2818,9 @@ static void download_pump(conn *c) {
         if (x->audio) {
             oc_audio_end ae = { x->audio_message_id };
             oc_encode_audio_end(&w, OC_PROTOCOL_VERSION, &ae);
+        } else if (x->export) {
+            oc_export_end ee = { x->attachment_id };
+            oc_encode_export_end(&w, OC_PROTOCOL_VERSION, &ee);
         } else {
             oc_download_end de = { x->attachment_id };
             oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
@@ -4901,6 +4987,32 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
 #endif
             continue;
         }
+        /* The export of a video message (ARCH-135): the download's gate in the
+         * lookup, then the copy already made, or the worker makes it. Refused by
+         * name, the connection kept, when export is not running here. */
+        if (hdr.msg_type == OC_MSG_EXPORT_GET) {
+            oc_export_get eg;
+            if (oc_decode_export_get(&p, &eg) != OC_OK) return -1;
+            if (!g_export) {
+                if (export_refuse(c, eg.attachment_id, OC_ERR_EXPORT_UNAVAILABLE) != 0) return -1;
+                continue;
+            }
+            if (c->xfer.state != XFER_NONE) {
+                /* One transfer at a time; the one running is left alone. */
+                if (export_refuse(c, eg.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_EXPORT_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = eg.attachment_id;
+            j->exp_version = strdup(g_export_codecs->version);
+            c->xfer.export = 1;
+            c->xfer.attachment_id = eg.attachment_id;
+            xfer_submit(dbw, &c->xfer, j);
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            continue;
+        }
 #ifdef OC_TTS
         if (hdr.msg_type == OC_MSG_AUDIO_GET) {
             oc_audio_get ag;
@@ -6698,6 +6810,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS_TCP);
             }
             caps.names[caps.count++] = oc_slice_str(OC_CAP_PDM);
+            /* The export of a video message, when built in and turned on (ARCH-135). */
+            if (g_export) caps.names[caps.count++] = oc_slice_str(OC_CAP_H264_EXPORT);
             /* Always: named so a client offers "Create a poll" only to a
              * daemon that can store one (REQ-225). */
             caps.names[caps.count++] = oc_slice_str(OC_CAP_POLLS);
@@ -8037,6 +8151,54 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
 #endif
+    case OC_RES_EXPORT_META: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (!xfer_current(x, r) || x->state != XFER_DOWN_AWAIT_LOOKUP || !x->export) break;
+        if (r->exp_cached) {
+            /* Made already: serve it, and mark it used so the storage sweep
+             * takes the copies nobody asks for first. */
+            oc_job *tj = oc_job_new(OC_JOB_EXPORT_TOUCH, 0);
+            if (tj) {
+                tj->attachment_id = r->exp_attachment_id;
+                tj->exp_version = strdup(g_export_codecs->version);
+                oc_dbwriter_submit(dbw, tj);
+            }
+            export_open_blob(ep, conns, c, r->exp_blob_key, r->exp_bytes, r->exp_duration_ms);
+            break;
+        }
+        const export_fresh *f = export_fresh_find(r->exp_attachment_id);
+        if (f) { export_open_blob(ep, conns, c, f->key, f->bytes, f->duration_ms); break; }
+        int fd = c->fd;
+        export_wait *wt = g_export ? calloc(1, sizeof *wt) : NULL;
+        int rc = !wt ? -1 : oc_export_worker_submit(g_export, ++g_export_req_seq, c->user_id, r->exp_attachment_id,
+                                                    r->exp_src_key, r->exp_src_size);
+        if (rc < 0) {
+            /* Not running, the person's three are in hand, or the queue is full. */
+            free(wt);
+            send_transfer_error(c, r->exp_attachment_id, OC_ERR_EXPORT_UNAVAILABLE);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        wt->req_id = g_export_req_seq;
+        wt->conn_id = c->conn_id;
+        wt->attachment_id = r->exp_attachment_id;
+        wt->next = g_export_waits;
+        g_export_waits = wt;
+        x->state = XFER_EXPORT_AWAIT_RENDER;
+        break;
+    }
+    case OC_RES_EXPORT_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        if (xfer_current(&c->xfer, r) && c->xfer.state == XFER_DOWN_AWAIT_LOOKUP && c->xfer.export) {
+            int fd = c->fd;
+            send_transfer_error(c, r->exp_attachment_id, r->err_code);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        }
+        break;
+    }
     case OC_RES_ATTACH_META: {
         /* DOWNLOAD_BEGIN authorized: open the blob and stream it (REQ-141). */
         conn *c = find_by_id(conns, r->conn_id);
@@ -9449,6 +9611,77 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     oc_dbwriter_submit(dbw, j);
 }
 
+/* An export the worker finished (ARCH-135): record the copy, then start every
+ * connection that was waiting for it. A waiter whose connection has gone, or
+ * which moved on to something else, is simply dropped. */
+static void deliver_export_results(int ep, conn **conns, oc_dbwriter *dbw) {
+    oc_export_result res;
+    while (g_export && oc_export_worker_next_result(g_export, &res)) {
+        if (res.status == OC_EXPORT_OK) {
+            oc_job *sj = oc_job_new(OC_JOB_EXPORT_STORE, 0);
+            if (sj) {
+                sj->attachment_id = res.attachment_id;
+                sj->exp_version = strdup(g_export_codecs->version);
+                sj->exp_blob_key = strdup(res.key);
+                sj->exp_bytes = res.bytes;
+                sj->exp_duration_ms = res.duration_ms;
+                oc_dbwriter_submit(dbw, sj);
+            }
+            export_fresh *f = calloc(1, sizeof *f);
+            if (f) {                                   /* held until its row is surely written */
+                f->attachment_id = res.attachment_id;
+                f->bytes = res.bytes;
+                f->duration_ms = res.duration_ms;
+                f->at_ms = now_ms();
+                snprintf(f->key, sizeof f->key, "%s", res.key);
+                f->next = g_export_fresh;
+                g_export_fresh = f;
+            }
+        } else if (res.status == OC_EXPORT_FAILED) {
+            fprintf(stderr, "export: attachment %llu failed: %s\n", (unsigned long long)res.attachment_id, res.reason);
+        }
+        for (size_t i = 0; i < res.n_req; i++) {
+            export_wait **link = &g_export_waits;
+            while (*link && (*link)->req_id != res.req_ids[i]) link = &(*link)->next;
+            export_wait *wt = *link;
+            if (!wt) continue;
+            *link = wt->next;
+            conn *c = find_by_id(conns, wt->conn_id);
+            if (c && c->xfer.state == XFER_EXPORT_AWAIT_RENDER && c->xfer.export &&
+                c->xfer.attachment_id == wt->attachment_id) {
+                int fd = c->fd;
+                if (res.status == OC_EXPORT_OK) {
+                    c->xfer.state = XFER_NONE;              /* export_open_blob sets the next one */
+                    export_open_blob(ep, conns, c, res.key, res.bytes, res.duration_ms);
+                } else {
+                    send_transfer_error(c, wt->attachment_id,
+                                        res.status == OC_EXPORT_NOT_VIDEO ? OC_ERR_MEDIA_INVALID : OC_ERR_INTERNAL);
+                    if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+                }
+            }
+            free(wt);
+        }
+        oc_export_result_free(&res);
+    }
+}
+
+/* A connection that goes away while its export is being made leaves no waiter
+ * behind: the export still finishes and is cached, it simply has nobody to send to. */
+static void export_drop_waiters(uint64_t conn_id) {
+    export_wait **link = &g_export_waits;
+    while (*link) {
+        export_wait *wt = *link;
+        if (wt->conn_id == conn_id) { *link = wt->next; free(wt); continue; }
+        link = &wt->next;
+    }
+}
+
+#ifdef OC_TTS
+/* While a read-aloud rendering runs no export starts (ARCH-135): the two
+ * together would not fit in a managed box's memory. */
+static int export_gate(void *ctx) { (void)ctx; return g_tts && oc_tts_worker_rendering(g_tts); }
+#endif
+
 #ifdef OC_TTS
 /* A render the worker finished: record it, then start every connection that was
  * waiting for that handle. A waiter whose connection has gone, or which moved on
@@ -9627,6 +9860,14 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
         }
         x->br = j->br;
         x->state = XFER_DOWN_ACTIVE;
+        if (x->export) {
+            oc_export_info ei = { x->attachment_id, x->export_duration_ms, x->remaining };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_encode_export_info(&w, OC_PROTOCOL_VERSION, &ei);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+            download_pump(c);
+            break;
+        }
         if (x->audio) {
             oc_audio_info ai = { x->audio_message_id, x->audio_duration_ms, x->remaining };
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -9657,6 +9898,9 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             if (x->audio) {
                 oc_audio_chunk ac = { x->audio_message_id, x->next_seq, { j->data, j->len } };
                 oc_encode_audio_chunk(&w, OC_PROTOCOL_VERSION, &ac);
+            } else if (x->export) {
+                oc_export_chunk ec = { x->attachment_id, x->next_seq, { j->data, j->len } };
+                oc_encode_export_chunk(&w, OC_PROTOCOL_VERSION, &ec);
             } else {
                 oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
                 oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
@@ -9975,6 +10219,36 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         }
     }
 #endif
+    /* The export worker (ARCH-135), beside the transfer pool because it writes to
+     * the same store. It runs only when the operator turned export on and this
+     * daemon carries the codecs; its temporary files go in the data directory. */
+    int export_eventfd = -1;
+    g_export_waits = NULL; g_export_fresh = NULL; g_export_req_seq = 0;
+    {
+        const oc_config *cfg = oc_config_get();
+        if (cfg->export_h264.enabled && !g_export_codecs) {
+            fprintf(stderr, "export: OPENCHIME_H264_EXPORT is on, but this daemon was built without it (EXPORT=1); export is off\n");
+        } else if (cfg->export_h264.enabled) {
+            char tmp_dir[1100];
+            snprintf(tmp_dir, sizeof tmp_dir, "%s/export", cfg->data_dir ? cfg->data_dir : ".");
+            if (mkdir(tmp_dir, 0700) != 0 && errno != EEXIST)
+                fprintf(stderr, "export: cannot make %s: %s\n", tmp_dir, strerror(errno));
+#ifdef OC_TTS
+            g_export = oc_export_worker_start(g_export_codecs, g_blobs, tmp_dir, export_gate, NULL);
+#else
+            g_export = oc_export_worker_start(g_export_codecs, g_blobs, tmp_dir, NULL, NULL);
+#endif
+            if (!g_export) {
+                fprintf(stderr, "export: cannot start the export worker; export is off\n");
+            } else {
+                export_eventfd = oc_export_worker_eventfd(g_export);
+                struct epoll_event xev;
+                xev.events = EPOLLIN; xev.data.fd = export_eventfd;
+                epoll_ctl(ep, EPOLL_CTL_ADD, export_eventfd, &xev);
+                fprintf(stderr, "export: H.264 + MP3 export on (%s)\n", g_export_codecs->version);
+            }
+        }
+    }
 #ifdef OC_TTS
     g_tts_fresh = NULL;   /* another loop's store is not this one's */
     g_tts_out = NULL; g_n_tts_out = g_cap_tts_out = 0; g_tts_lookup_seq = 0;
@@ -10224,6 +10498,12 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 #endif
+            if (export_eventfd >= 0 && fd == export_eventfd) {
+                uint64_t cnt;
+                while (read(export_eventfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                deliver_export_results(ep, conns, dbw);
+                continue;
+            }
 #ifdef OC_TTS
             if (fd == tts_eventfd) {
                 uint64_t cnt;
@@ -10298,6 +10578,13 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     for (stt_pend *x = g_stt_pend, *next; x; x = next) { next = x->next; stt_free(x); }
     g_stt_pend = NULL;
 #endif
+    /* Before the store it writes to, like the transfer pool. */
+    oc_export_worker_stop(g_export);
+    g_export = NULL;
+    for (export_wait *wt = g_export_waits, *next; wt; wt = next) { next = wt->next; free(wt); }
+    g_export_waits = NULL;
+    for (export_fresh *f = g_export_fresh, *next; f; f = next) { next = f->next; free(f); }
+    g_export_fresh = NULL;
 #ifdef OC_TTS
     /* Before the store it writes to, like the transfer pool. */
     oc_tts_worker_stop(g_tts);

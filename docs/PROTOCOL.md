@@ -1907,7 +1907,8 @@ their model is still coming up — a request sent then waits in the queue until 
 is ready; a daemon whose model did not come up answers whatever waited
 with a `SUMMARY` of status UNAVAILABLE (1, §5.16m) and leaves the name out of every later sign-in. `polls` is always
 present on a daemon that stores polls (§5.16n), so a client offers to make one
-only where it can be kept.
+only where it can be kept. `h264-export` is present exactly when the export of a
+video message is running (§5.14d): built in and turned on.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -1969,9 +1970,10 @@ when read-aloud is off, the queue is full, the connection is past 60 renderings
 a minute, or `voice_id` is not one `TTS_INFO` listed, and `TRANSFER_PROTOCOL` when another transfer is in flight.
 
 The `TTS_UNAVAILABLE` refusals above come from a daemon built with read-aloud. A
-daemon built without it (`TTS=0`, the plain build's default) has no handler for
-`AUDIO_GET` or `VOICE_PREVIEW_GET`: either frame is answered with a fatal
-`UNEXPECTED_MSG_TYPE` and the connection is closed. A client sends them only when
+daemon built without it (`TTS=0`, the plain build's default) answers `AUDIO_GET`
+and `VOICE_PREVIEW_GET` the same way as one built with it and turned off:
+`TTS_UNAVAILABLE`, naming the message asked about (0 for a preview), and the
+connection stays open (READ-ALOUD.md §6). A client sends them only when
 `CAPABILITIES` lists `tts`.
 
 ### 5.14c Voice input (REQ-296–300, ARCH-112)
@@ -2018,6 +2020,40 @@ encrypted DM (§5.19); `NOT_A_MEMBER`, `UNKNOWN_CHANNEL`, `CHANNEL_ARCHIVED` and
 `SEND_RATE_LIMITED` in free talk, as for `SEND`; and `TRANSFER_PROTOCOL` for a chunk
 out of order, a total that does not match, an `STT_BEGIN` mid-segment, a
 `sample_count` of 0, an unknown `mode`, or free talk with `channel_id` 0.
+
+### 5.14d Export of a video message (REQ-382–384, ARCH-135)
+
+A copy of a video message that players other than OpenChime open: H.264 and MP3
+in MP4, made by the daemon from the VP9 and Opus the message holds. It is the
+download's shape keyed by the **attachment** id, as read-aloud's is keyed by the
+message's.
+
+**`EXPORT_GET` (C → S), `0x013E`** `{ attachment_id: u64 }` — "the playable copy
+of this video message". The gate is the download's (`channel_read_access` on the
+video's channel), because the copy is the video. Then, in order:
+
+1. **`EXPORT_INFO` (S → C), `0x013F`** `{ attachment_id: u64, duration_ms: u32,
+   total_size: u64 }` — once, before the bytes.
+2. **`EXPORT_CHUNK` (S → C), `0x0140`** `{ attachment_id: u64, seq: u32, data: bytes }`
+   — sequential chunks, with the download path's backpressure.
+3. **`EXPORT_END` (S → C), `0x0141`** `{ attachment_id: u64 }` — everything sent.
+
+A first request **transcodes**, about a quarter of the video's length on a
+desktop and longer on a small machine, and the answer arrives when it is done;
+later requests are served from the cache. Two people asking for the same video at
+once cost one transcode. One transfer at a time per connection: an `EXPORT_GET`
+while another transfer runs is refused `TRANSFER_PROTOCOL` and the running one is
+left alone.
+
+Refusals are `ERROR` frames carrying the attachment id in `context`, and the
+connection stays open: `EXPORT_UNAVAILABLE` 3074 when export is not running here —
+not built in (`EXPORT=0`) or turned off (`OPENCHIME_H264_EXPORT`) — or the
+person already has three requests in hand, or the daemon's queue is full;
+`FORBIDDEN` when the caller cannot read the channel; `MEDIA_INVALID` when the
+attachment is not a video message, or is an encrypted DM's; `ATTACHMENT_GONE` when
+its bytes have been reclaimed; `UNKNOWN_ATTACHMENT` for an id that is not there or
+not yet sent; and `INTERNAL` when the transcode failed. A client sends it only when
+`CAPABILITIES` lists `h264-export`.
 
 ### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
 
@@ -3677,6 +3713,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3071` | `INVALID_PROFILE_FIELD` | admin    | no    | A profile field without a label, of an unknown kind or id, past the 20 a workspace may have; or a value over 200 bytes, for a field it does not have, or for a link not starting `https://`. |
 | `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
 | `3073` | `EMOJI_ALIAS_LIMIT`   | emoji      | no    | A `RENAME_EMOJI` past the 8 old names an emoji keeps, or the 256 a workspace does. |
+| `3074` | `EXPORT_UNAVAILABLE`  | attachment | no    | An `EXPORT_GET` where export is not running (not built in, or `OPENCHIME_H264_EXPORT` off), or the person's three or the daemon's queue are full (§5.14d). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3973,6 +4010,10 @@ this table cannot silently gain a shared value.
 | `0x013B` | `CHANNEL_ADD_MANAGER` | C → S | a manager, admin or owner names a member of the channel a manager (§5.7) |
 | `0x013C` | `CHANNEL_REMOVE_MANAGER` | C → S | and takes the role from any manager, the creator included |
 | `0x013D` | `RENAME_EMOJI` | C → S | a custom emoji's new name; the old one stays as an alias (§5.16g) |
+| `0x013E` | `EXPORT_GET` | C → S | the playable copy of a video message (§5.14d) |
+| `0x013F` | `EXPORT_INFO` | S → C | its duration and size (§5.14d) |
+| `0x0140` | `EXPORT_CHUNK` | S → C | a slice of the copy (§5.14d) |
+| `0x0141` | `EXPORT_END` | S → C | the whole copy is sent (§5.14d) |
 
 ## 10. Connection state machine
 

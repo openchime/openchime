@@ -51,6 +51,43 @@ int  oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t
 /* Stop without a file. */
 void oc_mp4_writer_abort(oc_mp4_writer *w);
 
+/* ---- the export writer (ARCH-135, docs/VIDEO-MESSAGES.md "Export") --------------
+ *
+ * A video message re-encoded for players that do not open VP9: one H.264 track
+ * and one MP3 track, written to a FILE as it goes -- the daemon's export never
+ * holds the whole copy in memory -- as ftyp · mdat · moov, the index last because
+ * a file saved for playing elsewhere is never streamed progressively. Not the
+ * restricted profile above: oc_mp4_parse refuses it. Not built for Windows,
+ * where nothing exports. */
+#if !defined(_WIN32)
+
+#define OC_MP4_EXPORT_MAX_FILE  0xF0000000ull      /* stco's 32-bit offsets, with room for moov */
+
+typedef struct oc_mp4_export oc_mp4_export;
+
+/* Create `path` for a `width`×`height` H.264 track and a mono MP3 track at
+ * `audio_rate` Hz. NULL on failure, with nothing left at `path`. */
+oc_mp4_export *oc_mp4_export_open(const char *path, int width, int height, unsigned audio_rate);
+/* Append one H.264 access unit in Annex B form (start codes), as an encoder
+ * emits it. Its SPS and PPS go into the sample entry, the first of each kept and
+ * later copies dropped, as are access unit delimiters; every other NAL unit is
+ * written length-prefixed. A unit holding an IDR slice is a sync sample, and the
+ * first unit must hold one. `pts_us` must not go backwards. */
+int oc_mp4_export_video(oc_mp4_export *x, const uint8_t *au, size_t len, int64_t pts_us);
+/* Append one MP3 frame of `samples` samples. */
+int oc_mp4_export_audio(oc_mp4_export *x, const uint8_t *frame, size_t len, unsigned samples);
+/* Write the index and close the file. `audio_delay` is the encoder's and
+ * decoder's delay in samples and `audio_samples` the real audio's length: an
+ * edit list plays exactly that, so the sound lines up with the picture. On 0,
+ * `*bytes` is the file's size and `*duration_ms` the longer track's; on -1 the
+ * file is removed. Frees `x` either way. */
+int oc_mp4_export_finish(oc_mp4_export *x, uint32_t audio_delay, uint64_t audio_samples,
+                         uint64_t *bytes, uint32_t *duration_ms);
+/* Stop: close and remove the file, free `x`. */
+void oc_mp4_export_abort(oc_mp4_export *x);
+
+#endif
+
 /* ---- reading --------------------------------------------------------------- */
 
 typedef struct {
@@ -84,6 +121,13 @@ typedef struct oc_mp4_info {
  * (`info->video.present` is 0). Never reads outside `data[0..len)`. */
 int  oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info);
 void oc_mp4_info_free(oc_mp4_info *info);
+/* The same from the file's head alone -- ftyp, moov and mdat's 8-byte header,
+ * `head_len` bytes of a file of `file_len` -- for a reader that streams the
+ * samples rather than holding them (the daemon's export, ARCH-135). The
+ * samples are checked against `file_len`; `*mdat_payload` (if non-NULL)
+ * receives where mdat's samples start. */
+int  oc_mp4_parse_head(const uint8_t *head, size_t head_len, uint64_t file_len, oc_mp4_info *info,
+                       uint64_t *mdat_payload);
 
 /* The index of the keyframe at or before `dts` in the video track, or -1. */
 int oc_mp4_keyframe_before(const oc_mp4_info *info, uint64_t dts);

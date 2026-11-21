@@ -1662,6 +1662,8 @@ const char *oc_error_text(uint16_t code) {
         return "out of office needs an end after its start, and a message of at most 280 bytes";
     case OC_ERR_EMOJI_ALIAS_LIMIT:
         return "that emoji has kept as many old names as it can: add it again under the new name instead";
+    case OC_ERR_EXPORT_UNAVAILABLE:
+        return "a copy for other players isn't available here right now";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2735,6 +2737,34 @@ oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chu
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_END);
     oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_get(oc_wbuf *w, uint16_t version, const oc_export_get *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_GET);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_INFO);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->duration_ms);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_END);
+    oc_w_u64(w, m->attachment_id);
     return oc_frame_end(w, off);
 }
 
@@ -4050,6 +4080,30 @@ oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m) {
 
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m) {
     m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_get(oc_rbuf *p, oc_export_get *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->duration_ms = oc_r_u32(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m) {
+    m->attachment_id = oc_r_u64(p);
     return r_done(p);
 }
 

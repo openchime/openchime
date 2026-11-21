@@ -38,9 +38,12 @@ Other people's work under their own licences, unchanged: committed under
 version, its licence and what uses it are [VENDORS.md](docs/VENDORS.md).
 
 All are compatible with AGPL-3.0-or-later, so none of them
-constrains the choice above. All are permissive but one: Mozilla's CA roots are
+constrains the choice above. All are permissive but two: Mozilla's CA roots are
 MPL-2.0, whose copyleft reaches only the file itself, and which names the GNU
-licences as ones its files may be combined under. Two consequences worth stating:
+licences as ones its files may be combined under; and LAME, the MP3 encoder a
+daemon built with the video export links (ARCH-135), is LGPL-2.0-**or-later**,
+which the "or later" makes compatible here as it does libsecret's. Two
+consequences worth stating:
 
 - Apache-2.0 is compatible with AGPL-3.0 but **not** with GPL-2.0 — while
   mbedTLS is linked, GPL-2.0 is not an available licence for this project.

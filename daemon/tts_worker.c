@@ -38,6 +38,7 @@ struct oc_tts_worker {
     result_node         *out_head, *out_tail;
     int                  stopping;
     int                  engine_is_open; /* read under mu */
+    int                  rendering;      /* read under mu: a render is running */
 
     int                  evfd;
 };
@@ -150,7 +151,13 @@ static void *run(void *arg) {
             uint32_t ms = 0;
             struct timespec t0, t1, t2;
             clock_gettime(CLOCK_MONOTONIC, &t0);
+            pthread_mutex_lock(&w->mu);
+            w->rendering = 1;
+            pthread_mutex_unlock(&w->mu);
             n->r.status = oc_tts_render(w->engine, engine, j->text, j->voice, &mp4, &len, &ms, err, sizeof err);
+            pthread_mutex_lock(&w->mu);
+            w->rendering = 0;
+            pthread_mutex_unlock(&w->mu);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             if (n->r.status == OC_TTS_OK) store(w, j, mp4, len, ms, &n->r);
             clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -268,4 +275,12 @@ int oc_tts_worker_engine_open(oc_tts_worker *w) {
     int open = w->engine_is_open;
     pthread_mutex_unlock(&w->mu);
     return open;
+}
+
+int oc_tts_worker_rendering(oc_tts_worker *w) {
+    if (!w) return 0;
+    pthread_mutex_lock(&w->mu);
+    int r = w->rendering;
+    pthread_mutex_unlock(&w->mu);
+    return r;
 }

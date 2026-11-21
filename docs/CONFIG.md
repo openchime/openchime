@@ -190,6 +190,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_S3_FILE` | *(unset)* | `OPENCHIME_S3`'s value, read from this file instead (mode 0600; a trailing newline is ignored), so the key and secret are not in the environment. Set one or the other, not both. |
 | `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
 | `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 55 MB, 40 MB of it the mapped model, against about 25 MB idle (TESTING.md, "Speech models' memory"); off saves that. `on` or `off`. |
+| `OPENCHIME_H264_EXPORT` | `off` | Export of a video message as an H.264 and MP3 copy that other players open (ARCH-135), in a build that carries it. H.264 is patent-encumbered: turning this on needs the operator's own H.264 patent licence, which is why it is off. A transcode runs one at a time, below the daemon's other work, and holds up to 96 MB while it runs. `on` or `off`. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
 | `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
 | `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
@@ -527,8 +528,9 @@ are remembered in `build/.features` until changed or `make distclean`.
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `TTS` | `0` | `1` builds read-aloud in; without it `OPENCHIME_TTS` is accepted and has no effect. The full build sets it, and the three below. |
+| `TTS` | `0` | `1` builds read-aloud in; without it `OPENCHIME_TTS` is accepted and has no effect. The full build sets it, and the four below. |
 | `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT`. |
 | `SUM` | `0` | `1` builds sumkit, the summary inference engine, in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
 | `WEB` | `0` | `1` compiles the web client's loader into the daemon, which then serves it at `/app/`. |
+| `EXPORT` | `0` | `1` builds the export of a video message in (ARCH-135): libavc and LAME to encode, libvpx and libopus to decode. The daemon still exports nothing until `OPENCHIME_H264_EXPORT` is on; without the switch that setting is accepted, logged, and has no effect. |
 | `OC_BUILD_ID` | *(unset: `dev`)* | The build id `--version` prints: the short commit the release-candidate compiled (ARCH-20, UPGRADING.md). A release number is assigned to a build afterwards and is not compiled in. |

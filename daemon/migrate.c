@@ -1760,6 +1760,32 @@ static const char MIGRATION_0069[] =
      * and none is invented for it; INVITE_LIST reports it as 0. */
     "ALTER TABLE invites ADD COLUMN created_at_ms INTEGER;";
 
+
+static const char MIGRATION_0086[] =
+    /* The export of a video message (ARCH-135): the H.264 + MP3 copies the
+     * daemon has already made, so a second request for the same video is served
+     * rather than transcoded again.
+     *
+     * `exported_video` is a CACHE, as `rendered_audio` is (0042): keyed by the
+     * video's attachment and `version`, which names the encoders and their
+     * settings together, so a change to either makes a new copy rather than
+     * serving one made differently. A row points at a blob and holds only what
+     * EXPORT_INFO needs. It is reclaimable storage, taken before any attachment
+     * tier and with no tombstone, least recently used first -- hence the index on
+     * `last_used_ms` -- and it goes when its video goes. Losing a row costs one
+     * transcode. */
+    "CREATE TABLE exported_video ("
+    "  attachment_id INTEGER NOT NULL REFERENCES attachments(id),"
+    "  version       TEXT NOT NULL,"
+    "  blob_key      TEXT NOT NULL,"
+    "  bytes         INTEGER NOT NULL,"
+    "  duration_ms   INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_used_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (attachment_id, version)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX exported_video_lru ON exported_video(last_used_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1846,6 +1872,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 83, MIGRATION_0083 },
     { 84, MIGRATION_0084 },
     { 85, MIGRATION_0085 },
+    { 86, MIGRATION_0086 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

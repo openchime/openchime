@@ -31,6 +31,8 @@ dist/
 !/third_party/libvpx/
 !/third_party/mbedtls/
 !/third_party/SDL3/
+!/third_party/libavc/
+!/third_party/lame/
 *.o
 *.db
 *.db-shm

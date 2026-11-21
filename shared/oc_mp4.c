@@ -15,8 +15,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include "oc_mp4.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 /* ---- a growable big-endian byte buffer ---------------------------------------- */
 
@@ -356,6 +361,260 @@ int oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t 
     return 0;
 }
 
+/* ---- the export writer (oc_mp4.h) ------------------------------------------------
+ *
+ *   ftyp · mdat (samples, streamed to the file) · moov{ mvhd · trak(avc1) · trak(mp4a) }
+ *
+ * The sample tables are the only thing held: a few bytes a sample. References:
+ * ISO/IEC 14496-15 (avc1 / avcC); ISO/IEC 14496-14 and -1 (mp4a / esds, MPEG-1
+ * audio as object type 0x6B). */
+#if !defined(_WIN32)
+
+#define EXPORT_TIMESCALE_VIDEO 90000u
+
+struct oc_mp4_export {
+    FILE    *f;
+    char    *path;
+    int      width, height;
+    unsigned audio_rate;
+    uint64_t mdat_at;               /* where mdat's header is */
+    uint64_t pos;                   /* the file's length so far */
+    wtrack   video, audio;
+    int64_t  last_pts_us;
+    int      have_video;
+    uint8_t *sps, *pps;
+    size_t   sps_len, pps_len;
+    int      bad;
+};
+
+static int x_write(oc_mp4_export *x, const void *p, size_t n) {
+    if (x->bad) return -1;
+    if (n && fwrite(p, 1, n, x->f) != n) { x->bad = 1; return -1; }
+    x->pos += n;
+    if (x->pos > OC_MP4_EXPORT_MAX_FILE) { x->bad = 1; return -1; }
+    return 0;
+}
+
+oc_mp4_export *oc_mp4_export_open(const char *path, int width, int height, unsigned audio_rate) {
+    if (!path || width <= 0 || height <= 0 || width > 65535 || height > 65535 || audio_rate == 0) return NULL;
+    oc_mp4_export *x = calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->path = strdup(path);
+    x->f = x->path ? fopen(path, "wb") : NULL;
+    if (!x->f) { free(x->path); free(x); return NULL; }
+    x->width = width; x->height = height; x->audio_rate = audio_rate;
+    bbuf h = {0};
+    size_t ftyp = box_begin(&h, "ftyp");
+    fourcc(&h, "isom"); u32(&h, 0x200);
+    fourcc(&h, "isom"); fourcc(&h, "iso2"); fourcc(&h, "avc1"); fourcc(&h, "mp41");
+    box_end(&h, ftyp);
+    x->mdat_at = h.n;
+    u32(&h, 0); fourcc(&h, "mdat");                        /* its size is written at finish */
+    if (h.bad || x_write(x, h.d, h.n) != 0) { free(h.d); oc_mp4_export_abort(x); return NULL; }
+    free(h.d);
+    return x;
+}
+
+/* The next NAL unit of an Annex B buffer at or after `*at`: its payload in
+ * [*start, *end), `*at` moved past it. 0, or -1 when there are no more. */
+static int next_nal(const uint8_t *b, size_t n, size_t *at, size_t *start, size_t *end) {
+    size_t i = *at;
+    while (i + 3 <= n && !(b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1)) i++;
+    if (i + 3 > n) return -1;
+    i += 3;
+    size_t j = i;
+    while (j + 3 <= n && !(b[j] == 0 && b[j + 1] == 0 && (b[j + 2] == 1 || (b[j + 2] == 0 && j + 3 < n && b[j + 3] == 1)))) j++;
+    if (j + 3 > n) j = n;
+    *start = i; *end = j; *at = j;
+    return i < j ? 0 : -1;
+}
+
+static int keep_param(uint8_t **dst, size_t *dst_len, const uint8_t *p, size_t n) {
+    if (*dst) return 0;                                    /* the first is the sample entry's */
+    if (n > 0xFFFF) return -1;
+    *dst = malloc(n);
+    if (!*dst) return -1;
+    memcpy(*dst, p, n);
+    *dst_len = n;
+    return 0;
+}
+
+int oc_mp4_export_video(oc_mp4_export *x, const uint8_t *au, size_t len, int64_t pts_us) {
+    if (!x || !au || x->bad) return -1;
+    if (x->have_video && pts_us < x->last_pts_us) return -1;
+    if (x->video.n + x->audio.n >= OC_MP4_MAX_SAMPLES) return -1;
+    uint64_t off = x->pos;
+    uint32_t size = 0;
+    int idr = 0;
+    size_t at = 0, s, e;
+    while (next_nal(au, len, &at, &s, &e) == 0) {
+        uint8_t type = au[s] & 0x1F;
+        if (type == 7) { if (keep_param(&x->sps, &x->sps_len, au + s, e - s) != 0) return -1; continue; }
+        if (type == 8) { if (keep_param(&x->pps, &x->pps_len, au + s, e - s) != 0) return -1; continue; }
+        if (type == 9) continue;                           /* access unit delimiter */
+        if (type == 5) idr = 1;
+        uint8_t hdr[4] = { (uint8_t)((e - s) >> 24), (uint8_t)((e - s) >> 16), (uint8_t)((e - s) >> 8), (uint8_t)(e - s) };
+        if (x_write(x, hdr, 4) != 0 || x_write(x, au + s, e - s) != 0) return -1;
+        size += (uint32_t)(4 + e - s);
+    }
+    if (size == 0) return 0;                               /* parameter sets alone: no sample */
+    if (!x->have_video) {
+        if (!idr || !x->sps || !x->pps) { x->bad = 1; return -1; }
+        x->last_pts_us = pts_us; x->have_video = 1;
+    } else {
+        wsample *prev = &x->video.s[x->video.n - 1];
+        uint64_t d = ((uint64_t)(pts_us - x->last_pts_us) * EXPORT_TIMESCALE_VIDEO + 500000) / 1000000;
+        prev->dur = (uint32_t)(d ? d : 1);
+        x->last_pts_us = pts_us;
+    }
+    return wt_push(&x->video, (wsample){ off, size, EXPORT_TIMESCALE_VIDEO / 30, (uint8_t)idr });
+}
+
+int oc_mp4_export_audio(oc_mp4_export *x, const uint8_t *frame, size_t len, unsigned samples) {
+    if (!x || !frame || !len || len > 0xFFFF || !samples || x->bad) return -1;
+    if (x->video.n + x->audio.n >= OC_MP4_MAX_SAMPLES) return -1;
+    uint64_t off = x->pos;
+    if (x_write(x, frame, len) != 0) return -1;
+    return wt_push(&x->audio, (wsample){ off, (uint32_t)len, samples, 1 });
+}
+
+/* An MPEG-4 descriptor's header: its tag and a one-byte size (all here are short). */
+static void desc(bbuf *b, uint8_t tag, uint8_t size) { u8(b, tag); u8(b, size); }
+
+static void build_export_moov(bbuf *b, const oc_mp4_export *x, uint32_t audio_delay, uint64_t audio_samples,
+                              uint64_t *movie_ms_out) {
+    uint64_t vdur = track_duration(&x->video), adur = track_duration(&x->audio);
+    uint64_t vms = vdur * 1000 / EXPORT_TIMESCALE_VIDEO;
+    if (audio_samples > adur) audio_samples = adur > audio_delay ? adur - audio_delay : 0;
+    uint64_t ams = audio_samples * 1000 / x->audio_rate;
+    uint64_t movie_ms = vms > ams ? vms : ams;
+    *movie_ms_out = movie_ms;
+    uint32_t next_id = 1;
+
+    size_t moov = box_begin(b, "moov");
+    size_t mvhd = fullbox_begin(b, "mvhd", 0, 0);
+    u32(b, 0); u32(b, 0); u32(b, 1000); u32(b, (uint32_t)movie_ms);
+    u32(b, 0x00010000); u16(b, 0x0100); zeros(b, 10);
+    unity_matrix(b); zeros(b, 24);
+    u32(b, (x->video.n ? 1u : 0u) + (x->audio.n ? 1u : 0u) + 1u);
+    box_end(b, mvhd);
+
+    if (x->video.n) {
+        size_t trak = box_begin(b, "trak");
+        write_tkhd(b, next_id++, vms, 1, x->width, x->height);
+        size_t mdia = box_begin(b, "mdia");
+        write_mdhd(b, EXPORT_TIMESCALE_VIDEO, vdur);
+        write_hdlr(b, "vide", "OpenChime video");
+        size_t minf = box_begin(b, "minf");
+        size_t vmhd = fullbox_begin(b, "vmhd", 0, 1); u16(b, 0); zeros(b, 6); box_end(b, vmhd);
+        write_dinf(b);
+        size_t stbl = box_begin(b, "stbl");
+        size_t stsd = fullbox_begin(b, "stsd", 0, 0); u32(b, 1);
+        size_t avc1 = box_begin(b, "avc1");
+        zeros(b, 6); u16(b, 1);                            /* reserved, data reference index */
+        u16(b, 0); u16(b, 0); zeros(b, 12);
+        u16(b, (uint16_t)x->width); u16(b, (uint16_t)x->height);
+        u32(b, 0x00480000); u32(b, 0x00480000); u32(b, 0);
+        u16(b, 1);                                         /* frame count */
+        zeros(b, 32);                                      /* compressor name */
+        u16(b, 0x0018); u16(b, 0xFFFF);
+        size_t avcc = box_begin(b, "avcC");
+        u8(b, 1);                                          /* configuration version */
+        u8(b, x->sps[1]); u8(b, x->sps[2]); u8(b, x->sps[3]);   /* profile, compatibility, level */
+        u8(b, 0xFF);                                       /* 4-byte NAL lengths */
+        u8(b, 0xE1); u16(b, (uint16_t)x->sps_len); bytes(b, x->sps, x->sps_len);
+        u8(b, 1);    u16(b, (uint16_t)x->pps_len); bytes(b, x->pps, x->pps_len);
+        box_end(b, avcc);
+        box_end(b, avc1);
+        box_end(b, stsd);
+        write_sample_tables(b, &x->video, 0, 1);
+        box_end(b, stbl); box_end(b, minf); box_end(b, mdia); box_end(b, trak);
+    }
+
+    if (x->audio.n) {
+        size_t trak = box_begin(b, "trak");
+        write_tkhd(b, next_id++, ams, 0, 0, 0);
+        /* The encoder's and decoder's delay is skipped and the padding after the
+         * last real sample is not played: the edit is exactly the audio. */
+        size_t edts = box_begin(b, "edts");
+        size_t elst = fullbox_begin(b, "elst", 0, 0);
+        u32(b, 1); u32(b, (uint32_t)ams); u32(b, audio_delay); u16(b, 1); u16(b, 0);
+        box_end(b, elst); box_end(b, edts);
+        size_t mdia = box_begin(b, "mdia");
+        write_mdhd(b, x->audio_rate, adur);
+        write_hdlr(b, "soun", "OpenChime audio");
+        size_t minf = box_begin(b, "minf");
+        size_t smhd = fullbox_begin(b, "smhd", 0, 0); u16(b, 0); u16(b, 0); box_end(b, smhd);
+        write_dinf(b);
+        size_t stbl = box_begin(b, "stbl");
+        size_t stsd = fullbox_begin(b, "stsd", 0, 0); u32(b, 1);
+        size_t mp4a = box_begin(b, "mp4a");
+        zeros(b, 6); u16(b, 1);
+        u32(b, 0); u32(b, 0);
+        u16(b, 1);                                         /* channels */
+        u16(b, 16); u16(b, 0); u16(b, 0);
+        u32(b, x->audio_rate << 16);
+        uint32_t max_frame = 0;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < x->audio.n; i++) {
+            if (x->audio.s[i].size > max_frame) max_frame = x->audio.s[i].size;
+            total += x->audio.s[i].size;
+        }
+        uint32_t avg_bps = adur ? (uint32_t)(total * 8 * x->audio_rate / adur) : 0;
+        size_t esds = fullbox_begin(b, "esds", 0, 0);
+        desc(b, 0x03, 3 + 2 + 13 + 2 + 1);                 /* ES_Descriptor */
+        u16(b, 0); u8(b, 0);                               /* ES_ID, flags */
+        desc(b, 0x04, 13);                                 /* DecoderConfigDescriptor */
+        u8(b, 0x6B);                                       /* MPEG-1 audio: MP3 */
+        u8(b, (0x05 << 2) | 1);                            /* audio stream */
+        u8(b, (uint8_t)(max_frame >> 16)); u16(b, (uint16_t)max_frame);   /* buffer size */
+        u32(b, avg_bps); u32(b, avg_bps);                  /* max and average bit rate: CBR */
+        desc(b, 0x06, 1); u8(b, 0x02);                     /* SLConfigDescriptor, predefined MP4 */
+        box_end(b, esds);
+        box_end(b, mp4a);
+        box_end(b, stsd);
+        write_sample_tables(b, &x->audio, 0, 0);
+        box_end(b, stbl); box_end(b, minf); box_end(b, mdia); box_end(b, trak);
+    }
+    box_end(b, moov);
+}
+
+static void export_free(oc_mp4_export *x) {
+    free(x->video.s); free(x->audio.s); free(x->sps); free(x->pps); free(x->path);
+    free(x);
+}
+
+void oc_mp4_export_abort(oc_mp4_export *x) {
+    if (!x) return;
+    if (x->f) fclose(x->f);
+    if (x->path) unlink(x->path);
+    export_free(x);
+}
+
+int oc_mp4_export_finish(oc_mp4_export *x, uint32_t audio_delay, uint64_t audio_samples,
+                         uint64_t *bytes_out, uint32_t *duration_ms) {
+    if (!x) return -1;
+    if (x->bad || x->video.n == 0 || !x->sps || x->sps_len < 4 || !x->pps) { oc_mp4_export_abort(x); return -1; }
+    uint64_t mdat_len = x->pos - x->mdat_at;
+    uint8_t sz[4] = { (uint8_t)(mdat_len >> 24), (uint8_t)(mdat_len >> 16), (uint8_t)(mdat_len >> 8), (uint8_t)mdat_len };
+    bbuf m = {0};
+    uint64_t movie_ms = 0;
+    build_export_moov(&m, x, audio_delay, audio_samples, &movie_ms);
+    int ok = !m.bad && mdat_len <= 0xFFFFFFFFu && x_write(x, m.d, m.n) == 0;
+    free(m.d);
+    ok = ok && fseeko(x->f, (off_t)x->mdat_at, SEEK_SET) == 0 && fwrite(sz, 1, 4, x->f) == 4;
+    ok = ok && fflush(x->f) == 0;
+    int closed = fclose(x->f);
+    x->f = NULL;
+    if (!ok || closed != 0) { oc_mp4_export_abort(x); return -1; }
+    if (bytes_out) *bytes_out = x->pos;
+    if (duration_ms) *duration_ms = (uint32_t)movie_ms;
+    export_free(x);
+    return 0;
+}
+
+#endif
+
 /* ---- reading ---------------------------------------------------------------------- */
 
 typedef struct { const uint8_t *p; size_t n; } span;
@@ -486,13 +745,10 @@ void oc_mp4_info_free(oc_mp4_info *info) {
     memset(info, 0, sizeof *info);
 }
 
-int oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info) {
-    memset(info, 0, sizeof *info);
-    if (!data || len < 16 || len > OC_MP4_MAX_FILE) return -1;
-    span file = { data, len }, ftyp, moov;
-    if (child(file, "ftyp", &ftyp) || child(file, "moov", &moov)) return -1;
-    if (child(file, "mdat", &(span){0}) != 0) return -1;
-
+/* The tracks of `moov`, their samples checked against a file of `file_len`
+ * bytes, into `info`; the durations from them. 0, or -1 with `info` freed. */
+static int parse_moov(span moov, size_t file_len, oc_mp4_info *info) {
+    size_t len = file_len;
     /* Walk each trak and classify it by its sample entry. */
     size_t at = 0;
     int rc = 0;
@@ -545,6 +801,35 @@ int oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info) {
     }
     info->duration_ms = (uint32_t)(vms > ams ? vms : ams);
     return 0;
+}
+
+int oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info) {
+    memset(info, 0, sizeof *info);
+    if (!data || len < 16 || len > OC_MP4_MAX_FILE) return -1;
+    span file = { data, len }, ftyp, moov;
+    if (child(file, "ftyp", &ftyp) || child(file, "moov", &moov)) return -1;
+    if (child(file, "mdat", &(span){0}) != 0) return -1;
+    return parse_moov(moov, len, info);
+}
+
+int oc_mp4_parse_head(const uint8_t *head, size_t head_len, uint64_t file_len, oc_mp4_info *info,
+                      uint64_t *mdat_payload) {
+    memset(info, 0, sizeof *info);
+    if (!head || head_len < 16 || file_len > OC_MP4_MAX_FILE || head_len > file_len) return -1;
+    /* ftyp, then moov, then mdat's header: all inside `head`, mdat running to the
+     * file's end. That order is the profile's (moov before mdat). */
+    span h = { head, head_len };
+    size_t at = 0;
+    uint32_t sz;
+    if (rd32(h, 0, &sz) || sz < 8 || sz > head_len || memcmp(head + 4, "ftyp", 4) != 0) return -1;
+    at = sz;
+    if (rd32(h, at, &sz) || sz < 8 || sz > head_len - at || memcmp(head + at + 4, "moov", 4) != 0) return -1;
+    span moov = { head + at + 8, sz - 8 };
+    at += sz;
+    if (rd32(h, at, &sz) || head_len - at < 8 || memcmp(head + at + 4, "mdat", 4) != 0) return -1;
+    if (sz < 8 || (uint64_t)at + sz != file_len) return -1;
+    if (mdat_payload) *mdat_payload = at + 8;
+    return parse_moov(moov, (size_t)file_len, info);
 }
 
 int oc_mp4_keyframe_before(const oc_mp4_info *info, uint64_t dts) {

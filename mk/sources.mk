@@ -9,7 +9,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -125,7 +125,10 @@ CORE_INC := -Iclient/core
 # or play video (the TUI) links no codec. libvpx and libopus are fetched and built
 # pinned (scripts/build/libvpx.sh, scripts/build/opus.sh), natively for `make
 # test` and cross-built for the Win32 client.
-MEDIA_SRC  := $(wildcard client/core/media/*.c)
+# The VP9 and Opus decoders are shared/ so the daemon's export links them too
+# (ARCH-135); every client build that has the media library has them.
+CODEC_DEC_SRC := shared/oc_vp9dec.c shared/oc_opusdec.c
+MEDIA_SRC  := $(wildcard client/core/media/*.c) $(CODEC_DEC_SRC)
 MEDIA_HDRS := $(wildcard client/core/media/*.h)
 LIBVPX_DIR := third_party/libvpx-1.17.0$(ARCH_SUFFIX)
 OPUS_DIR   := third_party/opus-1.6.1$(ARCH_SUFFIX)
@@ -136,6 +139,13 @@ OPUS_A     := $(OPUS_DIR)/lib/libopus.a
 # (scripts/build/speexdsp.sh) like the codecs.
 SPEEXDSP_DIR := third_party/speexdsp-1.2.1$(ARCH_SUFFIX)
 SPEEXDSP_A   := $(SPEEXDSP_DIR)/lib/libspeexdsp.a
+# The export of a video message (ARCH-135): libavc's H.264 encoder and LAME's MP3
+# encoder, committed and built pinned (scripts/build/libavc.sh,
+# scripts/build/lame.sh), natively, for a daemon built with EXPORT=1 alone.
+LIBAVC_DIR := third_party/libavc-1.10.0$(ARCH_SUFFIX)
+LAME_DIR   := third_party/lame-3.100$(ARCH_SUFFIX)
+LIBAVC_A   := $(LIBAVC_DIR)/lib/libavcenc.a
+LAME_A     := $(LAME_DIR)/lib/libmp3lame.a
 MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include -I$(SPEEXDSP_DIR)/include
 MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) -ldl -lm
 

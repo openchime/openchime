@@ -2218,3 +2218,29 @@ already in it, so two people marking a task at once agree. *A delete leaves the
 rows*: every read joins a message that stands, so a deleted message's list is
 never sent, and a restore brings it back as it was. An encrypted DM's body is not
 the daemon's to read, so it never holds a list.
+
+## 3by. Migration 0086 — exported copies of video messages
+
+```sql
+CREATE TABLE exported_video (
+  attachment_id INTEGER NOT NULL REFERENCES attachments(id),
+  version       TEXT NOT NULL,
+  blob_key      TEXT NOT NULL,
+  bytes         INTEGER NOT NULL,
+  duration_ms   INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_used_ms  INTEGER NOT NULL,
+  PRIMARY KEY (attachment_id, version)) WITHOUT ROWID;
+CREATE INDEX exported_video_lru ON exported_video(last_used_ms);
+```
+
+*`exported_video` is a cache*, as `rendered_audio` is: the H.264 + MP3 copies the
+daemon has made of video messages (ARCH-135), keyed by the video's attachment and
+`version`, which names the encoders and their settings, so a change to them makes
+a new copy rather than serving an old one. *Written* when a copy is finished, and
+only while its video is still there (`EXPORT_STORE`); `last_used_ms` *moved* each
+time one is served (`EXPORT_TOUCH`). *Read* by `EXPORT_LOOKUP`, and by the orphan
+sweep's reference check, which leaves a copy's blob alone while its row stands.
+*Deleted* by the storage pass: under pressure, least recently used first and
+before any attachment, and, pressure or not, as soon as its video is reclaimed.
+No tombstone: a lost copy costs one transcode.

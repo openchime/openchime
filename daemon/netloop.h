@@ -167,6 +167,11 @@ void oc_netloop_set_unfurler(struct oc_unfurler *u);
  * oc_netloop_run; NULL (the default, and a daemon built with TTS=0) means the
  * daemon advertises no read-aloud and answers AUDIO_GET with TTS_UNAVAILABLE. */
 struct oc_tts_engine;
+/* The export of a video message (ARCH-135): the codecs a daemon built with
+ * EXPORT=1 carries (oc_export_codecs_builtin), or a test's stub, or NULL. The
+ * worker runs only when OPENCHIME_H264_EXPORT is on as well. */
+struct oc_export_codecs;
+void oc_netloop_set_export(const struct oc_export_codecs *codecs);
 void oc_netloop_set_tts(const struct oc_tts_engine *engine);
 
 /* Wire voice input's recognizer (REQ-296-300, ARCH-112). The daemon passes the

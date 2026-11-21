@@ -97,7 +97,10 @@ LDFLAGS ?= -lpthread -lm   # -lm: SQLite FTS5 ranking (bm25) calls log()
 # (ttskit/data/); voice input (STT) needs the recognizer's data
 # (sttkit/data/); summaries (SUM) need
 # nothing beyond the tree; the web client (WEB) needs Emscripten and a wasm build of SDL3 and
-# the codecs. The full build turns them all on.
+# the codecs; the export of a video message (EXPORT, ARCH-135) needs libavc and
+# LAME (third_party/), built here. The full build turns them all on. EXPORT=1
+# only carries the codecs: the daemon exports nothing until its operator turns
+# OPENCHIME_H264_EXPORT on.
 #
 # The switches are remembered: build/.features holds the values of the last
 # run, is read back at the top of the next, and a value given on the command
@@ -121,6 +124,7 @@ TTS ?= 0
 STT ?= 0
 SUM ?= 0
 WEB ?= 0
+EXPORT ?= 0
 # The architecture and the release compiler are NOT remembered: `make
 # ARCH=aarch64` cross-builds the daemon for arm64 (build only: nothing here can
 # run it) with aarch64-linux-gnu-gcc-12 into build/aarch64/, and `make RELEASE=1`
@@ -130,7 +134,7 @@ WEB ?= 0
 HOST_ARCH := $(shell uname -m)
 ARCH    ?= $(HOST_ARCH)
 RELEASE ?= 0
-FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB)
+FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB) EXPORT=$(EXPORT)
 ifeq ($(REMEMBER),1)
 $(FEATURES): FORCE | build-dir
 	@printf '%s\n' $(FEATURES_NOW) | cmp -s - $@ || printf '%s\n' $(FEATURES_NOW) > $@
@@ -196,9 +200,9 @@ include mk/full.mk
 # one file at a time, as every build here does (.NOTPARALLEL, at the top):
 # compiles use memory the whole time they run, and several at once on a machine
 # with a memory limit run past it.
-FAST_MAKE = $(MAKE) --no-print-directory REMEMBER=0 TTS=0 STT=0 SUM=0 WEB=0
+FAST_MAKE = $(MAKE) --no-print-directory REMEMBER=0 TTS=0 STT=0 SUM=0 WEB=0 EXPORT=0
 # A switch given to them is not taken, and they say so.
-FAST_IGNORED = $(strip $(foreach v,TTS STT SUM WEB,$(if $(filter command line,$(origin $(v))),$(v))))
+FAST_IGNORED = $(strip $(foreach v,TTS STT SUM WEB EXPORT,$(if $(filter command line,$(origin $(v))),$(v))))
 build test:
 	@scripts/test/lib/require_local.sh $@
 	$(if $(FAST_IGNORED),@echo "make $@: $(FAST_IGNORED) not taken: the fast build is one configuration; make openchimed or make run takes them" >&2)

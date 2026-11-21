@@ -349,7 +349,13 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* To-do lists: a task added (todo_name, todo_desc), marked (todo_task,
         * todo_done), or the list renamed by its author (todo_name). Writes;
         * answered OC_RES_TODO to the conversation, or OC_RES_TODO_ERR. */
-       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163 };
+       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163,
+       /* The export of a video message (ARCH-135). EXPORT_LOOKUP (read):
+        * attachment_id + user_id, with exp_version the codecs' version; answered
+        * OC_RES_EXPORT_META -- the source to transcode, or the copy already made --
+        * or OC_RES_EXPORT_ERR. EXPORT_STORE writes a finished copy's row,
+        * EXPORT_TOUCH marks one served: write, fire and forget. */
+       OC_JOB_EXPORT_LOOKUP = 164, OC_JOB_EXPORT_STORE = 165, OC_JOB_EXPORT_TOUCH = 166 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -509,6 +515,14 @@ typedef struct oc_job {
      * voice at startup turns every later press of Play into a cache hit
      * (docs/READ-ALOUD.md §5). */
     uint8_t        tts_warm;
+
+    /* The export of a video message (ARCH-135): attachment_id (the upload
+     * fields, below), and the codecs' version (exp_version) the cache is keyed
+     * by; STORE adds what the worker made. */
+    char          *exp_version;
+    char          *exp_blob_key;
+    uint64_t       exp_bytes;
+    uint32_t       exp_duration_ms;
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -891,7 +905,12 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
         * empty one (user_id 0) when none was due. */
-       OC_RES_REMINDER_DUE = 135 };
+       OC_RES_REMINDER_DUE = 135,
+       /* EXPORT_LOOKUP's answer (ARCH-135): `exp_cached` says the copy is stored,
+        * described by exp_blob_key/exp_bytes/exp_duration_ms; otherwise
+        * exp_src_key/exp_src_size is the video to transcode. EXPORT_ERR carries
+        * err_code. attachment_id is echoed either way. */
+       OC_RES_EXPORT_META = 138, OC_RES_EXPORT_ERR = 139 };
 
 /* The usage figures (REQ-043), as USAGE carries them; the channels' names are
  * held here, since the frame only points at them. */
@@ -1540,6 +1559,12 @@ typedef struct oc_dbres {
     uint32_t                tts_duration_ms;
     uint8_t                 tts_voice, tts_cached, tts_persist, tts_warm;
     uint64_t                tts_author_id;
+    /* OC_RES_EXPORT_META (ARCH-135). */
+    uint64_t                exp_attachment_id;
+    char                   *exp_blob_key, *exp_src_key;
+    uint64_t                exp_bytes, exp_src_size;
+    uint32_t                exp_duration_ms;
+    uint8_t                 exp_cached;
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;

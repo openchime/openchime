@@ -25,6 +25,7 @@
 #include "listen.h"
 #include "migrate.h"
 #include "netloop.h"
+#include "export_render.h"   /* oc_export_codecs_builtin (ARCH-135) */
 #include "oidcrp.h"
 #include "push.h"
 #include "relaykeys.h"
@@ -640,6 +641,7 @@ int main(int argc, char **argv) {
             tts_engine = NULL;
         }
         oc_netloop_set_tts(tts_engine);
+        oc_netloop_set_export(oc_export_codecs_builtin());   /* NULL unless built with EXPORT=1 */
     }
 #endif
 #ifdef OC_STT

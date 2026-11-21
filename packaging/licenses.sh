@@ -13,14 +13,15 @@
 # Read-aloud (ARCH-111), voice input (ARCH-112) and summaries are in the
 # release's daemon, and with them the voice model, Opus, CMUdict-derived data
 # and the recognizer; for a daemon built without one, run this with
-# TTS=0, STT=0 or SUM=0.
+# TTS=0, STT=0 or SUM=0. The export of a video message (EXPORT, ARCH-135) brings
+# libavc, LAME, libvpx and Opus; for a daemon built without it, EXPORT=0.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
 # program, in the container image only, never linked into openchimed nor in
 # the tarball this file describes. Its own LICENSE travels beside it in the
 # image (packaging/image-context.sh, /usr/share/doc/litestream/LICENSE).
 #
-#   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
+#   [TTS=0] [STT=0] [SUM=0] [EXPORT=0] licenses.sh <mbedtls-dir>
 #
 # LICENSES_LIST=1 prints the path of each text it would include, one per line,
 # and nothing else: scripts/test/fast/notices.sh compares that list with what the
@@ -31,6 +32,7 @@ MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
 TTS="${TTS:-1}"
 STT="${STT:-1}"
 SUM="${SUM:-1}"
+EXPORT="${EXPORT:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 LIST="${LICENSES_LIST:-0}"
@@ -118,6 +120,21 @@ and, for voice input (built into the binary, its data in stt/):
 HEADER
 fi
 
+if [ "$EXPORT" = 1 ]; then
+  header <<'HEADER'
+
+and, for the export of a video message (built into the binary; used only when
+the operator turns OPENCHIME_H264_EXPORT on, which needs their own H.264 patent
+licence):
+
+  libavc 1.10.0        Apache-2.0   encoding H.264
+  LAME 3.100           LGPL-2.0-or- encoding MP3; its source is
+                       later        third_party/lame in the repository above
+  libvpx 1.17.0        BSD-3-Clause decoding the VP9 a video message holds
+  Opus 1.6.1           BSD-3-Clause decoding its audio
+HEADER
+fi
+
 if [ "$SUM" = 1 ]; then
   header <<'HEADER'
 
@@ -149,4 +166,13 @@ if [ "$TTS" = 1 ]; then
 fi
 if [ "$STT" = 1 ]; then
   emit "The recognizer -- MIT License" "${root}/sttkit/data/RECOGNIZER-LICENSE"
+fi
+if [ "$EXPORT" = 1 ]; then
+  emit "libavc 1.10.0 -- Apache License 2.0" "${root}/third_party/libavc/LICENSE"
+  emit "libavc 1.10.0 -- NOTICE" "${root}/third_party/libavc/NOTICE"
+  emit "LAME 3.100 -- GNU Library General Public License v2 or later" "${root}/third_party/lame/COPYING"
+  emit "libvpx 1.17.0 -- BSD 3-Clause License" "${root}/third_party/libvpx/LICENSE"
+  emit "libvpx 1.17.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libvpx/PATENTS"
+  # Opus once, whichever feature brought it.
+  [ "$TTS" = 1 ] || emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
 fi

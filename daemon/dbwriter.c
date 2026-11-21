@@ -335,6 +335,8 @@ static void job_free(oc_job *j) {
     free(j->tts_text);
     free(j->tts_lang);
     free(j->tts_blob_key);
+    free(j->exp_version);
+    free(j->exp_blob_key);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -880,6 +882,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->pfd); free(r->pfv);
     free(r->pf_ooo_message);
     free(r->tts_text); free(r->tts_blob_key);
+    free(r->exp_blob_key); free(r->exp_src_key);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
@@ -12271,6 +12274,106 @@ static oc_dbres *process_tts_touch(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* The export of a video message (ARCH-135). The gate is the download's: the
+ * copy is the video, so whoever may read the video may have it. Then it must be
+ * a video message -- an attachment with a media row of kind 1 -- whose bytes are
+ * still here and are not an encrypted DM's ciphertext. The answer names the
+ * copy already made for these codecs, or the source to make it from. */
+static oc_dbres *process_export_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->exp_attachment_id = j->attachment_id;
+    r->type = OC_RES_EXPORT_ERR;
+    r->err_code = OC_ERR_UNKNOWN_ATTACHMENT;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT a.channel_id, a.storage_key, a.size, a.reclaimed_at_ms, m.kind"
+            "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id"
+            " WHERE a.id = ?1 AND a.sha256 IS NOT NULL AND a.message_id IS NOT NULL;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return r; }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0);
+    const char *key = (const char *)sqlite3_column_text(st, 1);
+    char *src_key = strdup(key ? key : "");
+    uint64_t size = (uint64_t)sqlite3_column_int64(st, 2);
+    int gone = sqlite3_column_int64(st, 3) != 0;
+    int video = sqlite3_column_type(st, 4) != SQLITE_NULL && sqlite3_column_int(st, 4) == 1;
+    sqlite3_finalize(st);
+    if (!src_key) { r->err_code = OC_ERR_INTERNAL; return r; }
+    if (!channel_read_access(db, cid, j->user_id)) { free(src_key); r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (gone) { free(src_key); r->err_code = OC_ERR_ATTACHMENT_GONE; return r; }
+    if (!video || channel_is_e2e(db, cid)) { free(src_key); r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+
+    r->type = OC_RES_EXPORT_META;
+    r->channel_id = cid;
+    r->exp_src_key = src_key;
+    r->exp_src_size = size;
+    if (sqlite3_prepare_v2(db,
+            "SELECT blob_key, bytes, duration_ms FROM exported_video"
+            " WHERE attachment_id = ?1 AND version = ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_text(st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *bk = (const char *)sqlite3_column_text(st, 0);
+            r->exp_blob_key = strdup(bk ? bk : "");
+            r->exp_bytes = (uint64_t)sqlite3_column_int64(st, 1);
+            r->exp_duration_ms = (uint32_t)sqlite3_column_int(st, 2);
+            r->exp_cached = r->exp_blob_key != NULL;
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* A finished copy becomes a cache row, unless its video went while it was being
+ * made: then the row would point at a copy of nothing, and the blob is left for
+ * the orphan sweep. Write, fire and forget. */
+static oc_dbres *process_export_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO exported_video"
+            "  (attachment_id, version, blob_key, bytes, duration_ms, created_at_ms, last_used_ms)"
+            "  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?6 FROM attachments"
+            "   WHERE id = ?1 AND reclaimed_at_ms = 0;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    sqlite3_bind_text (st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, j->exp_blob_key ? j->exp_blob_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->exp_bytes);
+    sqlite3_bind_int  (st, 5, (int)j->exp_duration_ms);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Serving a stored copy makes it recently used, which is what the storage sweep
+ * evicts by. Write, fire and forget. */
+static oc_dbres *process_export_touch(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE exported_video SET last_used_ms = ?3 WHERE attachment_id = ?1 AND version = ?2;",
+            -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    sqlite3_bind_text (st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
 /* Write back the voice the daemon chose for an author, once, so the profile
  * shows it. Never overwrites a voice the user set. Write, fire and forget. */
 static oc_dbres *process_tts_voice_set(sqlite3 *db, const oc_job *j) {
@@ -12314,6 +12417,7 @@ static int is_read_job(int type) {
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
+           type == OC_JOB_EXPORT_LOOKUP ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
 }
@@ -12345,6 +12449,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_BLOCKS)    return process_list_blocks(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
+    if (j->type == OC_JOB_EXPORT_LOOKUP)  return process_export_lookup(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
@@ -12842,6 +12947,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SUMMARY_SEEN)  return process_summary_seen(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
+    if (j->type == OC_JOB_EXPORT_STORE)  return process_export_store(w->db, j);
+    if (j->type == OC_JOB_EXPORT_TOUCH)  return process_export_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w, j);
     if (j->type == OC_JOB_RESTORE)       return process_restore(w, j);
@@ -13336,6 +13443,48 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             }
             sqlite3_finalize(st);
         }
+    }
+
+    /* Exported copies (ARCH-135) go with their video: every pass, pressure or
+     * not, a copy whose video has been reclaimed is deleted. Then, under
+     * pressure, they are reclaimed with the read-aloud renderings above, least
+     * recently used first: a copy is the daemon's own work and is made again
+     * from its video, so it is as cheap to lose. No tombstone either. */
+    for (int under_pressure = 0; under_pressure < 2 && r->n_reclaim < cap; under_pressure++) {
+        if (under_pressure && !j->maint_evict) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db, under_pressure
+                ? "SELECT attachment_id, version, blob_key FROM exported_video"
+                  " ORDER BY last_used_ms ASC LIMIT ?1;"
+                : "SELECT e.attachment_id, e.version, e.blob_key FROM exported_video e"
+                  "  JOIN attachments a ON a.id = e.attachment_id"
+                  " WHERE a.reclaimed_at_ms != 0 LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(cap - r->n_reclaim));
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            sqlite3_int64 att = sqlite3_column_int64(st, 0);
+            const unsigned char *ver = sqlite3_column_text(st, 1);
+            const char *key = (const char *)sqlite3_column_text(st, 2);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            sqlite3_stmt *del = NULL;
+            int gone = 0;
+            if (sqlite3_prepare_v2(db, "DELETE FROM exported_video WHERE attachment_id = ?1 AND version = ?2;",
+                                   -1, &del, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(del, 1, att);
+                sqlite3_bind_text(del, 2, ver ? (const char *)ver : "", -1, SQLITE_TRANSIENT);
+                gone = sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0;
+                sqlite3_finalize(del);
+            }
+            if (!gone) { free(dup); continue; }
+            r->reclaim[r->n_reclaim].storage_key = dup;     /* not an attachment: the key alone */
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+            r->maint_renders++;
+        }
+        sqlite3_finalize(st);
     }
 
     /* Tier 1 (REQ-213): orphans — uploaded but never referenced by a message,
@@ -14585,7 +14734,8 @@ int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint
     int rc = -1;
     if (sqlite3_prepare_v2(db,
             "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_key=?1)"
-            "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1);",
+            "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1)"
+            "    OR EXISTS(SELECT 1 FROM exported_video WHERE blob_key=?1);",
             -1, &st, NULL) == SQLITE_OK) {
         rc = 0;
         for (size_t i = 0; i < n && rc == 0; i++) {

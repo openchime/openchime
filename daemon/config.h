@@ -181,6 +181,10 @@ typedef struct {
     /* The speech features: built in and on by default (ARCH-111/112); their
      * data is found as every build's is (tts_data.h). */
     struct { int enabled; } tts, stt;
+    /* The export of a video message as H.264 + MP3 (ARCH-135), in a build that
+     * carries it: OPENCHIME_H264_EXPORT, off unless the operator holds the
+     * licence turning it on needs. */
+    struct { int enabled; } export_h264;
     /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;

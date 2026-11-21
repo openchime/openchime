@@ -3036,6 +3036,45 @@ static void test_tts_frames(void) {
         oc_audio_end out;
         CHECK(oc_decode_audio_end(&p, &out) == OC_OK && out.message_id == 4242);
     }
+    /* The export of a video message (ARCH-135): the download's shape, by attachment. */
+    {
+        oc_export_get in = { 0x1122334455667788ull };
+        ROUNDTRIP(oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EXPORT_GET, h, p);
+        oc_export_get out;
+        CHECK(oc_decode_export_get(&p, &out) == OC_OK && out.attachment_id == 0x1122334455667788ull);
+    }
+    {
+        oc_export_info in = { 71, 10033, 21638581 };
+        ROUNDTRIP(oc_encode_export_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EXPORT_INFO, h, p);
+        oc_export_info out;
+        CHECK(oc_decode_export_info(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 71 && out.duration_ms == 10033 && out.total_size == 21638581);
+    }
+    {
+        uint8_t data[300];
+        for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 11);
+        oc_export_chunk in = { 71, 9, { data, sizeof data } };
+        ROUNDTRIP(oc_encode_export_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EXPORT_CHUNK, h, p);
+        oc_export_chunk out;
+        CHECK(oc_decode_export_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 71 && out.seq == 9 && out.data.len == sizeof data);
+        CHECK(out.data.ptr && memcmp(out.data.ptr, data, sizeof data) == 0);
+    }
+    {
+        oc_export_end in = { 71 };
+        ROUNDTRIP(oc_encode_export_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EXPORT_END, h, p);
+        oc_export_end out;
+        CHECK(oc_decode_export_end(&p, &out) == OC_OK && out.attachment_id == 71);
+    }
+    /* Malformed: an EXPORT_GET a byte short is refused, not guessed at. */
+    {
+        oc_export_get in = { 71 };
+        ROUNDTRIP(oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EXPORT_GET, h, p);
+        p.len -= 1;
+        oc_export_get out;
+        CHECK(oc_decode_export_get(&p, &out) != OC_OK);
+    }
+    CHECK(oc_error_text(OC_ERR_EXPORT_UNAVAILABLE) != NULL);
 }
 
 /* Blocks and DM privacy. */

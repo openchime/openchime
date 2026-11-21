@@ -51,6 +51,24 @@ SUM_DEPS  := $(SUMKIT_HDRS)
 SUM_FLAGS := -DOC_SUM
 endif
 
+# --- The export of a video message (ARCH-135) ---------------------------------
+# The codecs a copy is made with: libvpx and libopus to decode the VP9 and Opus
+# the clients record, libavc and LAME to encode H.264 and MP3, all C and all
+# built here. The render, the worker and the frames are plain C in DAEMON_SRC,
+# so `make test` drives them with a stub; only the engine is EXPORT's.
+# Without EXPORT the daemon refuses every export, whatever OPENCHIME_H264_EXPORT says.
+# The test binary links the engine whatever EXPORT is, for the export_media
+# suite; it is the only one that asks for it (oc_export_codecs_real).
+EXPORT_TEST_SRC  := daemon/export_engine.c
+EXPORT_TEST_INC  := -I$(LIBAVC_DIR)/include -I$(LAME_DIR)/include
+EXPORT_TEST_LIBS := $(LIBAVC_A) $(LAME_A)
+ifeq ($(EXPORT),1)
+EXPORT_SRC   := daemon/export_engine.c $(CODEC_DEC_SRC)
+EXPORT_DEPS  := $(LIBAVC_A) $(LAME_A) $(LIBVPX_A) $(OPUS_A)
+EXPORT_FLAGS := -DOC_EXPORT -I$(LIBAVC_DIR)/include -I$(LAME_DIR)/include -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
+EXPORT_LIBS  := $(LIBAVC_A) $(LAME_A) $(LIBVPX_A) $(if $(filter 1,$(TTS)),,$(OPUS_A))
+endif
+
 # sumkit and the converter that writes its file are in every build, as the
 # other models' converters are: `openchimed --summary-pack` makes summary.bin
 # whether or not the engine runs it here. nnkit comes with read-aloud or voice
@@ -66,13 +84,13 @@ SUMKIT_DAEMON_SRC := $(SUMKIT_SRC) $(if $(filter 1,$(TTS) $(STT)),,$(NNKIT_SRC))
 # the two models' data files are written in their formats (--voice-pack,
 # daemon/voice_pack.c; --recognizer-pack, daemon/recognizer_pack.c) whether or
 # not read-aloud or voice input is compiled in.
-DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
-DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC))
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
+DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) $(EXPORT_FLAGS)
+DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC) $(EXPORT_SRC))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS)))
 -include $(DAEMON_OBJS:.o=.d)
-$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
+$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(EXPORT_LIBS) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever

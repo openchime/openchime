@@ -335,6 +335,22 @@ framework.
   camera and tone, and `ffprobe` (installed in CI as a validator, never linked)
   checks the file it writes; the player plays, seeks and copes with a slow
   decoder. `tests/test_video_media.c` covers the protocol and daemon side.
+- **Export of a video message** (ARCH-135) — in `make test`,
+  `tests/test_export.c`: the H.264 + MP3 writer's layout, parameter sets, sync
+  samples, offsets and audio edit; the render, with stub codecs, reading a source
+  once front to back and handing every sample over in file order, and stopping
+  cleanly when cancelled or when a read fails; the worker's read-aloud gate,
+  joining of duplicate requests, three requests a person, order, keys and the
+  temporary files it never leaves; and the cache's refusals, hits by version,
+  reclaim first under pressure and with its video. `itest_export_wire` (in
+  `tests/itest_netloop.c`, also in `make test`) runs a daemon with export off, on
+  without codecs, and on with the stub: the capability, the refusal by name with
+  the connection kept, and the copy streamed byte for byte. In the full suite,
+  `tests/test_export_media.c` (`export_media`) exports a synthetic 1080p
+  recording with the real codecs and has `ffprobe` and `ffmpeg` check it: one
+  H.264 Constrained Baseline and one MP3 stream at the source's size and
+  duration, a flash and a click within a frame of each other, and the transcode's
+  peak memory under 96 MB. Run it here with `OC_TEST_ONLY=export_media`.
 - **Screen recording** (`tests/test_media.c`, REQ-162) — the camera box's geometry
   and the frame views that draw it; the screen front end repeating a still screen
   at the frame rate; recordings of the synthetic screen with the camera boxed into

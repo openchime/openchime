@@ -17,7 +17,8 @@ are four ways a dependency enters the build; each row below says which:
 ([LICENSING.md](../LICENSING.md)); every *third-party* component linked into the
 shipping **daemon** and **TUI** is permissive — MIT, Apache-2.0, Public Domain,
 or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later —
-except Mozilla's CA roots, which are data under MPL-2.0, a file-level copyleft. No
+except Mozilla's CA roots, which are data under MPL-2.0, a file-level copyleft,
+and LAME, LGPL-2.0-or-later, in a daemon built with the video export. No
 third-party GPL/AGPL code is linked into any shipped binary (a host build's libgcc is GPL-3.0 with the GCC Runtime Library
 Exception), and every one of these is compatible with the AGPL.
 
@@ -47,6 +48,8 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73); the daemon, to encode read-aloud (ARCH-111) | https://opus-codec.org | BSD-3-Clause |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
+| **libavc** | 1.10.0 | H.264 encode (Constrained Baseline), the encoder and the common code it uses | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://github.com/ittiam-systems/libavc | Apache-2.0 |
+| **LAME** | 3.100 | MP3 encode (`libmp3lame` alone) | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://lame.sourceforge.io | LGPL-2.0-or-later |
 | **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx), Windows and web | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 
@@ -78,6 +81,34 @@ which the Win32 link therefore pulls in statically. **The daemon links no
 libvpx**: it stores a video message as opaque bytes (ARCH-110). BSD-3-Clause,
 whose binary-redistribution clause wants the notice carried with a shipped
 client.
+
+**libavc** is committed in `third_party/libavc/` as ittiam-systems' v1.10.0
+release (the tag's source archive, commit `ddc061bd`, SHA-256
+`929128fd96907fee6206b6a8a1642eaf28a6e1b0416f4b0d0f44b3f54299563e`), unmodified,
+its `LICENSE` and `NOTICE` with it. It is upstream's release rather than the copy
+Android carries, which trails it. `scripts/build/libavc.sh` compiles only the
+**encoder** and the common code it uses, as plain C (and, on aarch64, the
+encoder's assembly), static, into `third_party/libavc-1.10.0[-arch]/`
+(gitignored); nothing is downloaded. Upstream's CMake project is not used: it
+declares C++ for its tests and fuzzers, so configuring it needs a C++ compiler
+for a library that has no C++ in it. Each x86 source is compiled with only the
+instruction set its name says it uses (`*_ssse3.c` with `-mssse3`, `*_sse42.c`
+with `-msse4.2`, the rest with none) rather than upstream's `-mavx2` on every
+file, and the common AVX2 sources, which the encoder never calls, are not built;
+the daemon chooses the SSE4.2, SSSE3 or generic path at run time. Linked only by
+a daemon built with `EXPORT=1`, for the export of a video message (ARCH-135).
+Apache-2.0, whose notice travels with the binary.
+
+**LAME** is committed in `third_party/lame/` as the 3.100 release tarball,
+unmodified, its `COPYING` with it (SHA-256
+`ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e`).
+`scripts/build/lame.sh` builds `libmp3lame` alone out of tree, static, with no
+decoder (`--disable-decoder`, so mpglib is not built) and no frontend, into
+`third_party/lame-3.100[-arch]/` (gitignored); nothing is downloaded. Its
+library sources are LGPL-2.0-**or-later**, the "or later" being what makes it
+compatible with the AGPL; `libmp3lame/fft.c` carries no licence header of its
+own and ships under LAME's. MP3's patents have expired. Linked only by a daemon
+built with `EXPORT=1`, for the export of a video message (ARCH-135).
 
 **Mbed TLS** is committed in `third_party/mbedtls/` as the 3.6.7 release
 tarball (the 3.6 LTS line), unmodified, its `LICENSE` with it (the tarball was

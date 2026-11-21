@@ -9,18 +9,18 @@
 # "One build at a time"). The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
 # never needs Emscripten, whatever the switches say.
-TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) -DOC_TTS -DOC_STT \
+TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) -DOC_TTS -DOC_STT $(EXPORT_TEST_INC) \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
-                $(TTSKIT_SRC) $(NNKIT_SRC) $(SUMKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
+                $(TTSKIT_SRC) $(NNKIT_SRC) $(SUMKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(EXPORT_TEST_SRC))
 # One object per source, in a tree of its own (mk/sources.mk, "Objects"),
 # compiled with the flags the binary always had; the link takes them in the
 # sorted order above, then SQLite and Argon2 (the daemon's own objects) and the
 # vendored libraries, which only have to exist before anything compiles.
 TEST_CC     = $(CC) $(CFLAGS) -O0 -g $(TEST_INC)
 TEST_OBJS   := $(call oc_objs,$(OBJ_DIR)/test,$(TEST_ALL_SRC))
-TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
+TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(EXPORT_TEST_LIBS)
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TEST_OBJS:.o=.d)
 # --- The fast suite (docs/TESTING.md) -----------------------------------------
@@ -40,7 +40,7 @@ TSAN_BIN := build/tests-tsan
 # suites start threads and fails one SUITES[] does not mark THREADS
 # (tests/main.c).
 $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
-	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
 # The same test binary under ThreadSanitizer (scripts/test/full/tsan.sh runs
 # it). The vendored libraries are not instrumented.
 TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
@@ -48,7 +48,7 @@ TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TSAN_OBJS:.o=.d)
 $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client the full suite drives against a natively-run daemon

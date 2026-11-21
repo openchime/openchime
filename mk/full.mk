@@ -35,7 +35,7 @@
 #
 # A check on a binary or an image this machine cannot run says so and skips
 # it (the arm64 package and image, on an x86 runner).
-FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1 REMEMBER=0
+FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1 EXPORT=1 REMEMBER=0
 FULL_PARTS    := plain threads packages image windows
 PKG_ARCH    ?= $(if $(filter aarch64,$(ARCH)),arm64,amd64)
 PKG_VERSION ?= 0

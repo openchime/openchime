@@ -102,6 +102,7 @@ const cfg_row OC_CFG[] = {
            cfg_parse_s3_file, 0),
     BOOL("OPENCHIME_TTS", CFG_OPERATOR, G_FLAG, "on", "Read-aloud (ARCH-111), in a build that carries it. While it reads aloud the daemon holds up to 170 MB, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", tts.enabled),
     BOOL("OPENCHIME_STT", CFG_OPERATOR, G_FLAG, "on", "Voice input (ARCH-112), in a build that carries it. While it hears a segment the daemon holds about 55 MB, 40 MB of it the mapped model, against about 25 MB idle (TESTING.md, \"Speech models' memory\"); off saves that.", stt.enabled),
+    BOOL("OPENCHIME_H264_EXPORT", CFG_OPERATOR, G_FLAG, "off", "Export of a video message as an H.264 and MP3 copy that other players open (ARCH-135), in a build that carries it. H.264 is patent-encumbered: turning this on needs the operator's own H.264 patent licence, which is why it is off. A transcode runs one at a time, below the daemon's other work, and holds up to 96 MB while it runs.", export_h264.enabled),
     CUSTOM("OPENCHIME_SUMMARY", CFG_OPERATOR, G_FLAG, "off",
            "Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there).",
            cfg_parse_summary, 0),
