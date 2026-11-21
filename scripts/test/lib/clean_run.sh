@@ -78,7 +78,7 @@ ours() {
 # assembler and were not started by another one. One line each: pid and
 # command line. A script run by an interpreter (a wrapper named cc, emcc.py)
 # is known by the script's name.
-names='^(cc|c[+][+]|gcc|g[+][+]|clang|clang[+][+]|cc1|cc1plus|as|nasm|yasm|zig|emcc|em[+][+])(-[0-9][0-9.]*)?$|-(cc|c[+][+]|gcc|g[+][+]|clang|clang[+][+]|as)(-[0-9][0-9.]*)?$'
+names='^(cc|c[+][+]|gcc|g[+][+]|clang|clang[+][+]|cc1|cc1plus|as|nasm|yasm|emcc|em[+][+])(-[0-9][0-9.]*)?$|-(cc|c[+][+]|gcc|g[+][+]|clang|clang[+][+]|as)(-[0-9][0-9.]*)?$'
 compiles() {
   local pids
   pids="$(marked | tr '\n' ',')"; pids="${pids%,}"

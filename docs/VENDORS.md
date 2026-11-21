@@ -168,13 +168,17 @@ tag, whose own table pins the sum of everything it installs), into `third_party/
 and puts it first on `PATH` for every recipe and vendor script, so nothing
 depends on what a machine or a runner image happens to have installed.
 The full build needs only cc and c++ (C++17), make, cmake, python3, git, curl, xz, bzip2 and nasm beyond them.
+The release's Linux daemon is the exception: it compiles with the build
+machine's own gcc 12, on Ubuntu 22.04 so that its glibc 2.35 is the binary's floor
+(ARCHITECTURE.md, ARCH-20), and the arm64 daemon with Ubuntu's cross packages,
+installed from the distribution, not fetched.
 A bump is the version and the sum in one script and a pull request, built and
 tested by the next release-candidate (dispatched by hand); `tools/toolchains.sh`, run by hand, says when upstream
 has moved.
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **zig** (its bundled clang and lld) | 0.17.1 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and the full suite's second-compiler pass (`make test-all`) | MIT |
+| **gcc 12** (Ubuntu 22.04's `gcc-12` and `g++-12`, with `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross` for arm64; not the default gcc 11, which leaves read-aloud's kernels unvectorised) | the distribution's 12.3 | none: installed from Ubuntu's packages on the runner (`release-candidate.yml`, `stage`) | the release's Linux daemon against glibc 2.35 (`make RELEASE=1`) and the arm64 daemon cross-built from x86 (`make ARCH=aarch64`) | GPL-3.0 with the GCC Runtime Library Exception |
 | **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make build/web/openchime.js`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-all`) | MIT / NCSA |
 | **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make build`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 | **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
@@ -415,7 +419,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
-| **Debian** | `bookworm-slim` | Runtime base of the container image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
+| **Debian** | `bookworm-slim` | Runtime base of the container image (glibc 2.36, above the binary's 2.35 floor) | mixed (base OS) | https://www.debian.org |
 | **Litestream** | 0.5.17 | In the image only: streams `openchime.db` and the identity to the deployment's bucket, each to `<prefix>/db` under its own prefix, and restores each onto a box that has none, when the deployment writes its `replica-*` files (ARCH-3, ARCH-39; CONFIG.md); a separate program, not linked into the daemon | Apache-2.0 (its `LICENSE` ships in the image at `/usr/share/doc/litestream/LICENSE`) | https://github.com/benbjohnson/litestream |
 
 One image, and it is an **output** rather than a tool: the OCI image the staging
@@ -458,9 +462,10 @@ is the upstream's own stability contract for a base OS.
 - **bash, curl, tar, bzip2, xz, git, python3, cmake** — used by the
   `scripts/build/*.sh` fetch scripts; cmake and python3 by SDL3's own builds.
 - **pkg-config** — detects libsecret for the TUI.
-- **zig, Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
-  zig is the release's compiler and CI's second compiler; `make build` and a
-  `make openchimed` of the host's daemon use the system cc.
+- **Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
+  `make build` and a `make openchimed` of the host's daemon use the system cc;
+  the release uses Ubuntu 22.04's `gcc-12`, and for arm64 Ubuntu's
+  `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross`.
 - **buildah / podman / skopeo** — **release-candidate and release only**.
   Build, start and push the OCI image, check its digest and copy it to
   `:N-rcK` and `:rc` (the release-candidate),
@@ -535,8 +540,8 @@ paths ship; nothing is fetched at runtime.
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
-| **Apache-2.0 WITH LLVM-exception** | compiler-rt (zig's), llvm-mingw | Toolchain runtime; static in the release daemon and the Windows clients; the exception waives binary attribution |
-| **GPL-3.0 with GCC Runtime Library Exception** | libgcc | Host builds only (without `RELEASE=1`); the exception permits linking it into the daemon. Releases use zig's compiler-rt instead |
+| **Apache-2.0 WITH LLVM-exception** | llvm-mingw | Toolchain runtime; static in the Windows clients; the exception waives binary attribution |
+| **GPL-3.0 with GCC Runtime Library Exception** | libgcc | Toolchain runtime of every Linux build, the release's included; the exception permits linking it into the daemon |
 
 **Bottom line:** every third-party dependency in the shipped daemon and TUI is
 permissively licensed (MIT, BSD, Apache-2.0, CC0, ISC, zlib, Public Domain, plus

@@ -238,7 +238,7 @@ It runs three jobs, each its steps one after another on one runner:
 | Job | Environment | What it does |
 |---|---|---|
 | `test` (`test-all.yml`) | none | The gate, then the full suite's code tests (below). |
-| `stage` | `release` | Reports the release credentials; builds what a release ships — both daemons with their data and packages, the images and their manifest list, and the Windows clients with their installer and MSIX — each checked by `make test-all` (PART=packages, image, windows); stores the daemon trees, the Windows binaries and the images by commit. |
+| `stage` | `release` | On `ubuntu-22.04`, whose glibc 2.35 is the release binary's floor. Reports the release credentials; builds what a release ships — both daemons with their data and packages, the images and their manifest list, and the Windows clients with their installer and MSIX — each checked by `make test-all` (PART=packages, image, windows); stores the daemon trees, the Windows binaries and the images by commit. |
 | `publish` | `release` | Reads the stored build back and verifies it, tags the commit `release-N-rcK`, tags the image, publishes the prerelease, and copies all of it to the public repository. |
 
 The gate refuses any ref but staging's tip, a commit already released or
@@ -249,14 +249,16 @@ policy warns). Then the full suite's code tests, in the same job:
 - **`make build-all PART=plain` and `make test-all PART=plain`** — the daemon
   with every feature; the source checks and actionlint; every suite that
   starts no thread, and `media`, with its timing judged; the static-link
-  check; the daemon started and driven over TLS with the e2e client; every
-  Linux translation unit through the release's clang under `-Werror`; the
+  check; the daemon started and driven over TLS with the e2e client; the
   speech round trip; the web client's header dependencies (TESTING.md §3.4);
   the fuzzing pass.
 - **then PART=threads** — the suites that start threads, under
   ThreadSanitizer, their one run (TESTING.md §2.4).
 
-Only when both pass does `stage` build anything. Everything runs on Linux,
+Only when both pass does `stage` build anything. It compiles the release
+with Ubuntu 22.04's own gcc 12, and the arm64 daemon with Ubuntu's gcc 12 cross packages
+on the same x86 runner (`make ARCH=aarch64`); no compiler is fetched for
+either. Everything runs on Linux,
 the Windows packaging included (NSIS, makemsix). Every vendored library and
 toolchain is cached by the script that builds it, one cache per library keyed
 by its version, its own script and the compiler that builds it, so a change to

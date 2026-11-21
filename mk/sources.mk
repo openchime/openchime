@@ -26,8 +26,8 @@ HDRS       := $(wildcard shared/*.h daemon/*.h)
 # --- Objects -------------------------------------------------------------------
 # A binary is linked from one object per source, so `make -j` compiles them all
 # at once. A source compiles differently per binary (the daemon -O2, the tests
-# -O0 -g, ThreadSanitizer's -O1, the release's compiler), so each flag set has a
-# tree of its own under $(OBJ_DIR) or build/relcc: <tree>/<source path>.o, and
+# -O0 -g, ThreadSanitizer's -O1), so each flag set has a tree of its own under
+# $(OBJ_DIR): <tree>/<source path>.o, and
 # <tree>/gen/<name>.o for a source generated into $(GEN_DIR).
 #   $(call oc_objs,<tree>,<sources>)  the objects, in the sources' order (the
 #                                     link order)

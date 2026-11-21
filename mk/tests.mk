@@ -50,39 +50,6 @@ $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
-# --- The release's compiler (CI) ----------------------------------------------
-# The daemon's sources through the RELEASE's compiler, with the release's flags,
-# stopping short of the link (the release links libraries built by the same
-# compiler, which CI does not build): real objects, under build/relcc, since
-# some warnings are raised only while generating code, one rule per object so
-# that `make -j` compiles them all at once. A newer clang refuses things CI's
-# accepts -- a declaration after a label, a C23 extension -- and the release is
-# the wrong place to learn it. `RELEASE_CC` is the release toolchain's compiler
-# (zig cc against glibc 2.34, as `make RELEASE=1` uses through zig_cc.sh). The same compiler then goes over everything else CI builds for
-# Linux -- the client app-core, its media, voice and call code, and the tests --
-# so this one clang pass is the tree's second-compiler check as well: -Werror
-# makes any warning clang raises and gcc does not fatal.
-RELEASE_CC ?= $(ZIG) cc -target x86_64-linux-gnu.2.34
-RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
-                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(NNKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
-# The release compiler as a file, like $(CC_STAMP): a different one recompiles.
-RELCC_DIR   := build/relcc
-RELCC_STAMP := $(RELCC_DIR)/.cc
-$(RELCC_STAMP): FORCE | build-dir
-	@mkdir -p $(dir $@)
-	@echo '$(RELEASE_CC)' | cmp -s - $@ || echo '$(RELEASE_CC)' > $@
-RELCC_TEST_CC     = $(RELEASE_CC) $(CFLAGS) $(TEST_INC)
-RELCC_TEST_OBJS   := $(call oc_objs,$(RELCC_DIR)/test,$(RELEASE_CC_TEST_SRC))
-RELCC_VENDOR      := $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
-$(eval $(call oc_obj_rules,$(RELCC_DIR)/test,RELCC_TEST_CC,$(RELCC_STAMP),$(RELCC_VENDOR),@))
--include $(RELCC_TEST_OBJS:.o=.d)
-# The daemon's own sources are not compiled here: the release-candidate's stage
-# compiles them with this compiler for the release (make RELEASE=1), and a
-# warning there fails it the same way (docs/CONTRIBUTING.md, "Billed minutes":
-# no check twice).
-check-release-cc: $(RELCC_TEST_OBJS)
-	@echo "check-release-cc: $(words $(RELEASE_CC_TEST_SRC)) sources clean"
-
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client the full suite drives against a natively-run daemon
 # (scripts/test/full/e2e.sh, docs/TESTING.md §3); links only the shared wire
@@ -93,8 +60,8 @@ build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard
 	    tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # The fuzzing tier (docs/TESTING.md, "Fuzzing"): one libFuzzer binary per
 # harness in FUZZ_HARNESSES (mk/sources.mk), build/fuzz/<harness>, from
-# tests/fuzz/<harness>.c, under ASan and UBSan. The host's clang, since zig's
-# has no libFuzzer runtime: a prerequisite for building a harness only, never
+# tests/fuzz/<harness>.c, under ASan and UBSan. The host's clang, for its
+# libFuzzer runtime: a prerequisite for building a harness only, never
 # for the fast build or suite.
 # By path when it is in the usual places: make puts the pinned llvm-mingw first
 # on PATH (mk/toolchains.mk), and its clang has no Linux sanitizer runtimes.

@@ -447,7 +447,7 @@ static int uf_header(const char *h, size_t n, const char *name, char *out, size_
 /* The header already does `typedef struct oc_unfurler oc_unfurler;` so callers
  * can hold an opaque pointer; this only defines the struct. Repeating the
  * typedef here is a C11 feature and C99 does not allow it -- gcc accepts it
- * silently, clang does not, and the release builds with `zig cc`. */
+ * silently, clang does not, and the tree builds with either. */
 struct oc_unfurler {
     oc_dbwriter    *dbw;
     oc_tls_client   tls;

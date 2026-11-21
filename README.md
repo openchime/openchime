@@ -96,7 +96,8 @@ echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://
 sudo apt update && sudo apt install openchimed
 ```
 
-**RHEL / Rocky / Alma / Fedora** — RHEL 9 and newer:
+**RHEL / Rocky / Alma / Fedora** — RHEL 10 and newer (RHEL 9, with glibc
+2.34, runs the container image below, with Podman or Docker):
 
 ```sh
 sudo curl -fsSL https://openchime.io/dist/openchime.repo -o /etc/yum.repos.d/openchime.repo
@@ -179,8 +180,10 @@ installing cannot collide with a web server on 443; switch
 `OPENCHIME_PORT=443` for a real deployment, which needs no root because
 the unit already carries `CAP_NET_BIND_SERVICE`.
 
-**Requirements:** glibc **2.34+**. Everything else, TLS and SQLite included,
-is statically linked. Debian bullseye (glibc 2.31) is too old.
+**Requirements:** glibc **2.35+**: Ubuntu 22.04 and newer, Debian bookworm and
+newer, RHEL 10 and newer. Everything else, TLS and SQLite included, is
+statically linked. Debian bullseye (glibc 2.31) and RHEL 9 (glibc 2.34) are too
+old for the packages; RHEL 9 runs the container image (Podman or Docker).
 
 ## Install the clients
 
@@ -220,11 +223,12 @@ a C++17 compiler, git and xz besides, and the build fetches its own pinned Emscr
 read-aloud and voice input need beside it, and the Linux TUI, and starts it
 (below); `make openchimed` builds the daemon alone. The switches are
 remembered in `build/.features`, so a later `make openchimed` or `make run`
-builds the same daemon; `make distclean` forgets them. `make openchimed ARCH=aarch64`
-cross-builds the daemon for arm64 into `build/aarch64/` (build only), and
-`make openchimed RELEASE=1` builds the host's as the release does, with zig
-against glibc 2.34; zig is fetched only for these two and for the full suite's
-release-compiler check. `make openchimed OC_BUILD_ID=<commit>` stamps the build
+builds the same daemon; `make distclean` forgets them. `make ARCH=aarch64
+build/aarch64/openchimed` cross-builds the daemon for arm64 (build only), and
+`make openchimed RELEASE=1` builds the host's as the release does, with gcc 12
+(`gcc-12`, `g++-12`), stripped; the arm64 build needs Ubuntu's gcc 12 cross
+compiler (`gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu`,
+`libc6-dev-arm64-cross`). `make openchimed OC_BUILD_ID=<commit>` stamps the build
 id into `openchimed --version`; an unstamped build reports `dev`. There is one
 build: the tests, the GUI and web harness and the demo scripts run it with
 `OPENCHIME_MODE=development`, which a deployment never sets (CONFIG.md,
@@ -239,16 +243,16 @@ packaging/build-rpm.sh     <version> amd64 ./openchimed dist   # needs rpmbuild
 packaging/build-tarball.sh <version> amd64 ./openchimed dist
 ```
 
-Note the release binaries are **not** built with the host toolchain. The
-release-candidate compiles them with
-[`zig cc`](https://ziglang.org) targeting `glibc 2.34`, the oldest supported
-target, because a binary linked against a newer glibc will not start on an older
-one — and every hosted runner carries a newer one. Zig ships glibc stub
-libraries for each version and links against whichever it is told to, so the
-floor holds without a container, and the arm64 daemon comes off the same x86
-runner (`make RELEASE=1 ARCH=aarch64`). The full suite asserts the result rather
-than trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the
-build fails. Linux runners build everything, the Windows installer and MSIX
+Note the release binaries are built on **Ubuntu 22.04**, with its own gcc 12,
+because a binary linked against a newer glibc will not start on an older one:
+built there, they need glibc 2.35 at most, the oldest supported. The arm64
+daemon comes off the same x86 runner, cross-compiled with Ubuntu's
+`aarch64-linux-gnu-gcc-12` against Ubuntu 22.04's arm64 glibc (`make ARCH=aarch64`).
+gcc 12 rather than the release's default gcc 11, which leaves read-aloud's
+kernels unvectorised and about five times slower.
+The full suite asserts the result rather than trusting it: if the built binary
+needs a symbol above `GLIBC_2.35`, the build fails. A binary built on a newer
+machine, this one say, links and runs there and is refused by that check. Linux runners build everything, the Windows installer and MSIX
 included (NSIS and makemsix, signed with jsign when configured); nothing in the
 pipeline uses Docker or Windows.
 

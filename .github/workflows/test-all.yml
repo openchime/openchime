@@ -169,17 +169,16 @@ jobs:
       # `make build-all PART=plain` has built it: a cache saved at the end of
       # the job would be lost to any later failure, the sanitizer's included.
       #
-      # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
-      # release-compiler pass, Emscripten for the web client the daemon embeds.
-      # Keyed by the scripts, which pin the versions and the checksums.
+      # The toolchain make fetches pinned (mk/toolchains.mk): Emscripten for
+      # the web client the daemon embeds. Keyed by the script, which pins the
+      # version and the checksum.
       - id: c-toolchains
         name: Restore the toolchains
         uses: actions/cache/restore@v6
         with:
           path: &toolchains-path |
-            third_party/zig-0.17.1
             third_party/emsdk-6.0.13
-          key: &toolchains-key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
+          key: &toolchains-key toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/emsdk.sh') }}
       # The vendored native libraries, one cache each: each script builds only
       # what is missing, so a hit skips the download and the build. Each is
       # keyed by its version, its own script, which pins the version and the
@@ -254,7 +253,7 @@ jobs:
       # e2e client and the fuzzing harnesses; then the source checks,
       # actionlint, the suites that start no thread and media, plainly with
       # their timing verdicts judged, the static-link check, the end-to-end
-      # run, the release's compiler, the speech round trip, the web client's
+      # run, the speech round trip, the web client's
       # header dependencies, and the fuzzing pass.
       # Built under the release's build id, so the web client built here is the
       # one stage packages (WEB_PREBUILT, mk/web.mk): it is built once.
