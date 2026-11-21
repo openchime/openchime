@@ -74,6 +74,7 @@ int run_client_core_tests(void);
 int run_enroll_tests(void);
 int run_push_tests(void);
 int run_invite_mail_tests(void);
+int run_address_report_tests(void);
 int run_mention_tests(void);
 int run_searchq_tests(void);
 int run_richtext_tests(void);
@@ -328,6 +329,7 @@ static const struct suite {
     S(run_enroll_tests,          FAST, THREADS),
     S(run_push_tests,            FAST, THREADS),
     S(run_invite_mail_tests,     FAST, THREADS),
+    S(run_address_report_tests,  FAST, THREADS),
     S(run_mention_tests,         FAST, PLAIN),
     S(run_searchq_tests,         FAST, PLAIN),
     S(run_richtext_tests,        FAST, PLAIN),

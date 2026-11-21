@@ -31,8 +31,9 @@ int oc_enroll_build_code(const char *privkey_pem, const char *audience,
 int oc_enroll_sign_proof(const char *privkey_pem, const char *audience, const char *nonce,
                          char *sig_b64, size_t sig_cap);
 
-/* The address proof (AUTH.md §3.6): central, asked by the daemon to record its
- * address, POSTs {"nonce": <base64url of 32 random bytes>} to /enroll-proof at
+/* The address proof (AUTH.md §3.6): central, asked by the daemon to record the
+ * address it is reached at -- its DNS name, or with none, the address the report
+ * came from -- POSTs {"nonce": <base64url of 32 random bytes>} to /enroll-proof at
  * that address, and the daemon answers with its enrollment key's signature over
  *   openchime-address-proof-v1|<aud>|<nonce>
  * (ASN.1 DER ECDSA, base64), so central knows the server there holds the key. */
@@ -45,12 +46,15 @@ int oc_enroll_sign_address_proof(const char *privkey_pem, const char *audience, 
 /* 1 when `nonce` (len bytes, not NUL-terminated) is the shape central sends:
  * OC_ADDRESS_NONCE_LEN base64url characters. */
 int oc_enroll_nonce_ok(const char *nonce, size_t len);
-/* The address this box reports to central: OPENCHIME_MANAGED_ADDRESS when set,
- * else the first name it is certified for (OPENCHIME_TLS=acme:<names>), lower-
- * cased, with ":<port>" unless the port is 443. 0, or -1 when there is no DNS
- * name to report. */
-int oc_enroll_address(const char *workspace_address, const char *tls_names, int port,
-                      char *out, size_t cap);
+/* The body of this box's address report to central (POST /api/machine/address).
+ * With a DNS name, {"address":"<host>[:<port>]"}: OPENCHIME_MANAGED_ADDRESS when
+ * set, else the first name it is certified for (OPENCHIME_TLS=acme:<names>),
+ * lower-cased, with ":<port>" unless the port is 443. With neither, {}: central
+ * then proves the address the report came from, on 443, and the daemon sends no
+ * port. 0, or -1 for a name that is set but is not a usable DNS name, or an
+ * `out` too small. */
+int oc_enroll_address_body(const char *workspace_address, const char *tls_names, int port,
+                           char *out, size_t cap);
 
 typedef enum {
     OC_ENROLL_ACTIVE  =  0,  /* central acked activation */

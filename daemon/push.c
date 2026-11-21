@@ -320,15 +320,22 @@ oc_machine_http *oc_machine_http_open(const char *url) {
     return h;
 }
 
-int oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
-                         const char *privkey_pem, const char *body, int *status) {
-    if (!h || !path || !audience || !privkey_pem || !body || !status) return -1;
+int oc_machine_http_post_read(oc_machine_http *h, const char *path, const char *audience,
+                              const char *privkey_pem, const char *body, int *status,
+                              char *resp, size_t resp_cap) {
+    if (!h || !path || !audience || !privkey_pem || !body || !status || !resp || resp_cap == 0) return -1;
+    resp[0] = '\0';
     long ts = (long)time(NULL);
     char sig[512];
     if (oc_push_sign(privkey_pem, "POST", path, audience, body, ts, sig, sizeof sig) != 0) return -1;
-    char resp[1024];
     size_t rlen = 0;
-    return post_signed(&h->ctx, path, audience, ts, sig, body, status, resp, sizeof resp, &rlen);
+    return post_signed(&h->ctx, path, audience, ts, sig, body, status, resp, resp_cap, &rlen);
+}
+
+int oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
+                         const char *privkey_pem, const char *body, int *status) {
+    char resp[1024];
+    return oc_machine_http_post_read(h, path, audience, privkey_pem, body, status, resp, sizeof resp);
 }
 
 void oc_machine_http_close(oc_machine_http *h) {

@@ -421,11 +421,16 @@ int oc_enroll_nonce_ok(const char *nonce, size_t len) {
     return 1;
 }
 
-int oc_enroll_address(const char *workspace_address, const char *tls_names, int port,
-                      char *out, size_t cap) {
+int oc_enroll_address_body(const char *workspace_address, const char *tls_names, int port,
+                           char *out, size_t cap) {
+    if (!out || cap == 0) return -1;
     const char *from = workspace_address && workspace_address[0] ? workspace_address : tls_names;
-    if (!from || !out || cap == 0) return -1;
-    while (*from == ' ') from++;
+    if (from) while (*from == ' ') from++;
+    if (!from || !*from) {                       /* no name of its own */
+        if (cap < 3) return -1;
+        memcpy(out, "{}", 3);
+        return 0;
+    }
     size_t n = 0;
     while (from[n] && from[n] != ',' && from[n] != ' ') n++;
     if (n == 0 || n > 253) return -1;
@@ -440,7 +445,8 @@ int oc_enroll_address(const char *workspace_address, const char *tls_names, int 
     char host[254];
     for (size_t i = 0; i < n; i++) host[i] = (char)tolower((unsigned char)from[i]);
     host[n] = '\0';
-    int w = port > 0 && port != 443 ? snprintf(out, cap, "%s:%d", host, port) : snprintf(out, cap, "%s", host);
+    int w = port > 0 && port != 443 ? snprintf(out, cap, "{\"address\":\"%s:%d\"}", host, port)
+                                    : snprintf(out, cap, "{\"address\":\"%s\"}", host);
     return w > 0 && (size_t)w < cap ? 0 : -1;
 }
 

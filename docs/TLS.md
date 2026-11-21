@@ -171,7 +171,10 @@ comes from:
   `CAP_NET_BIND_SERVICE`) or forward 443 to the daemon's port, and point each
   name's DNS at the box.
 - **`central`**: through central, for a name under the service suffix (AUTH.md
-  §8.9) — the default on a managed box, and refused without an enrollment.
+  §8.9) — the default on a managed box, and refused without an enrollment. A
+  self-hosted server with no DNS name of its own is proved at the address its
+  address report comes from, on port 443 (AUTH.md §3.6): 443 must reach the
+  daemon, directly (`OPENCHIME_PORT=443`) or forwarded to its port.
 
 Until a CA-issued certificate is obtained the daemon presents its self-signed
 one; once one is, it is kept (migration 0049, in the identity since 0064) and
