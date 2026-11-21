@@ -450,11 +450,11 @@ static char *unescape(const char *s) {
 }
 
 static int32_t *read_id_lines(const char *path, long *n) {
+    *n = 0;
     FILE *fp = fopen(path, "r");
     if (!fp) return NULL;
     long cap = 4096, x;
     int32_t *v = malloc((size_t)cap * sizeof *v);
-    *n = 0;
     while (fscanf(fp, "%ld", &x) == 1) {
         if (*n == cap) v = realloc(v, (size_t)(cap *= 2) * sizeof *v);
         v[(*n)++] = (int32_t)x;
@@ -510,7 +510,7 @@ static int real_tokenizer_checks(void) {
         memcpy(u0, user, un);
         char *prompt = sk_chat_prompt(s0, u0);
         snprintf(path, sizeof path, "%s/%s.prompt", root, name);
-        long wn;
+        long wn = 0;
         int32_t *want = read_id_lines(path, &wn), *ids;
         long n = prompt ? sk_tokenize(t, prompt, &ids) : -1;
         int same = n > 0 && ids_are(ids, n, want, wn);
