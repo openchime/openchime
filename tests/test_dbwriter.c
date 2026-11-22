@@ -2421,103 +2421,36 @@ static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
  * (a loaded export writes none), so the server's unread count read 0
  * where the client, reading the text, counted the @channel lines. Crossing
  * schema step 60 the writer scans every message without rows once, with the
- * scanner a send uses. Made here by sending, wiping the rows and the step, and
- * starting again. */
+ * scanner a send uses. Made here as test_migrate.c makes a database of an
+ * earlier step: the migrations up to 59 only, its people and messages written
+ * there with SQL, and the writer started on it, which runs the rest. Nothing
+ * here names a later step, so a new migration cannot break it. */
 static void test_index_mentions(void) {
     const char *path = tdb("index_mentions.db");
     cleanup_db(path);
-    oc_dbwriter *w = start_db(path);
-    CHECK(w != NULL);
-    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
-    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
-    CHECK(alice && bob);
-    uint8_t idem[OC_IDEM_LEN] = { 0x60, 1 };
-    uint64_t m1 = send_msg(w, alice, idem, "@channel the office is closed Friday");
-    idem[1] = 2;
-    uint64_t m2 = send_msg(w, alice, idem, "@bob can you take the 3 o'clock");
-    idem[1] = 3;
-    uint64_t m3 = send_msg(w, alice, idem, "nothing for anyone here");
-    CHECK(m1 && m2 && m3);
-    oc_dbwriter_stop(w);
-
     sqlite3 *db = NULL;
+    char *err = NULL;
     CHECK(raw_open(path, &db) == SQLITE_OK);
-    /* Back to before step 60; the columns of steps 61 to 63 go too (with 63's
-     * and 72's triggers, back to step 6's), so that they can run again. */
-    CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
-                           "DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad; DROP TRIGGER messages_fts_au;"
-                           "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN"
-                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
-                           "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN"
-                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body); END;"
-                           "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN"
-                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
-                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
-                           "ALTER TABLE channels DROP COLUMN e2e;"
-                           "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;"
-                           "ALTER TABLE local_credentials DROP COLUMN kdf;"
-                           "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;"
-                           /* Before 0064 the identity's tables were the data's. */
-                           "CREATE TABLE server_identity (id INTEGER PRIMARY KEY, cert_pem TEXT, key_pem TEXT, created_at_ms INTEGER);"
-                           "CREATE TABLE enrollment (id INTEGER PRIMARY KEY, privkey_pem TEXT, audience TEXT, state TEXT,"
-                           "  activated_at_ms INTEGER, created_at_ms INTEGER);"
-                           "CREATE TABLE acme_account (id INTEGER PRIMARY KEY, directory_url TEXT, account_key_pem TEXT,"
-                           "  account_url TEXT, created_at_ms INTEGER);"
-                           "CREATE TABLE tls_certificate (id INTEGER PRIMARY KEY, source TEXT, names TEXT, chain_pem TEXT,"
-                           "  key_pem TEXT, issued_at_ms INTEGER, not_after_ms INTEGER);"
-                           "CREATE TABLE local_issuer (id INTEGER PRIMARY KEY, key_pem TEXT, issuer TEXT, created_at_ms INTEGER);"
-                           /* 0065's polls. */
-                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;"
-                           /* 0066's workspace sender. */
-                           "ALTER TABLE users DROP COLUMN is_system;"
-                           /* 0067's own-schedule flag. */
-                           "ALTER TABLE users DROP COLUMN dnd_own;"
-                           /* 0068's read receipts. */
-                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;"
-                           /* 0069's invitation time. */
-                           "ALTER TABLE invites DROP COLUMN created_at_ms;"
-                           /* 0070's collapsed messages. */
-                           "DROP TABLE collapsed_messages;"
-                           /* 0071's kind of principal. */
-                           "ALTER TABLE users DROP COLUMN kind;"
-                           /* 0073's reply also in the channel. */
-                           "ALTER TABLE messages DROP COLUMN also_channel;"
-                           /* 0074's following every thread. */
-                           "ALTER TABLE notification_prefs DROP COLUMN follow_threads;"
-                           /* 0075's reminders on saved items. */
-                           "DROP INDEX idx_saved_remind;"
-                           "ALTER TABLE saved_items DROP COLUMN remind_at_ms;"
-                           "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;"
-                           /* 0076's active days. */
-                           "DROP TABLE user_active_days;"
-                           /* 0077's muted people. */
-                           "DROP TABLE muted_users;"
-                           /* 0078's snippets. */
-                           "DROP TABLE snippets_fts;"
-                           "ALTER TABLE attachment_media DROP COLUMN title;"
-                           "ALTER TABLE attachment_media DROP COLUMN language;"
-                           /* 0079's blocks and DM privacy. */
-                           "DROP TABLE blocks; DROP TABLE withheld_messages;"
-                           "ALTER TABLE users DROP COLUMN dm_privacy;"
-                           /* 0080's profile fields. */
-                           "DROP TABLE profile_field_values; DROP TABLE profile_fields;"
-                           /* 0081's out of office. */
-                           "ALTER TABLE users DROP COLUMN ooo_start_ms; ALTER TABLE users DROP COLUMN ooo_end_ms;"
-                           "ALTER TABLE users DROP COLUMN ooo_message;"
-                           /* 0082's channel managers. */
-                           "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;"
-                           /* 0083's emoji aliases. */
-                           "DROP TABLE custom_emoji_aliases;"
-                           /* 0084's audit channel. */
-                           "ALTER TABLE audit_log DROP COLUMN channel_id;"
-                           /* 0085's to-do lists. */
-                           "DROP TABLE todo_tasks; DROP TABLE todo_lists;",
-                       NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 59, &err) == SQLITE_OK);
+    sqlite3_free(err); err = NULL;
+    CHECK(oc_schema_version(db) == 59);
+    const uint64_t bob = 2, m1 = 1, m2 = 2, m3 = 3;   /* the ids written below */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,display_name,role,created_at_ms) VALUES"
+        "  (1,'local:alice','alice','owner',1),(2,'local:bob','bob','member',1);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(1,1,1),(1,2,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES"
+        "  (1,1,1,CAST('@channel the office is closed Friday' AS BLOB),10),"
+        "  (2,1,1,CAST('@bob can you take the 3 o''clock' AS BLOB),11),"
+        "  (3,1,1,CAST('nothing for anyone here' AS BLOB),12);",
+        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
-    w = start_db(path);
+    oc_dbwriter *w = start_db(path);   /* the file is there: no template copied */
     CHECK(w != NULL);
     CHECK(raw_open(path, &db) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == OC_MIGRATIONS[OC_MIGRATIONS_COUNT - 1].version);
     sqlite3_stmt *st = NULL;
     int rows = 0, chan = 0, named = 0, none = 0;
     sqlite3_prepare_v2(db, "SELECT message_id, user_id, kind FROM mentions;", -1, &st, NULL);
