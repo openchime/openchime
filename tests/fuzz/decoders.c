@@ -139,6 +139,10 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_download_info di; D(oc_decode_download_info(&p, &di));
     oc_download_chunk dc; D(oc_decode_download_chunk(&p, &dc));
     oc_download_end den; D(oc_decode_download_end(&p, &den));
+    oc_preview_begin pvb; D(oc_decode_preview_begin(&p, &pvb));
+    oc_preview_info pvi; D(oc_decode_preview_info(&p, &pvi));
+    oc_preview_chunk pvc; D(oc_decode_preview_chunk(&p, &pvc));
+    oc_preview_end pve; D(oc_decode_preview_end(&p, &pve));
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
     oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
     D(oc_decode_list_groups(&p));

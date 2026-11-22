@@ -822,7 +822,7 @@ typedef struct {
      * accumulates if nobody asks. */
     /* A few, not one: transfers queue now, so a thumbnail and a video can both
      * land between two frames, and the second must not free the first. */
-    struct { uint64_t id; uint8_t *data; size_t len; } fetched[8];
+    struct { uint64_t id; uint8_t *data; size_t len; uint8_t rung; } fetched[8];
     uint8_t  n_fetched;
     /* The transfer running now (0 tag = none), for a progress bar or ring. */
     uint64_t xfer_tag, xfer_done, xfer_total;
@@ -1244,6 +1244,9 @@ uint64_t oc_model_now_ms(void);
 /* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
+/* The same, with the preview rung the bytes were asked for at (ARCH-137;
+ * oc_client_fetch_image): 0 for a fetch of the original. */
+uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, uint8_t *rung);
 
 /* What a message says in a one-line summary — a sidebar row, a toast, the
  * activity feed: its text, or for a message that is only a file, what the file

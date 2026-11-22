@@ -39,6 +39,10 @@ void oc_xfer_job_free(oc_xfer_job *j) {
     free(j->key);
     free(j->data);
     if (j->sha) { mbedtls_sha256_free(j->sha); free(j->sha); }
+    if (j->pv) {
+        for (int i = 0; i < OC_PREVIEW_RUNGS; i++) free(j->pv->keys[i]);
+        free(j->pv);
+    }
     free(j);
 }
 
@@ -60,6 +64,70 @@ static oc_xfer_job *q_pop(oc_xfer_job **head, oc_xfer_job **tail) {
 }
 
 /* --- the work ------------------------------------------------------------- */
+
+/* Store `len` bytes under `key`, whole. */
+static int put_all(oc_blobstore *bs, const char *key, const uint8_t *data, size_t len) {
+    oc_blob_writer *bw = oc_blob_put_begin(bs, key, len);
+    if (!bw) return -1;
+    size_t off = 0;
+    while (off < len) {
+        size_t n = len - off < 1u << 20 ? len - off : 1u << 20;
+        if (oc_blob_put_chunk(bw, data + off, n) != 0) { oc_blob_put_abort(bw); return -1; }
+        off += n;
+    }
+    return oc_blob_put_commit(bw);
+}
+
+/* An attachment's previews (ARCH-137): decode, resize and encode are CPU work
+ * of the same kind as the blob I/O around them, which is why they run here and
+ * never on the network loop. Whatever goes wrong, the outcome is only "no
+ * preview": nothing half-stored is left behind. */
+static void run_preview(oc_blobstore *bs, oc_xfer_job *j) {
+    oc_xfer_preview *pv = j->pv;
+    j->rc = 0;
+    if (!pv) { j->rc = -1; return; }
+    pv->status = OC_PREVIEW_MALFORMED;
+    uint64_t size = 0;
+    oc_blob_reader *br = oc_blob_get_begin(bs, j->key, &size);
+    if (!br) { j->rc = -1; return; }
+    if (size > pv->lim.max_bytes) {                 /* the byte cap, before any read */
+        oc_blob_get_close(br);
+        pv->status = OC_PREVIEW_TOO_BIG;
+        return;
+    }
+    uint8_t *buf = malloc(size ? (size_t)size : 1);
+    if (!buf) { oc_blob_get_close(br); pv->status = OC_PREVIEW_NO_MEMORY; return; }
+    size_t got = 0;
+    while (got < size) {
+        long n = oc_blob_get_chunk(br, buf + got, (size_t)size - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    oc_blob_get_close(br);
+    if (got != size) { free(buf); j->rc = -1; return; }
+
+    oc_preview_set set;
+    pv->status = oc_preview_make(buf, got, &pv->lim, &set);
+    free(buf);
+    pv->width = set.width;
+    pv->height = set.height;
+    if (pv->status != OC_PREVIEW_MADE) return;
+    int ok = 1;
+    for (int i = 0; i < OC_PREVIEW_RUNGS && ok; i++) {
+        ok = pv->keys[i] && put_all(bs, pv->keys[i], set.rung[i].data, set.rung[i].len) == 0;
+        pv->rung_w[i] = set.rung[i].width;
+        pv->rung_h[i] = set.rung[i].height;
+        pv->rung_size[i] = set.rung[i].len;
+        pv->rung_mime[i] = set.rung[i].mime;
+    }
+    oc_preview_set_free(&set);
+    if (!ok) {
+        for (int i = 0; i < OC_PREVIEW_RUNGS; i++) if (pv->keys[i]) oc_blob_delete(bs, pv->keys[i]);
+        j->rc = -1;
+        return;
+    }
+    pv->stored = 1;
+}
 
 /* Run one job against the blob store. Called on a worker thread with no lock
  * held: the handle is reachable only through this job, and the caller's
@@ -108,6 +176,9 @@ static void run_job(oc_blobstore *bs, oc_xfer_job *j) {
          * it runs here rather than on the writer that decided to reclaim. */
         j->rc = oc_blob_delete(bs, j->key);
         break;
+    case OC_XFER_PREVIEW:
+        run_preview(bs, j);
+        break;
     }
 }
 
@@ -126,7 +197,7 @@ static void *worker(void *arg) {
 
         /* A fire-and-forget cleanup (abort/close for a connection that already
          * went away) has nobody to hand the result to. */
-        if (j->conn_id == 0) { oc_xfer_job_free(j); continue; }
+        if (j->conn_id == 0 && j->op != OC_XFER_PREVIEW) { oc_xfer_job_free(j); continue; }
 
         pthread_mutex_lock(&p->mu);
         q_push(&p->out_head, &p->out_tail, j);
@@ -173,7 +244,7 @@ static void release_owned(oc_xfer_job *j) {
         if (j->br) oc_blob_get_close(j->br);
         break;
     case OC_XFER_WRITE: case OC_XFER_READ:
-    case OC_XFER_DELETE:
+    case OC_XFER_DELETE: case OC_XFER_PREVIEW:
         break;                      /* holds no handle to release */
     }
     oc_xfer_job_free(j);

@@ -35,6 +35,8 @@ int oc_fuzz_cbor(const uint8_t *data, size_t len);
 int oc_fuzz_jwt(const uint8_t *data, size_t len);
 int oc_fuzz_webauthn(const uint8_t *data, size_t len);
 int oc_fuzz_idtoken(const uint8_t *data, size_t len);
+/* The image-preview decoders (ARCH-137). */
+int oc_fuzz_image(const uint8_t *data, size_t len);
 
 /* An input as `n` parts, for a function that takes several: each part but the
  * last is prefixed by its length, a big-endian u16, cut short where the input

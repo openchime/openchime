@@ -2954,6 +2954,49 @@ static void test_user_mute_frames(void) {
  */
 /* Read-aloud's frames (REQ-291-295, ARCH-111): the capability after
  * authentication, and the download of one message's speech. */
+/* Image previews (ARCH-137): the four frames, each field through and back; a
+ * frame a byte short is refused. */
+static void test_preview_frames(void) {
+    static uint8_t frame[2048];
+    {
+        oc_preview_begin in = { 81, OC_PREVIEW_RUNG_EXPANDED_WIRE };
+        ROUNDTRIP(oc_encode_preview_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PREVIEW_BEGIN, h, p);
+        oc_preview_begin out;
+        CHECK(oc_decode_preview_begin(&p, &out) == OC_OK && out.attachment_id == 81 && out.rung == 2);
+    }
+    {
+        oc_preview_info in = { 81, 1, 480, 360, oc_slice_str("image/webp"), 12345 };
+        ROUNDTRIP(oc_encode_preview_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PREVIEW_INFO, h, p);
+        oc_preview_info out;
+        CHECK(oc_decode_preview_info(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 81 && out.rung == 1 && out.width == 480 && out.height == 360 &&
+              out.total_size == 12345 && out.mime.len == 10 && memcmp(out.mime.ptr, "image/webp", 10) == 0);
+    }
+    {
+        uint8_t data[300];
+        for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 7);
+        oc_preview_chunk in = { 81, 2, 4, { data, sizeof data } };
+        ROUNDTRIP(oc_encode_preview_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PREVIEW_CHUNK, h, p);
+        oc_preview_chunk out;
+        CHECK(oc_decode_preview_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 81 && out.rung == 2 && out.seq == 4 && out.data.len == sizeof data &&
+              memcmp(out.data.ptr, data, sizeof data) == 0);
+    }
+    {
+        oc_preview_end in = { 81, 1 };
+        ROUNDTRIP(oc_encode_preview_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PREVIEW_END, h, p);
+        oc_preview_end out;
+        CHECK(oc_decode_preview_end(&p, &out) == OC_OK && out.attachment_id == 81 && out.rung == 1);
+    }
+    {
+        oc_preview_begin in = { 81, 1 };
+        ROUNDTRIP(oc_encode_preview_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PREVIEW_BEGIN, h, p);
+        p.len -= 1;                                   /* the rung's byte missing */
+        oc_preview_begin out;
+        CHECK(oc_decode_preview_begin(&p, &out) == OC_E_MALFORMED);
+    }
+}
+
 static void test_tts_frames(void) {
     uint8_t frame[4096];
     {
@@ -3501,6 +3544,7 @@ int run_protocol_tests(void) {
     test_user_mute_frames();
     test_profile_frames();
     test_tts_frames();
+    test_preview_frames();
     test_call_frames();
     test_block_frames();
     test_profile_field_frames();

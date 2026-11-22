@@ -676,6 +676,16 @@ void oc_export_copy_name(const char *video_name, char *out, size_t cap);
  * rather than buffered, so a caller should fall back to a real download. */
 void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
 
+/* Fetch an image attachment for showing at a size (ARCH-137): the daemon's
+ * preview at `rung` -- OC_PREVIEW_RUNG_INLINE_WIRE for the timeline,
+ * OC_PREVIEW_RUNG_EXPANDED_WIRE for the image viewer -- into memory, as
+ * oc_client_fetch_attachment does. When the daemon has none at that rung (a
+ * small image, a GIF, one never previewed or one whose preview was reclaimed)
+ * the core fetches the original instead, quietly; either way the bytes arrive
+ * as OC_EV_ATTACHMENT_DATA with op = `rung`, and are taken with
+ * oc_model_take_image. */
+void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung);
+
 /* Transfers wait their turn in a queue rather than being refused while another
  * runs; each carries a tag that its OC_EV_XFER progress and completion events
  * repeat. A download's or fetch's tag is the attachment id. */

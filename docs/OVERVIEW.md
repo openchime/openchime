@@ -73,6 +73,7 @@ the map behind it.
 | [CALLS.md](./details/CALLS.md) | Calls: the model, Calls home, signaling, end-to-end encryption, screen sharing, cameras, recording. | ARCH-73, 86, 87, 113, 136; REQ-150–152, 160–161, 301–306 |
 | [AUDIO.md](./details/AUDIO.md) | A call's audio: the relay, the client's audio engine, transport and echo cancellation. | ARCH-18, 31, 73; REQ-151–152 |
 | [VIDEO-MESSAGES.md](./details/VIDEO-MESSAGES.md) | Recording, posting and playing a video message, and its export. | ARCH-110, 135; REQ-162–166, 382–384 |
+| [IMAGE-PREVIEWS.md](./details/IMAGE-PREVIEWS.md) | Image previews: the two rungs, when an image gets none, each format, the four decode bounds, fuzzing, storage. | ARCH-137; REQ-142, 390–393 |
 | [READ-ALOUD.md](./details/READ-ALOUD.md) | Reading a conversation aloud, rendered in the daemon. | ARCH-111; REQ-291–295 |
 | [VOICE-INPUT.md](./details/VOICE-INPUT.md) | Speaking instead of typing, recognized in the daemon. | ARCH-112; REQ-296–300 |
 | [SUMMARIES.md](./details/SUMMARIES.md) | Summaries of a conversation: the standard, the pipeline, the model. | ARCH-116; REQ-310–313 |

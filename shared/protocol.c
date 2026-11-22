@@ -1669,6 +1669,10 @@ const char *oc_error_text(uint16_t code) {
         return "a call needs a subject, of at most 200 bytes";
     case OC_ERR_RECORDING_UNAVAILABLE:
         return "calls can't be recorded here right now";
+    case OC_ERR_PREVIEW_MISSING:
+        return "this image has no preview: the whole image is shown instead";
+    case OC_ERR_PREVIEW_RUNG:
+        return "that preview size doesn't exist";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -3000,6 +3004,40 @@ oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_c
 oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_END);
     oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_begin(oc_wbuf *w, uint16_t version, const oc_preview_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_BEGIN);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_info(oc_wbuf *w, uint16_t version, const oc_preview_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_INFO);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    oc_w_u32(w, m->width);
+    oc_w_u32(w, m->height);
+    oc_w_str(w, m->mime);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_chunk(oc_wbuf *w, uint16_t version, const oc_preview_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_END);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
     return oc_frame_end(w, off);
 }
 
@@ -4342,6 +4380,36 @@ oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m) {
 
 oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m) {
     m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_begin(oc_rbuf *p, oc_preview_begin *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_info(oc_rbuf *p, oc_preview_info *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    m->width = oc_r_u32(p);
+    m->height = oc_r_u32(p);
+    m->mime = oc_r_str(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
     return r_done(p);
 }
 

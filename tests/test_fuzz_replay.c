@@ -51,6 +51,7 @@ int run_fuzz_replay_tests(void) {
         { "jwt", oc_fuzz_jwt },
         { "webauthn", oc_fuzz_webauthn },
         { "idtoken", oc_fuzz_idtoken },
+        { "image", oc_fuzz_image },
     };
     int total = 0;
     for (size_t i = 0; i < sizeof H / sizeof H[0]; i++) {

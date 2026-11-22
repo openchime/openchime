@@ -1852,6 +1852,20 @@ void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
+    if (!c || !attachment_id) return;
+    if (rung != OC_PREVIEW_RUNG_INLINE_WIRE && rung != OC_PREVIEW_RUNG_EXPANDED_WIRE) {
+        oc_client_fetch_attachment(c, attachment_id);
+        return;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH_PREVIEW);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    cmd->op = rung;
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
                               uint32_t duration_ms, uint16_t width, uint16_t height,

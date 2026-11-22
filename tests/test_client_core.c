@@ -37,6 +37,8 @@
 #include "callrec_render.h" /* the stand-in codecs it is made with */
 #include "oc_vp9dec.h"
 #include "oc_opusdec.h"
+#include "preview.h"         /* image previews' sizes (ARCH-137) */
+#include "preview_samples.h" /* images made in memory to upload */
 #include <sqlite3.h>
 #include "audio.h"        /* the relay, run on a thread for the call test */
 #include "e2e_hpke.h"
@@ -378,6 +380,33 @@ static uint8_t *take_fetched(oc_client *cl, uint64_t aid, size_t *len) {
         free(d);
     }
     return NULL;
+}
+
+/* Take fetched image bytes for `aid` with the rung they were asked at. */
+static uint8_t *take_image(oc_client *cl, uint64_t aid, size_t *len, uint8_t *rung) {
+    uint64_t id; size_t n; uint8_t *d; uint8_t r;
+    while ((d = oc_model_take_image((oc_model *)oc_client_model(cl), &id, &n, &r)) != NULL) {
+        if (id == aid) { *len = n; *rung = r; return d; }
+        free(d);
+    }
+    return NULL;
+}
+
+/* One look for `aid` at `rung` being `w` x `h`: asks when nothing is out,
+ * and judges what came back by its own header. A preview is made after the
+ * upload is confirmed, so the first answers may be the original; asked
+ * again, the preview comes. For WAIT_FOR, which keeps looking. */
+static int image_is(oc_client *cl, uint64_t aid, uint8_t rung, uint32_t w, uint32_t h, int *asked) {
+    if (!*asked) { oc_client_fetch_image(cl, aid, rung); *asked = 1; }
+    size_t n = 0;
+    uint8_t got = 0;
+    uint8_t *d = take_image(cl, aid, &n, &got);
+    if (!d) return 0;
+    *asked = 0;
+    uint32_t iw = 0, ih = 0;
+    int ok = oc_preview_probe(d, n, &iw, &ih) == 0 && got == rung && iw == w && ih == h;
+    free(d);
+    return ok;
 }
 
 static const oc_msg *channel_msg_by_body(const oc_model *m, uint64_t cid, const char *body) {
@@ -7812,6 +7841,57 @@ int run_client_core_tests(void) {
                 snprintf(path, sizeof path, "%s/itest_core_page%d.bin", g_dir, k);
                 unlink(path);
             }
+        }
+
+        /* Image previews (ARCH-137): dana posts a large JPEG and a small PNG;
+         * erik asks for each at the rung he would draw it at. The JPEG comes
+         * back at the inline rung's size and at the expanded rung's; the PNG,
+         * which gets no preview, comes back as itself whichever rung is asked,
+         * and nothing is said about it. */
+        {
+            size_t jn = 0, pn = 0;
+            uint8_t *jpg = sample_jpeg(2000, 1500, &jn);
+            uint8_t *png = sample_png(120, 90, 0, &pn);
+            CHECK(jpg && png);
+            char jpath[sizeof g_dir + 32], ppath[sizeof g_dir + 32];
+            snprintf(jpath, sizeof jpath, "%s/itest_preview.jpg", g_dir);
+            snprintf(ppath, sizeof ppath, "%s/itest_preview.png", g_dir);
+            FILE *jf = fopen(jpath, "wb"), *pf = fopen(ppath, "wb");
+            CHECK(jf && pf);
+            if (jf) { fwrite(jpg, 1, jn, jf); fclose(jf); }
+            if (pf) { fwrite(png, 1, pn, pf); fclose(pf); }
+            const char *paths[2] = { jpath, ppath };
+            CHECK(oc_client_post_files(a, 1, 0, paths, 2, "two pictures") != 0);
+            const oc_msg *pm = NULL;
+            CHECK(WAIT_FOR(b, (pm = channel_msg_by_body(m, 1, "two pictures")) != NULL && pm->n_attach == 2));
+            pm = channel_msg_by_body(oc_client_model(b), 1, "two pictures");
+            if (pm && pm->n_attach == 2) {
+                uint64_t jid = pm->attach[0].id, pid = pm->attach[1].id;
+                CHECK(strcmp(pm->attach[0].mime, "image/jpeg") == 0 && strcmp(pm->attach[1].mime, "image/png") == 0);
+                int asked = 0;
+                CHECK(WAIT_FOR_MS(b, image_is(b, jid, OC_PREVIEW_RUNG_INLINE_WIRE, 480, 360, &asked), 30000));
+                asked = 0;
+                CHECK(WAIT_FOR_MS(b, image_is(b, jid, OC_PREVIEW_RUNG_EXPANDED_WIRE, 1600, 1200, &asked), 30000));
+                for (uint8_t rung = 1; rung <= 2; rung++) {
+                    oc_client_fetch_image(b, pid, rung);
+                    size_t n = 0;
+                    uint8_t got = 0, *d = NULL;
+                    CHECK(WAIT_FOR(b, (d = take_image(b, pid, &n, &got)) != NULL));
+                    CHECK(d && got == rung && n == pn && memcmp(d, png, pn) == 0);   /* the original */
+                    free(d);
+                }
+                /* The original is still there, whole, for saving. */
+                oc_client_fetch_attachment(b, jid);
+                size_t n = 0;
+                uint8_t *d = NULL;
+                CHECK(WAIT_FOR(b, (d = take_fetched(b, jid, &n)) != NULL));
+                CHECK(d && n == jn && memcmp(d, jpg, jn) == 0);
+                free(d);
+            }
+            unlink(jpath);
+            unlink(ppath);
+            free(jpg);
+            free(png);
         }
 
         /* video messages (REQ-162/165): dana asks for an earlier file's bytes and

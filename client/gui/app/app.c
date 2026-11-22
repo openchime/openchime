@@ -1829,6 +1829,29 @@ static int mime_is_image(const char *mime) {
                     strcmp(mime, "image/webp") == 0);
 }
 
+/* ---- image previews (ARCH-137) ------------------------------------------------
+ * The daemon keeps two smaller copies of an uploaded JPEG, PNG or WebP. An
+ * image is asked for at the rung matching the size it is drawn at -- the
+ * inline rung in the timeline, the expanded rung in the viewer -- and the core
+ * fetches the original in its place where there is none (CLIENT.md, "Image
+ * previews"). The cache holds each rung under a key of its own, the rung in
+ * the top bits of the attachment id; an avatar, a poster and a GIF stay keyed
+ * by the id alone, as the original. */
+#define IMG_KEY(id, rung) ((uint64_t)(id) | ((uint64_t)(rung) << 60))
+static int mime_previewed(const char *mime) {
+    return mime && (strcmp(mime, "image/png") == 0 || strcmp(mime, "image/jpeg") == 0 ||
+                    strcmp(mime, "image/webp") == 0);
+}
+/* The cache key an attachment of type `mime` is shown under at `rung`. */
+static uint64_t img_key(uint64_t id, const char *mime, uint8_t rung) {
+    return mime_previewed(mime) ? IMG_KEY(id, rung) : id;
+}
+/* Ask for attachment `id` at `rung`, as its cache key says. */
+static void img_fetch(uint64_t id, const char *mime, uint8_t rung) {
+    if (mime_previewed(mime)) oc_client_fetch_image(g_client, id, rung);
+    else oc_client_fetch_attachment(g_client, id);
+}
+
 static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h) {
     (void)rt;
     for (int i = 0; i < g_n_thumbs; i++) {
@@ -8204,7 +8227,8 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                       rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
             by += LINE_H;
             unsigned iw = 0, ih = 0;
-            gfx_tex *bmp = thumb_get(rt, at->id, &iw, &ih);
+            uint64_t key = img_key(at->id, at->mime, OC_PREVIEW_RUNG_INLINE_WIRE);
+            gfx_tex *bmp = thumb_get(rt, key, &iw, &ih);
             float bw = THUMB_W, bh = THUMB_H;
             if (bmp) {
                 /* Fit inside the box and never upscale: the box is a maximum,
@@ -8225,7 +8249,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                 /* The filename is on the line above; this only says why there is
                  * no picture yet. */
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, thumb_failed(at->id) ? "preview unavailable" : "loading\u2026",
+                draw_text(rt, thumb_failed(key) ? "preview unavailable" : "loading\u2026",
                           g_meta, ph, OC_COL_FAINT);
                 g_meta->align = ST_ALIGN_LEFT;
                 /* Ask for it — one at a time, and only for what is on screen.
@@ -8233,10 +8257,10 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                  * harness: that render is not the user's screen, and treating
                  * its forced miss as "not fetched yet" re-requested every image
                  * on every shot. */
-                if (!g_preview && !g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
-                    g_thumb_pending = at->id;
+                if (!g_preview && !g_thumbs_off && !thumb_failed(key) && !g_thumb_pending && g_client) {
+                    g_thumb_pending = key;
                     g_thumb_deadline = now_ms() + 8000;
-                    oc_client_fetch_attachment(g_client, at->id);
+                    img_fetch(at->id, at->mime, OC_PREVIEW_RUNG_INLINE_WIRE);
                 }
             }
             /* One hit-box for the whole image area whether or not it decoded,
@@ -31680,10 +31704,16 @@ static void draw_lightbox(gfx *rt, float W, float H) {
     int n = lb_items(it, 512), i = lb_index(it, n);
     g_lb_i = i; g_lb_n = n;
     const lb_item *cur = i >= 0 ? &it[i] : NULL;
-    /* A video shows its poster; an image itself. */
-    uint64_t want = cur && cur->video ? cur->at->poster_id : g_lightbox;
+    /* A video shows its poster; an image itself, at the expanded rung -- and
+     * meanwhile its inline rung, drawn larger, rather than nothing. */
+    const char *wmime = cur && !cur->video ? cur->at->mime : NULL;
+    uint64_t want = cur && cur->video ? cur->at->poster_id
+                  : img_key(g_lightbox, wmime, OC_PREVIEW_RUNG_EXPANDED_WIRE);
     unsigned iw = 0, ih = 0;
     gfx_tex *bmp = want ? thumb_get(rt, want, &iw, &ih) : NULL;
+    if (!bmp && wmime && mime_previewed(wmime))
+        bmp = thumb_get(rt, img_key(g_lightbox, wmime, OC_PREVIEW_RUNG_INLINE_WIRE), &iw, &ih);
+    int lb_stand_in = !bmp || (want && !thumb_get(rt, want, NULL, NULL));
 
     rectf all = rf(0, 0, W, H);
     gfx_fill(rt, gr(all), 0x000000, 0.82f);
@@ -31719,14 +31749,16 @@ static void draw_lightbox(gfx *rt, float W, float H) {
         g_display->align = ST_ALIGN_LEFT;
     }
 
+    /* Not here yet: ask for it -- this one, once. */
+    if (lb_stand_in && want && !g_thumbs_off && !thumb_failed(want) && !g_thumb_pending && g_client) {
+        g_thumb_pending = want;
+        g_thumb_deadline = now_ms() + 8000;
+        if (cur && cur->video) oc_client_fetch_attachment(g_client, want);
+        else img_fetch(g_lightbox, wmime, OC_PREVIEW_RUNG_EXPANDED_WIRE);
+    }
     if (!bmp || !iw || !ih) {
-        /* Not here yet: ask for it -- this one, once -- and say so meanwhile,
-         * rather than show whatever was on screen before. */
-        if (want && !g_thumbs_off && !thumb_failed(want) && !g_thumb_pending && g_client) {
-            g_thumb_pending = want;
-            g_thumb_deadline = now_ms() + 8000;
-            oc_client_fetch_attachment(g_client, want);
-        }
+        /* ...and say so meanwhile, rather than show whatever was on screen
+         * before. */
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, thumb_failed(want) ? "This image could not be loaded." : "Loading\xE2\x80\xA6",
                   g_meta, rf(0, H / 2 - 12, W, H / 2 + 12), OC_COL_MUTED);
@@ -44137,17 +44169,21 @@ static int on_tick(oc_win *hwnd) {
             /* An inline image arrived: decode and cache it. */
             {
                 uint64_t fid = 0; size_t flen = 0;
-                uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
-                if (fd && vm_take_bytes(fid, fd, flen)) {
+                uint8_t frung = 0;
+                uint8_t *fd = oc_model_take_image((oc_model *)m, &fid, &flen, &frung);
+                if (fd && !frung && vm_take_bytes(fid, fd, flen)) {
                     invalidate();   /* a video, now owned by the cache */
-                } else if (fd && fid == g_snip_pending) {
+                } else if (fd && !frung && fid == g_snip_pending) {
                     snip_store(fid, fd, flen);   /* a snippet's text (REQ-226) */
                     g_snip_pending = 0;
                     invalidate();
                 } else if (fd) {
-                    thumb_decode(fid, fd, flen);
+                    /* An image at the rung it was asked for (ARCH-137), or an
+                     * original: cached under the key it was asked by. */
+                    uint64_t key = frung ? IMG_KEY(fid, frung) : fid;
+                    thumb_decode(key, fd, flen);
                     free(fd);
-                    if (g_thumb_pending == fid) g_thumb_pending = 0;
+                    if (g_thumb_pending == key) g_thumb_pending = 0;
                     invalidate();
                 }
             }

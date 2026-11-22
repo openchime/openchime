@@ -206,6 +206,19 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   `oc_client_summary_cancel` cancels one being made. Activity lists notices as
   kind 4.
 
+- **Images at the size they are drawn** (REQ-142, REQ-390, ARCH-137).
+  `oc_client_fetch_image(c, attachment, rung)` fetches an image attachment into
+  memory at a preview rung -- `OC_PREVIEW_RUNG_INLINE_WIRE` for the timeline,
+  `OC_PREVIEW_RUNG_EXPANDED_WIRE` for the viewer -- with `PREVIEW_BEGIN` and the
+  daemon's `PREVIEW_INFO`/`PREVIEW_CHUNK`/`PREVIEW_END`, queued as a fetch is. A
+  daemon with no preview at that rung answers `PREVIEW_MISSING`, and the core
+  then fetches the **original** in its place, quietly: no status line, since a
+  small image, a GIF and one uploaded before previews all have none. Either way
+  the bytes arrive as `OC_EV_ATTACHMENT_DATA` carrying the rung asked for, and
+  `oc_model_take_image` hands them over with it, so a frontend caches each rung
+  under a key of its own. The original is fetched whole only to be saved or
+  opened (`oc_client_download`).
+
 - **Transfers queue** (REQ-140/162). A connection runs one transfer at a time,
   as the daemon requires, so the net thread keeps a FIFO of transfer commands —
   uploads, downloads, in-memory fetches and video posts — instead of refusing a
@@ -1449,6 +1462,32 @@ email", "your workspace has turned this off") rather than disappearing. A link
 in a notification email opens the app at a workspace, conversation and message
 (EMAIL.md §7). Each is specified here as it is built; the design is
 [EMAIL.md](./EMAIL.md).
+
+### Images: a preview at the size drawn, and how a file comes in
+
+**The rung matches the size.** The timeline draws an image inside a box of
+260 × 160 points, so it asks for the **inline** rung; the viewer draws it up to
+the window, so it asks for the **expanded** rung, and shows the inline rung,
+larger, while that comes, rather than nothing. Each is cached under the
+attachment and the rung (`IMG_KEY`). A GIF and a BMP have no previews and are
+fetched as they are, as are avatars and a video's poster. Where the daemon has
+no preview the core brings the original instead (§2), which the same cache holds
+under the rung's key, drawn scaled as before. A client never asks for the
+original to show an image; Save does, and the file saved is the original.
+
+**How a file comes in**, the same in the Win32 and web clients, since both are
+the one SDL application:
+
+- **Attach**, the composer's paperclip: the platform's file picker.
+- **Drop** files on the window (`SDL_EVENT_DROP_FILE`): each goes into the open
+  conversation's tray, as a picked file does.
+- **Paste** (Ctrl+V; ⌘V in a browser on a Mac): copied files paste as
+  themselves; an image copied from any other program (`oc_plat_clipboard_image`)
+  pastes as an image named `pasted-image-YYYYMMDD-HHMMSS.<ext>`, held in memory
+  and uploaded from there, never written to disk (ARCH-88).
+
+The terminal client draws no images (ARCH-75): an image is its attachment line,
+and it attaches by path.
 
 ### Links
 

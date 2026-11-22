@@ -1901,6 +1901,37 @@ static const char MIGRATION_0087[] =
     "ALTER TABLE messages ADD COLUMN call_id INTEGER REFERENCES calls(id);"
     "CREATE INDEX idx_messages_call ON messages(call_id) WHERE call_id IS NOT NULL;";
 
+static const char MIGRATION_0088[] =
+    /* Image previews (ARCH-137): the daemon's smaller copies of an uploaded
+     * JPEG, PNG or WebP, made once at upload on a transfer worker.
+     *
+     * `width` and `height` on `attachments` are the original's, read from its
+     * header when it was previewed; NULL for anything else, and for every
+     * attachment uploaded before this.
+     *
+     * `attachment_previews` holds one row per rung made: 1 the inline rung,
+     * 2 the expanded one, each in its original's format. It is DERIVED data, as
+     * `exported_video` is (0086): made again from the original, reclaimed
+     * before any attachment tier, least recently served first -- hence the
+     * index on `last_used_ms` -- and with no tombstone, since a client that
+     * finds a rung missing shows the original instead. A row goes when its
+     * attachment's bytes go. */
+    "ALTER TABLE attachments ADD COLUMN width INTEGER;"
+    "ALTER TABLE attachments ADD COLUMN height INTEGER;"
+    "CREATE TABLE attachment_previews ("
+    "  attachment_id INTEGER NOT NULL REFERENCES attachments(id),"
+    "  rung          INTEGER NOT NULL,"
+    "  storage_key   TEXT NOT NULL,"
+    "  width         INTEGER NOT NULL,"
+    "  height        INTEGER NOT NULL,"
+    "  size          INTEGER NOT NULL,"
+    "  mime          TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_used_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (attachment_id, rung)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX attachment_previews_lru ON attachment_previews(last_used_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1989,6 +2020,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 85, MIGRATION_0085 },
     { 86, MIGRATION_0086 },
     { 87, MIGRATION_0087 },
+    { 88, MIGRATION_0088 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

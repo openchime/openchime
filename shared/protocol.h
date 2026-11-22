@@ -706,6 +706,14 @@ typedef enum {
     OC_MSG_EXPORT_INFO          = 0x013F, /* S->C, its duration and size */
     OC_MSG_EXPORT_CHUNK         = 0x0140, /* S->C, a slice of the copy */
     OC_MSG_EXPORT_END           = 0x0141, /* S->C, the whole copy is sent */
+    /* Image previews (ARCH-137): a smaller copy of an image attachment, made by
+     * the daemon at upload, at one of two rungs. Downloaded as an attachment is,
+     * on frames of their own so a preview and the original are never mistaken
+     * for each other. New frames, so no version bump. */
+    OC_MSG_PREVIEW_BEGIN        = 0x0142, /* C->S, a rung of an attachment's preview */
+    OC_MSG_PREVIEW_INFO         = 0x0143, /* S->C, its size, dimensions and type */
+    OC_MSG_PREVIEW_CHUNK        = 0x0144, /* S->C, a slice of the preview */
+    OC_MSG_PREVIEW_END          = 0x0145, /* S->C, the whole preview is sent */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -829,6 +837,8 @@ typedef enum {
     OC_ERR_EXPORT_UNAVAILABLE  = 3074, /* no export here: not built in or turned off, or the person's or the daemon's queue is full (ARCH-135) */
     OC_ERR_CALL_SUBJECT        = 3075, /* a call started, or renamed, without a subject, or with one too long (CALLS.md §1) */
     OC_ERR_RECORDING_UNAVAILABLE = 3076, /* no recording here: not built in, turned off, a demo, or the recordings' space is used up (CALLS.md §8) */
+    OC_ERR_PREVIEW_MISSING     = 3077, /* the attachment has no preview at that rung: never made, or reclaimed; download the original (ARCH-137) */
+    OC_ERR_PREVIEW_RUNG        = 3078, /* PREVIEW_BEGIN named a rung that does not exist (ARCH-137) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -2098,6 +2108,20 @@ typedef struct { uint64_t attachment_id; uint32_t duration_ms; uint64_t total_si
 typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_export_chunk;
 typedef struct { uint64_t attachment_id; } oc_export_end;
 
+/* Image previews (ARCH-137). PREVIEW_BEGIN asks for rung `rung` of attachment
+ * `attachment_id` (OC_PREVIEW_RUNG_*), under the download's own gate; it is
+ * answered by PREVIEW_INFO, PREVIEW_CHUNKs and PREVIEW_END, or by an ERROR
+ * naming the attachment -- PREVIEW_MISSING when there is no such preview, and
+ * the client then downloads the original. `mime` is the preview's, always its
+ * original's format. */
+#define OC_PREVIEW_RUNG_INLINE_WIRE   1u
+#define OC_PREVIEW_RUNG_EXPANDED_WIRE 2u
+typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_begin;
+typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t width; uint32_t height; oc_slice mime;
+                 uint64_t total_size; } oc_preview_info;
+typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t seq; oc_slice data; } oc_preview_chunk;
+typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_end;
+
 /* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
  * little-endian PCM, at most max_segment_ms long. */
 #define OC_STT_RATE        16000u
@@ -2560,6 +2584,10 @@ oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
 oc_result oc_encode_export_get(oc_wbuf *w, uint16_t version, const oc_export_get *m);
+oc_result oc_encode_preview_begin(oc_wbuf *w, uint16_t version, const oc_preview_begin *m);
+oc_result oc_encode_preview_info(oc_wbuf *w, uint16_t version, const oc_preview_info *m);
+oc_result oc_encode_preview_chunk(oc_wbuf *w, uint16_t version, const oc_preview_chunk *m);
+oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_end *m);
 oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
 oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
 oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
@@ -2806,6 +2834,10 @@ oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
 oc_result oc_decode_export_get(oc_rbuf *p, oc_export_get *m);
+oc_result oc_decode_preview_begin(oc_rbuf *p, oc_preview_begin *m);
+oc_result oc_decode_preview_info(oc_rbuf *p, oc_preview_info *m);
+oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m);
+oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m);
 oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
 oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
 oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);

@@ -34,6 +34,10 @@ dist/
 !/third_party/SDL3/
 !/third_party/libavc/
 !/third_party/lame/
+!/third_party/libjpeg-turbo/
+!/third_party/libspng/
+!/third_party/libwebp/
+!/third_party/miniz/
 *.o
 *.db
 *.db-shm
@@ -48,3 +52,5 @@ package-lock.json
 
 # The container image's build context (packaging/image-context.sh).
 image/
+# ...which is not the image-preview harness's corpus.
+!/tests/fuzz/corpus/image/

@@ -9,7 +9,7 @@
 # "One build at a time"). The binary
 # always carries read-aloud's and voice input's test paths (stub engines) and
 # never needs Emscripten, whatever the switches say.
-TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) -DOC_TTS -DOC_STT $(EXPORT_TEST_INC) \
+TEST_INC  := $(INC) $(PREVIEW_INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) -DOC_TTS -DOC_STT $(EXPORT_TEST_INC) \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
@@ -20,7 +20,7 @@ TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_S
 # vendored libraries, which only have to exist before anything compiles.
 TEST_CC     = $(CC) $(CFLAGS) -O0 -g $(TEST_INC)
 TEST_OBJS   := $(call oc_objs,$(OBJ_DIR)/test,$(TEST_ALL_SRC))
-TEST_VENDOR := $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(EXPORT_TEST_LIBS)
+TEST_VENDOR := $(MBEDTLS_A) $(PREVIEW_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(EXPORT_TEST_LIBS)
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/test,TEST_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TEST_OBJS:.o=.d)
 # --- The fast suite (docs/details/TESTING.md) -----------------------------------------
@@ -40,7 +40,7 @@ TSAN_BIN := build/tests-tsan
 # suites start threads and fails one SUITES[] does not mark THREADS
 # (tests/main.c).
 $(TEST_BIN): $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
-	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O0 -g $(TEST_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -Wl,--wrap=pthread_create -lresolv -lpthread -lm -o $@
 # The same test binary under ThreadSanitizer (scripts/test/full/tsan.sh runs
 # it). The vendored libraries are not instrumented.
 TSAN_CC   = $(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC)
@@ -48,7 +48,7 @@ TSAN_OBJS := $(call oc_objs,$(OBJ_DIR)/tsan,$(TEST_ALL_SRC))
 $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 -include $(TSAN_OBJS:.o=.d)
 $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client the full suite drives against a natively-run daemon
@@ -77,14 +77,18 @@ FUZZ_SRC_cbor     := daemon/cbor.c
 FUZZ_SRC_jwt      := daemon/jwt.c daemon/json.c
 FUZZ_SRC_webauthn := daemon/webauthn.c daemon/cbor.c daemon/json.c daemon/jwt.c
 FUZZ_SRC_idtoken  := daemon/idtoken.c daemon/json.c daemon/jwt.c
+# The image harness links the preview engine and its three decoders, built as
+# the daemon's are: only daemon/preview.c is instrumented for coverage.
+FUZZ_SRC_image    := daemon/preview.c
+FUZZ_LIBS_image   := $(PREVIEW_LIBS)
 FUZZ_ALL_SRC := $(sort $(foreach h,$(FUZZ_HARNESSES),$(FUZZ_SRC_$(h))))
-build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBEDTLS_A) \
+build/fuzz/%: tests/fuzz/main.c tests/fuzz/%.c $(FUZZ_LIB) $(FUZZ_ALL_SRC) $(MBEDTLS_A) $(PREVIEW_A) \
               $(wildcard shared/*.h daemon/*.h tests/fuzz/*.h) | build-dir
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(CFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
-	    -Ishared -Idaemon -Itests -Ithird_party/jsmn -Ithird_party/picohttpparser -I$(MBEDTLS_INC) \
+	    -Ishared -Idaemon -Itests -Ithird_party/jsmn -Ithird_party/picohttpparser -I$(MBEDTLS_INC) $(PREVIEW_INC) \
 	    -DOC_FUZZ_TARGET=oc_fuzz_$* tests/fuzz/main.c tests/fuzz/$*.c \
-	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) $(FUZZ_SRC_$*) $(MBEDTLS_LIBS) -o $@
+	    $(filter-out tests/fuzz/$*.c,$(FUZZ_LIB)) $(FUZZ_SRC_$*) $(MBEDTLS_LIBS) $(FUZZ_LIBS_$*) -lm -o $@
 # Writes one valid frame per message type, and a few streams of them, as the
 # harnesses' seed corpora (tests/fuzz/corpus/): build/fuzz/seeds <dir>.
 build/fuzz/seeds: tests/fuzz/seeds.c shared/protocol.c $(wildcard shared/*.h) | build-dir

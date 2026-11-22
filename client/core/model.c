@@ -209,10 +209,15 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
 }
 
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
+    return oc_model_take_image(m, attachment_id, len, NULL);
+}
+
+uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, uint8_t *rung) {
     if (!m || !m->n_fetched) return NULL;
     uint8_t *d = m->fetched[0].data;
     if (attachment_id) *attachment_id = m->fetched[0].id;
     if (len) *len = m->fetched[0].len;
+    if (rung) *rung = m->fetched[0].rung;
     memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
     m->n_fetched--;
     return d;
@@ -3568,6 +3573,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->fetched[m->n_fetched].id = e->message_id;
         m->fetched[m->n_fetched].data = (uint8_t *)e->body;
         m->fetched[m->n_fetched].len = e->count;
+        m->fetched[m->n_fetched].rung = (uint8_t)e->op;
         m->n_fetched++;
         e->body = NULL;                      /* the model owns the bytes now */
         break;

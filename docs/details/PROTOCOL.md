@@ -2066,6 +2066,50 @@ at `ATTACH_MEDIA_SET` when it is marked. Clients refuse a longer
 text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
 one.
 
+### 5.14f Image previews (ARCH-137)
+
+A smaller copy of an image attachment, made by the daemon once at upload: the
+**inline** rung (`1`), for a message in the timeline, and the **expanded** rung
+(`2`), for the image viewer. Each is in its original's format: a JPEG's are JPEGs,
+a PNG's PNGs, a WebP's WebPs. The original is always kept and is still fetched
+with `DOWNLOAD_BEGIN`. Only a JPEG, PNG or WebP larger than the inline box gets
+previews; a small image, a GIF, a HEIC, an animated image, and one the daemon
+refused to decode (docs/details/IMAGE-PREVIEWS.md) get none.
+
+Previews have **frames of their own**, rather than a rung field on
+`DOWNLOAD_BEGIN` (a field changes an existing layout and bumps the version) or
+the download's frames for the bytes (a preview and its original, both keyed by
+the attachment id, could not be told apart). New frames need no version bump: a
+peer that does not know them never sends them and is never sent them.
+
+**`PREVIEW_BEGIN` (C → S), `0x0142`** `{ attachment_id: u64, rung: u8 }` — "this
+rung of this attachment's preview". The gate is the download's
+(`channel_read_access` on the attachment's channel, or everyone for an avatar),
+because a preview shows the image. Then, in order:
+
+1. **`PREVIEW_INFO` (S → C), `0x0143`** `{ attachment_id: u64, rung: u8,
+   width: u32, height: u32, mime: str, total_size: u64 }` — once, before the
+   bytes: the preview's own size in pixels and its type.
+2. **`PREVIEW_CHUNK` (S → C), `0x0144`** `{ attachment_id: u64, rung: u8, seq: u32,
+   data: bytes }` — sequential chunks, with the download path's backpressure.
+3. **`PREVIEW_END` (S → C), `0x0145`** `{ attachment_id: u64, rung: u8 }` —
+   everything sent.
+
+One transfer at a time per connection, as for a download: a `PREVIEW_BEGIN`
+while another transfer runs is refused `TRANSFER_PROTOCOL` and the running one is
+left alone.
+
+Refusals are `ERROR` frames carrying the attachment id in `context`, and the
+connection stays open: **`PREVIEW_MISSING` 3077** when the attachment has no
+preview at that rung — never made, or reclaimed under storage pressure — on which
+a client **downloads the original** instead and shows nothing amiss;
+**`PREVIEW_RUNG` 3078** for a rung that is neither `1` nor `2`; and the
+download's own `FORBIDDEN`, `ATTACHMENT_GONE` and `UNKNOWN_ATTACHMENT`.
+
+A client asks for the rung matching the size it will draw the image at (CLIENT.md,
+"Image previews"): the inline rung in the timeline, the expanded one in the
+viewer, the original only to save or open the file.
+
 ---
 
 ### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
@@ -3863,6 +3907,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3074` | `EXPORT_UNAVAILABLE`  | attachment | no    | An `EXPORT_GET` where export is not running (not built in, or `OPENCHIME_H264_EXPORT` off), or the person's three or the daemon's queue are full (§5.14d). |
 | `3075` | `CALL_SUBJECT`        | call       | no    | A call started, or renamed, with a subject that is blank or longer than 200 bytes (§5.17). |
 | `3076` | `RECORDING_UNAVAILABLE` | call     | no    | A `CALL_RECORD` start where recording is not offered: not built in, turned off by an admin, a public demo, or the recordings' space used up (§5.17). |
+| `3077` | `PREVIEW_MISSING` | transfer | no    | A `PREVIEW_BEGIN` for a rung the attachment has no preview at: never made, or reclaimed. The client downloads the original instead (§5.14f). |
+| `3078` | `PREVIEW_RUNG` | transfer | no    | A `PREVIEW_BEGIN` naming a rung that is neither 1 nor 2 (§5.14f). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -4172,6 +4218,10 @@ this table cannot silently gain a shared value.
 | `0x013F` | `EXPORT_INFO` | S → C | its duration and size (§5.14d) |
 | `0x0140` | `EXPORT_CHUNK` | S → C | a slice of the copy (§5.14d) |
 | `0x0141` | `EXPORT_END` | S → C | the whole copy is sent (§5.14d) |
+| `0x0142` | `PREVIEW_BEGIN` | C → S | a rung of an image attachment's preview (§5.14f) |
+| `0x0143` | `PREVIEW_INFO` | S → C | the preview's dimensions, type and size (§5.14f) |
+| `0x0144` | `PREVIEW_CHUNK` | S → C | a slice of the preview (§5.14f) |
+| `0x0145` | `PREVIEW_END` | S → C | the whole preview is sent (§5.14f) |
 
 ## 10. Connection state machine
 

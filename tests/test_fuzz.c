@@ -11,7 +11,10 @@
 #include "protocol.h"
 #include "check.h"
 #include "fuzz/fuzz.h"   /* the decoders, shared with the libFuzzer harnesses */
+#include "preview.h"         /* the image decoders (ARCH-137) */
+#include "preview_samples.h" /* their seeds, made in memory */
 
+#include <stdlib.h>
 #include <string.h>
 
 /* Iteration counts. The PRNG is deterministic (fixed seed), so a moderate sweep
@@ -22,6 +25,9 @@
 #endif
 #ifndef OC_FUZZ_FRAMED_ITERS
 #define OC_FUZZ_FRAMED_ITERS 2000
+#endif
+#ifndef OC_FUZZ_IMAGE_ITERS
+#define OC_FUZZ_IMAGE_ITERS 400      /* per format */
 #endif
 
 /* xorshift32 with a fixed seed — deterministic across runs/platforms. */
@@ -91,10 +97,66 @@ static void test_fuzz_framed(void) {
     }
 }
 
+/* The image decoders (ARCH-137), the daemon's first parser of untrusted media:
+ * a valid JPEG, PNG, lossy and lossless WebP each, mutated -- bytes flipped,
+ * runs overwritten, the file cut short -- and made into previews under small
+ * boxes, so every one is decoded rather than passed as small. Whatever comes
+ * in, a result is one of the statuses, a made preview probes as an image, and
+ * a refused one holds no rung. The coverage-guided tier fuzzes them too
+ * (tests/fuzz/image.c). */
+static void test_fuzz_images(void) {
+    size_t n[4] = { 0, 0, 0, 0 };
+    uint8_t *seed[4] = { sample_jpeg(96, 64, &n[0]), sample_png(96, 64, 1, &n[1]),
+                         sample_webp(96, 64, 0, &n[2]), sample_webp(96, 64, 1, &n[3]) };
+    oc_preview_limits lim;
+    oc_preview_limits_default(&lim);
+    lim.inline_px = 16;
+    lim.expanded_px = 40;
+    lim.max_pixels = 1u << 20;          /* a mutated header claiming more is refused there */
+    for (int f = 0; f < 4; f++) {
+        CHECK(seed[f] != NULL);
+        if (!seed[f]) continue;
+        uint8_t *buf = malloc(n[f]);
+        for (int iter = 0; iter < OC_FUZZ_IMAGE_ITERS && buf; iter++) {
+            memcpy(buf, seed[f], n[f]);
+            size_t len = n[f];
+            switch (fz() % 3) {
+            case 0:                                          /* a few bytes flipped */
+                for (int k = 0, flips = 1 + (int)(fz() % 8); k < flips; k++) buf[fz() % len] ^= (uint8_t)(1u << (fz() % 8));
+                break;
+            case 1: {                                        /* a run overwritten */
+                size_t at = fz() % len, run = 1 + fz() % 32;
+                for (size_t k = at; k < len && k < at + run; k++) buf[k] = (uint8_t)fz();
+                break;
+            }
+            default:                                         /* cut short */
+                len = 1 + fz() % len;
+                break;
+            }
+            uint32_t w, h;
+            (void)oc_preview_probe(buf, len, &w, &h);
+            oc_preview_set s;
+            oc_preview_status st = oc_preview_make(buf, len, &lim, &s);
+            CHECK(st >= OC_PREVIEW_MADE && st <= OC_PREVIEW_NO_MEMORY);
+            if (st == OC_PREVIEW_MADE) {
+                for (int r = 0; r < OC_PREVIEW_RUNGS; r++)
+                    CHECK(s.rung[r].data && oc_preview_probe(s.rung[r].data, s.rung[r].len, &w, &h) == 0);
+            } else {
+                CHECK(!s.rung[0].data && !s.rung[1].data);
+            }
+            oc_preview_set_free(&s);
+        }
+        free(buf);
+        free(seed[f]);
+    }
+}
+
 int run_fuzz_tests(void) {
-    printf("test_fuzz: %d random + %d framed iterations through parse + all decoders\n",
-           OC_FUZZ_RANDOM_ITERS, OC_FUZZ_FRAMED_ITERS);
+    printf("test_fuzz: %d random + %d framed iterations through parse + all decoders; "
+           "%d mutations of each image format through the preview decoders\n",
+           OC_FUZZ_RANDOM_ITERS, OC_FUZZ_FRAMED_ITERS, OC_FUZZ_IMAGE_ITERS);
     test_fuzz_random();
     test_fuzz_framed();
+    test_fuzz_images();
     return failures;
 }

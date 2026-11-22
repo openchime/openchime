@@ -384,7 +384,17 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_RECORDINGS_PENDING = 252, OC_JOB_RECORDING_DONE = 253,
        /* REC_PEOPLE (read): who call_uids are -- a name and an avatar's store
         * key each -- for call_id's recording; answered OC_RES_REC_PEOPLE. */
-       OC_JOB_REC_PEOPLE = 254 };
+       OC_JOB_REC_PEOPLE = 254,
+       /* Image previews (ARCH-137, SCHEMA.md `attachment_previews`).
+        * PREVIEW_STORE (write, fire and forget): attachment_id's dimensions
+        * (pv_width, pv_height; 0 unknown) and its pv_count rungs (pv_keys,
+        * pv_w, pv_h, pv_size, pv_mime); answered OC_RES_PREVIEW_STORED, whose
+        * pv_drop names the rungs' bytes to delete when the attachment went
+        * while they were made. PREVIEW_LOOKUP (read): attachment_id + user_id
+        * + pv_rung, the download's gate; answered OC_RES_PREVIEW_META or
+        * OC_RES_PREVIEW_ERR. PREVIEW_TOUCH (write, fire and forget): a rung
+        * served, for the least-recently-used reclaim. */
+       OC_JOB_PREVIEW_STORE = 255, OC_JOB_PREVIEW_LOOKUP = 256, OC_JOB_PREVIEW_TOUCH = 257 };
 
 /* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
  * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
@@ -562,6 +572,16 @@ typedef struct oc_job {
     char          *exp_blob_key;
     uint64_t       exp_bytes;
     uint32_t       exp_duration_ms;
+
+    /* Image previews (ARCH-137): PREVIEW_STORE's and PREVIEW_LOOKUP's
+     * fields, with attachment_id. pv_keys and pv_mime are heap. */
+    uint8_t        pv_rung;
+    uint8_t        pv_count;
+    uint32_t       pv_width, pv_height;
+    char          *pv_keys[2];
+    char          *pv_mime[2];
+    uint32_t       pv_w[2], pv_h[2];
+    uint64_t       pv_size[2];
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -992,7 +1012,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * SEND-shaped fields with its attachment, and `members`. */
        OC_RES_RECORDING_DONE = 145,
        /* Who people in a recording are: call_id, rec_people (n_rec_people). */
-       OC_RES_REC_PEOPLE = 146 };
+       OC_RES_REC_PEOPLE = 146,
+       /* Image previews (ARCH-137): a rung to serve (pv_key, pv_size, pv_w,
+        * pv_h, pv_mime, pv_rung), or why not (err_code); and a store done. */
+       OC_RES_PREVIEW_META = 147, OC_RES_PREVIEW_ERR = 148, OC_RES_PREVIEW_STORED = 149 };
 
 /* A line of a call's transcript as the daemon's transcript function takes it:
  * the speaker (0 unknown), from and to in ms from the call's start, the text. */
@@ -1662,6 +1685,12 @@ typedef struct oc_dbres {
     uint64_t                exp_bytes, exp_src_size;
     uint32_t                exp_duration_ms;
     uint8_t                 exp_cached;
+    /* OC_RES_PREVIEW_META and OC_RES_PREVIEW_STORED (ARCH-137). */
+    char                   *pv_key, *pv_mime;
+    uint64_t                pv_size;
+    uint32_t                pv_w, pv_h;
+    uint8_t                 pv_rung;
+    char                   *pv_drop[2];
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;
@@ -1676,6 +1705,7 @@ typedef struct oc_dbres {
     uint64_t                maint_expired;
     uint64_t                maint_evicted;
     uint64_t                maint_renders;   /* read-aloud renderings reclaimed (ARCH-111) */
+    uint64_t maint_previews;   /* image previews reclaimed (ARCH-137) */
     /* Storage report (REQ-214). The free-space half is filled in by the net
      * thread from its cached statvfs sample; the writer supplies what only the
      * database knows. */

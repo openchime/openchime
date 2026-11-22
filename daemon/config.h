@@ -193,6 +193,10 @@ typedef struct {
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;
     uint64_t max_video_size;            /* OPENCHIME_MAX_VIDEO_SIZE: a video message's cap, sent to clients (REQ-164) */
+    /* Image previews (ARCH-137): made at upload unless turned off; each rung's
+     * box (the longer side, px), and the decode's byte cap, pixel cap and time
+     * limit. CONFIG.md, "Image previews". */
+    struct { int enabled; int inline_px, expanded_px; uint64_t max_bytes, max_pixels; int timeout_ms; } previews;
 
     /* Development mode only (OPENCHIME_DEV_*). In any other mode these are the
      * constants and the variables refuse the start. */

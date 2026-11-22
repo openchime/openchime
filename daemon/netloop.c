@@ -197,6 +197,10 @@ typedef struct {
     /* The export of a video message: this transfer is its playable copy. */
     int              export;
     uint32_t         export_duration_ms;
+    /* An image preview (ARCH-137): the rung this transfer sends (0: not a
+     * preview), and its dimensions for PREVIEW_INFO; dl_mime is its type. */
+    uint8_t          preview;
+    uint32_t         pv_w, pv_h;
     /* Which transfer this is: advanced whenever one ends (xfer_reset), stamped
      * on each database job the transfer submits and echoed on its result, so a
      * result is acted on only by the transfer that asked for it. A cancelled
@@ -3023,6 +3027,7 @@ static void stt_drop_conn(uint64_t conn_id) {
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
 static int send_transfer_error(conn *c, uint64_t aid, uint16_t code);
+static void preview_submit(uint64_t attachment_id, const char *storage_key, const char *mime);
 
 #ifdef OC_TTS
 /* Start streaming a stored rendering: open the blob, then AUDIO_INFO and the
@@ -3181,6 +3186,9 @@ static void download_pump(conn *c) {
         } else if (x->export) {
             oc_export_end ee = { x->attachment_id };
             oc_encode_export_end(&w, OC_PROTOCOL_VERSION, &ee);
+        } else if (x->preview) {
+            oc_preview_end pe = { x->attachment_id, x->preview };
+            oc_encode_preview_end(&w, OC_PROTOCOL_VERSION, &pe);
         } else {
             oc_download_end de = { x->attachment_id };
             oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
@@ -5374,6 +5382,29 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             xfer_submit(dbw, &c->xfer, j);
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             c->xfer.attachment_id = db.attachment_id;
+            continue;
+        }
+        /* An image preview (ARCH-137): the download's gate, then the rung. */
+        if (hdr.msg_type == OC_MSG_PREVIEW_BEGIN) {
+            oc_preview_begin pb;
+            if (oc_decode_preview_begin(&p, &pb) != OC_OK) return -1;
+            if (pb.rung != OC_PREVIEW_RUNG_INLINE && pb.rung != OC_PREVIEW_RUNG_EXPANDED) {
+                if (send_transfer_error(c, pb.attachment_id, OC_ERR_PREVIEW_RUNG) != 0) return -1;
+                continue;
+            }
+            if (c->xfer.state != XFER_NONE) {
+                if (send_transfer_error(c, pb.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_PREVIEW_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = pb.attachment_id;
+            j->pv_rung = pb.rung;
+            c->xfer.preview = pb.rung;
+            c->xfer.attachment_id = pb.attachment_id;
+            xfer_submit(dbw, &c->xfer, j);
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             continue;
         }
         /* Voice input (REQ-296-300, ARCH-112): one segment of speech, uploaded
@@ -8522,8 +8553,59 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_upload_ok ok = { x->attachment_id, r->att_size, { x->digest, 32 } };
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &ok);
+        preview_submit(x->attachment_id, r->storage_key, r->mime);
         xfer_reset(x);
         send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_PREVIEW_STORED:
+        /* The attachment went while its previews were made: their bytes go too. */
+        for (int i = 0; i < 2; i++) {
+            if (!r->pv_drop[i]) continue;
+            oc_xfer_job *dj = oc_xfer_job_new(OC_XFER_DELETE, 0);
+            if (dj && (dj->key = strdup(r->pv_drop[i]))) oc_xferpool_submit(g_xfers, dj);
+            else oc_xfer_job_free(dj);
+        }
+        break;
+    case OC_RES_PREVIEW_META: {
+        /* PREVIEW_BEGIN authorized and the rung there: open it and stream it as
+         * a download is, on the preview's own frames. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (!xfer_current(x, r) || x->state != XFER_DOWN_AWAIT_LOOKUP || !x->preview) break;
+        free(x->dl_mime);
+        x->dl_mime = strdup(r->pv_mime ? r->pv_mime : "");
+        x->pv_w = r->pv_w;
+        x->pv_h = r->pv_h;
+        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_R, c->conn_id);
+        if (!j || !x->dl_mime || !(j->key = strdup(r->pv_key ? r->pv_key : ""))) {
+            oc_xfer_job_free(j);
+            int fd = c->fd;
+            send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);   /* resets the transfer */
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        j->attachment_id = r->attachment_id;
+        x->remaining = r->pv_size;
+        x->next_seq = 0;
+        x->state = XFER_DOWN_AWAIT_OPEN;
+        x->in_flight = 1;
+        oc_xferpool_submit(g_xfers, j);
+        update_interest(ep, c);
+        /* Served: the last of its kind to be reclaimed. */
+        oc_job *tj = oc_job_new(OC_JOB_PREVIEW_TOUCH, 0);
+        if (tj) { tj->attachment_id = r->attachment_id; tj->pv_rung = r->pv_rung; oc_dbwriter_submit(dbw, tj); }
+        break;
+    }
+    case OC_RES_PREVIEW_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (!xfer_current(x, r) || x->state != XFER_DOWN_AWAIT_LOOKUP || !x->preview) break;
+        int fd = c->fd;
+        send_transfer_error(c, x->attachment_id, r->err_code ? r->err_code : OC_ERR_INTERNAL);
+        if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
         break;
     }
 #ifdef OC_STT
@@ -8956,9 +9038,10 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         }
         if (r->n_reclaim)
             fprintf(stderr, "openchimed: storage maintenance reclaimed %zu blob(s) "
-                            "(%llu read-aloud, %llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
+                            "(%llu read-aloud, %llu previews, %llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
                     r->n_reclaim,
                     (unsigned long long)r->maint_renders,
+                    (unsigned long long)r->maint_previews,
                     (unsigned long long)r->maint_orphans,
                     (unsigned long long)r->maint_expired,
                     (unsigned long long)r->maint_evicted,
@@ -10296,7 +10379,69 @@ static void tts_drop_waiters(uint64_t conn_id) {
 }
 #endif
 
+/* --- Image previews (ARCH-137) ------------------------------------------------
+ * A finished upload that says it is an image is handed to a transfer worker,
+ * which reads it, makes its two rungs and stores them (daemon/preview.c,
+ * xferpool.c). The type the uploader gave only decides whether to look: the
+ * worker goes by the file's own bytes. Nothing of it reaches the uploader; an
+ * image that gets no preview is simply served whole. */
+static void preview_submit(uint64_t attachment_id, const char *storage_key, const char *mime) {
+    const oc_config *cfg = oc_config_get();
+    if (!cfg->previews.enabled || !g_xfers || !storage_key || !*storage_key || !mime ||
+        strncmp(mime, "image/", 6) != 0)
+        return;
+    oc_xfer_job *j = oc_xfer_job_new(OC_XFER_PREVIEW, 0);
+    if (!j) return;
+    j->attachment_id = attachment_id;
+    j->pv = calloc(1, sizeof *j->pv);
+    j->key = strdup(storage_key);
+    if (!j->pv || !j->key) { oc_xfer_job_free(j); return; }
+    j->pv->lim.inline_px = (uint32_t)cfg->previews.inline_px;
+    j->pv->lim.expanded_px = (uint32_t)cfg->previews.expanded_px;
+    j->pv->lim.max_bytes = cfg->previews.max_bytes;
+    j->pv->lim.max_pixels = cfg->previews.max_pixels;
+    j->pv->lim.timeout_ms = (uint32_t)cfg->previews.timeout_ms;
+    /* Each rung under its original's key and its number: an attachment's key is
+     * hex alone, so these can name nothing else. */
+    for (int i = 0; i < OC_PREVIEW_RUNGS; i++) {
+        size_t n = strlen(storage_key) + 3;
+        j->pv->keys[i] = malloc(n);
+        if (!j->pv->keys[i]) { oc_xfer_job_free(j); return; }
+        snprintf(j->pv->keys[i], n, "%s-%d", storage_key, i + 1);
+    }
+    oc_xferpool_submit(g_xfers, j);
+}
+
+/* A preview job back from its worker: the rows for what it made, and the
+ * original's dimensions whatever it made. */
+static void preview_done(oc_dbwriter *dbw, oc_xfer_job *j) {
+    oc_xfer_preview *pv = j->pv;
+    if (!pv) return;
+    if (pv->status != OC_PREVIEW_MADE && pv->status != OC_PREVIEW_SMALL && pv->status != OC_PREVIEW_PASSTHROUGH)
+        fprintf(stderr, "openchimed: attachment %llu: no preview (%s)\n", (unsigned long long)j->attachment_id,
+                oc_preview_status_name(pv->status));
+    if (!pv->stored && !(pv->width && pv->height)) return;
+    oc_job *sj = oc_job_new(OC_JOB_PREVIEW_STORE, 0);
+    if (!sj) return;
+    sj->attachment_id = j->attachment_id;
+    sj->pv_width = pv->width;
+    sj->pv_height = pv->height;
+    if (pv->stored) {
+        sj->pv_count = OC_PREVIEW_RUNGS;
+        for (int i = 0; i < OC_PREVIEW_RUNGS; i++) {
+            sj->pv_keys[i] = pv->keys[i];          /* moved */
+            pv->keys[i] = NULL;
+            sj->pv_mime[i] = strdup(pv->rung_mime[i] ? pv->rung_mime[i] : "");
+            sj->pv_w[i] = pv->rung_w[i];
+            sj->pv_h[i] = pv->rung_h[i];
+            sj->pv_size[i] = pv->rung_size[i];
+        }
+    }
+    oc_dbwriter_submit(dbw, sj);
+}
+
 static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_job *j) {
+    if (j->op == OC_XFER_PREVIEW) { preview_done(dbw, j); return; }
     conn *c = find_by_id(conns, j->conn_id);
     if (!c) {
         /* Orphaned: release whatever the job is still holding, off-thread. */
@@ -10403,12 +10548,24 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
                 oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
                 if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
             }
+            /* A preview's bytes gone from under its row: the client is told the
+             * preview is missing, and fetches the original. */
             send_transfer_error(c, j->attachment_id,
-                                j->rc == OC_XFER_GONE ? OC_ERR_ATTACHMENT_GONE : OC_ERR_INTERNAL);
+                                j->rc == OC_XFER_GONE ? (x->preview ? OC_ERR_PREVIEW_MISSING : OC_ERR_ATTACHMENT_GONE)
+                                                      : OC_ERR_INTERNAL);
             break;
         }
         x->br = j->br;
         x->state = XFER_DOWN_ACTIVE;
+        if (x->preview) {
+            oc_preview_info pi = { x->attachment_id, x->preview, x->pv_w, x->pv_h,
+                                   oc_slice_str(x->dl_mime ? x->dl_mime : ""), x->remaining };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_encode_preview_info(&w, OC_PROTOCOL_VERSION, &pi);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+            download_pump(c);
+            break;
+        }
         if (x->export) {
             oc_export_info ei = { x->attachment_id, x->export_duration_ms, x->remaining };
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -10450,6 +10607,9 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             } else if (x->export) {
                 oc_export_chunk ec = { x->attachment_id, x->next_seq, { j->data, j->len } };
                 oc_encode_export_chunk(&w, OC_PROTOCOL_VERSION, &ec);
+            } else if (x->preview) {
+                oc_preview_chunk pc = { x->attachment_id, x->preview, x->next_seq, { j->data, j->len } };
+                oc_encode_preview_chunk(&w, OC_PROTOCOL_VERSION, &pc);
             } else {
                 oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
                 oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
@@ -10464,6 +10624,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
     case OC_XFER_ABORT:
     case OC_XFER_CLOSE:
     case OC_XFER_DELETE:
+    case OC_XFER_PREVIEW:                       /* belongs to no connection */
         break;                                  /* submitted fire-and-forget */
     }
 

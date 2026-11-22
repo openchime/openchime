@@ -1227,13 +1227,43 @@ where one exists.
   a filename line, for the common image types. This is a graphical-frontend
   capability; the **text-only TUI is exempt** (ARCH-75, no graphics), continuing
   to show the attachment line. Non-image types have shown a typed placeholder.
-  The Win32 implementation decodes the common image types client-side (WIC) with
-  a client-side thumbnail cache; no server-side thumbnailing exists.
+  The thumbnail and the expanded view are drawn from the daemon's **image
+  previews** at the rung matching their size (REQ-390), and from the original
+  where an image has none; the original is downloaded whole only to be saved or
+  opened.
 - **REQ-143.** A user has been able to browse a channel's **files** — a view
   listing the attachments shared in a channel (and, per-user, files they shared or
   that were shared with them) — building on the attachment metadata already
   stored (REQ-140, SCHEMA.md migration 0009). A channel with thousands of files
   has been browsable past the first page (ARCH-91, PROTOCOL.md `LIST_FILES`).
+- **REQ-390.** The daemon has made **previews** of an uploaded JPEG, PNG or WebP,
+  once, when its upload finished: an **inline** rung for the timeline and an
+  **expanded** rung for the image viewer, each scaled down with its aspect kept
+  and each **in its original's format**, so a screenshot stays lossless and a
+  photo stays lossy (ARCH-137). An image that already fits the inline box and is
+  small has had **no preview**, the original being as cheap to send. An animated
+  GIF has never been previewed, only shown at a capped size; a HEIC, an animated
+  PNG or WebP, and any other type have passed through unpreviewed. A client has
+  asked for the rung matching the size it draws an image at (PROTOCOL.md
+  §5.14f), so a channel of photos has rendered without its originals being
+  downloaded.
+- **REQ-391.** Making a preview has been **bounded four ways**, none of which can be
+  turned off: only hardened decoders (libjpeg-turbo, libspng, libwebp), a cap on
+  the bytes decoded, a cap on the pixels read from the image's header **before
+  any pixel buffer is allocated** (what stops a decompression bomb), and a time
+  limit. An image refused by a bound, or one that does not decode, has simply had
+  no preview, and its uploader has been told of no error. Previews have been made
+  on the transfer workers, never on the network loop (ARCH-69, ARCH-137).
+- **REQ-392.** Previews have been **derived data**: made again from the original,
+  never tombstoned, and **reclaimed before any original** under storage pressure,
+  least recently served first (REQ-215, REQ-217). A preview has gone when its
+  attachment's bytes went. A client that finds a rung missing has shown the
+  original instead, saying nothing of it.
+- **REQ-393.** An operator has been able to turn previews off, and to set each
+  rung's size and the decode's byte cap, pixel cap and time limit (CONFIG.md,
+  `OPENCHIME_IMAGE_PREVIEWS` and the `OPENCHIME_PREVIEW_*` settings). Turned off,
+  no previews have been made and every image has been sent whole; previews already
+  made have still been served.
 
 ### 6.2 Audio Conferencing
 

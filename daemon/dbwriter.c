@@ -338,6 +338,7 @@ static void job_free(oc_job *j) {
     free(j->tts_blob_key);
     free(j->exp_version);
     free(j->exp_blob_key);
+    for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -904,6 +905,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->pf_ooo_message);
     free(r->tts_text); free(r->tts_blob_key);
     free(r->exp_blob_key); free(r->exp_src_key);
+    free(r->pv_key); free(r->pv_mime); free(r->pv_drop[0]); free(r->pv_drop[1]);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
@@ -10590,12 +10592,20 @@ static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT size, uploader_id, sha256 FROM attachments WHERE id=?;", -1, &st, NULL);
+        "SELECT size, uploader_id, sha256, storage_key, mime FROM attachments WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
     int found = sqlite3_step(st) == SQLITE_ROW;
     uint64_t declared = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
     uint64_t owner    = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
     int already       = found && sqlite3_column_type(st, 2) != SQLITE_NULL;
+    /* The key and type ride back so the net loop can have the image previewed
+     * (ARCH-137) without asking again. */
+    if (found) {
+        const char *k = (const char *)sqlite3_column_text(st, 3);
+        const char *m = (const char *)sqlite3_column_text(st, 4);
+        r->storage_key = strdup(k ? k : "");
+        r->mime = strdup(m ? m : "");
+    }
     sqlite3_finalize(st);
 
     if (!found || owner != j->user_id || already) {
@@ -10850,6 +10860,111 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
     r->att_size = sz;
     if (dg && dglen == 32) memcpy(r->att_sha256, dg, 32);
     sqlite3_finalize(st);
+    return r;
+}
+
+/* Image previews (ARCH-137). STORE records what a transfer worker made of an
+ * upload: its dimensions on `attachments`, and a row per rung. The rows are
+ * written only while the attachment is still there and not reclaimed; if it
+ * went while its previews were being made, the rungs' keys come back in
+ * pv_drop for the net loop to delete, so no preview outlives its original.
+ * Write. */
+static oc_dbres *process_preview_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->attachment_id = j->attachment_id;
+    r->type = OC_RES_PREVIEW_STORED;
+    sqlite3_stmt *st = NULL;
+    int live = 0;
+    if (sqlite3_prepare_v2(db, "SELECT reclaimed_at_ms FROM attachments WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        live = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int64(st, 0) == 0;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (live && j->pv_width && j->pv_height &&
+        sqlite3_prepare_v2(db, "UPDATE attachments SET width=?2, height=?3 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->pv_width);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->pv_height);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    uint64_t now = dbw_now_ms();
+    for (int i = 0; i < j->pv_count && i < 2; i++) {
+        int stored = 0;
+        st = NULL;
+        if (live && j->pv_keys[i] &&
+            sqlite3_prepare_v2(db,
+                "INSERT OR REPLACE INTO attachment_previews"
+                "  (attachment_id, rung, storage_key, width, height, size, mime, created_at_ms, last_used_ms)"
+                " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_bind_int  (st, 2, i + 1);
+            sqlite3_bind_text (st, 3, j->pv_keys[i], -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)j->pv_w[i]);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)j->pv_h[i]);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)j->pv_size[i]);
+            sqlite3_bind_text (st, 7, j->pv_mime[i] ? j->pv_mime[i] : "", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 8, (sqlite3_int64)now);
+            stored = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+        if (!stored && j->pv_keys[i]) r->pv_drop[i] = strdup(j->pv_keys[i]);
+    }
+    return r;
+}
+
+/* PREVIEW_LOOKUP: the download's own gate (process_attach_lookup: the
+ * channel's read check, or an avatar's everyone), then the rung asked for. A
+ * rung that was never made, or was reclaimed, is PREVIEW_MISSING, which a
+ * client answers by downloading the original. Read (query connection). */
+static oc_dbres *process_preview_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = process_attach_lookup(db, j);
+    if (!r) return NULL;
+    if (r->type != OC_RES_ATTACH_META) {
+        r->type = OC_RES_PREVIEW_ERR;
+        return r;
+    }
+    r->pv_rung = j->pv_rung;
+    sqlite3_stmt *st = NULL;
+    r->type = OC_RES_PREVIEW_ERR;
+    r->err_code = OC_ERR_PREVIEW_MISSING;
+    if (sqlite3_prepare_v2(db,
+            "SELECT storage_key, width, height, size, mime FROM attachment_previews"
+            " WHERE attachment_id=?1 AND rung=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, j->pv_rung);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *k = (const char *)sqlite3_column_text(st, 0);
+            const char *m = (const char *)sqlite3_column_text(st, 4);
+            r->pv_key = strdup(k ? k : "");
+            r->pv_w = (uint32_t)sqlite3_column_int64(st, 1);
+            r->pv_h = (uint32_t)sqlite3_column_int64(st, 2);
+            r->pv_size = (uint64_t)sqlite3_column_int64(st, 3);
+            r->pv_mime = strdup(m ? m : "");
+            if (r->pv_key && r->pv_mime) { r->type = OC_RES_PREVIEW_META; r->err_code = 0; }
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* PREVIEW_TOUCH: a rung served, so it is the last of its kind reclaimed. Write,
+ * fire and forget. */
+static oc_dbres *process_preview_touch(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE attachment_previews SET last_used_ms=?3 WHERE attachment_id=?1 AND rung=?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, j->pv_rung);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) { r->type = OC_RES_OK; r->conn_id = j->conn_id; }
     return r;
 }
 
@@ -13376,7 +13491,7 @@ static int is_read_job(int type) {
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
-           type == OC_JOB_EXPORT_LOOKUP ||
+           type == OC_JOB_EXPORT_LOOKUP || type == OC_JOB_PREVIEW_LOOKUP ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
 }
@@ -13409,6 +13524,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_EXPORT_LOOKUP)  return process_export_lookup(rdb, j);
+    if (j->type == OC_JOB_PREVIEW_LOOKUP) return process_preview_lookup(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
@@ -13912,6 +14028,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_EXPORT_STORE)  return process_export_store(w->db, j);
     if (j->type == OC_JOB_EXPORT_TOUCH)  return process_export_touch(w->db, j);
+    if (j->type == OC_JOB_PREVIEW_STORE) return process_preview_store(w->db, j);
+    if (j->type == OC_JOB_PREVIEW_TOUCH) return process_preview_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w, j);
     if (j->type == OC_JOB_RESTORE)       return process_restore(w, j);
@@ -14482,6 +14600,49 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             r->reclaim[r->n_reclaim].attachment_id = 0;
             r->n_reclaim++;
             r->maint_renders++;
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* Image previews (ARCH-137) are derived data too, and go the same way as
+     * the exported copies: every pass, pressure or not, a preview whose
+     * attachment's bytes are gone (reclaimed, or the row itself deleted) goes
+     * with them; and under pressure, least recently served first, before any
+     * attachment tier below. No tombstone: a client that finds a rung missing
+     * shows the original. */
+    for (int under_pressure = 0; under_pressure < 2 && r->n_reclaim < cap; under_pressure++) {
+        if (under_pressure && !j->maint_evict) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db, under_pressure
+                ? "SELECT attachment_id, rung, storage_key FROM attachment_previews"
+                  " ORDER BY last_used_ms ASC LIMIT ?1;"
+                : "SELECT p.attachment_id, p.rung, p.storage_key FROM attachment_previews p"
+                  "  LEFT JOIN attachments a ON a.id = p.attachment_id"
+                  " WHERE a.id IS NULL OR a.reclaimed_at_ms != 0 LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(cap - r->n_reclaim));
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            sqlite3_int64 att = sqlite3_column_int64(st, 0);
+            int rung = sqlite3_column_int(st, 1);
+            const char *key = (const char *)sqlite3_column_text(st, 2);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            sqlite3_stmt *del = NULL;
+            int gone = 0;
+            if (sqlite3_prepare_v2(db, "DELETE FROM attachment_previews WHERE attachment_id = ?1 AND rung = ?2;",
+                                   -1, &del, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(del, 1, att);
+                sqlite3_bind_int(del, 2, rung);
+                gone = sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0;
+                sqlite3_finalize(del);
+            }
+            if (!gone) { free(dup); continue; }
+            r->reclaim[r->n_reclaim].storage_key = dup;     /* not an attachment: the key alone */
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+            r->maint_previews++;
         }
         sqlite3_finalize(st);
     }
@@ -15736,7 +15897,8 @@ int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint
     if (sqlite3_prepare_v2(db,
             "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_key=?1)"
             "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1)"
-            "    OR EXISTS(SELECT 1 FROM exported_video WHERE blob_key=?1);",
+            "    OR EXISTS(SELECT 1 FROM exported_video WHERE blob_key=?1)"
+            "    OR EXISTS(SELECT 1 FROM attachment_previews WHERE storage_key=?1);",
             -1, &st, NULL) == SQLITE_OK) {
         rc = 0;
         for (size_t i = 0; i < n && rc == 0; i++) {

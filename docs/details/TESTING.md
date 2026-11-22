@@ -683,7 +683,9 @@ over a zeroed message) and a few streams of them for `framebuf`. They are kept
 whole rather than minimized with `-merge=1`, which would keep about one in five
 and lose the frame for most message types. `tests/fuzz/frame.dict` holds the
 protocol version and every message type id. Regenerate both when the protocol
-changes.
+changes. The `image` harness's corpus is images rather than frames: a small
+JPEG, PNG and WebP of each kind the preview decoders take, made with the same
+libraries (docs/details/IMAGE-PREVIEWS.md §5).
 
 **A crash.** Reproduce it with `build/fuzz/<harness> <file>`, and minimize it
 with `build/fuzz/<harness> -minimize_crash=1 -runs=10000 <file>`. Check the

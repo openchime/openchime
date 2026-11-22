@@ -53,6 +53,10 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **LAME** | 3.100 | MP3 encode (`libmp3lame` alone) | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://lame.sourceforge.io | LGPL-2.0-or-later |
 | **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx), Windows and web | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
+| **libjpeg-turbo** | 3.2.1 | JPEG decode and encode, the libjpeg API alone, for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://github.com/libjpeg-turbo/libjpeg-turbo | IJG, BSD-3-Clause and zlib (`LICENSE.md`) |
+| **libspng** | 0.7.4 | PNG decode and encode, for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://github.com/randy408/libspng | BSD-2-Clause |
+| **miniz** | 3.1.2 | The zlib libspng inflates and deflates with (`SPNG_USE_MINIZ`), so no system zlib is linked | Daemon, inside libspng | https://github.com/richgel999/miniz | MIT |
+| **libwebp** | 1.6.0 | WebP decode and encode (libwebp and libsharpyuv), for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://chromium.googlesource.com/webm/libwebp | BSD-3-Clause (with a separate patent grant) |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
 tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
@@ -83,6 +87,34 @@ libvpx only when built with `EXPORT=1` or `CALLREC=1`; otherwise it stores a
 video message as opaque bytes (ARCH-110). BSD-3-Clause,
 whose binary-redistribution clause wants the notice carried with a shipped
 client.
+
+**The image-preview codecs** (ARCH-137) are the daemon's first parser of
+untrusted media, so only hardened, maintained decoders are used, each committed
+as its upstream released it, unmodified, with its licence beside it, and built
+out of tree into `third_party/<name>-<version>[-arch]/` (gitignored); nothing is
+downloaded. **libjpeg-turbo** is in `third_party/libjpeg-turbo/` as the 3.2.1
+release tarball (SHA-256
+`c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f`, its signature
+verified against the libjpeg-turbo Project's signing key, fingerprint 0338 C8D8
+D9FD A62C F9C4 21BD 7EC2 DBB6 F4DB F434); `scripts/build/libjpeg-turbo.sh` builds
+the static libjpeg API alone with CMake, 8-bit, with its SIMD (nasm on x86_64),
+and no TurboJPEG API, tools or tests. **libwebp** is in `third_party/libwebp/` as
+the 1.6.0 release tarball (SHA-256
+`e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`, verified
+against the WebP release signing key, fingerprint 6B0E 6B70 976D E303 EDF2 F601
+F9C3 D6BD B823 2B5D); `scripts/build/libwebp.sh` builds libwebp and libsharpyuv
+static with CMake, with no tools, extras, mux or demux, and no threads of its own.
+**libspng** is in `third_party/libspng/` as the v0.7.4 tag's source archive
+(SHA-256 `47ec02be6c0a6323044600a9221b049f63e1953faf816903e7383d4dc4234487`), and
+**miniz** in `third_party/miniz/` as the 3.1.2 release's amalgamated `miniz.c`
+and `miniz.h` (the release zip's SHA-256
+`f0446d863f9c19926ad9483c523fdc42e42b8d4a6a431d27e09d49c79a140d9a`);
+`scripts/build/libspng.sh` compiles the two single files as plain C into one
+static `libspng.a`, libspng pointed at miniz's zlib API, so no system zlib is
+linked. Every daemon links all three; no client links any. stb_image is
+deliberately **not** used for previews, whatever it already decodes for avatars
+in the call recording: it is convenient and historically weak on malformed
+input, and these decoders run on whatever anyone uploads.
 
 **libavc** is committed in `third_party/libavc/` as ittiam-systems' v1.10.0
 release (the tag's source archive, commit `ddc061bd`, SHA-256
@@ -574,6 +606,10 @@ paths ship; nothing is fetched at runtime.
 | **BSD-2-style** | CMUdict (ttskit's pronunciation data) | Generated data, committed with its notice; daemon only |
 | **Apache-2.0** | Kitten TTS mini (data) | Converted and committed (`ttskit/data/voice.bin`, its licence `ttskit/data/VOICE-LICENSE`), shipped beside the daemon |
 | **zlib** | SDL3 | Vendored, committed; static-linked; graphical clients only |
+| **IJG, BSD-3-Clause and zlib** | libjpeg-turbo | Committed and static-linked, **daemon only**: image previews (ARCH-137). Its notices travel with the daemon |
+| **BSD-2-Clause** | libspng | Committed and static-linked, **daemon only**: image previews (ARCH-137) |
+| **MIT** | miniz | Committed, compiled into libspng, **daemon only** |
+| **BSD-3-Clause** | libwebp (and libsharpyuv) | Committed and static-linked, **daemon only**: image previews (ARCH-137); its patent grant beside its licence |
 | **MPL-2.0** | Mozilla CA roots (data) | Generated, compiled in; daemon and every client. File-level copyleft |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |

@@ -50,6 +50,7 @@
 #include <stdint.h>
 
 #include "blobstore.h"
+#include "preview.h"
 
 typedef struct oc_xferpool oc_xferpool;
 
@@ -62,7 +63,27 @@ typedef enum {
     OC_XFER_READ,        /* oc_blob_get_chunk(br, buf, cap)                    */
     OC_XFER_CLOSE,       /* oc_blob_get_close(br)  — frees br                  */
     OC_XFER_DELETE,      /* oc_blob_delete(key) — storage reclamation (ARCH-78) */
+    OC_XFER_PREVIEW,     /* read the original at key, make its previews and store
+                          * them (ARCH-137); its result comes back whatever
+                          * conn_id is, since it belongs to no connection */
 } oc_xfer_op;
+
+/* A preview job's input and output (OC_XFER_PREVIEW). The worker reads the
+ * original, refusing one over the byte cap without reading it, makes both rungs
+ * (daemon/preview.c) and stores each under its own key. On the way back the
+ * encoded bytes are gone (stored, or never made); what is left is what the
+ * attachment_previews rows need. */
+typedef struct {
+    oc_preview_limits lim;
+    char             *keys[OC_PREVIEW_RUNGS];   /* where each rung is stored (heap) */
+    /* Filled by the worker. */
+    oc_preview_status status;
+    uint32_t          width, height;            /* the original's, 0 when unknown   */
+    uint32_t          rung_w[OC_PREVIEW_RUNGS], rung_h[OC_PREVIEW_RUNGS];
+    uint64_t          rung_size[OC_PREVIEW_RUNGS];
+    const char       *rung_mime[OC_PREVIEW_RUNGS];   /* static strings */
+    int               stored;                   /* 1: both rungs are in the store   */
+} oc_xfer_preview;
 
 /* An OPEN_R whose blob the store does not have, as against one it could not
  * read: the client is told the attachment is gone, not that the server failed. */
@@ -90,6 +111,9 @@ typedef struct oc_xfer_job {
     /* The handle this job operates on, and which it hands back in the result. */
     oc_blob_writer *bw;
     oc_blob_reader *br;
+
+    /* PREVIEW: its input and output (heap, freed with the job). */
+    oc_xfer_preview *pv;
 
     /* Filled by the worker. */
     int        rc;             /* 0 on success, <0 on failure; OPEN_R gives

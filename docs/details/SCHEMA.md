@@ -2348,3 +2348,47 @@ nothing else's; what is kept is what happened.
 - **`messages.call_id`** — the one message (kind `1`) a call started from a
   conversation leaves there, naming its call. A missed-call line from before this
   migration names none.
+
+## 3ca. Migration 0088 — image previews (ARCH-137)
+
+```sql
+ALTER TABLE attachments ADD COLUMN width INTEGER;
+ALTER TABLE attachments ADD COLUMN height INTEGER;
+CREATE TABLE attachment_previews (
+  attachment_id INTEGER NOT NULL REFERENCES attachments(id),
+  rung          INTEGER NOT NULL,
+  storage_key   TEXT NOT NULL,
+  width         INTEGER NOT NULL,
+  height        INTEGER NOT NULL,
+  size          INTEGER NOT NULL,
+  mime          TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_used_ms  INTEGER NOT NULL,
+  PRIMARY KEY (attachment_id, rung)) WITHOUT ROWID;
+CREATE INDEX attachment_previews_lru ON attachment_previews(last_used_ms);
+```
+
+- **`attachments.width`, `attachments.height`** — the original image's size in
+  pixels, read from its own header when a transfer worker looked at it after
+  upload. NULL for anything that is not a JPEG, PNG or WebP, for an image whose
+  header did not parse, and for every attachment uploaded before this migration.
+- **`attachment_previews`** — the daemon's smaller copies of an image attachment,
+  one row per **rung**: `1` the inline preview a message shows in the timeline,
+  `2` the expanded one the image viewer shows (docs/details/IMAGE-PREVIEWS.md).
+  Each is in its original's format (`mime`), and its bytes are a blob of their
+  own under `storage_key` — the original's key and `-1` or `-2`, which no other
+  blob's key can be. *Written* when a transfer worker has stored both rungs, and
+  only while the attachment is there and not reclaimed (`PREVIEW_STORE`); an
+  image that fits the inline box and is small, or is a GIF, HEIC or animated
+  image, or was refused by a decode bound, gets no rows. `last_used_ms` is
+  *moved* each time a rung is served (`PREVIEW_TOUCH`). *Read* by
+  `PREVIEW_LOOKUP`, behind the attachment's own download gate, and by the orphan
+  sweep's reference check, which leaves a preview's blob alone while its row
+  stands.
+
+*It is derived data*, as `exported_video` is: made again from the original.
+*Deleted* by the storage pass: under pressure, least recently served first and
+before any attachment tier; and, pressure or not, as soon as its attachment's
+bytes are reclaimed or its message deleted. No tombstone: a client that finds a
+rung missing (`PREVIEW_MISSING`) shows the original instead, so there is nothing
+for a reader to be told.

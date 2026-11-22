@@ -107,6 +107,11 @@ in full here, as those licences require.
                    MIT
   Noto Sans        SIL OFL 1.1  the font a call's recording names people in,
                                 embedded as data
+  libjpeg-turbo    IJG, BSD-3-  decoding and encoding JPEG image previews
+    3.2.1          Clause, Zlib
+  libspng 0.7.4    BSD-2-Clause decoding and encoding PNG image previews
+  miniz 3.1.2      MIT          the zlib libspng's PNG previews use
+  libwebp 1.6.0    BSD-3-Clause decoding and encoding WebP image previews
 HEADER
 
 if [ "$TTS" = 1 ]; then
@@ -179,6 +184,12 @@ emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LIC
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 emit "stb_image and stb_truetype -- Public Domain or MIT License" "${root}/third_party/stb/LICENSE"
+emit "libjpeg-turbo 3.2.1 -- IJG License, BSD 3-Clause License and zlib License" "${root}/third_party/libjpeg-turbo/LICENSE.md"
+emit "libjpeg-turbo 3.2.1 -- the IJG README" "${root}/third_party/libjpeg-turbo/README.ijg"
+emit "libspng 0.7.4 -- BSD 2-Clause License" "${root}/third_party/libspng/LICENSE"
+emit "miniz 3.1.2 -- MIT License" "${root}/third_party/miniz/LICENSE"
+emit "libwebp 1.6.0 -- BSD 3-Clause License" "${root}/third_party/libwebp/COPYING"
+emit "libwebp 1.6.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libwebp/PATENTS"
 emit "Noto Sans -- SIL Open Font License 1.1" "${root}/third_party/fonts/OFL.txt"
 
 if [ "$TTS" = 1 ]; then

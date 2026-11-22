@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 87);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls */
+    CHECK(oc_schema_version(db) == 88);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -119,7 +119,7 @@ static void test_embedded_schema(void) {
                              "todo_lists", "todo_tasks",
                              "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
-                             "call_transcripts_fts" };
+                             "call_transcripts_fts", "attachment_previews" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -427,7 +427,7 @@ static void test_calls_0087(void) {
         "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,kind) VALUES(7,1,1,'Missed call',5,1);",
         NULL, NULL, NULL) == SQLITE_OK);
     CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 87);
+    CHECK(oc_schema_version(db) == 88);
     const char *tables[] = { "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
                              "call_transcripts_fts" };
@@ -478,6 +478,41 @@ static void text_of(sqlite3 *db, const char *sql, char *out, size_t cap) {
  * has every SQL function the daemon's connections have: the excerpt helper,
  * the spoiler test and the search index's oc_unspoiled, each answering as the
  * daemon's does. */
+/* 0088, image previews (ARCH-137): an attachment uploaded before it keeps its
+ * row, with no dimensions; a preview row is one per attachment and rung, and
+ * the least-recently-used index is there for the reclaim. */
+static void test_previews_0088(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 87, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 87);
+    CHECK(!table_exists(db, "attachment_previews"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+        " VALUES(5,1,1,'00ff','a.jpg','image/jpeg',100,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 88);
+    CHECK(table_exists(db, "attachment_previews"));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM attachments WHERE id=5 AND width IS NULL AND height IS NULL;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='attachment_previews_lru';") == 1);
+    CHECK(sqlite3_exec(db,
+        "UPDATE attachments SET width=4000, height=3000 WHERE id=5;"
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,1,'00ff-1',480,360,9000,'image/jpeg',2,2);"
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,2,'00ff-2',1600,1200,90000,'image/jpeg',2,2);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM attachment_previews WHERE attachment_id=5;") == 2);
+    /* One row per rung: a second rung 1 is refused. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,1,'00ff-x',1,1,1,'image/jpeg',3,3);", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 static void test_sql_functions(void) {
     sqlite3 *db = open_mem();
     oc_migrate_functions(db);
@@ -531,6 +566,7 @@ int run_migrate_tests(void) {
     test_spoilers_reindexed();
     test_also_channel();
     test_calls_0087();
+    test_previews_0088();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

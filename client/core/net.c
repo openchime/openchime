@@ -340,7 +340,8 @@ typedef struct {
                            * AUDIO_* frames, keyed by message id rather than attachment;
                            * 5 a voice's audition; 6 a video message's playable copy
                            * (ARCH-135): the download shape over EXPORT_* frames, into
-                           * the file the person chose */
+                           * the file the person chose; 7 an image's preview (ARCH-137):
+                           * the in-memory download shape over PREVIEW_* frames */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
     /* An in-memory download: `fp` is NULL and chunks accumulate here
@@ -366,6 +367,8 @@ typedef struct {
     char     ename[48];   /* purpose 2: the shortcode to claim it as (REQ-072) */
     char     name[128];   /* filename (upload src basename / download dest label) */
     char    *path;        /* mode 6: the file being written, removed if the copy fails */
+    uint8_t  rung;        /* mode 7, and the original fetched in its place: the rung
+                           * asked for, which OC_EV_ATTACHMENT_DATA repeats */
 } oc_xfer;
 
 /* Per-channel high-water the net thread tracks (from every BROADCAST) so a
@@ -725,6 +728,65 @@ static void begin_export(disp_ctx *ctx, uint64_t aid, FILE *fp, const char *path
     }
 }
 
+/* An image's preview at `rung` (ARCH-137), into memory. */
+static void begin_preview(disp_ctx *ctx, uint64_t aid, uint8_t rung) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 7; x->id = aid; x->rung = rung; x->buf_max = OC_INLINE_MAX;
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_preview_begin pb = { aid, rung };
+    if (oc_encode_preview_begin(&w, OC_PROTOCOL_VERSION, &pb) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0)
+        xfer_reset(x);
+}
+
+/* No preview at that rung: the original, into memory, in its place -- as
+ * oc_client_fetch_attachment would, but answered with the rung asked for. */
+static void preview_fall_back(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    uint64_t aid = x->id;
+    uint8_t rung = x->rung;
+    xfer_reset(x);
+    begin_download(ctx, aid, NULL, OC_INLINE_MAX, NULL);
+    if (x->mode == 2) x->rung = rung;
+}
+
+/* Bytes of an in-memory transfer, bounded by its ceiling. 0, or -1 when they
+ * would pass it or memory ran out. */
+static int mem_append(oc_xfer *x, const uint8_t *d, size_t n) {
+    if (x->buf_len + n > (x->buf_max ? x->buf_max : OC_INLINE_MAX)) return -1;
+    if (x->buf_len + n > x->buf_cap) {
+        size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+        while (want < x->buf_len + n) want *= 2;
+        uint8_t *g = realloc(x->buf, want);
+        if (!g) return -1;
+        x->buf = g; x->buf_cap = want;
+    }
+    memcpy(x->buf + x->buf_len, d, n);
+    x->buf_len += n;
+    return 0;
+}
+
+/* An in-memory transfer arrived whole: its bytes to the UI thread, which owns
+ * them from here. No notice: an image on screen is not something the person
+ * asked to be told about. */
+static void mem_deliver(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    int short_read = (x->total && x->done != x->total);
+    if (!short_read && x->buf_len) {
+        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
+        if (e) {
+            e->message_id = x->id;
+            e->count = (uint32_t)x->buf_len;
+            e->body = (char *)x->buf;
+            e->op = x->rung;
+            x->buf = NULL; x->buf_len = x->buf_cap = 0;
+            oc_queue_push(ctx->to_ui, e);
+        }
+    }
+    xfer_reset(x);
+}
+
 /* A wire string as a heap C string ("" if empty, NULL on failure). */
 /* Record a segment as sent, and look up where one was spoken. */
 static void stt_note(oc_stt_sent *t, uint32_t id, uint8_t mode, uint64_t channel_id, uint64_t root) {
@@ -863,6 +925,8 @@ static void xq_start(disp_ctx *ctx) {
         /* op 1: a video message, fetched whole into memory under the attachment
          * ceiling rather than the thumbnail one (ARCH-88: nothing on disk). */
         begin_download(ctx, c->message_id, NULL, c->op == 1 ? (size_t)OC_MAX_ATTACHMENT_SIZE : OC_INLINE_MAX, NULL);
+    } else if (c->type == OC_CMD_FETCH_PREVIEW) {
+        begin_preview(ctx, c->message_id, (uint8_t)c->op);
     } else if (c->type == OC_CMD_DOWNLOAD) {
         FILE *fp = fopen(c->body, "wb");
         if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
@@ -915,6 +979,13 @@ static void xq_pump(disp_ctx *ctx) {
  * running for the same attachment is not queued twice: frontends ask again on
  * every frame until the bytes arrive. */
 static void xq_add(oc_xqueue *q, oc_cmd *c) {
+    if (c->type == OC_CMD_FETCH_PREVIEW) {
+        int dup = q->active && q->active->type == c->type && q->active->message_id == c->message_id &&
+                  q->active->op == c->op;
+        for (size_t i = 0; i < q->n && !dup; i++)
+            dup = q->q[i]->type == c->type && q->q[i]->message_id == c->message_id && q->q[i]->op == c->op;
+        if (dup) { oc_cmd_free(c); return; }
+    }
     if (c->type == OC_CMD_FETCH) {
         if (q->active && q->active->type == OC_CMD_FETCH && q->active->message_id == c->message_id &&
             q->active->op >= c->op) { oc_cmd_free(c); return; }
@@ -2436,17 +2507,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     /* In-memory: hand the bytes to the UI thread, which owns them
                      * from here. No notice — an inline thumbnail is not an event
                      * the user asked for and should not toast. */
-                    if (!short_read && x->buf_len) {
-                        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
-                        if (e) {
-                            e->message_id = x->id;
-                            e->count = (uint32_t)x->buf_len;
-                            e->body = (char *)x->buf;
-                            x->buf = NULL; x->buf_len = x->buf_cap = 0;
-                            oc_queue_push(ctx->to_ui, e);
-                        }
-                    }
-                    xfer_reset(x);
+                    mem_deliver(ctx);
                 } else {
                     char msg[256];
                     if (short_read)
@@ -2458,6 +2519,24 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     xfer_reset(x);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_INFO) {
+            oc_preview_info pi;
+            if (oc_decode_preview_info(&p, &pi) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pi.attachment_id == ctx->xfer->id && pi.rung == ctx->xfer->rung)
+                ctx->xfer->total = pi.total_size;
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_CHUNK) {
+            oc_preview_chunk pc;
+            if (oc_decode_preview_chunk(&p, &pc) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pc.attachment_id == ctx->xfer->id && pc.rung == ctx->xfer->rung && pc.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                if (pc.data.len && mem_append(x, pc.data.ptr, pc.data.len) != 0) xfer_reset(x);
+                else { x->done += pc.data.len; x->next_seq++; }
+            }
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_END) {
+            oc_preview_end pe;
+            if (oc_decode_preview_end(&p, &pe) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pe.attachment_id == ctx->xfer->id && pe.rung == ctx->xfer->rung)
+                mem_deliver(ctx);
         } else if (hdr.msg_type == OC_MSG_EXPORT_INFO) {
             oc_export_info ei;
             if (oc_decode_export_info(&p, &ei) == OC_OK && ctx && ctx->xfer->mode == 6 &&
@@ -2818,6 +2897,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     stt_where(ctx, e->count, e);
                     oc_queue_push(to_ui, e);
                 }
+            } else if (ctx && ctx->xfer->mode == 7 &&
+                       (err.code == OC_ERR_PREVIEW_MISSING || err.code == OC_ERR_PREVIEW_RUNG)) {
+                /* No preview at that rung (ARCH-137): the original instead,
+                 * and nothing said -- this is the ordinary case for a small
+                 * image, a GIF, or one uploaded before previews. */
+                preview_fall_back(ctx);
             } else if (err.code == OC_ERR_CALL_UNAVAILABLE || err.code == OC_ERR_CALL_FULL ||
                        err.code == OC_ERR_NOT_CALL_STARTER || err.code == OC_ERR_NOT_IN_CALL ||
                        err.code == OC_ERR_CALL_SUBJECT || err.code == OC_ERR_RECORDING_UNAVAILABLE ||
@@ -4498,6 +4583,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+                c->type == OC_CMD_FETCH_PREVIEW ||
                 (c->type == OC_CMD_POST_FILES && c->n_paths) ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) || (c->type == OC_CMD_EXPORT && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2) ||

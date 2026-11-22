@@ -9,7 +9,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c daemon/callrec.c daemon/callrec_render.c daemon/callrec_worker.c client/core/call/share.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c daemon/callrec.c daemon/callrec_render.c daemon/callrec_worker.c daemon/preview.c client/core/call/share.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -70,6 +70,19 @@ SQLITE_O   := build$(BUILD_SUFFIX)/sqlite3.o
 # vendored (third_party/argon2, CC0 or Apache-2.0), one object of its own.
 ARGON2_DIR := third_party/argon2
 ARGON2_O   := build$(BUILD_SUFFIX)/argon2.o
+# Image previews (ARCH-137, docs/details/IMAGE-PREVIEWS.md): the hardened JPEG,
+# PNG and WebP decoders and encoders, committed and built pinned
+# (scripts/build/libjpeg-turbo.sh, libspng.sh with miniz as its zlib,
+# libwebp.sh). The daemon's alone; no client links them.
+LIBJPEG_DIR  := third_party/libjpeg-turbo-3.2.1$(ARCH_SUFFIX)
+LIBSPNG_DIR  := third_party/libspng-0.7.4$(ARCH_SUFFIX)
+LIBWEBP_DIR  := third_party/libwebp-1.6.0$(ARCH_SUFFIX)
+LIBJPEG_A    := $(LIBJPEG_DIR)/lib/libjpeg.a
+LIBSPNG_A    := $(LIBSPNG_DIR)/lib/libspng.a
+LIBWEBP_A    := $(LIBWEBP_DIR)/lib/libwebp.a
+PREVIEW_INC  := -I$(LIBJPEG_DIR)/include -I$(LIBSPNG_DIR)/include -I$(LIBWEBP_DIR)/include -DSPNG_STATIC
+PREVIEW_A    := $(LIBJPEG_A) $(LIBSPNG_A) $(LIBWEBP_A)
+PREVIEW_LIBS := $(LIBWEBP_A) $(LIBWEBP_DIR)/lib/libsharpyuv.a $(LIBSPNG_A) $(LIBJPEG_A)
 
 INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird_party/qrcodegen -I$(MBEDTLS_INC)
 
@@ -88,7 +101,7 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # number of inputs the full suite runs it for, from a fixed seed: the same
 # work every run, sized from CI's measured speed so that all of them together
 # take well inside fuzz.sh's 20 seconds.
-FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
+FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken image
 FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
 FUZZ_DICT_frame    := tests/fuzz/frame.dict
 FUZZ_DICT_framebuf := tests/fuzz/frame.dict
@@ -107,6 +120,7 @@ FUZZ_RUNS_cbor     := 35000
 FUZZ_RUNS_jwt      := 50000
 FUZZ_RUNS_webauthn := 33000
 FUZZ_RUNS_idtoken  := 20000
+FUZZ_RUNS_image    := 6000
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests

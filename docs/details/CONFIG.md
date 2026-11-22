@@ -171,6 +171,12 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_DELETE_WINDOW` | *(empty)* | How long an author may delete their own message (REQ-052): `never`, or seconds after sending, 1 to 31536000. Empty: always. An admin's or owner's delete of someone else's message is never limited. Clients are told it, read-only, as `delete_window`. |
 | `OPENCHIME_DEFAULT_CHANNELS` | *(empty)* | Public channels, by name and comma-separated, that a new member joins when their account is made, beside #general. A name that matches no public, unarchived channel is skipped, said once in the log at start. Clients are told it, read-only, as `default_channels`. |
 | `OPENCHIME_MAX_VIDEO_SIZE` | `167772160` | The most bytes one video message may hold (REQ-164), at most the attachment cap of 209715200; clients learn it at sign-in and record within it. 160 MiB by default. Integer 1048576..209715200. |
+| `OPENCHIME_IMAGE_PREVIEWS` | `on` | Whether the daemon makes previews of an uploaded JPEG, PNG or WebP (ARCH-137): two smaller copies in the image's own format, made once at upload on a transfer worker, so a reader is sent a thumbnail rather than the original. Off: none are made and every image is sent whole; previews already made are still served. `on` or `off`. |
+| `OPENCHIME_PREVIEW_INLINE_PX` | `480` | The longer side, in pixels, of the inline preview: the one a message shows in the timeline. An image that fits it and is under 256 KiB gets no preview at all. Integer 64..2048. |
+| `OPENCHIME_PREVIEW_EXPANDED_PX` | `1600` | The longer side, in pixels, of the expanded preview: the one the image viewer shows. The original is always kept and sent when asked for. Integer 256..4096. |
+| `OPENCHIME_PREVIEW_MAX_BYTES` | `33554432` | The largest image, in bytes, the daemon decodes to make a preview; a larger one gets none and is sent whole. 32 MiB by default. Integer 1048576..209715200. |
+| `OPENCHIME_PREVIEW_MAX_PIXELS` | `50000000` | The most pixels (width times height, read from the image's header before anything is decoded) an image may have to be previewed; a larger one gets none. This is what stops a decompression bomb. 50 megapixels by default. Integer 1000000..268435456. |
+| `OPENCHIME_PREVIEW_TIMEOUT_MS` | `5000` | How long, in milliseconds, making one image's previews may take before it is given up and the image gets none. Integer 100..60000. |
 | `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `identity/`, `blobs/`, `cert.pem`, `key.pem`, `summary/`. The packages set `/var/lib/openchime`. |
 | `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
@@ -445,6 +451,27 @@ SSRF gate (no loopback, private, link-local, CGNAT, multicast or reserved
 destination — checked on every resolved address and re-checked per redirect)
 and is capped in bytes, redirects and time; an air-gapped box's fetches simply
 fail, bounded and silent.
+
+## Image previews (REQ-390–393, ARCH-137)
+
+On by default: an uploaded JPEG, PNG or WebP larger than the inline box gets two
+smaller copies, in its own format, made once on a transfer worker. The settings
+in the reference above:
+
+- `OPENCHIME_IMAGE_PREVIEWS` — `off` makes none, and every image is sent whole;
+  previews already made are still served.
+- `OPENCHIME_PREVIEW_INLINE_PX`, `OPENCHIME_PREVIEW_EXPANDED_PX` — each rung's
+  longer side. An image within the inline box and under 256 KiB gets none.
+- `OPENCHIME_PREVIEW_MAX_BYTES`, `OPENCHIME_PREVIEW_MAX_PIXELS`,
+  `OPENCHIME_PREVIEW_TIMEOUT_MS` — the decode's bounds: an image over the byte
+  cap is never read, one whose header claims more pixels than the cap is never
+  decoded, and a job past its time limit is given up. Each can be tightened or
+  loosened, none removed. Refused, an image simply gets no preview.
+
+Previews cost storage, a fraction of their originals', and are the first
+uploads reclaimed under pressure. Memory while one is made is about four bytes
+a pixel of the decoded image, once per transfer worker (`OC_XFER_WORKERS`) at
+most; the pixel cap is what bounds it.
 
 ## Email (REQ-280, ARCH-126)
 

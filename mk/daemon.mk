@@ -99,13 +99,13 @@ SUMKIT_DAEMON_SRC := $(SUMKIT_SRC) $(if $(filter 1,$(TTS) $(STT)),,$(NNKIT_SRC))
 # the two models' data files are written in their formats (--voice-pack,
 # daemon/voice_pack.c; --recognizer-pack, daemon/recognizer_pack.c) whether or
 # not read-aloud or voice input is compiled in.
-DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(CALL_INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) $(EXPORT_FLAGS) $(CALLREC_FLAGS)
+DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(PREVIEW_INC) $(CALL_INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) $(EXPORT_FLAGS) $(CALLREC_FLAGS)
 DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(sort $(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC) $(EXPORT_SRC) $(CALLREC_SRC)))
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS)))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(PREVIEW_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS)))
 -include $(DAEMON_OBJS:.o=.d)
-$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
+$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(PREVIEW_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(EXPORT_LIBS) $(CALLREC_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(TTS_LIBS) $(EXPORT_LIBS) $(CALLREC_LIBS) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever

@@ -254,7 +254,7 @@ enum {
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
-    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
+    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string), op=the preview rung asked for (0: the original was) */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text
                             * (NULL on a bare progress tick), xfer_tag/xfer_done/xfer_total */
     OC_EV_MEDIA_POSTED,    /* a video message went out: xfer_tag, attach_id = the video, channel_id */
@@ -812,6 +812,12 @@ enum {
      * person chose: message_id = the video's attachment id, body = dest path.
      * A queued transfer, as OC_CMD_DOWNLOAD is. */
     OC_CMD_EXPORT,
+    /* An image attachment's preview INTO MEMORY (ARCH-137): message_id = the
+     * attachment, op = the rung (OC_PREVIEW_RUNG_INLINE_WIRE or _EXPANDED_WIRE).
+     * Its bytes arrive as OC_EV_ATTACHMENT_DATA with op = that rung; where the
+     * daemon has no preview, the original's bytes do, with the same op. Queued
+     * as OC_CMD_FETCH is. */
+    OC_CMD_FETCH_PREVIEW,
     OC_CMD_QUIT
 };
 
