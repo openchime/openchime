@@ -502,7 +502,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 37);     /* OPENCHIME_MODE and OPENCHIME_H264_EXPORT among them */
+    CHECK(operator_rows == 40);     /* OPENCHIME_MODE, OPENCHIME_H264_EXPORT and the three OPENCHIME_CALL_RECORDING among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 12);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

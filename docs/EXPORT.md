@@ -25,6 +25,7 @@ messages.jsonl
 reactions.jsonl
 pins.jsonl
 attachments.jsonl
+calls.jsonl
 attachments/
 ```
 
@@ -103,6 +104,10 @@ Every channel and every DM, archived ones included, but encrypted DMs (§4).
 | `archived_ms` | When it was archived; `null` when it is not. | `channels.archived_at_ms` |
 | `members` | The member user ids. | derived: the channel's `channel_members` rows |
 | `created_ms` | When it was made. | `channels.created_at_ms` |
+| `call` | For a call's own chat, the call (in `calls.jsonl`); `null` for any other. | `channels.call_id` |
+
+A call's chat is a DM in kind and is exported as one, with its call named; a
+reader that knows no calls shows it as a group DM.
 
 `members` is who is in the channel when the export is taken, however they came
 to be: added directly, or through a user group the channel has. Groups are not
@@ -121,7 +126,8 @@ Every message in an exported channel, thread replies included.
 | `body` | The text as typed, its formatting marks and `@names` as written (MARKDOWN.md), or `null` for a deleted message. A mention by id, `<@U<id>>` or `<@U<id>\|label>` (MARKDOWN.md §1e), names the user whose `id` in `users.jsonl` is `<id>`. | `messages.body` |
 | `edited_ms` | When it was last edited; `null` if never. | `messages.edited_at_ms` |
 | `thread_root` | The top-level message it replies to; `null` for a top-level message. | `messages.parent_id` |
-| `kind` | `message`, or `call` for the record the daemon writes of a missed call. | derived: `messages.kind` (`0`, `1`) |
+| `kind` | `message`, or `call` for the message the daemon writes of a call in the conversation it was started from (or, before calls had records, of a missed call). | derived: `messages.kind` (`0`, `1`) |
+| `call` | For a `call` message, the call it is about, in `calls.jsonl`; `null` otherwise, and for a missed call from before calls had records. | `messages.call_id` |
 | `attachments` | The ids of its files, in `attachments.jsonl`; `[]` for none. | derived: the `attachments` rows whose `message_id` is this message |
 
 **A deleted message is kept, with a `null` body**, as the daemon keeps it
@@ -172,6 +178,29 @@ refuses a `path` that is not `attachments/` followed by a name with no slash.
 
 Files no message carries are not exported: uploads never sent, and the images
 behind avatars and custom emoji.
+
+### 3.7 `calls.jsonl`
+
+Every call (CALLS.md §1), with its record. A call's recording is a file of its
+chat, so its bytes are in `attachments.jsonl` and `attachments/` like any other.
+
+| Field | Meaning | Source |
+|---|---|---|
+| `id` | The call's id. | `calls.id` |
+| `subject` | What it was about. | `calls.subject` |
+| `starter` | Who started it. | `calls.starter` |
+| `from_channel` | The conversation it was started from; `null` for one started from Calls home. | `calls.from_channel` |
+| `chat` | Its own chat, in `channels.jsonl`. | derived: the channel whose `call_id` is this call |
+| `started_ms`, `ended_ms` | When it started and ended; `ended_ms` `null` while it runs. | `calls.started_at_ms`, `calls.ended_at_ms` |
+| `end_reason` | `left` (the last one left), `ended` (ended for everyone) or `stopped` (the daemon stopped with it open); `null` while it runs. | `calls.end_reason` |
+| `invitees` | Who was asked: `{user, by, at_ms, declined_ms}` each, `declined_ms` `null` for one who did not decline. | `call_invitees` |
+| `stays` | Who was in it and when: `{user, joined_ms, left_ms}` each, in join order; one person may have several. | `call_participants` |
+| `events` | The timeline: `{at_ms, user, kind, detail}` each, `kind` one of `camera_on`, `camera_off`, `share_on`, `share_off`, `record_on`, `record_off`, `subject` (whose `detail` is the new subject; `null` for the rest). | `call_events` |
+| `recordings` | `{id, by, started_ms, stopped_ms, state, duration_ms, attachment}` each: `state` `recording`, `processing`, `ready` or `failed`; `attachment` the video's id in `attachments.jsonl`, `null` unless ready. | `call_recordings` |
+| `transcript` | `null`, or `{language, lines}`, each line `{speaker, start_ms, end_ms, text}`, its times from the call's start. | `call_transcripts`, `call_transcript_lines` |
+
+A call's people and transcript are exported with it however few of them are
+still members of anything: the record is the call's, not the channel's.
 
 ## 4. What is never exported
 

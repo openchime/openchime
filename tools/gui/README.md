@@ -138,6 +138,7 @@ machine does not meet one:
 |---|---|---|
 | `speech` | `./openchimed` was built with read-aloud and voice input and their data (`TTS=1 STT=1`): it takes `--tts-say` and `--stt-hear` | `voice` |
 | `ffmpeg` | `ffmpeg` and `ffprobe` are on `PATH`, to read back what was recorded | `screenrec` |
+| `callrec` | `./openchimed` was built with the codecs a call's recording is made with (`CALLREC=1`); `run.sh` passes the remembered `CALLREC` to its build | `calls`, `callhome` |
 
 A need `run.sh` does not know is a skip too ("needs X, which run.sh cannot
 check"), never a pass. A test whose own fixture cannot come up on this machine

@@ -369,6 +369,14 @@ int main(int argc, char **argv) {
     { static oc_storage_status m; FRAME("storage_status", oc_encode_storage_status(&w, V, &m)); }
     { static oc_client_settings m; FRAME("client_settings", oc_encode_client_settings(&w, V, &m)); }
     { static oc_call_join m; FRAME("call_join", oc_encode_call_join(&w, V, &m)); }
+    { static oc_call_start m; FRAME("call_start", oc_encode_call_start(&w, V, &m)); }
+    { static oc_call_subject m; FRAME("call_subject", oc_encode_call_subject(&w, V, &m)); }
+    { static oc_call_history m; FRAME("call_history", oc_encode_call_history(&w, V, &m)); }
+    { static oc_call_history_page m; FRAME("call_history_page", oc_encode_call_history_page(&w, V, &m)); }
+    { static oc_call_detail m; FRAME("call_detail", oc_encode_call_detail(&w, V, &m)); }
+    { static oc_call_page m; FRAME("call_page", oc_encode_call_page(&w, V, &m)); }
+    { static oc_call_delete m; FRAME("call_delete", oc_encode_call_delete(&w, V, OC_MSG_CALL_DELETE, &m)); }
+    { static oc_call_record m; FRAME("call_record", oc_encode_call_record(&w, V, &m)); }
     { static oc_call_leave m; FRAME("call_leave", oc_encode_call_leave(&w, V, &m)); }
     { static oc_call_joined m; FRAME("call_joined", oc_encode_call_joined(&w, V, &m)); }
     { static oc_call_roster m; FRAME("call_roster", oc_encode_call_roster(&w, V, &m)); }

@@ -45,6 +45,8 @@
 #include "idmap.h"
 #include "srccount.h"
 #include "relay.h"
+#include "callrec.h"
+#include "callrec_worker.h"
 #include "ioloop.h"
 #include "export_worker.h"   /* the export of a video message (ARCH-135) */
 
@@ -244,13 +246,13 @@ typedef struct conn_s {
     uint32_t     send_count;     /* sends counted in the current window */
     uint32_t     send_rate_max;  /* sends a window allows (send_rate_cap); 0: no cap */
     struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl, pdm_rl;
-    /* CALL_JOIN is answered after the reader's check, so a leave can arrive
-     * first. Each join advances the counter and carries it (oc_job.gen), a leave
-     * of the conversation the latest join named advances it again, and a join's
-     * answer is acted on only while the counter is still its own: a join
-     * superseded or left before it was answered does nothing (REQ-301). */
+    /* CALL_START is answered after the writer makes the call's row, so another
+     * start, a join or a leave can come first. Each of them advances the
+     * counter, a start carries it (oc_job.gen), and a start's answer puts its
+     * starter in the call only while the counter is still its own: a start
+     * overtaken before it was answered makes a call nobody is in, which ends
+     * at once (CALLS.md §1). */
     uint32_t     call_gen;
-    uint64_t     call_join_ch;
     int          presence_deferred;   /* a broadcast is owed once presence_rl allows it */
     uint64_t     audio_win_start;/* the same, for read-aloud requests (ARCH-111) */
     uint32_t     audio_count;
@@ -355,6 +357,8 @@ static oc_sum_worker *g_sum;
  * answer and its cache row is served rather than exported again. */
 static const oc_export_codecs *g_export_codecs;
 static __thread oc_export_worker *g_export;
+static __thread oc_callrec_worker *g_callrec;   /* makes stopped recordings (CALLS.md §8) */
+static __thread int g_callrec_fd = -1;          /* its eventfd, in the loop's epoll */
 typedef struct export_wait { uint64_t req_id, conn_id, attachment_id; struct export_wait *next; } export_wait;
 static __thread export_wait *g_export_waits;
 static __thread uint64_t g_export_req_seq;
@@ -1196,8 +1200,11 @@ static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
 
 /* --- Audio calls (REQ-150, REQ-301-305, ephemeral net-thread state) ----- */
 
-/* One call per conversation (ARCH-73). State is in-memory on the net thread
- * (like presence, ARCH-67) -- calls end on restart. CALLS.md is the design. */
+/* A call is an object of its own (CALLS.md §1, ARCH-73): a row in `calls`,
+ * whose id it carries, with its people, timeline and chat kept there. What is
+ * held here is what only a running call has -- connections, slots, tokens,
+ * device keys, the epoch -- on the net thread, as presence is (ARCH-67). Each
+ * change the record keeps is written as it happens (OC_JOB_CALL_LOG). */
 #define OC_MAX_CALLS 64
 /* A participant: a user on one connection, with the media token the relay knows
  * it by, the slot its SFrame KIDs carry and the device key others seal to. */
@@ -1210,30 +1217,33 @@ typedef struct {
     uint64_t detached_ms;          /* when its connection went (conn_id is then 0):
                                     * its seat is held for a rejoin; 0 while attached */
     uint8_t  camera;               /* its camera is on (CALL_CAMERA, REQ-160) */
+    uint8_t  recorder;             /* the Recorder (CALLS.md §8): no connection, no token */
 } call_part;
 typedef struct {
-    uint64_t  channel_id;          /* 0 marks a free slot */
-    uint64_t  call_id;             /* this call, unique: a later call in the same
-                                    * conversation is another one (HPKE info binds it) */
+    uint64_t  call_id;             /* the `calls` row; 0 marks a free slot */
+    char      subject[OC_CALL_SUBJECT_MAX + 1];
+    uint64_t  from_channel;        /* the conversation it was started from, 0 none */
+    uint64_t  chat_channel;        /* the call's own chat (a channels row of its own) */
     uint64_t  starter, started_at;
     uint32_t  epoch;               /* up by one on every join and leave (CALLS.md §5.3) */
-    int       others_joined;       /* anyone but the starter ever took part */
-    int       invited_any;
     call_part parts[OC_MAX_CALL_PARTICIPANTS];
     int       n;
     uint64_t  invited[OC_MAX_CALL_INVITES];   /* invitations not yet taken or declined */
     int       n_inv;
-    uint64_t *members;             /* heap: the conversation's members, refreshed on each
-                                    * join and invitation -- who is told about the call */
-    size_t    n_members;
+    uint64_t *invitees;            /* heap: everyone ever asked, the starter first --
+                                    * who may join, and who is told about the call */
+    size_t    n_invitees, cap_invitees;
     uint64_t  sharer_conn;         /* the participant sharing a screen, 0 for none; one
                                     * at a time (REQ-161) */
+    oc_callrec *rec;               /* its Recorder while it is being recorded (CALLS.md §8) */
+    uint64_t  rec_id;              /* ...the recording's row */
+    uint64_t  rec_by;              /* who started it */
+    int       rec_pending;         /* a start asked for, its row not yet made */
 } call_t;
 static __thread call_t  *g_calls;   /* OC_MAX_CALLS, the loop's own */
-static __thread uint64_t g_next_call_id;
-/* The writer, for the jobs raised with no frame behind them: the missed-call
- * line when a call ends, and taking a connection's summary requests out of the
- * queue -- both of which can happen as a connection closes. */
+/* The writer, for the jobs raised with no frame behind them: a call's record
+ * as it changes, and taking a connection's summary requests out of the queue
+ * -- both of which can happen as a connection closes. */
 static __thread oc_dbwriter *g_call_dbw;
 
 /* Call media (REQ-150/151, ARCH-18/73): the UDP socket the relay runs on and
@@ -1501,6 +1511,11 @@ static void relay_gone(void *ctx, const uint8_t *token, size_t len) {
     if (len == audio_token_len()) call_drop_token(rc->ep, rc->conns, token);
 }
 
+/* A packet of a call being recorded, for its Recorder (CALLS.md §8). */
+static call_t *call_find(uint64_t call_id);
+static void relay_record(void *ctx, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                         const uint8_t *ct, size_t len);
+
 /* Media for a participant on the connection transport (relay.h), as CALL_MEDIA.
  * Media never costs a connection: with more than OC_MEDIA_SOFT already waiting
  * to be written it is dropped, and the loss is recovered as UDP loss is -- by
@@ -1519,7 +1534,6 @@ static void relay_tcp_send(void *ctx, uint64_t conn_id, uint64_t sender, uint16_
     if (out_append(c, buf, w.len) == 0) flush_out(c);
 }
 
-static int in_members(uint64_t uid, const uint64_t *m, size_t n);
 
 /* Every call frame goes out through this, as presence does: queued and flushed,
  * but never closing the connection on a failed write. A call fan-out runs inside
@@ -1531,26 +1545,64 @@ static void call_send(int ep, conn *c, const uint8_t *buf, size_t len) {
     presence_send(ep, c, buf, len);
 }
 
-static call_t *call_find(uint64_t channel_id) {
-    if (!channel_id) return NULL;
+/* The wall clock, in ms: what a recording's spool is stamped with. */
+static uint64_t wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static call_t *call_find(uint64_t call_id) {
+    if (!call_id) return NULL;
     for (int i = 0; i < OC_MAX_CALLS; i++)
-        if (g_calls[i].channel_id == channel_id) return &g_calls[i];
+        if (g_calls[i].call_id == call_id) return &g_calls[i];
     return NULL;
 }
 
-static call_t *call_new(uint64_t channel_id, uint64_t starter) {
+static int call_slots_free(void) {
+    int n = 0;
+    for (int i = 0; i < OC_MAX_CALLS; i++) if (!g_calls[i].call_id) n++;
+    return n;
+}
+
+/* A call whose row was just made: its starter is its first invitee. NULL when
+ * every slot is busy. */
+static call_t *call_new(uint64_t call_id, uint64_t starter, uint64_t started_at,
+                        const char *subject, uint64_t from_channel) {
     for (int i = 0; i < OC_MAX_CALLS; i++)
-        if (g_calls[i].channel_id == 0) {
+        if (g_calls[i].call_id == 0) {
             call_t *c = &g_calls[i];
             memset(c, 0, sizeof *c);
-            if (!g_next_call_id) g_next_call_id = now_ms();   /* distinct across restarts too */
-            c->channel_id = channel_id;
-            c->call_id = g_next_call_id++;
+            c->call_id = call_id;
             c->starter = starter;
-            c->started_at = now_ms();
+            c->started_at = started_at;
+            c->from_channel = from_channel;
+            snprintf(c->subject, sizeof c->subject, "%s", subject);
             return c;
         }
-    return NULL;   /* every call slot busy */
+    return NULL;
+}
+
+/* A change to the call's record (SCHEMA.md `calls`), written as it happens. */
+static void call_log(const call_t *c, uint8_t op, uint64_t user_id) {
+    if (!g_call_dbw || !c->call_id) return;
+    oc_job *j = oc_job_new(OC_JOB_CALL_LOG, 0);
+    if (!j) return;
+    j->call_id = c->call_id;
+    j->call_log = op;
+    j->user_id = user_id;
+    oc_dbwriter_submit(g_call_dbw, j);
+}
+
+static void call_log_event(const call_t *c, uint8_t ev, uint64_t user_id) {
+    if (!g_call_dbw) return;
+    oc_job *j = oc_job_new(OC_JOB_CALL_LOG, 0);
+    if (!j) return;
+    j->call_id = c->call_id;
+    j->call_log = OC_CALL_LOG_EVENT;
+    j->call_event = ev;
+    j->user_id = user_id;
+    oc_dbwriter_submit(g_call_dbw, j);
 }
 
 /* --- encrypted DMs (PRIVATE-DM.md) ----------------------------------------- *
@@ -1794,7 +1846,7 @@ static int pdm_refuses(const conn *c, uint64_t cid) {
 static call_t *call_of_conn(uint64_t conn_id, int *idx) {
     for (int i = 0; i < OC_MAX_CALLS; i++) {
         call_t *c = &g_calls[i];
-        if (!c->channel_id) continue;
+        if (!c->call_id) continue;
         for (int k = 0; k < c->n; k++)
             if (c->parts[k].conn_id == conn_id) { if (idx) *idx = k; return c; }
     }
@@ -1804,6 +1856,14 @@ static call_t *call_of_conn(uint64_t conn_id, int *idx) {
 static int call_part_of_user(const call_t *c, uint64_t user_id) {
     for (int k = 0; k < c->n; k++) if (c->parts[k].user_id == user_id) return k;
     return -1;
+}
+
+/* The people in the call: its participants but the Recorder, which is not
+ * counted toward the cap (CALLS.md §8). */
+static int call_people(const call_t *c) {
+    int n = 0;
+    for (int k = 0; k < c->n; k++) if (!c->parts[k].recorder) n++;
+    return n;
 }
 
 static int call_invited(const call_t *c, uint64_t user_id) {
@@ -1839,27 +1899,34 @@ static uint8_t call_free_slot(const call_t *c) {
     return 0;   /* unreachable: a call holds at most OC_MAX_CALL_PARTICIPANTS */
 }
 
-static void call_take_members(call_t *c, oc_dbres *r) {
-    free(c->members);
-    c->members = r->members;
-    c->n_members = r->n_members;
-    r->members = NULL;
-    r->n_members = 0;
+/* Who may see and join the call (CALLS.md §1): everyone ever asked, the
+ * starter included. Participants are among them, since only they may join. */
+static int call_audience(const call_t *c, uint64_t user_id) {
+    for (size_t i = 0; i < c->n_invitees; i++) if (c->invitees[i] == user_id) return 1;
+    return 0;
 }
 
-/* Who hears about a call: the conversation's members, its invitees and its
- * participants (someone reading a public channel they have not joined). */
-static int call_audience(const call_t *c, uint64_t user_id) {
-    if (in_members(user_id, c->members, c->n_members)) return 1;
-    if (call_invited(c, user_id) >= 0) return 1;
-    return call_part_of_user(c, user_id) >= 0;
+static int call_add_invitee(call_t *c, uint64_t user_id) {
+    if (call_audience(c, user_id)) return 0;
+    if (c->n_invitees == c->cap_invitees) {
+        size_t cap = c->cap_invitees ? c->cap_invitees * 2 : 16;
+        uint64_t *g = realloc(c->invitees, cap * sizeof *g);
+        if (!g) return -1;
+        c->invitees = g;
+        c->cap_invitees = cap;
+    }
+    c->invitees[c->n_invitees++] = user_id;
+    return 0;
 }
 
 static size_t call_encode_state(const call_t *c, int ended, uint8_t *buf, size_t cap) {
     uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
-    for (int k = 0; k < c->n; k++) parts[k] = c->parts[k].user_id;
-    oc_call_state st = { c->channel_id, c->call_id, c->starter, c->started_at, (uint8_t)(ended ? 1 : 0),
-                         (uint16_t)c->n, parts, (uint16_t)c->n_inv, c->invited,
+    int np = 0;
+    for (int k = 0; k < c->n; k++) if (!c->parts[k].recorder) parts[np++] = c->parts[k].user_id;
+    oc_call_state st = { c->call_id, oc_slice_str(c->subject), c->starter, c->started_at, c->from_channel,
+                         c->chat_channel, (uint8_t)(!ended && c->rec ? OC_CALL_STATE_RECORDING : 0),
+                         (uint8_t)(ended ? 1 : 0),
+                         (uint16_t)(ended ? 0 : np), parts, (uint16_t)(ended ? 0 : c->n_inv), c->invited,
                          ended || !c->sharer_conn ? 0 : call_sharer(c) };
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
     return oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK ? w.len : 0;
@@ -1877,22 +1944,19 @@ static void call_send_users(int ep, const uint64_t *uids, size_t n, uint64_t gen
         }
 }
 
-/* CALL_STATE to the call's audience (REQ-303): the conversation's members, its
- * invitees and its participants, found through the user index rather than by
- * walking every connection, each connection once. A call send never closes a
- * connection (an over-full one misses the frame), so nothing it does can
- * change the lists or the call while they are walked. */
+/* CALL_STATE to the call's audience -- its invitees, the starter and every
+ * participant among them -- and nobody else (CALLS.md §1), found through the
+ * user index rather than by walking every connection, each connection once. A
+ * call send never closes a connection (an over-full one misses the frame), so
+ * nothing it does can change the lists or the call while they are walked. */
 static void call_send_state(int ep, conn **conns, const call_t *c, int ended) {
     (void)conns;
-    uint8_t buf[1024];
+    if (c->rec && !ended) oc_callrec_sharer(c->rec, c->sharer_conn ? call_sharer(c) : 0, wall_ms());
+    uint8_t buf[1536];
     size_t len = call_encode_state(c, ended, buf, sizeof buf);
     if (!len) return;
-    uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
-    for (int k = 0; k < c->n; k++) parts[k] = c->parts[k].user_id;
     uint64_t gen = ++g_fan_gen;
-    call_send_users(ep, c->members, c->n_members, gen, buf, len);
-    call_send_users(ep, c->invited, (size_t)c->n_inv, gen, buf, len);
-    call_send_users(ep, parts, (size_t)c->n, gen, buf, len);
+    call_send_users(ep, c->invitees, c->n_invitees, gen, buf, len);
 }
 
 static void call_fill_parts(const call_t *c, oc_call_part *out) {
@@ -1902,8 +1966,71 @@ static void call_fill_parts(const call_t *c, oc_call_part *out) {
         memcpy(out[k].device_key, c->parts[k].device_key, OC_CALL_DEVICE_KEY_LEN);
         out[k].codecs = c->parts[k].codecs;
         out[k].flags = (uint8_t)((c->parts[k].detached_ms ? OC_CALL_PART_AWAY : 0) |
-                                 (c->parts[k].camera ? OC_CALL_PART_CAMERA : 0));
+                                 (c->parts[k].camera ? OC_CALL_PART_CAMERA : 0) |
+                                 (c->parts[k].recorder ? OC_CALL_PART_RECORDER : 0));
     }
+}
+
+/* --- the Recorder (CALLS.md §8) ------------------------------------------- */
+
+static __thread conn **g_rec_conns;     /* the loop's connections, for the Recorder's sends */
+static __thread int g_rec_ep;
+
+/* A key the Recorder sealed to a participant, sent as from it. */
+static void rec_key_for(void *ctx, uint64_t call_id, uint32_t epoch, uint64_t recipient,
+                        const uint8_t sealed[OC_CALL_SEALED_LEN]) {
+    (void)ctx;
+    call_t *c = call_find(call_id);
+    int k = c ? call_part_of_user(c, recipient) : -1;
+    conn *pc = k >= 0 && c->parts[k].conn_id && g_rec_conns ? find_by_id(g_rec_conns, c->parts[k].conn_id) : NULL;
+    if (!pc) return;
+    oc_call_key_for kf = { call_id, epoch, OC_CALL_RECORDER_ID, { sealed, OC_CALL_SEALED_LEN } };
+    uint8_t buf[256];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_call_key_for(&w, OC_PROTOCOL_VERSION, &kf) == OC_OK) call_send(g_rec_ep, pc, buf, w.len);
+}
+
+/* A packet the Recorder puts into the call: a NACK or a keyframe request. */
+static void rec_inject(void *ctx, uint64_t call_id, uint16_t seq, uint8_t stream, const uint8_t *ct, size_t len) {
+    (void)ctx;
+    if (g_relay) oc_relay_inject(g_relay, call_id, OC_CALL_RECORDER_ID, seq, stream, ct, len);
+}
+
+static const oc_callrec_io g_rec_io = { rec_key_for, rec_inject, NULL };
+
+/* The roster as the Recorder must know it: on every change, and its own key
+ * for a new epoch. */
+static void call_rec_roster(const call_t *c) {
+    if (!c->rec) return;
+    oc_callrec_part rp[OC_MAX_CALL_PARTICIPANTS];
+    uint8_t mine = 0;
+    for (int k = 0; k < c->n; k++) {
+        rp[k].user = c->parts[k].user_id;
+        rp[k].slot = c->parts[k].slot;
+        memcpy(rp[k].key, c->parts[k].device_key, OC_CALL_DEVICE_KEY_LEN);
+        if (c->parts[k].recorder) mine = c->parts[k].slot;
+    }
+    oc_callrec_roster(c->rec, c->epoch, mine, rp, c->n, &g_rec_io);
+}
+
+/* The engine that makes a recording from its spool, set by main.c when the
+ * daemon carries it (CALLREC=1); NULL: nobody records here (CALLS.md §8). */
+static const struct oc_callrec_codecs *g_callrec_codecs;
+void oc_netloop_set_callrec(const struct oc_callrec_codecs *codecs) { g_callrec_codecs = codecs; }
+
+static oc_dl *g_demo_limits;   /* below: a demo workspace's limits, NULL in any other mode */
+
+/* Whether calls may be recorded here: built in, not turned off by an admin,
+ * not a public demo, and the relay up to carry calls at all. */
+static int recording_offered(void) {
+    return g_callrec_codecs && g_relay && oc_config_get()->call_recording.enabled &&
+           !(g_demo_limits && !OC_DEMO_RECORDING);
+}
+
+/* The directory recordings are spooled in, under the data directory. */
+static void recordings_dir(char *out, size_t cap) {
+    const oc_config *cfg = oc_config_get();
+    snprintf(out, cap, "%s/recordings", cfg->data_dir ? cfg->data_dir : ".");
 }
 
 /* CALL_ROSTER -- the participants, their slots and keys, and the epoch -- to
@@ -1916,7 +2043,8 @@ static void call_send_roster(int ep, conn **conns, const call_t *c, uint64_t exc
     call_fill_parts(c, parts);
     for (int k = 0; k < c->n; k++) if (c->parts[k].conn_id != except_conn) cids[nc++] = c->parts[k].conn_id;
     if (also_conn) cids[nc++] = also_conn;
-    oc_call_roster ro = { c->channel_id, c->call_id, c->epoch, (uint16_t)c->n, parts };
+    oc_call_roster ro = { c->call_id, c->epoch, (uint16_t)c->n, parts };
+    call_rec_roster(c);
     uint8_t buf[2048];
     oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     if (oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &ro) != OC_OK) return;
@@ -1934,48 +2062,65 @@ static int demo_ok(oc_dl_kind k, uint64_t user) {
     return !g_demo_limits || oc_dl_take(g_demo_limits, k, user, now_ms());
 }
 
-/* A call is over (REQ-301): tell its audience, drop every participant from the
- * relay, and -- when nobody but its starter ever joined and somebody was asked
- * -- leave the missed-call line in the conversation (REQ-304). The slot is freed
- * before anything is sent, so nothing a send sets off can find the call again. */
-static void call_finish(int ep, conn **conns, call_t *c) {
-    call_t done = *c;
-    c->channel_id = 0;
-    c->members = NULL;
-    c->n_members = 0;
-    for (int k = 0; k < done.n; k++) audio_revoke(done.parts[k].token);
-    call_send_state(ep, conns, &done, 1);
-    if (!done.others_joined && done.invited_any && g_call_dbw) {
-        static const char text[] = OC_CALL_MISSED_TEXT;
-        uint8_t *body = malloc(sizeof text - 1);
-        oc_job *j = body ? oc_job_new(OC_JOB_CALL_EVENT, 0) : NULL;
-        if (j) {
-            memcpy(body, text, sizeof text - 1);
-            j->body = body;
-            j->body_len = sizeof text - 1;
-            j->user_id = done.starter;
-            j->channel_id = done.channel_id;
-            oc_dbwriter_submit(g_call_dbw, j);
-        } else {
-            free(body);
-        }
-    }
-    free(done.members);
+/* A call is over (REQ-301): its record says how (OC_CALL_END_*), its audience
+ * is told, and every participant is off the relay. A call nobody but its
+ * starter joined writes nothing more -- Calls home shows it as missed from its
+ * record. The slot is freed before anything is sent, so nothing a send sets
+ * off can find the call again. */
+static void relay_record(void *ctx, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                         const uint8_t *ct, size_t len) {
+    (void)ctx;
+    call_t *c = call_find(call_id);
+    if (c && c->rec) oc_callrec_packet(c->rec, sender, seq, stream, ct, len, wall_ms(), &g_rec_io);
 }
 
-/* Take participant `idx` out of `c`: off the relay, and a new epoch for the
- * rest, who rekey (CALLS.md §5.3). The last one out ends the call. `tell_conn`,
- * when not 0, is a connection that was the participant and is still open -- one
- * the relay swept -- and is sent the roster without it, so it knows it is out
- * and can rejoin (PROTOCOL.md §5.17). */
+/* The Recorders' clocks: what they are missing is asked for again. */
+static void call_recorders_tick(void) {
+    uint64_t now = wall_ms();
+    for (int i = 0; g_calls && i < OC_MAX_CALLS; i++)
+        if (g_calls[i].call_id && g_calls[i].rec) oc_callrec_tick(g_calls[i].rec, now, &g_rec_io);
+}
+
+static void call_rec_stop(int ep, conn **conns, call_t *c, uint64_t by, int tell);
+static void call_finish(int ep, conn **conns, call_t *c, uint8_t reason) {
+    if (c->rec) call_rec_stop(ep, conns, c, c->rec_by, 0);
+    c->rec_pending = 0;
+    call_t done = *c;
+    c->call_id = 0;
+    c->invitees = NULL;
+    c->n_invitees = c->cap_invitees = 0;
+    for (int k = 0; k < done.n; k++) audio_revoke(done.parts[k].token);
+    if (g_call_dbw) {
+        oc_job *j = oc_job_new(OC_JOB_CALL_LOG, 0);
+        if (j) {
+            j->call_id = done.call_id;
+            j->call_log = OC_CALL_LOG_END;
+            j->call_reason = reason;
+            oc_dbwriter_submit(g_call_dbw, j);
+        }
+    }
+    call_send_state(ep, conns, &done, 1);
+    free(done.invitees);
+}
+
+/* Take participant `idx` out of `c`: off the relay, its stay closed, and a new
+ * epoch for the rest, who rekey (CALLS.md §5.3). The last one out ends the
+ * call. `tell_conn`, when not 0, is a connection that was the participant and
+ * is still open -- one the relay swept -- and is sent the roster without it, so
+ * it knows it is out and can rejoin (PROTOCOL.md §5.17). */
 static void call_drop_tell(int ep, conn **conns, call_t *c, int idx, uint64_t tell_conn) {
     audio_revoke(c->parts[idx].token);
+    call_log(c, OC_CALL_LOG_LEAVE, c->parts[idx].user_id);
+    if (c->parts[idx].conn_id && c->parts[idx].conn_id == c->sharer_conn)
+        call_log_event(c, OC_CALL_EV_SHARE_OFF, c->parts[idx].user_id);
+    if (c->parts[idx].camera) call_log_event(c, OC_CALL_EV_CAMERA_OFF, c->parts[idx].user_id);
+    if (c->rec) oc_callrec_presence(c->rec, c->parts[idx].user_id, 0, wall_ms());
     call_remove_part(c, idx);
-    if (c->n == 0) { call_finish(ep, conns, c); return; }
+    if (call_people(c) == 0) { call_finish(ep, conns, c, OC_CALL_END_LEFT); return; }
     c->epoch++;
-    uint64_t ch = c->channel_id;
+    uint64_t id = c->call_id;
     call_send_roster(ep, conns, c, 0, tell_conn);
-    call_t *cc = call_find(ch);
+    call_t *cc = call_find(id);
     if (cc) call_send_state(ep, conns, cc, 0);
 }
 
@@ -1986,11 +2131,11 @@ static void call_drop(int ep, conn **conns, call_t *c, int idx) {
 /* A participant's connection went (REQ-152). Its seat is held, not emptied:
  * off the relay, so nothing reaches it, but still in the roster -- marked away,
  * so the others can say so -- for call_grace_ms(): long enough for a client to
- * reconnect and rejoin, which takes the seat back (the join's same-user path).
- * A call whose members all lose their connection together, as a front door's
- * failover does, is still there when they come back. The rest are told in a
- * new epoch, as for any change to the roster; a sharer that goes stops sharing
- * at once. */
+ * reconnect and rejoin, which takes the seat back (the join's same-user path)
+ * in the same stay. A call whose members all lose their connection together,
+ * as a front door's failover does, is still there when they come back. The
+ * rest are told in a new epoch, as for any change to the roster; a sharer that
+ * goes stops sharing at once. */
 static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
     int idx;
     call_t *c = call_of_conn(conn_id, &idx);
@@ -1998,7 +2143,8 @@ static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
     call_part *pt = &c->parts[idx];
     audio_revoke(pt->token);
     int was_sharer = c->sharer_conn == conn_id;
-    if (was_sharer) c->sharer_conn = 0;
+    if (was_sharer) { c->sharer_conn = 0; call_log_event(c, OC_CALL_EV_SHARE_OFF, pt->user_id); }
+    if (pt->camera) call_log_event(c, OC_CALL_EV_CAMERA_OFF, pt->user_id);
     pt->conn_id = 0;
     pt->camera = 0;                  /* a rejoin turns it on again if it wants */
     pt->detached_ms = now_ms();
@@ -2014,11 +2160,11 @@ static void call_expire_detached(int ep, conn **conns) {
     for (int i = 0; i < OC_MAX_CALLS; i++) {
         call_t *c = &g_calls[i];
         /* A demo's calls last at most twenty minutes (demolimits.h). */
-        if (g_demo_limits && c->channel_id && c->started_at && t - c->started_at >= OC_DEMO_CALL_MAX_MS) {
-            call_finish(ep, conns, c);
+        if (g_demo_limits && c->call_id && c->started_at && t - c->started_at >= OC_DEMO_CALL_MAX_MS) {
+            call_finish(ep, conns, c, OC_CALL_END_ENDED);
             continue;
         }
-        for (int k = c->channel_id ? c->n - 1 : -1; k >= 0 && c->channel_id; k--)
+        for (int k = c->call_id ? c->n - 1 : -1; k >= 0 && c->call_id; k--)
             if (c->parts[k].detached_ms && t - c->parts[k].detached_ms >= grace)
                 call_drop(ep, conns, c, k);   /* swaps the last, already seen, into k */
     }
@@ -2029,7 +2175,7 @@ static void call_expire_detached(int ep, conn **conns) {
 static void call_drop_token(int ep, conn **conns, const uint8_t *token) {
     for (int i = 0; i < OC_MAX_CALLS; i++) {
         call_t *c = &g_calls[i];
-        if (!c->channel_id) continue;
+        if (!c->call_id) continue;
         for (int k = 0; k < c->n; k++)
             if (memcmp(c->parts[k].token, token, audio_token_len()) == 0) {
                 call_drop_tell(ep, conns, c, k, c->parts[k].conn_id);
@@ -2050,13 +2196,14 @@ static void send_call_error(int ep, conn *c, uint16_t code, const char *msg) {
  * desktop's toast comes from CALL_STATE, decided by the client that shows it. */
 static void call_push_invites(const call_t *c, const uint64_t *uids, int n, uint64_t inviter) {
     for (int i = 0; i < n; i++)
-        if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify_call(cur_push(), c->channel_id, inviter, uids[i]);
+        if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify_call(cur_push(), c->from_channel, inviter, uids[i]);
 }
 
-/* Add the invitees in `uids` -- already known to be able to read the
- * conversation -- who are neither in the call nor asked already, keeping
- * participants plus invitations within the cap (REQ-305). Returns how many were
- * added, left at `added`; or -1, adding none, when they would not fit. */
+/* Ask the people in `uids` -- already known to be accounts that may be asked
+ * -- who are neither in the call nor asked already, keeping participants plus
+ * invitations within the cap (REQ-305). Returns how many were added, left at
+ * `added`; or -1, adding none, when they would not fit. Each becomes an
+ * invitee for good: declining or leaving does not take that away. */
 static int call_add_invites(call_t *c, const uint64_t *uids, size_t n, uint64_t *added) {
     int cap = oc_config_get()->call_max, na = 0;
     for (size_t i = 0; i < n && na < (int)OC_MAX_CALL_INVITES; i++) {
@@ -2066,15 +2213,207 @@ static int call_add_invites(call_t *c, const uint64_t *uids, size_t n, uint64_t 
         for (int k = 0; k < na; k++) if (added[k] == u) dup = 1;
         if (!dup) added[na++] = u;
     }
-    if (c->n + c->n_inv + na > cap) return -1;
-    for (int k = 0; k < na; k++) c->invited[c->n_inv++] = added[k];
-    if (na) c->invited_any = 1;
+    if (call_people(c) + c->n_inv + na > cap) return -1;
+    for (int k = 0; k < na; k++) {
+        if (call_add_invitee(c, added[k]) != 0) { na = k; break; }
+        c->invited[c->n_inv++] = added[k];
+    }
     return na;
 }
 
-static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
-    for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
+/* The Recorder joins (CALLS.md §8): its row made, it comes in as a
+ * participant of its own -- a slot, its key, marked RECORDER, no connection --
+ * at a new epoch, so the devices seal their keys to it from now on and never
+ * for anything said before. The relay hands it the call's packets from now. */
+static void call_rec_begin(int ep, conn **conns, call_t *c, uint64_t rec_id, uint64_t by) {
+    c->rec_pending = 0;
+    if (c->rec || c->n >= (int)OC_MAX_CALL_PARTICIPANTS) return;
+    char dir[1200], base[1100];
+    recordings_dir(base, sizeof base);
+    snprintf(dir, sizeof dir, "%s/%llu", base, (unsigned long long)rec_id);
+    c->rec = oc_callrec_start(c->call_id, rec_id, dir, wall_ms());
+    if (!c->rec) {
+        oc_job *j = g_call_dbw ? oc_job_new(OC_JOB_RECORDING_STOP, 0) : NULL;
+        if (j) { j->rec_id = rec_id; oc_dbwriter_submit(g_call_dbw, j); }
+        return;
+    }
+    c->rec_id = rec_id;
+    c->rec_by = by;
+    call_part *pt = &c->parts[c->n];
+    memset(pt, 0, sizeof *pt);
+    pt->user_id = OC_CALL_RECORDER_ID;
+    pt->slot = call_free_slot(c);
+    pt->recorder = 1;
+    memcpy(pt->device_key, oc_callrec_public_key(c->rec), OC_CALL_DEVICE_KEY_LEN);
+    c->n++;
+    c->epoch++;
+    uint64_t now = wall_ms();
+    for (int k = 0; k < c->n; k++) {
+        if (c->parts[k].recorder) continue;
+        oc_callrec_presence(c->rec, c->parts[k].user_id, 1, now);
+        if (c->parts[k].camera) oc_callrec_camera(c->rec, c->parts[k].user_id, 1, now);
+    }
+    if (g_relay) oc_relay_set_recorded(g_relay, c->call_id, 1);
+    call_log_event(c, OC_CALL_EV_RECORD_ON, by);
+    call_send_roster(ep, conns, c, 0, 0);   /* the Recorder is given the roster, and makes its key */
+    call_send_state(ep, conns, c, 0);
+}
+
+/* The Recorder leaves: at a new epoch, so nothing said from now is sealed to
+ * it; its keys are wiped, its spool closed, and the recording goes to be
+ * processed. `tell`: the rest are sent the roster and the state (not when the
+ * call is ending anyway). */
+#ifdef OC_TTS
+static int export_gate(void *ctx);
+#endif
+/* A test holds the recordings' worker to read a spool before it is made. */
+static int g_callrec_held;
+void oc_netloop_hold_callrec(int on) { __atomic_store_n(&g_callrec_held, on ? 1 : 0, __ATOMIC_RELEASE); }
+/* No recording is made while read-aloud renders, as no export is (the two
+ * together would not fit a managed box), nor while a test holds it. */
+static int callrec_gate(void *ctx) {
+#ifdef OC_TTS
+    if (export_gate(ctx)) return 1;
+#endif
+    (void)ctx;
+    return __atomic_load_n(&g_callrec_held, __ATOMIC_ACQUIRE);
+}
+
+/* The recordings' worker, started if calls may be recorded here and it is not
+ * yet: as the loop starts, and when a recording stops after the codecs came
+ * (oc_netloop_set_callrec, after the start). Those waiting from before are
+ * asked for and given it. 0 when it runs. */
+static int callrec_ensure(int ep, oc_dbwriter *dbw) {
+    if (g_callrec) return 0;
+    if (!recording_offered()) return -1;
+    char rdir[1100];
+    recordings_dir(rdir, sizeof rdir);
+    if (mkdir(rdir, 0700) != 0 && errno != EEXIST)
+        fprintf(stderr, "callrec: cannot make %s: %s\n", rdir, strerror(errno));
+    g_callrec = oc_callrec_worker_start(g_callrec_codecs, g_blobs, rdir, callrec_gate, NULL);
+    if (!g_callrec) {
+        fprintf(stderr, "callrec: cannot start the recordings' worker; recordings wait\n");
+        return -1;
+    }
+    g_callrec_fd = oc_callrec_worker_eventfd(g_callrec);
+    struct epoll_event cev;
+    memset(&cev, 0, sizeof cev);
+    cev.events = EPOLLIN; cev.data.fd = g_callrec_fd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, g_callrec_fd, &cev);
+    oc_job *pj = dbw ? oc_job_new(OC_JOB_RECORDINGS_PENDING, 0) : NULL;
+    if (pj) oc_dbwriter_submit(dbw, pj);
     return 0;
+}
+
+static void call_rec_stop(int ep, conn **conns, call_t *c, uint64_t by, int tell) {
+    if (!c->rec) return;
+    if (g_relay) oc_relay_set_recorded(g_relay, c->call_id, 0);
+    for (int k = 0; k < c->n; k++)
+        if (c->parts[k].recorder) { c->parts[k] = c->parts[--c->n]; break; }
+    oc_callrec_stop(c->rec);
+    c->rec = NULL;
+    call_log_event(c, OC_CALL_EV_RECORD_OFF, by);
+    oc_job *j = g_call_dbw ? oc_job_new(OC_JOB_RECORDING_STOP, 0) : NULL;
+    if (j) { j->rec_id = c->rec_id; oc_dbwriter_submit(g_call_dbw, j); }
+    /* Made into the recording now, behind the net loop. */
+    char dir[1200], base[1100];
+    recordings_dir(base, sizeof base);
+    snprintf(dir, sizeof dir, "%s/%llu", base, (unsigned long long)c->rec_id);
+    if (callrec_ensure(ep, g_call_dbw) == 0 && oc_callrec_worker_submit(g_callrec, c->rec_id, dir) != 0)
+        fprintf(stderr, "callrec: recording %llu waits for the next start: the queue is full\n",
+                (unsigned long long)c->rec_id);
+    c->rec_id = 0;
+    if (!tell) return;
+    c->epoch++;
+    call_send_roster(ep, conns, c, 0, 0);
+    call_send_state(ep, conns, c, 0);
+}
+
+/* A subject as a call may have it (CALLS.md §1): not blank, at most
+ * OC_CALL_SUBJECT_MAX bytes. */
+static int call_subject_ok(oc_slice s) {
+    if (!s.ptr || s.len > OC_CALL_SUBJECT_MAX) return 0;
+    for (size_t i = 0; i < s.len; i++) if (!isspace((unsigned char)s.ptr[i])) return 1;
+    return 0;
+}
+
+/* Put connection `jc` in call `c` (CALLS.md §1, PROTOCOL.md §5.17), its user
+ * already known to be an invitee: out of any other call first; out of this
+ * one and straight back in for a rejoin, with a fresh token and slot -- how a
+ * client whose address changed is relayed again; a held seat or another device
+ * of the same user taken over, which is the same stay. A new participant is a
+ * new stay in the record. */
+static void call_join_conn(int ep, conn **conns, call_t *c, conn *jc, const uint8_t *key, uint8_t codecs) {
+    uint64_t call_id = c->call_id, jconn = jc->conn_id, uid = jc->user_id;
+    int idx;
+    call_t *prev = call_of_conn(jconn, &idx);
+    int same_stay = 0;
+    if (prev == c) {
+        audio_revoke(c->parts[idx].token);
+        if (c->parts[idx].conn_id == c->sharer_conn) call_log_event(c, OC_CALL_EV_SHARE_OFF, uid);
+        if (c->parts[idx].camera) call_log_event(c, OC_CALL_EV_CAMERA_OFF, uid);
+        call_remove_part(c, idx);
+        same_stay = 1;
+    } else if (prev) {
+        call_drop(ep, conns, prev, idx);
+    }
+    jc = find_by_id(conns, jconn);
+    c = call_find(call_id);
+    if (!c) return;   /* cannot happen: only another call was left */
+    if (!jc) { if (call_people(c) == 0) call_finish(ep, conns, c, OC_CALL_END_LEFT); return; }
+    /* The same user on another device moves here (one device per user per
+     * call); that device is told by a roster without it. */
+    uint64_t moved_from = 0;
+    int k = call_part_of_user(c, uid);
+    if (k >= 0) {
+        moved_from = c->parts[k].conn_id;   /* 0 for a held seat: nobody to tell */
+        audio_revoke(c->parts[k].token);
+        if (c->parts[k].conn_id && c->parts[k].conn_id == c->sharer_conn)
+            call_log_event(c, OC_CALL_EV_SHARE_OFF, uid);
+        if (c->parts[k].camera) call_log_event(c, OC_CALL_EV_CAMERA_OFF, uid);
+        call_remove_part(c, k);
+        same_stay = 1;
+    }
+    if (call_people(c) >= oc_config_get()->call_max) {
+        send_call_error(ep, jc, OC_ERR_CALL_FULL, "the call is full");
+        if (same_stay) call_log(c, OC_CALL_LOG_LEAVE, uid);
+        if (call_people(c) == 0) { call_finish(ep, conns, c, OC_CALL_END_LEFT); return; }
+        if (moved_from || same_stay) { c->epoch++; call_send_roster(ep, conns, c, 0, moved_from); call_send_state(ep, conns, c, 0); }
+        return;
+    }
+    uint8_t token[OC_AUDIO_TOKEN_MAX];
+    const oc_config *acfg = oc_config_get();
+    memcpy(token, acfg->audio_token_prefix, acfg->audio_token_prefix_len);
+    if (oc_rand_bytes(token + acfg->audio_token_prefix_len, OC_AUDIO_TOKEN_RAND) != 0) {
+        if (same_stay) call_log(c, OC_CALL_LOG_LEAVE, uid);
+        if (call_people(c) == 0) call_finish(ep, conns, c, OC_CALL_END_LEFT);
+        send_call_error(ep, jc, OC_ERR_INTERNAL, "no randomness");
+        return;
+    }
+    call_part *pt = &c->parts[c->n];
+    memset(pt, 0, sizeof *pt);
+    pt->user_id = uid;
+    pt->conn_id = jconn;
+    pt->slot = call_free_slot(c);
+    memcpy(pt->token, token, audio_token_len());
+    memcpy(pt->device_key, key, OC_CALL_DEVICE_KEY_LEN);
+    pt->codecs = codecs;
+    c->n++;
+    c->epoch++;
+    call_uninvite(c, uid);
+    if (!same_stay) call_log(c, OC_CALL_LOG_JOIN, uid);
+    if (c->rec) oc_callrec_presence(c->rec, uid, 1, wall_ms());
+    /* Register the participant + token with the relay (ARCH-31). */
+    audio_authorize(c->call_id, pt->user_id, pt->conn_id, token);
+    oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
+    call_fill_parts(c, parts);
+    oc_call_joined jd = { c->call_id, audio_advertised_port(), { token, audio_token_len() },
+                          pt->slot, c->epoch, c->starter, c->started_at, (uint16_t)c->n, parts };
+    uint8_t buf[2048];
+    oc_wbuf jw; oc_wbuf_init(&jw, buf, sizeof buf);
+    if (oc_encode_call_joined(&jw, OC_PROTOCOL_VERSION, &jd) == OC_OK) call_send(ep, jc, buf, jw.len);
+    call_send_roster(ep, conns, c, jconn, moved_from);
+    call_send_state(ep, conns, c, 0);
 }
 
 /* Fill an on-wire attachment-entry array from the DB's attachment metadata
@@ -4519,43 +4858,48 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             pdm_end(ep, conns, d, side, pe.reason == OC_PDM_END_LOST ? OC_PDM_END_LOST : OC_PDM_END_CLOSED);
             continue;
         }
-        if ((hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE ||
+        if ((hdr.msg_type == OC_MSG_CALL_START || hdr.msg_type == OC_MSG_CALL_JOIN ||
+             hdr.msg_type == OC_MSG_CALL_INVITE || hdr.msg_type == OC_MSG_CALL_SUBJECT ||
+             hdr.msg_type == OC_MSG_CALL_RECORD ||
              hdr.msg_type == OC_MSG_CALL_SHARE || hdr.msg_type == OC_MSG_CALL_KEY ||
              hdr.msg_type == OC_MSG_CALL_CAMERA || hdr.msg_type == OC_MSG_CALL_VIDEO_SUB) &&
             !win_ok(&c->call_rl, OC_CALL_RATE_MAX, OC_CALL_RATE_MS)) {
             if (reject_rate(c, 0, "call signalling rate exceeded") != 0) return -1;
             continue;
         }
-        if (hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE) {
-            /* Both ask the reader the same question (REQ-301/302): may the actor
-             * read the conversation, and which of the named users may. The call
-             * itself changes when the answer comes back. */
+        if (hdr.msg_type == OC_MSG_CALL_START) {
+            /* A new call (CALLS.md §1): its row is made by the writer, which
+             * checks that the starter may read the conversation it is started
+             * from, if any, and which of the people named may be asked; the
+             * starter joins it when the answer comes back. */
             uint64_t uids[OC_MAX_CALL_INVITES];
-            oc_job *j;
-            if (hdr.msg_type == OC_MSG_CALL_JOIN) {
-                oc_call_join cj;
-                if (oc_decode_call_join(&p, &cj, uids, OC_MAX_CALL_INVITES) != OC_OK) return -1;
-                if (!demo_ok(OC_DL_CALL, c->user_id)) {
-                    if (demo_refuse(c, NULL, 0, OC_DL_CALL) != 0) return -1;
-                    continue;
-                }
-                if (!(j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id))) return -1;
-                j->call_op = OC_CALL_OP_JOIN;
-                j->channel_id = cj.channel_id;
-                j->gen = ++c->call_gen;
-                c->call_join_ch = cj.channel_id;
-                memcpy(j->call_key, cj.device_key, OC_CALL_DEVICE_KEY_LEN);
-                j->call_codecs = cj.codecs;
-                j->n_call_uids = cj.n_invite;
-            } else {
-                oc_call_invite ci;
-                if (oc_decode_call_invite(&p, &ci, uids, OC_MAX_CALL_INVITES) != OC_OK) return -1;
-                if (!(j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id))) return -1;
-                j->call_op = OC_CALL_OP_INVITE;
-                j->channel_id = ci.channel_id;
-                j->n_call_uids = ci.count;
+            oc_call_start cs;
+            if (oc_decode_call_start(&p, &cs, uids, OC_MAX_CALL_INVITES) != OC_OK) return -1;
+            c->call_gen++;   /* overtakes any start still out */
+            if (!call_subject_ok(cs.subject)) {
+                send_call_error(ep, c, OC_ERR_CALL_SUBJECT, "a call needs a subject");
+                continue;
             }
+            if (!g_relay) { send_call_error(ep, c, OC_ERR_CALL_UNAVAILABLE, "calls are unavailable"); continue; }
+            if (!call_slots_free()) { send_call_error(ep, c, OC_ERR_CALL_UNAVAILABLE, "too many calls"); continue; }
+            if (!demo_ok(OC_DL_CALL, c->user_id)) {
+                if (demo_refuse(c, NULL, 0, OC_DL_CALL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_CALL_START, c->conn_id);
+            if (!j) return -1;
             j->user_id = c->user_id;
+            j->channel_id = cs.from_channel;
+            j->gen = c->call_gen;
+            memcpy(j->call_key, cs.device_key, OC_CALL_DEVICE_KEY_LEN);
+            j->call_codecs = cs.codecs;
+            j->call_subject = malloc(cs.subject.len + 1);
+            if (!j->call_subject) { oc_job_free(j); return -1; }
+            memcpy(j->call_subject, cs.subject.ptr, cs.subject.len);
+            j->call_subject[cs.subject.len] = '\0';
+            /* No more than fit beside the starter, in the order given. */
+            uint16_t room = (uint16_t)(oc_config_get()->call_max > 1 ? oc_config_get()->call_max - 1 : 0);
+            j->n_call_uids = cs.n_invite < room ? cs.n_invite : room;
             if (j->n_call_uids) {
                 j->call_uids = malloc(j->n_call_uids * sizeof *j->call_uids);
                 if (!j->call_uids) j->n_call_uids = 0;
@@ -4564,23 +4908,147 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
-        if (hdr.msg_type == OC_MSG_CALL_LEAVE) {
-            /* Leave THIS conversation's call; a leave naming another is a no-op,
-             * so a late leave cannot take someone out of the call they moved to. */
-            oc_call_leave cl;
-            if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
-            if (c->call_join_ch == cl.channel_id) { c->call_gen++; c->call_join_ch = 0; }   /* a join still out is void */
+        if (hdr.msg_type == OC_MSG_CALL_JOIN) {
+            /* Join a call (CALLS.md §1): only its invitees may. */
+            oc_call_join cj;
+            if (oc_decode_call_join(&p, &cj) != OC_OK) return -1;
+            c->call_gen++;   /* a start still out is overtaken */
+            call_t *cc = call_find(cj.call_id);
+            if (!cc) { send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "no such call"); continue; }
+            if (!call_audience(cc, c->user_id)) {
+                send_call_error(ep, c, OC_ERR_NOT_A_MEMBER, "not invited to this call");
+                continue;
+            }
+            if (!g_relay) { send_call_error(ep, c, OC_ERR_CALL_UNAVAILABLE, "calls are unavailable"); continue; }
+            if (!demo_ok(OC_DL_CALL, c->user_id)) {
+                if (demo_refuse(c, NULL, 0, OC_DL_CALL) != 0) return -1;
+                continue;
+            }
+            call_join_conn(ep, conns, cc, c, cj.device_key, cj.codecs);   /* a call send never closes c */
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_INVITE) {
+            /* A participant asks more people (REQ-302): the writer says which of
+             * them may be asked, and the call changes when the answer comes. */
+            uint64_t uids[OC_MAX_CALL_INVITES];
+            oc_call_invite ci;
+            if (oc_decode_call_invite(&p, &ci, uids, OC_MAX_CALL_INVITES) != OC_OK) return -1;
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
-            if (cc && cc->channel_id == cl.channel_id) call_drop(ep, conns, cc, idx);
+            if (!cc || cc->call_id != ci.call_id) { send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call"); continue; }
+            if (!ci.count) continue;
+            oc_job *j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id);
+            if (!j) return -1;
+            j->call_op = OC_CALL_OP_INVITE;
+            j->call_id = ci.call_id;
+            j->user_id = c->user_id;
+            j->call_uids = malloc(ci.count * sizeof *j->call_uids);
+            if (!j->call_uids) { oc_job_free(j); return -1; }
+            memcpy(j->call_uids, uids, ci.count * sizeof *j->call_uids);
+            j->n_call_uids = ci.count;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_SUBJECT) {
+            /* Anyone in the call may rename it; the rename is on its timeline. */
+            oc_call_subject su;
+            if (oc_decode_call_subject(&p, &su) != OC_OK) return -1;
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (!cc || cc->call_id != su.call_id) { send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call"); continue; }
+            if (!call_subject_ok(su.subject)) { send_call_error(ep, c, OC_ERR_CALL_SUBJECT, "a call needs a subject"); continue; }
+            memcpy(cc->subject, su.subject.ptr, su.subject.len);
+            cc->subject[su.subject.len] = '\0';
+            oc_job *j = g_call_dbw ? oc_job_new(OC_JOB_CALL_LOG, 0) : NULL;
+            if (j) {
+                j->call_id = cc->call_id;
+                j->call_log = OC_CALL_LOG_SUBJECT;
+                j->user_id = c->user_id;
+                j->call_subject = strdup(cc->subject);
+                oc_dbwriter_submit(g_call_dbw, j);
+            }
+            call_send_state(ep, conns, cc, 0);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_RECORD) {
+            /* Anyone in the call may start or stop recording it (CALLS.md §8),
+             * where recording is offered; everyone in it is told. */
+            oc_call_record rc;
+            if (oc_decode_call_record(&p, &rc) != OC_OK) return -1;
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (!cc || cc->call_id != rc.call_id) { send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call"); continue; }
+            if (!rc.on) { call_rec_stop(ep, conns, cc, c->user_id, 1); continue; }
+            if (cc->rec || cc->rec_pending) continue;
+            if (!recording_offered()) {
+                send_call_error(ep, c, OC_ERR_RECORDING_UNAVAILABLE, "recording is unavailable");
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_RECORDING_START, c->conn_id);
+            if (!j) return -1;
+            char base[1100];
+            recordings_dir(base, sizeof base);
+            j->call_id = cc->call_id;
+            j->user_id = c->user_id;
+            j->call_spool = strdup(base);
+            j->call_cap_bytes = oc_config_get()->call_recording.max_mb * 1024u * 1024u;
+            cc->rec_pending = 1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_HISTORY || hdr.msg_type == OC_MSG_CALL_DETAIL) {
+            /* Calls home's history and a call's page (CALLS.md §1): the reader
+             * answers, to this user's calls only. */
+            oc_job *j;
+            if (hdr.msg_type == OC_MSG_CALL_HISTORY) {
+                oc_call_history ch;
+                if (oc_decode_call_history(&p, &ch) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_CALL_HISTORY, c->conn_id))) return -1;
+                j->call_before_ms = ch.before_ms;
+                j->call_limit = ch.limit;
+            } else {
+                oc_call_detail cd;
+                if (oc_decode_call_detail(&p, &cd) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_CALL_DETAIL, c->conn_id))) return -1;
+                j->call_id = cd.call_id;
+                j->call_line_from = cd.line_from;
+            }
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_DELETE) {
+            /* A transcript (an admin's) or a recording (its starter's, or an
+             * admin's) deleted; the writer checks who may. */
+            oc_call_delete cd;
+            if (oc_decode_call_delete(&p, &cd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CALL_DELETE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->call_id = cd.call_id;
+            j->call_del_what = cd.what;
+            j->call_del_id = cd.id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_LEAVE) {
+            /* Leave THIS call; a leave naming another is a no-op, so a late leave
+             * cannot take someone out of the call they moved to. */
+            oc_call_leave cl;
+            if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
+            c->call_gen++;   /* a start still out is void */
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (cc && cc->call_id == cl.call_id) call_drop(ep, conns, cc, idx);
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_DECLINE) {
             oc_call_decline cd;
             if (oc_decode_call_decline(&p, &cd) != OC_OK) return -1;
-            call_t *cc = call_find(cd.channel_id);
+            call_t *cc = call_find(cd.call_id);
             if (cc && call_invited(cc, c->user_id) >= 0) {
                 call_uninvite(cc, c->user_id);
+                call_log(cc, OC_CALL_LOG_DECLINE, c->user_id);
                 call_send_state(ep, conns, cc, 0);
             }
             continue;
@@ -4589,11 +5057,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             /* The starter ends it for everyone (REQ-301); nobody else may. */
             oc_call_end ce;
             if (oc_decode_call_end(&p, &ce) != OC_OK) return -1;
-            call_t *cc = call_find(ce.channel_id);
-            if (!cc) send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "no call here");
+            call_t *cc = call_find(ce.call_id);
+            if (!cc || !call_audience(cc, c->user_id)) send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "no call here");
             else if (cc->starter != c->user_id) send_call_error(ep, c, OC_ERR_NOT_CALL_STARTER,
                                                                 "only the starter can end the call");
-            else call_finish(ep, conns, cc);
+            else call_finish(ep, conns, cc, OC_CALL_END_ENDED);
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_MEDIA) {
@@ -4614,7 +5082,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_call_camera(&p, &cam) != OC_OK) return -1;
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
-            if (!cc || cc->channel_id != cam.channel_id) {
+            if (!cc || cc->call_id != cam.call_id) {
                 send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
                 continue;
             }
@@ -4622,6 +5090,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (g_relay) oc_relay_set_camera(g_relay, c->conn_id, on);
             if (cc->parts[idx].camera != on) {
                 cc->parts[idx].camera = on;
+                call_log_event(cc, on ? OC_CALL_EV_CAMERA_ON : OC_CALL_EV_CAMERA_OFF, c->user_id);
+                if (cc->rec) oc_callrec_camera(cc->rec, c->user_id, on, wall_ms());
                 call_send_roster(ep, conns, cc, 0, 0);
             }
             continue;
@@ -4634,7 +5104,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_call_video_sub(&p, &vs, who, OC_MAX_CALL_PARTICIPANTS) != OC_OK) return -1;
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
-            if (!cc || cc->channel_id != vs.channel_id) {
+            if (!cc || cc->call_id != vs.call_id) {
                 send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
                 continue;
             }
@@ -4649,14 +5119,21 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_call_share(&p, &sh) != OC_OK) return -1;
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
-            if (!cc || cc->channel_id != sh.channel_id) {
+            if (!cc || cc->call_id != sh.call_id) {
                 send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
                 continue;
             }
             uint64_t was = cc->sharer_conn;
             if (sh.on) cc->sharer_conn = c->conn_id;
             else if (cc->sharer_conn == c->conn_id) cc->sharer_conn = 0;
-            if (cc->sharer_conn != was) call_send_state(ep, conns, cc, 0);
+            if (cc->sharer_conn != was) {
+                if (was) {
+                    for (int k = 0; k < cc->n; k++)
+                        if (cc->parts[k].conn_id == was) call_log_event(cc, OC_CALL_EV_SHARE_OFF, cc->parts[k].user_id);
+                }
+                if (cc->sharer_conn) call_log_event(cc, OC_CALL_EV_SHARE_ON, c->user_id);
+                call_send_state(ep, conns, cc, 0);
+            }
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_KEY) {
@@ -4669,11 +5146,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_call_key(&p, &ck, ents, OC_MAX_CALL_PARTICIPANTS) != OC_OK) return -1;
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
-            if (!cc || cc->channel_id != ck.channel_id) {
+            if (!cc || cc->call_id != ck.call_id) {
                 send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
                 continue;
             }
-            if (ck.call_id != cc->call_id || ck.epoch != cc->epoch) continue;
+            if (ck.epoch != cc->epoch) continue;
             uint64_t sender = c->user_id;
             uint64_t to_conn[OC_MAX_CALL_PARTICIPANTS];
             oc_call_key_for kf[OC_MAX_CALL_PARTICIPANTS];
@@ -4681,8 +5158,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             for (uint16_t i = 0; i < ck.count; i++) {
                 int r = call_part_of_user(cc, ents[i].recipient);
                 if (r < 0 || ents[i].recipient == sender || ents[i].sealed.len != OC_CALL_SEALED_LEN) continue;
+                if (cc->parts[r].recorder) {   /* sealed to the Recorder: opened here, by it alone */
+                    if (cc->rec) oc_callrec_key(cc->rec, sender, ck.epoch, ents[i].sealed.ptr, ents[i].sealed.len);
+                    continue;
+                }
                 to_conn[nk] = cc->parts[r].conn_id;
-                kf[nk] = (oc_call_key_for){ cc->channel_id, cc->call_id, cc->epoch, sender, ents[i].sealed };
+                kf[nk] = (oc_call_key_for){ cc->call_id, cc->epoch, sender, ents[i].sealed };
                 nk++;
             }
             for (int i = 0; i < nk; i++) {
@@ -6809,6 +7290,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                 caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS);
                 caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS_TCP);
             }
+            /* Recording calls, where it is offered (CALLS.md §8). */
+            if (recording_offered()) caps.names[caps.count++] = oc_slice_str(OC_CAP_CALL_RECORDING);
             caps.names[caps.count++] = oc_slice_str(OC_CAP_PDM);
             /* The export of a video message, when built in and turned on (ARCH-135). */
             if (g_export) caps.names[caps.count++] = oc_slice_str(OC_CAP_H264_EXPORT);
@@ -6918,12 +7401,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         }
         if (!conns[fd]) break;
 
-        /* The calls there are, as the Calls section lists them (REQ-303): one
-         * CALL_STATE for each this user may hear about. */
+        /* The calls running that this user was asked to, as Calls home lists
+         * them (CALLS.md §1): one CALL_STATE each. */
         for (int i = 0; i < OC_MAX_CALLS && conns[fd]; i++) {
             const call_t *cl = &g_calls[i];
-            if (!cl->channel_id || !call_audience(cl, uid)) continue;
-            uint8_t cbuf[1024];
+            if (!cl->call_id || !call_audience(cl, uid)) continue;
+            uint8_t cbuf[1536];
             size_t clen = call_encode_state(cl, 0, cbuf, sizeof cbuf);
             if (clen) send_bytes(ep, conns, fd, cbuf, clen);
         }
@@ -7008,7 +7491,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0 };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
             broadcast_set_attach(&b, r->attach, r->n_attach);
             b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
@@ -7100,7 +7583,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_RESTORE_OK: {
         /* Back for every member: the message whole, replacing its tombstone. */
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0 };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
@@ -7951,6 +8434,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[i].snippet.len = r->search[i].body_len;
             ents[i].action = r->search[i].action;   /* REQ-058 */
             ents[i].rank = r->search[i].rank;
+            ents[i].call_id = r->search[i].call_line ? r->search[i].call_id : 0;   /* a transcript's line */
+            ents[i].line_id = r->search[i].call_line;
         }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         /* A result that is a to-do list carries its state, ahead of the
@@ -8484,7 +8969,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* Fan the posted message out to connected members (like SEND_OK)... */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0 };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
         b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
@@ -9090,144 +9575,158 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
     case OC_RES_CALL_AUTH: {
+        /* More people asked (REQ-302), by someone in the call, within the cap. */
         conn *jc = find_by_id(conns, r->conn_id);
         if (!jc || !jc->authed) break;
-        if (r->call_op == OC_CALL_OP_INVITE) {
-            /* More people asked (REQ-302), by someone in the call, within the cap. */
-            int idx;
-            call_t *c = call_of_conn(jc->conn_id, &idx);
-            if (!c || c->channel_id != r->channel_id) {
-                send_call_error(ep, jc, OC_ERR_NOT_IN_CALL, "not in this call");
-                break;
-            }
-            call_take_members(c, r);
-            uint64_t added[OC_MAX_CALL_INVITES];
-            int na = call_add_invites(c, r->call_uids, r->n_call_uids, added);
-            if (na < 0) { send_call_error(ep, jc, OC_ERR_CALL_FULL, "the call is full"); break; }
-            if (na == 0) break;
-            call_send_state(ep, conns, c, 0);
-            call_push_invites(c, added, na, jc->user_id);
-            break;
-        }
-        if (r->gen != jc->call_gen) break;   /* left, or joined elsewhere, before this was answered */
-        if (!g_relay) {
-            /* No media endpoint: say so, rather than hand the joiner a UDP port
-             * that nothing is listening on. */
-            send_call_error(ep, jc, OC_ERR_CALL_UNAVAILABLE, "calls are unavailable");
-            break;
-        }
-        /* One call per connection (CALLS.md §1): joining another leaves the one
-         * it was in. A connection rejoining the same call is taken out and put
-         * back, with a fresh token and slot, which is how a client whose address
-         * changed gets relayed again (AUDIO.md §4). */
         int idx;
-        call_t *prev = call_of_conn(jc->conn_id, &idx);
-        if (prev && prev->channel_id == r->channel_id) {
-            /* The same call: out and straight back in below, so a rejoin by the
-             * only one in it does not end the call (or write it as missed). */
-            audio_revoke(prev->parts[idx].token);
-            call_remove_part(prev, idx);
-        } else if (prev) {
-            call_drop(ep, conns, prev, idx);
-        }
-        jc = find_by_id(conns, r->conn_id);
-        if (!jc) {
-            call_t *left = call_find(r->channel_id);
-            if (left && left->n == 0) call_finish(ep, conns, left);
+        call_t *c = call_of_conn(jc->conn_id, &idx);
+        if (!c || c->call_id != r->call_id) {
+            send_call_error(ep, jc, OC_ERR_NOT_IN_CALL, "not in this call");
             break;
         }
-
-        call_t *c = call_find(r->channel_id);
-        int starting = !c;
-        uint64_t moved_from = 0;
-        if (c) {
-            /* The same user on another device moves here (one device per user
-             * per call); that device is told by a roster without it. */
-            int k = call_part_of_user(c, jc->user_id);
-            if (k >= 0) {
-                moved_from = c->parts[k].conn_id;   /* 0 for a held seat: nobody to tell */
-                audio_revoke(c->parts[k].token);
-                call_remove_part(c, k);
-            }
-            if (c->n >= oc_config_get()->call_max) {
-                send_call_error(ep, jc, OC_ERR_CALL_FULL, "the call is full");
-                if (moved_from) { c->epoch++; call_send_roster(ep, conns, c, 0, moved_from); call_send_state(ep, conns, c, 0); }
-                break;
-            }
-        } else if (!(c = call_new(r->channel_id, jc->user_id))) {
-            send_call_error(ep, jc, OC_ERR_CALL_UNAVAILABLE, "too many calls");
-            break;
-        }
-        call_take_members(c, r);
-        uint8_t token[OC_AUDIO_TOKEN_MAX];
-        const oc_config *acfg = oc_config_get();
-        memcpy(token, acfg->audio_token_prefix, acfg->audio_token_prefix_len);
-        if (oc_rand_bytes(token + acfg->audio_token_prefix_len, OC_AUDIO_TOKEN_RAND) != 0) {
-            if (starting) { c->channel_id = 0; free(c->members); c->members = NULL; }
-            else if (c->n == 0) call_finish(ep, conns, c);
-            send_call_error(ep, jc, OC_ERR_INTERNAL, "no randomness");
-            break;
-        }
-        call_part *pt = &c->parts[c->n];
-        memset(pt, 0, sizeof *pt);
-        pt->user_id = jc->user_id;
-        pt->conn_id = jc->conn_id;
-        pt->slot = call_free_slot(c);
-        memcpy(pt->token, token, audio_token_len());
-        memcpy(pt->device_key, r->call_key, OC_CALL_DEVICE_KEY_LEN);
-        pt->codecs = r->call_codecs;
-        c->n++;
-        c->epoch++;
-        call_uninvite(c, jc->user_id);
-        if (jc->user_id != c->starter) c->others_joined = 1;
-        /* A start names who it invites (REQ-301); joining a call already there
-         * names nobody, and anything named is ignored. */
         uint64_t added[OC_MAX_CALL_INVITES];
-        int na = 0;
-        if (starting && r->n_call_uids) {
-            na = call_add_invites(c, r->call_uids, r->n_call_uids, added);
-            if (na < 0) {
-                /* More than fit: the first that fit, in the order given -- the
-                 * client already cut the list to the cap, so this is a daemon
-                 * with a smaller cap than the client believed. */
-                size_t fit = (size_t)(oc_config_get()->call_max - c->n);
-                na = call_add_invites(c, r->call_uids, fit < r->n_call_uids ? fit : r->n_call_uids, added);
-                if (na < 0) na = 0;
-            }
+        int na = call_add_invites(c, r->call_uids, r->n_call_uids, added);
+        if (na < 0) { send_call_error(ep, jc, OC_ERR_CALL_FULL, "the call is full"); break; }
+        if (na == 0) break;
+        oc_job *lj = g_call_dbw ? oc_job_new(OC_JOB_CALL_LOG, 0) : NULL;
+        if (lj) {
+            lj->call_id = c->call_id;
+            lj->call_log = OC_CALL_LOG_INVITE;
+            lj->user_id = jc->user_id;
+            lj->call_uids = malloc((size_t)na * sizeof *lj->call_uids);
+            if (lj->call_uids) { memcpy(lj->call_uids, added, (size_t)na * sizeof *added); lj->n_call_uids = (uint16_t)na; }
+            oc_dbwriter_submit(g_call_dbw, lj);
         }
-        /* Register the participant + token with the relay (ARCH-31). */
-        audio_authorize(c->call_id, pt->user_id, pt->conn_id, token);
-        oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
-        call_fill_parts(c, parts);
-        oc_call_joined jd = { c->channel_id, c->call_id, audio_advertised_port(), { token, audio_token_len() },
-                              pt->slot, c->epoch, c->starter, c->started_at, (uint16_t)c->n, parts };
-        uint8_t buf[2048];
-        oc_wbuf jw; oc_wbuf_init(&jw, buf, sizeof buf);
-        if (oc_encode_call_joined(&jw, OC_PROTOCOL_VERSION, &jd) == OC_OK) call_send(ep, jc, buf, jw.len);
-        call_send_roster(ep, conns, c, jc->conn_id, moved_from);
         call_send_state(ep, conns, c, 0);
-        if (na > 0) call_push_invites(c, added, na, c->starter);
+        call_push_invites(c, added, na, jc->user_id);
+        break;
+    }
+    case OC_RES_CALL_STARTED: {
+        /* A call's row is made (CALLS.md §1). The message it leaves in the
+         * conversation it was started from goes to that conversation as any
+         * message does, notifying nobody; then the call is held here and its
+         * starter put in it -- unless the starter went, or started or joined
+         * something else, meanwhile: then nobody is in it and it ends at once. */
+        if (r->message_id) {
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_slice body = { r->body, r->body_len };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_CALL,
+                               body, 0, {{0}}, {0}, 0, 0, r->call_id };
+            oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+            size_t blen = w.len;
+            fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+            fanout_actions(ep, conns, r);   /* "not an action", as every live message is answered (ARCH-115) */
+        }
+        conn *jc = find_by_id(conns, r->conn_id);
+        call_t *c = NULL;
+        if (jc && jc->authed && r->gen == jc->call_gen && g_relay)
+            c = call_new(r->call_id, r->user_id, r->server_time, "", r->channel_id);
+        if (!c) {
+            if (g_call_dbw) {
+                oc_job *ej = oc_job_new(OC_JOB_CALL_LOG, 0);
+                if (ej) { ej->call_id = r->call_id; ej->call_log = OC_CALL_LOG_END; ej->call_reason = OC_CALL_END_LEFT;
+                          oc_dbwriter_submit(g_call_dbw, ej); }
+            }
+            if (jc && jc->authed && r->gen == jc->call_gen)
+                send_call_error(ep, jc, OC_ERR_CALL_UNAVAILABLE, g_relay ? "too many calls" : "calls are unavailable");
+            break;
+        }
+        if (r->call_subject) snprintf(c->subject, sizeof c->subject, "%s", r->call_subject);
+        c->chat_channel = r->call_chat;
+        call_add_invitee(c, r->user_id);
+        uint64_t added[OC_MAX_CALL_INVITES];
+        int na = r->n_call_uids ? call_add_invites(c, r->call_uids, r->n_call_uids, added) : 0;
+        if (na < 0) na = 0;   /* the writer took no more than fit beside the starter */
+        call_join_conn(ep, conns, c, jc, r->call_key, r->call_codecs);
+        c = call_find(r->call_id);
+        if (c && na > 0) call_push_invites(c, added, na, r->user_id);
         break;
     }
     case OC_RES_CALL_ERR: {
+        if (r->err_code == OC_ERR_RECORDING_UNAVAILABLE) {   /* the recordings' space is used up */
+            call_t *rc = call_find(r->call_id);
+            if (rc) rc->rec_pending = 0;
+        }
         conn *jc = find_by_id(conns, r->conn_id);
         if (!jc) break;
-        send_call_error(ep, jc, r->err_code, "call join denied");
+        if (r->gen && r->gen != jc->call_gen) break;   /* a start overtaken: nobody is waiting */
+        send_call_error(ep, jc, r->err_code, r->err_code == OC_ERR_CALL_SUBJECT ? "a call needs a subject"
+                                           : r->err_code == OC_ERR_RECORDING_UNAVAILABLE ? "recording is unavailable"
+                                           : r->err_code == OC_ERR_NOT_A_MEMBER ? "not invited to this call"
+                                                                                : "call refused");
         break;
     }
-    case OC_RES_CALL_EVENT: {
-        /* A missed call (REQ-304), fanned out as any message is -- to the
-         * conversation's connected members -- with its kind. It notifies nobody:
-         * the invitation already did. */
-        if (r->err_code) break;
+    case OC_RES_RECORDING_STARTED: {
+        /* The recording's row is made: the Recorder joins, if the call still
+         * wants it; otherwise the row is closed as stopped, with nothing in it. */
+        call_t *c = call_find(r->call_id);
+        if (c && c->rec_pending && !c->rec) {
+            call_rec_begin(ep, conns, c, r->rec_id, r->user_id);
+        } else if (g_call_dbw) {
+            oc_job *j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
+            if (j) { j->rec_id = r->rec_id; oc_dbwriter_submit(g_call_dbw, j); }
+        }
+        break;
+    }
+    case OC_RES_RECORDINGS_PENDING: {
+        /* Recordings the daemon stopped before making: made now. */
+        for (size_t i = 0; g_callrec && i < r->n_recs; i++)
+            oc_callrec_worker_submit(g_callrec, r->rec_ids[i], r->rec_spools[i]);
+        break;
+    }
+    case OC_RES_RECORDING_DONE: {
+        /* The recording, in the call's chat: its people are sent the message
+         * carrying it, as any message with a file. */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_CALL,
-                           body, 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
+                           body, 0, {{0}}, {0}, 0, 0, 0 };
+        broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
-        fanout_actions(ep, conns, r);   /* "not an action", as every live message is answered (ARCH-115) */
+        fanout_actions(ep, conns, r);
+        break;
+    }
+    case OC_RES_CALL_FRAME: {
+        /* An answer the writer encoded whole: Calls home's history or a call's page. */
+        conn *jc = find_by_id(conns, r->conn_id);
+        if (jc && r->frame) call_send(ep, jc, r->frame, r->frame_len);
+        break;
+    }
+    case OC_RES_CALL_DELETED: {
+        /* Gone from the call's page: every connection of its people is told, the
+         * deleter's too, and a recording's bytes go off-thread. */
+        oc_call_delete cd = { r->call_id, r->call_del_what, r->call_del_id };
+        uint8_t buf[64];
+        oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_call_delete(&w, OC_PROTOCOL_VERSION, OC_MSG_CALL_DELETED, &cd) == OC_OK) {
+            uint64_t gen = ++g_fan_gen;
+            call_send_users(ep, r->members, r->n_members, gen, buf, w.len);
+            conn *dc = find_by_id(conns, r->conn_id);
+            if (dc && dc->fan_gen != gen) call_send(ep, dc, buf, w.len);
+        }
+        for (size_t i = 0; i < r->n_reclaim; i++) {
+            oc_xfer_job *dj = oc_xfer_job_new(OC_XFER_DELETE, 0);
+            if (!dj) break;
+            dj->key = strdup(r->reclaim[i].storage_key ? r->reclaim[i].storage_key : "");
+            dj->attachment_id = r->reclaim[i].attachment_id;
+            if (!dj->key) { oc_xfer_job_free(dj); break; }
+            oc_xferpool_submit(g_xfers, dj);
+        }
+        break;
+    }
+    case OC_RES_CALL_EVENT: {
+        /* A call's message, brought up to date as the call is renamed or ends
+         * (CALLS.md §1): to the conversation's connected members, as an edit
+         * of the daemon's own. */
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_slice body = { r->body, r->body_len };
+        oc_msg_edited m = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
+        oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &m);
+        size_t blen = w.len;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_actions(ep, conns, r);   /* "not an action", as every live message frame is answered (ARCH-115) */
         break;
     }
     case OC_RES_NOTICE: {
@@ -9237,7 +9736,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
-                           body, 0, {{0}}, {0}, r->broadcast_stored, 0 };
+                           body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
@@ -9285,10 +9784,11 @@ static size_t backfill_next(conn *c) {
             if (i >= r->n_replay) { c->bf_phase = BF_PIN; c->bf_i = 0; continue; }
             oc_replay_msg *m = &r->replay[i];
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored, 0 };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored, 0, 0 };
             broadcast_set_attach(&b, m->attach, m->n_attach);
             b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             b.parent_id = m->parent_id;   /* a reply also in the channel, with its thread (REQ-062) */
+            b.call_id = m->call_id;       /* a call message's call (CALLS.md §1) */
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             c->bf_phase = BF_META;
             return w.len;
@@ -9608,7 +10108,28 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     j->maint_batch      = g_spol.batch;
     j->maint_evict      = (pressure && g_spol.evict_enabled);
     j->audit_max_age_ms = g_spol.audit_max_age_ms;
+    j->maint_rec_days   = (uint32_t)oc_config_get()->call_recording.days;   /* CALLS.md §8 */
     oc_dbwriter_submit(dbw, j);
+}
+
+/* Recordings made, or not (CALLS.md §8): written to their rows. */
+static void deliver_callrec_results(oc_dbwriter *dbw) {
+    oc_callrec_result res;
+    while (g_callrec && oc_callrec_worker_next_result(g_callrec, &res)) {
+        oc_job *j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+        if (!j) continue;
+        j->rec_id = res.rec_id;
+        if (res.status == OC_CALLREC_OK) {
+            j->call_spool = strdup(res.key);
+            j->exp_bytes = res.bytes;
+            j->exp_duration_ms = res.duration_ms;
+            memcpy(j->att_sha256, res.sha256, sizeof j->att_sha256);
+        } else {
+            j->rec_failed = 1;
+            oc_job_set_body(j, res.reason, strlen(res.reason));
+        }
+        oc_dbwriter_submit(dbw, j);
+    }
 }
 
 /* An export the worker finished (ARCH-135): record the copy, then start every
@@ -9680,6 +10201,7 @@ static void export_drop_waiters(uint64_t conn_id) {
 /* While a read-aloud rendering runs no export starts (ARCH-135): the two
  * together would not fit in a managed box's memory. */
 static int export_gate(void *ctx) { (void)ctx; return g_tts && oc_tts_worker_rendering(g_tts); }
+
 #endif
 
 #ifdef OC_TTS
@@ -10083,7 +10605,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_calls = calloc(OC_MAX_CALLS, sizeof *g_calls);
     g_pdms = calloc(OC_PDM_MAX, sizeof *g_pdms);
     g_sched_tick_ms = oc_config_get()->sched_tick_ms;
-    g_last_sched_ms = 0; g_sched_more = 0; g_next_conn_id = 1; g_next_call_id = 0;
+    g_last_sched_ms = 0; g_sched_more = 0; g_next_conn_id = 1;
     g_last_maint_ms = 0; g_dnd_dirty = 0;
 #ifdef OC_TTS
     g_tts_waits = NULL;
@@ -10249,6 +10771,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             }
         }
     }
+    /* The recordings' worker (CALLS.md §8), where calls may be recorded here:
+     * it makes each stopped recording from its spool, and those the daemon
+     * stopped in the middle of are given it again now. */
+    g_callrec_fd = -1;
+    callrec_ensure(ep, dbw);
 #ifdef OC_TTS
     g_tts_fresh = NULL;   /* another loop's store is not this one's */
     g_tts_out = NULL; g_n_tts_out = g_cap_tts_out = 0; g_tts_lookup_seq = 0;
@@ -10376,10 +10903,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * leaves calls refused, which is said once, here. */
     g_relay = NULL;
     g_relay_ctx = (relay_ctx){ ep, conns };
+    g_rec_conns = conns; g_rec_ep = ep;   /* the Recorder sends to them (CALLS.md §8) */
     g_loop_udp_port = __atomic_load_n(&g_audio_udp_port, __ATOMIC_RELAXED);
     g_loop_udp = __atomic_exchange_n(&g_audio_udp, -1, __ATOMIC_ACQ_REL);
     if (g_loop_udp >= 0) {
-        oc_relay_hooks rh = { relay_gone, relay_tcp_send };
+        oc_relay_hooks rh = { relay_gone, relay_tcp_send, relay_record };
         g_relay = oc_relay_open(g_loop_udp, &rh, &g_relay_ctx);
         if (g_relay) {
             ev.events = EPOLLIN; ev.data.fd = g_loop_udp;
@@ -10445,6 +10973,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
         pdm_expire(ep, conns);
+        call_recorders_tick();
         if (__atomic_exchange_n(&g_sum_failed_pending, 0, __ATOMIC_ACQ_REL)) {
             oc_job *j = oc_job_new(OC_JOB_SUMMARY_FAIL, 0);
             if (j) oc_dbwriter_submit(dbw, j);
@@ -10498,6 +11027,12 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 #endif
+            if (g_callrec_fd >= 0 && fd == g_callrec_fd) {
+                uint64_t cnt;
+                while (read(g_callrec_fd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                deliver_callrec_results(dbw);
+                continue;
+            }
             if (export_eventfd >= 0 && fd == export_eventfd) {
                 uint64_t cnt;
                 while (read(export_eventfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
@@ -10579,6 +11114,9 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_stt_pend = NULL;
 #endif
     /* Before the store it writes to, like the transfer pool. */
+    oc_callrec_worker_stop(g_callrec);
+    g_callrec = NULL;
+    g_callrec_fd = -1;
     oc_export_worker_stop(g_export);
     g_export = NULL;
     for (export_wait *wt = g_export_waits, *next; wt; wt = next) { next = wt->next; free(wt); }

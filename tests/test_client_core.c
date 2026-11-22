@@ -33,6 +33,11 @@
 #include "blobstore.h"
 #include "oc_call_engine.h"
 #include "oc_capture.h"
+#include "callrec.h"       /* the Recorder's spool and its counts (CALLS.md §8) */
+#include "callrec_render.h" /* the stand-in codecs it is made with */
+#include "oc_vp9dec.h"
+#include "oc_opusdec.h"
+#include <sqlite3.h>
 #include "audio.h"        /* the relay, run on a thread for the call test */
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
@@ -1138,6 +1143,7 @@ static int csum_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
 static int csum_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
 static uint64_t csum_now(void *c) { (void)c; static uint64_t t; t += SUM_LOAD_SAMPLE_MS; return t; }
 static oc_dbwriter *g_csum_dbw;
+static oc_dbwriter *g_core_dbw;   /* the call tests' daemon's, to store a transcript as the daemon does */
 static int csum_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
     (void)ctx;
     return oc_dbwriter_sum_store(g_csum_dbw, a, nodes, n);
@@ -4335,7 +4341,7 @@ static double heard(tone_io *t, int k) {
 #define CALL_WAIT(ms, cond) \
     WAIT_UNTIL_DO(({ oc_client_tick(a); oc_client_tick(b); if (c) oc_client_tick(c); }), (cond), (ms))
 
-static int calls_in(const oc_model *m, uint64_t ch) { return oc_model_call_in(m, ch) != NULL; }
+static int calls_in(const oc_model *m, uint64_t call_id) { return oc_model_call(m, call_id) != NULL; }
 
 /* The newest frame of a share on `e`, and whether the synthetic screen's frame
  * numbers in what arrived kept rising. */
@@ -4387,7 +4393,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
     oc_call_engine_stats(ea, &st);
     CHECK(st.share_state == 1);                               /* waiting for the daemon */
-    oc_client_call_share(a, 1, 1);
+    oc_client_call_share(a, ma->call.call_id, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
     /* Ten frames, with no gap of six seconds. This once counted ten frames
@@ -4432,7 +4438,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
 
     /* faye joins late: a keyframe comes for her. */
     uint64_t joined = mono_ms();
-    oc_client_call_join(c, 1);
+    oc_client_call_join(c, ma->call.call_id);
     CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
     CHECK(share_frames(a, b, c, ec, &wc, 1, 6000));
     printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
@@ -4443,7 +4449,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
 
     /* erik takes over: dana's share stops, and dana sees erik's. */
     CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);
-    oc_client_call_share(b, 1, 1);
+    oc_client_call_share(b, ma->call.call_id, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
     CHECK(share_frames(a, b, c, ea, &wa, 5, 6000));
@@ -4451,13 +4457,13 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
 
     /* erik stops: nobody shares, and the picture goes. */
     oc_call_engine_share_stop(eb);
-    oc_client_call_share(b, 1, 0);
+    oc_client_call_share(b, ma->call.call_id, 0);
     CHECK(CALL_WAIT(3000, ma->call.sharer == 0 && mb->call.sharer == 0 && mc->call.sharer == 0));
     CHECK(CALL_WAIT(3000, ({ watch(ea, &wa); wa.gone; })));
     oc_call_engine_stats(eb, &st);
     CHECK(st.share_state == 0 && st.sharer == 0);
 
-    oc_client_call_leave(c, 1);
+    oc_client_call_leave(c, ma->call.call_id);
     CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
     oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&wc.f);
     unsetenv("OPENCHIME_DEV_CAPTURE");
@@ -4524,7 +4530,7 @@ static void test_camera_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_c
     CHECK(cam_frames(a, b, ea, ua, &self, 3, 3000) && self.f.width == 640 && self.f.height == 480);
     oc_call_engine_stats(ea, &st);
     CHECK(st.camera_state == 1 && st.camera_frames == 0);
-    oc_client_call_camera(a, 1, 1);
+    oc_client_call_camera(a, ma->call.call_id, 1);
     CHECK(CALL_WAIT(3000, cam_flag(ma, ua) && cam_flag(mb, ua)));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.camera_state == 2; })));
 
@@ -4532,7 +4538,7 @@ static void test_camera_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_c
     CHECK(cam_frames(a, b, eb, ua, &wb, 15, 6000));
     CHECK(wb.f.width == 640 && wb.f.height == 480 && wb.rising && wb.bad == 0);
     CHECK(oc_call_engine_camera_start(eb, "synthetic", 640, 480, 30) == 0);
-    oc_client_call_camera(b, 1, 1);
+    oc_client_call_camera(b, ma->call.call_id, 1);
     CHECK(CALL_WAIT(3000, cam_flag(ma, ub)));
     CHECK(cam_frames(a, b, ea, ub, &wa, 10, 6000));
     CHECK(wa.rising && wa.bad == 0);
@@ -4552,18 +4558,18 @@ static void test_camera_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_c
 
     /* dana shares her screen with her camera on: erik has both. */
     CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
-    oc_client_call_share(a, 1, 1);
+    oc_client_call_share(a, ma->call.call_id, 1);
     CHECK(CALL_WAIT(3000, mb->call.sharer == ua));
     CHECK(share_frames(a, b, c, eb, &ws, 5, 6000) && ws.f.width == 1280 && ws.rising && ws.bad == 0);
     int had = wb.frames;
     CHECK(cam_frames(a, b, eb, ua, &wb, had + 10, 6000) && wb.rising && wb.bad == 0);
     oc_call_engine_share_stop(ea);
-    oc_client_call_share(a, 1, 0);
+    oc_client_call_share(a, ma->call.call_id, 0);
     CHECK(CALL_WAIT(3000, mb->call.sharer == 0));
 
     /* erik takes nobody's camera: hers stops coming, her voice does not. */
     oc_call_engine_camera_subscribe(eb, 0, NULL, 0);
-    oc_client_call_video_sub(b, 1, 0, NULL, 0);
+    oc_client_call_video_sub(b, ma->call.call_id, 0, NULL, 0);
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(eb, &sb); pd = peer_stats(&sb, ua); pd && !pd->camera_subscribed; })));
     uint64_t settle = mono_ms() + 1000;
     CALL_WAIT(1500, mono_ms() >= settle);                     /* what was on its way has landed */
@@ -4595,20 +4601,20 @@ static void test_camera_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_c
     __atomic_store_n(&g_tap.relabel, 0, __ATOMIC_RELEASE);
     /* ...and back to every camera: hers comes again. */
     oc_call_engine_camera_subscribe(eb, 1, NULL, 0);
-    oc_client_call_video_sub(b, 1, 1, NULL, 0);
+    oc_client_call_video_sub(b, ma->call.call_id, 1, NULL, 0);
     had = wb.frames;
     CHECK(cam_frames(a, b, eb, ua, &wb, had + 5, 6000));
 
     /* dana turns hers off: the roster says so, and erik's picture of her goes. */
     oc_call_engine_camera_stop(ea);
-    oc_client_call_camera(a, 1, 0);
+    oc_client_call_camera(a, ma->call.call_id, 0);
     CHECK(CALL_WAIT(3000, !cam_flag(mb, ua)));
     CHECK(CALL_WAIT(3000, ({ cam_watch(eb, ua, &wb); wb.gone; })));
     CHECK(CALL_WAIT(3000, ({ cam_watch(ea, ua, &self); self.gone; })));   /* and her preview */
     oc_call_engine_stats(ea, &st);
     CHECK(st.camera_state == 0);
     oc_call_engine_camera_stop(eb);
-    oc_client_call_camera(b, 1, 0);
+    oc_client_call_camera(b, ma->call.call_id, 0);
     CHECK(CALL_WAIT(3000, !cam_flag(ma, ub)));
     oc_frame_free(&self.f); oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&ws.f);
     unsetenv("OPENCHIME_DEV_CAPTURE");
@@ -4749,6 +4755,309 @@ static void test_pdm_e2e(oc_client *a, oc_client *b) {
     if (pdm_of(mb, ua)) oc_model_pdm_forget((oc_model *)mb, pdm_of(mb, ua)->id);
 }
 
+/* A spool file, whole, into a heap buffer; NULL if there is none. */
+static uint8_t *spool_read(const char *dir, const char *name, size_t *len) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = n > 0 ? malloc((size_t)n) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    fclose(f);
+    *len = b ? (size_t)n : 0;
+    return b;
+}
+static uint32_t sp32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+static size_t spool_bytes(const char *dir, const char *name) {
+    char path[1200]; struct stat sb;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    return stat(path, &sb) == 0 ? (size_t)sb.st_size : 0;
+}
+
+/* A spool's audio for one person (callrec.h): the frames in the order they were
+ * had, each numbered after the one before, decoded to one tone; 1 when they
+ * are, the count at *frames. */
+static int spool_audio_is(const char *dir, uint64_t user, double freq, double other, int *frames) {
+    char name[48]; size_t len = 0;
+    snprintf(name, sizeof name, "audio.%llu", (unsigned long long)user);
+    uint8_t *b = spool_read(dir, name, &len);
+    if (!b) return 0;
+    oc_opusdec *d = oc_opusdec_open_rate(16000);
+    int ok = d != NULL, n = 0, ordered = 1;
+    uint32_t last = 0;
+    double want = 0, not = 0;
+    int16_t pcm[320];
+    for (size_t at = 0; ok && at + 14 <= len; ) {
+        uint32_t frame = sp32(b + at + 8);
+        size_t fl = ((size_t)b[at + 12] << 8) | b[at + 13];
+        if (at + 14 + fl > len) { ok = 0; break; }
+        if (n && frame <= last) ordered = 0;
+        last = frame;
+        int got = oc_opusdec_decode_frame(d, b + at + 14, fl, 0, pcm, 320);
+        if (got == 320) { want += goertzel(pcm, 320, freq); not += goertzel(pcm, 320, other); }
+        n++;
+        at += 14 + fl;
+    }
+    if (d) oc_opusdec_close(d);
+    free(b);
+    *frames = n;
+    return ok && ordered && n > 50 && want > 4 * not;
+}
+
+/* A spool's video (a camera's or the shared screen's): decoded from its first
+ * keyframe, each frame the synthetic picture with its number, the numbers
+ * rising; 1 when they are, the count at *frames. `hdr` is the record's header
+ * length, `len_at` where its length is, `key_at` its keyframe byte. */
+static int spool_video_is(const char *dir, const char *name, size_t hdr, size_t key_at, size_t len_at, int *frames) {
+    size_t len = 0;
+    uint8_t *b = spool_read(dir, name, &len);
+    if (!b) return 0;
+    oc_vp9dec *d = oc_vp9dec_open_threads(1);
+    int ok = d != NULL, n = 0, read = 0, started = 0, last = -1, first = -1, rising = 1;
+    for (size_t at = 0; ok && at + hdr <= len; ) {
+        size_t fl = sp32(b + at + len_at);
+        if (at + hdr + fl > len) { ok = 0; break; }
+        if (!started && b[at + key_at]) started = 1;
+        oc_frame f;
+        if (started && oc_vp9dec_decode(d, b + at + hdr, fl, 0, &f) == 0) {
+            int num = oc_capture_synthetic_frame_number(&f);
+            /* Never backwards: a still screen sends its picture again (CALLS.md §6.5.5). */
+            if (num >= 0) { if (read && num < last) rising = 0; if (!read) first = num; read++; last = num; }
+        }
+        n++;
+        at += hdr + fl;
+    }
+    if (d) oc_vp9dec_close(d);
+    free(b);
+    *frames = read;
+    rising = rising && last > first;   /* and onwards */
+    if (!(ok && started && rising && read >= 5 && read * 10 >= n * 9))
+        printf("  spool %s: %d records, %d readable, whole %d, from a keyframe %d, rising %d\n",
+               name, n, read, ok, started, rising);
+    return ok && started && rising && read >= 5 && read * 10 >= n * 9;
+}
+
+/* Recording the call (CALLS.md §8), through the real daemon and relay with the
+ * tap: erik starts it; the Recorder comes in at a new epoch and every device
+ * seals its key to it. Over a lossy tap it opens every packet of the epochs it
+ * was given and none from before it came, asks again for what it is missing,
+ * and spools what was sent: dana's voice and erik's, erik's camera and dana's
+ * shared screen, each in order, each what its sender encoded. dana stops it. */
+static void test_record_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_call_engine *eb,
+                            tone_io *ta, tone_io *tb) {
+    (void)tb;
+    oc_client *c = NULL;   /* CALL_WAIT ticks the clients there are */
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+    const uint64_t id = ma->call.call_id;
+    oc_call_stats st;
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    oc_netloop_set_callrec(&oc_callrec_stub_codecs);
+    oc_netloop_hold_callrec(1);   /* the spool is read before it is made */
+
+    /* erik's camera and dana's screen, going before the recording starts. */
+    CHECK(oc_call_engine_camera_start(eb, "synthetic", 640, 480, 30) == 0);
+    oc_client_call_camera(b, id, 1);
+    CHECK(CALL_WAIT(3000, cam_flag(ma, ub) && cam_flag(mb, ub)));
+    CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
+    oc_client_call_share(a, id, 1);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
+
+    uint32_t epoch0 = ma->call.epoch;
+    oc_client_call_record(b, id, 1);
+    CHECK(CALL_WAIT(3000, ma->call.recording && mb->call.recording && ma->call.epoch > epoch0));
+    { int rec = 0; for (uint16_t i = 0; i < ma->call.n_parts; i++) if (ma->call.recorder[i]) rec = 1; CHECK(rec); }
+    /* Its spool, found from its row. */
+    char dir[1100] = "";
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *q = NULL;
+        CHECK(sqlite3_open_v2(tpath("itest_core.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        if (sqlite3_prepare_v2(db, "SELECT spool FROM call_recordings ORDER BY id DESC LIMIT 1;", -1, &q, NULL) == SQLITE_OK &&
+            sqlite3_step(q) == SQLITE_ROW)
+            snprintf(dir, sizeof dir, "%s", (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+        sqlite3_close(db);
+    }
+    CHECK(dir[0] != '\0');
+    /* Recorded through 10% loss on the way in, until each stream has some
+     * seconds in the spool. */
+    __atomic_store_n(&g_tap.drop_pm, 100, __ATOMIC_RELEASE);
+    char an[48], bn[48], cn[48];
+    snprintf(an, sizeof an, "audio.%llu", (unsigned long long)ua);
+    snprintf(bn, sizeof bn, "audio.%llu", (unsigned long long)ub);
+    snprintf(cn, sizeof cn, "camera.%llu", (unsigned long long)ub);
+    CHECK(CALL_WAIT(20000, spool_bytes(dir, an) > 16384 && spool_bytes(dir, bn) > 16384 &&
+                           spool_bytes(dir, cn) > 65536 && spool_bytes(dir, "share") > 65536));
+    __atomic_store_n(&g_tap.drop_pm, 0, __ATOMIC_RELEASE);
+    oc_client_call_record(a, id, 0);
+    CHECK(CALL_WAIT(3000, !ma->call.recording && !mb->call.recording));
+
+    /* What the Recorder did: every packet of its epochs opened, none from
+     * before it came, and what was lost asked for again. */
+    oc_callrec_stats rs;
+    oc_callrec_last_stats(&rs);
+    CHECK(rs.call_id == id && rs.first_epoch > epoch0);
+    CHECK(rs.opened > 500 && rs.unopened == 0);
+    CHECK(rs.nacks + rs.plis > 0);
+    printf("  the Recorder: %u packets, %u opened, %u from before it came, %u not; %u NACKs, %u PLIs;"
+           " %u audio, %u camera and %u share frames\n", rs.packets, rs.opened, rs.before, rs.unopened,
+           rs.nacks, rs.plis, rs.audio_frames, rs.camera_frames, rs.share_frames);
+
+    /* The spool: each stream what its sender sent. */
+    int na = 0, nb = 0, nc = 0, ns = 0;
+    CHECK(spool_audio_is(dir, ua, 440, 660, &na));
+    CHECK(spool_audio_is(dir, ub, 660, 440, &nb));
+    CHECK(spool_video_is(dir, cn, 21, 12, 17, &nc));
+    CHECK(spool_video_is(dir, "share", 25, 16, 21, &ns));
+    printf("  the spool: dana's voice %d frames, erik's %d; erik's camera %d frames, dana's screen %d, all readable\n",
+           na, nb, nc, ns);
+
+    /* Made: the recording is a video in the call's chat, carried by a
+     * message from erik, who started it; the spool is gone. */
+    oc_netloop_hold_callrec(0);
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open_v2(tpath("itest_core.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        char q[600];
+        snprintf(q, sizeof q,
+                 "SELECT COUNT(*) FROM call_recordings r JOIN attachments a ON a.id = r.attachment_id"
+                 " JOIN attachment_media m ON m.attachment_id = a.id JOIN messages g ON g.id = a.message_id"
+                 " JOIN channels ch ON ch.id = g.channel_id"
+                 " WHERE r.call_id = %llu AND r.state = 'ready' AND r.spool IS NULL AND r.bytes = a.size"
+                 " AND r.duration_ms > 1000 AND a.mime = 'video/mp4' AND m.width = 1280 AND m.height = 720"
+                 " AND length(a.sha256) = 32"
+                 " AND ch.call_id = r.call_id AND g.author_id = %llu;",
+                 (unsigned long long)id, (unsigned long long)ub);
+        CHECK(WAIT_UNTIL(({
+            sqlite3_stmt *q2 = NULL; int made = 0;
+            if (sqlite3_prepare_v2(db, q, -1, &q2, NULL) == SQLITE_OK && sqlite3_step(q2) == SQLITE_ROW)
+                made = sqlite3_column_int(q2, 0) == 1;
+            sqlite3_finalize(q2);
+            made; }), 10000));
+        sqlite3_close(db);
+        struct stat sb;
+        CHECK(stat(dir, &sb) != 0);
+    }
+    /* ...and dana, in the call, is sent it: the message, with its video. */
+    {
+        char body[OC_CALL_SUBJECT_MAX + 32];
+        snprintf(body, sizeof body, "Recording of %s", ma->call.subject);
+        const uint64_t chat = ma->call.chat_channel;
+        CHECK(chat != 0);
+        CHECK(CALL_WAIT(5000, ({ const oc_msg *g = channel_msg_by_body(ma, chat, body); g && g->n_attach == 1; })));
+    }
+
+    /* The history and the call's page, through the core (CALLS.md §1): the
+     * call listed for erik with its recording; its page has both people, the
+     * recording ready with the video it plays from, and a transcript stored as
+     * the daemon stores one, in two pages of lines. */
+    oc_client_call_history(b, 0);
+    CHECK(CALL_WAIT(5000, ({ int f = 0; for (size_t i = 0; i < mb->n_call_hist; i++)
+                                 if (mb->call_hist[i].call_id == id && (mb->call_hist[i].flags & OC_CALL_HIST_RECORDING) &&
+                                     (mb->call_hist[i].flags & OC_CALL_HIST_JOINED) &&
+                                     !strcmp(mb->call_hist[i].subject, mb->call.subject)) f = 1;
+                             f; })));
+    {
+        oc_transcript_line tl[OC_CALL_PAGE_LINES + 20];
+        static char texts[OC_CALL_PAGE_LINES + 20][24];
+        for (int i = 0; i < (int)OC_CALL_PAGE_LINES + 20; i++) {
+            snprintf(texts[i], sizeof texts[i], "line %d of it", i);
+            tl[i].speaker = i % 2 ? ub : ua; tl[i].start_ms = (uint32_t)i * 1000; tl[i].end_ms = (uint32_t)i * 1000 + 900;
+            tl[i].text = texts[i];
+        }
+        CHECK(oc_dbwriter_call_transcript(g_core_dbw, id, "en", tl, OC_CALL_PAGE_LINES + 20) == 0);
+    }
+    uint32_t seq0 = mb->call_page_seq;
+    oc_client_call_detail(b, id, 0);
+    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && mb->call_page->call_id == id &&
+                          mb->call_page->has_transcript));
+    const oc_call_page_view *pg = mb->call_page;
+    if (pg) {
+        int sa = 0, sb2 = 0;
+        for (uint16_t i = 0; i < pg->n_stays; i++) { if (pg->stays[i].user_id == ua) sa = 1; if (pg->stays[i].user_id == ub) sb2 = 1; }
+        CHECK(sa && sb2);
+        CHECK(pg->n_recordings == 1 && pg->recordings[0].state == OC_CALL_REC_READY && pg->recordings[0].attachment_id &&
+              pg->recordings[0].started_by == ub && pg->recordings[0].duration_ms > 1000);
+        CHECK(pg->n_lines_total == OC_CALL_PAGE_LINES + 20 && pg->n_lines == OC_CALL_PAGE_LINES);
+        CHECK(!strcmp(pg->transcript_lang, "en"));
+        int rec_on = 0;
+        for (uint16_t i = 0; i < pg->n_events; i++) if (pg->events[i].kind == OC_CALL_EV_RECORD_ON && pg->events[i].user_id == ub) rec_on = 1;
+        CHECK(rec_on);
+    }
+    /* The next lines, gathered onto the page held. */
+    seq0 = mb->call_page_seq;
+    oc_client_call_detail(b, id, OC_CALL_PAGE_LINES);
+    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && mb->call_page->n_lines == OC_CALL_PAGE_LINES + 20));
+    if (mb->call_page && mb->call_page->n_lines == OC_CALL_PAGE_LINES + 20)
+        /* contract: the last line comes back as it was stored, after the first page's */
+        CHECK(!strcmp(mb->call_page->lines[OC_CALL_PAGE_LINES + 19].text, "line 219 of it") &&
+              mb->call_page->lines[OC_CALL_PAGE_LINES + 19].speaker == ub);
+    /* dana, an admin, deletes the transcript: gone from erik's page. */
+    seq0 = mb->call_page_seq;
+    oc_client_call_delete(a, id, OC_CALL_DEL_TRANSCRIPT, 0);
+    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && !mb->call_page->has_transcript &&
+                          mb->call_page->n_lines == 0));
+
+    /* The recording gate (CALLS.md §8). Recorded again; erik, already in, is
+     * not held back (his frontend shows the notice). He leaves and comes back:
+     * now he came into a recorded call, and sends nothing until he says he
+     * has seen so -- dana does not hear him -- and then he is heard. */
+    const uint32_t e_rec2 = ma->call.epoch;
+    oc_client_call_record(b, id, 1);
+    CHECK(CALL_WAIT(3000, ma->call.recording && mb->call.recording));
+    oc_call_engine_stats(eb, &st);
+    CHECK(!st.rec_gate);
+    oc_call_engine_stats(ea, &st);
+    CHECK(!st.rec_gate);
+    oc_client_call_leave(b, id);
+    CHECK(CALL_WAIT(3000, !mb->in_call && ma->call.n_parts == 2));   /* dana and the Recorder */
+    oc_client_call_join(b, id);
+    CHECK(CALL_WAIT(3000, mb->in_call && ma->call.n_parts == 3));
+    CHECK(CALL_WAIT(3000, oc_call_engine_recording_gated(eb)));
+    CHECK(CALL_WAIT(4000, heard(ta, 1) < 300));
+    CHECK(CALL_WAIT(2000, ({ oc_call_engine_stats(eb, &st); st.rec_gate && !st.speaking; })));
+    char dir2[1100] = "";
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *q = NULL;
+        CHECK(sqlite3_open_v2(tpath("itest_core.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        if (sqlite3_prepare_v2(db, "SELECT spool FROM call_recordings WHERE state='recording' ORDER BY id DESC LIMIT 1;",
+                               -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+            snprintf(dir2, sizeof dir2, "%s", (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+        sqlite3_close(db);
+    }
+    CHECK(dir2[0] != '\0');
+    CHECK(spool_bytes(dir2, bn) == 0);                  /* nothing of erik's yet */
+    oc_call_engine_ack_recording(eb);
+    CHECK(CALL_WAIT(8000, heard(ta, 1) > 1000));
+    CHECK(CALL_WAIT(8000, spool_bytes(dir2, bn) > 4096)); /* ...and now his voice */
+    oc_client_call_record(a, id, 0);
+    CHECK(CALL_WAIT(3000, !ma->call.recording && !mb->call.recording));
+    {
+        /* What erik sent once he had said so was recorded, and all of it opened. */
+        oc_callrec_stats r2;
+        CHECK(CALL_WAIT(3000, (oc_callrec_last_stats(&r2), r2.first_epoch > e_rec2 && r2.audio_frames > 0)));
+        printf("  the second recording, erik back in it: %u packets, %u opened, %u before, %u not; %u audio frames\n",
+               r2.packets, r2.opened, r2.before, r2.unopened, r2.audio_frames);
+        CHECK(r2.call_id == id && r2.unopened == 0 && r2.audio_frames > 0);
+    }
+
+    oc_client_call_share(a, id, 0);
+    oc_call_engine_share_stop(ea);
+    oc_client_call_camera(b, id, 0);
+    oc_call_engine_camera_stop(eb);
+    CHECK(CALL_WAIT(3000, !cam_flag(ma, ub) && ma->call.sharer == 0));
+    oc_netloop_set_callrec(NULL);
+    unsetenv("OPENCHIME_DEV_CAPTURE");
+}
+
 static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
     tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
@@ -4774,18 +5083,32 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     uint64_t ua = ma->user_id, ub = mb->user_id, uc = mc->user_id;
     oc_call_stats st;
 
-    /* dana starts a call in channel 1, inviting erik: she is in it; erik sees it
-     * in his Calls list as an invitation, and it is one worth a toast. */
+    /* dana starts a call from channel 1, inviting erik: she is in it; erik sees
+     * it in Calls home as an invitation, and it is one worth a toast. */
     uint64_t inv[1] = { ub };
-    oc_client_call_start(a, 1, inv, 1);
-    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1 && ma->call.starter == ua));
-    CHECK(CALL_WAIT(3000, calls_in(mb, 1) && oc_model_call_invited(oc_model_call_in(mb, 1), ub)));
+    oc_client_call_start(a, 1, "standup", inv, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.from_channel == 1 && ma->call.starter == ua &&
+                          strcmp(ma->call.subject, "standup") == 0));
+    const uint64_t id = ma->call.call_id;
+    CHECK(CALL_WAIT(3000, calls_in(mb, id) && oc_model_call_invited(oc_model_call(mb, id), ub)));
+    CHECK(oc_model_call_from(mb, 1) == oc_model_call(mb, id));
     oc_call_notice nt[4];
-    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 1 && nt[0].channel_id == 1 && nt[0].starter == ua);
+    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 1 && nt[0].channel_id == 1 && nt[0].call_id == id &&
+          nt[0].starter == ua);
     CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 0);        /* considered once */
+    /* faye, in channel 1 but not asked, sees the call's message there and not
+     * the call. */
+    CHECK(CALL_WAIT(3000, ({
+        const oc_channel *ch = oc_model_channel((oc_model *)mc, 1);
+        int seen = 0;
+        for (size_t i = 0; ch && i < ch->n_msgs; i++)
+            if (ch->msgs[i].kind == OC_MSG_KIND_CALL && ch->msgs[i].author_id == ua && ch->msgs[i].body &&
+                strstr(ch->msgs[i].body, "started a call: standup")) seen = 1;   /* contract: the body names the subject (CALLS.md §1) */
+        seen; })));
+    CHECK(!calls_in(mc, id));
 
     /* erik joins: each hears the other's tone and not their own. */
-    oc_client_call_join(b, 1);
+    oc_client_call_join(b, id);
     uint64_t joined_ms = mono_ms();
     CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
     CHECK(CALL_WAIT(6000, heard(&ta, 1) > 1500 && heard(&tb, 0) > 1500));
@@ -4813,7 +5136,9 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
 
     /* faye joins: a new epoch, new keys all round, and everyone hears everyone. */
     uint32_t epoch2 = ma->call.epoch;
-    oc_client_call_join(c, 1);
+    oc_client_call_invite(a, id, &uc, 1);
+    CHECK(CALL_WAIT(3000, calls_in(mc, id)));
+    oc_client_call_join(c, id);
     CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 3 && mb->call.n_parts == 3));
     CHECK(ma->call.epoch > epoch2);
     CHECK(CALL_WAIT(8000, heard(&ta, 1) > 1000 && heard(&ta, 2) > 1000 && heard(&tb, 0) > 1000 &&
@@ -4829,7 +5154,7 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     /* faye leaves. Everyone after her epoch sends under keys she was never given:
      * the relay may forward to her or not, it makes no difference. */
     uint32_t her_last = mc->call.epoch;
-    oc_client_call_leave(c, 1);
+    oc_client_call_leave(c, id);
     CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
     CHECK(ma->call.epoch > her_last);
     uint64_t after_leave = mono_ms() + 1100;          /* past the 1 s grace */
@@ -4881,34 +5206,38 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
 
     test_share_e2e(a, b, c, ea, eb, ec);
     test_camera_e2e(a, b, ea, eb);
+    test_record_e2e(a, b, ea, eb, &ta, &tb);
 
     /* erik may not end it; dana, who started it, may -- for everyone. */
     uint32_t errs = mb->call_error_seq;
-    oc_client_call_end(b, 1);
+    oc_client_call_end(b, id);
     CHECK(CALL_WAIT(3000, mb->call_error_seq != errs && mb->call_error == OC_ERR_NOT_CALL_STARTER));
-    oc_client_call_end(a, 1);
-    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call && !calls_in(ma, 1) && !calls_in(mb, 1)));
+    oc_client_call_end(a, id);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call && !calls_in(ma, id) && !calls_in(mb, id)));
     oc_call_engine_stats(eb, &st);
     CHECK(!st.active);
 
-    /* A missed call: dana starts one inviting faye, nobody comes, dana leaves.
-     * faye's history gains a line that is a call event, not something dana said. */
-    uint64_t inv_c[1] = { uc };
-    oc_client_call_start(a, 1, inv_c, 1);
-    CHECK(CALL_WAIT(3000, ma->in_call));
-    CHECK(CALL_WAIT(3000, calls_in(mc, 1)));
-    oc_client_call_leave(a, 1);
-    CHECK(CALL_WAIT(3000, !ma->in_call && !calls_in(mc, 1)));
-    int missed = 0;
+    /* The call's message follows it: over, it says how long it lasted. */
     CHECK(CALL_WAIT(3000, ({
         const oc_channel *ch = oc_model_channel((oc_model *)mc, 1);
-        missed = 0;
+        int over = 0;
         for (size_t i = 0; ch && i < ch->n_msgs; i++)
-            /* a call event (the only one there is: a missed call), dana's, with
-             * words to read where a client draws none of its own */
-            if (ch->msgs[i].kind == OC_MSG_KIND_CALL && ch->msgs[i].author_id == ua &&
-                ch->msgs[i].body && ch->msgs[i].body[0]) missed = 1;
-        missed; })));
+            if (ch->msgs[i].kind == OC_MSG_KIND_CALL && ch->msgs[i].body &&
+                strstr(ch->msgs[i].body, "started a call: standup (ended after")) over = 1;   /* contract: the body says it ended (CALLS.md §1) */
+        over; })));
+
+    /* A call nobody takes: dana starts one from Calls home asking faye, nobody
+     * comes, dana leaves. It ends, and leaves no line anywhere. */
+    size_t lines = 0;
+    { const oc_channel *ch = oc_model_channel((oc_model *)mc, 1); lines = ch ? ch->n_msgs : 0; }
+    uint64_t inv_c[1] = { uc };
+    oc_client_call_start(a, 0, "nobody came", inv_c, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.call_id != id));
+    const uint64_t id2 = ma->call.call_id;
+    CHECK(CALL_WAIT(3000, calls_in(mc, id2)));
+    oc_client_call_leave(a, id2);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !calls_in(mc, id2)));
+    { const oc_channel *ch = oc_model_channel((oc_model *)mc, 1); CHECK((ch ? ch->n_msgs : 0) == lines); }
 
     oc_client_set_call_media(a, NULL, NULL);
     oc_client_set_call_media(b, NULL, NULL);
@@ -4940,9 +5269,11 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
     oc_call_stats sa, sb;
 
     __atomic_store_n(&g_tap.block, 1, __ATOMIC_RELEASE);
-    oc_client_call_start(a, 1, NULL, 0);
-    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
-    oc_client_call_join(b, 1);
+    oc_client_call_start(a, 0, "standup", &mb->user_id, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.call_id));
+    const uint64_t id = ma->call.call_id;
+    CHECK(CALL_WAIT(3000, calls_in(mb, id)));
+    oc_client_call_join(b, id);
     CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
     CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
                            sa.transport == 1 && sb.transport == 1)));
@@ -4964,8 +5295,8 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
     printf("  UDP back: both on it again; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
            heard(&ta, 1), heard(&tb, 0));
 
-    oc_client_call_leave(b, 1);
-    oc_client_call_leave(a, 1);
+    oc_client_call_leave(b, id);
+    oc_client_call_leave(a, id);
     CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call));
     oc_client_set_call_media(a, NULL, NULL);
     oc_client_set_call_media(b, NULL, NULL);
@@ -5084,9 +5415,10 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
     const oc_model *ma = oc_client_model(a), *mc = oc_client_model(c);
     oc_call_stats sa, sc;
 
-    oc_client_call_start(a, 1, NULL, 0);
-    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    oc_client_call_start(a, 0, "standup", &mc->user_id, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.call_id));
     uint64_t call_id = ma->call.call_id;
+    CHECK(CALL_WAIT(3000, calls_in(mc, call_id)));
     /* dana talks alone -- nothing comes back but the relay's answers to her
      * keep-alives -- for twice the lost-path time: her path is not lost, and
      * she stays put, on UDP. */
@@ -5095,7 +5427,7 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
       CALL_WAIT(1700, 0);
       oc_call_engine_stats(ea, &sa);
       CHECK(ma->in_call && ma->call_back_seq == b0 && !ma->call_rejoining && sa.transport == 0); }
-    oc_client_call_join(c, 1);
+    oc_client_call_join(c, call_id);
     CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 2));
     CHECK(CALL_WAIT(8000, heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
 
@@ -5103,7 +5435,7 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
      * has her -- the seat is held. dana, still connected, goes nowhere. */
     uint32_t back = mc->call_back_seq, epoch = ma->call.epoch, back_a0 = ma->call_back_seq;
     __atomic_store_n(&g_px.cut, 1, __ATOMIC_RELEASE);
-    CHECK(CALL_WAIT(3000, mc->call_rejoining == 1 && !mc->in_call));
+    CHECK(CALL_WAIT(3000, mc->call_rejoining == call_id && !mc->in_call));
     /* ...and dana sees her marked as away, not gone. */
     CHECK(CALL_WAIT(3000, ma->call.n_parts == 2 && away_in(ma, mc->user_id) == 1));
     oc_client_reconnect(c);
@@ -5136,8 +5468,8 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
            heard(&ta, 2), heard(&tc, 0));
     CHECK(ma->call_lost_seq == 0 && mc->call_lost_seq == 0);
 
-    oc_client_call_leave(c, 1);
-    oc_client_call_leave(a, 1);
+    oc_client_call_leave(c, call_id);
+    oc_client_call_leave(a, call_id);
     CHECK(CALL_WAIT(3000, !ma->in_call && !mc->in_call));
     oc_client_set_call_media(a, NULL, NULL);
     oc_client_set_call_media(c, NULL, NULL);
@@ -6313,7 +6645,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0 };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0, 0 };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;
@@ -6707,6 +7039,7 @@ int run_client_core_tests(void) {
 
     unlink_db(tpath("itest_core.db"));
     oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_core.db"));
+    g_core_dbw = dbw;
     if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); oc_test_rmtree(g_dir); return failures; }

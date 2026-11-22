@@ -255,7 +255,7 @@ exact `shared/` wire source, so client and server can't drift (the same reason
 - **Calls** (ARCH-73/113). Signaling, the device key and the media keys are the
   core's, on the network thread (`client/core/callsig.c`): `oc_client_call_start`,
   `_join`, `_leave`, `_decline`, `_end` and `_invite`, answered in the model as
-  `calls` (the Calls section), `call`/`in_call` and `call_error`, with invitations
+  `calls` (Calls home), `call_hist` and `call_page` (CALLS.md §1), `call`/`in_call` and `call_error`, with invitations
   worth a toast drained by `oc_client_call_notify_take`. A call the device was put
   out of by its connection, a sweep or a moved media path is rejoined by the core
   (CALLS.md §4): `call_rejoining` names it meanwhile, `call` still describing it,

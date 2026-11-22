@@ -370,70 +370,121 @@ void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_C
 
 /* ---- calls (REQ-150, REQ-301-305) ------------------------------------------ */
 
-static void call_cmd(oc_client *c, int type, uint64_t channel_id, const uint64_t *uids, int n) {
-    if (!c || !channel_id) return;
+static void call_cmd(oc_client *c, int type, uint64_t call_id, const uint64_t *uids, int n) {
+    if (!c || !call_id) return;
     oc_cmd *cmd = oc_cmd_new(type);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
     for (int i = 0; uids && i < n; i++) cmd->uids[cmd->n_uids++] = uids[i];
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n) {
-    if (!c) return;
-    c->model.call_pending = channel_id;
-    call_cmd(c, OC_CMD_CALL_JOIN, channel_id, invite, n);
+void oc_client_call_start(oc_client *c, uint64_t from_channel, const char *subject,
+                          const uint64_t *invite, int n) {
+    if (!c || !subject) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_START);
+    if (!cmd) return;
+    if (!(cmd->body = strdup(subject))) { oc_cmd_free(cmd); return; }
+    cmd->channel_id = from_channel;
+    if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
+    for (int i = 0; invite && i < n; i++) cmd->uids[cmd->n_uids++] = invite[i];
+    c->model.call_pending = 1;
+    oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_join(oc_client *c, uint64_t channel_id) {
-    oc_client_call_start(c, channel_id, NULL, 0);
+void oc_client_call_join(oc_client *c, uint64_t call_id) {
+    if (!c || !call_id) return;
+    c->model.call_pending = 1;
+    call_cmd(c, OC_CMD_CALL_JOIN, call_id, NULL, 0);
 }
 
-void oc_client_call_leave(oc_client *c, uint64_t channel_id) {
+void oc_client_call_subject(oc_client *c, uint64_t call_id, const char *subject) {
+    if (!c || !call_id || !subject) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SUBJECT);
+    if (!cmd) return;
+    if (!(cmd->body = strdup(subject))) { oc_cmd_free(cmd); return; }
+    cmd->call_id = call_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_record(oc_client *c, uint64_t call_id, int on) {
+    if (!c || !call_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_RECORD);
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_history(oc_client *c, uint64_t before_ms) {
+    oc_cmd *cmd = c ? oc_cmd_new(OC_CMD_CALL_HISTORY) : NULL;
+    if (!cmd) return;
+    cmd->start_ms = before_ms;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from) {
+    oc_cmd *cmd = c && call_id ? oc_cmd_new(OC_CMD_CALL_DETAIL) : NULL;
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->req_id = line_from;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_delete(oc_client *c, uint64_t call_id, uint8_t what, uint64_t rec_id) {
+    oc_cmd *cmd = c && call_id ? oc_cmd_new(OC_CMD_CALL_DELETE) : NULL;
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->op = what;
+    cmd->message_id = rec_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_leave(oc_client *c, uint64_t call_id) {
     if (!c) return;
     /* Leaving while getting back in is over here at once, connected or not:
      * the command waits for a connection, the window does not. */
-    if (c->model.call_rejoining && c->model.call_rejoining == channel_id) {
+    if (c->model.call_rejoining && c->model.call_rejoining == call_id) {
         c->model.call_rejoining = 0;
         memset(&c->model.call, 0, sizeof c->model.call);
     }
-    call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0);
+    call_cmd(c, OC_CMD_CALL_LEAVE, call_id, NULL, 0);
 }
-void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
-void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
+void oc_client_call_decline(oc_client *c, uint64_t call_id) { call_cmd(c, OC_CMD_CALL_DECLINE, call_id, NULL, 0); }
+void oc_client_call_end(oc_client *c, uint64_t call_id)     { call_cmd(c, OC_CMD_CALL_END, call_id, NULL, 0); }
 
-void oc_client_call_share(oc_client *c, uint64_t channel_id, int on) {
+void oc_client_call_share(oc_client *c, uint64_t call_id, int on) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SHARE);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(on ? 1 : 0);
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on) {
+void oc_client_call_camera(oc_client *c, uint64_t call_id, int on) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_CAMERA);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(on ? 1 : 0);
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n) {
+void oc_client_call_video_sub(oc_client *c, uint64_t call_id, int all, const uint64_t *users, int n) {
     if (!c || n < 0) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_VIDEO_SUB);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(all ? 1 : 0);
     if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
     for (int i = 0; !all && users && i < n; i++) cmd->uids[cmd->n_uids++] = users[i];
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
-    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
+void oc_client_call_invite(oc_client *c, uint64_t call_id, const uint64_t *uids, int n) {
+    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, call_id, uids, n);
 }
 
 void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx) {

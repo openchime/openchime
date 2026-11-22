@@ -215,8 +215,16 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 47** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 49** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 49 made a call an object of its own (CALLS.md §1, §5.17): `CALL_START` and
+> `CALL_SUBJECT` were added, every call frame names its call by `call_id` and no
+> longer a conversation, `CALL_JOIN` lost its invitees, `CALL_STATE` gained
+> `subject`, `from_channel` and `chat_channel`, and `BROADCAST` gained `call_id` after
+> `parent_id`; `CALL_HISTORY`, `CALL_DETAIL` and `CALL_DELETE`, with their answers,
+> were added, and each `SEARCH_RESULTS` entry gained `call_id` and `line_id`;
+> `CALL_RECORD` was added, a participant's flags gained `RECORDER`, and
+> `CALL_STATE` gained `flags` after `chat_channel`. Version
 > 47 put `stream` in `CALL_MEDIA`, as in the relay's datagrams, gave a call
 > participant's flags `CAMERA`, and added `CALL_CAMERA` and `CALL_VIDEO_SUB`
 > (REQ-160, §5.17). Version 46 appended `channel_id` to each `AUDIT_PAGE` entry, the channel the entry
@@ -601,9 +609,10 @@ tenant-monotonic (ARCH-43).
 | `channel_id`   | u64  | Channel the message belongs to.              |
 | `author_id`    | u64  | Authoring user's id.                         |
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
-| `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
+| `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — the message a call started from a conversation leaves there, or a missed-call line stored before version 49 (§5.17). Any other value is malformed. |
 | `broadcast_stored` | u8 | `1` when the daemon stored a broadcast mention (`@here`, `@channel` or `@everyone`) for the message when it was sent, so a broadcast its body holds notifies (REQ-221); else `0`, whatever the body. Any other value is malformed. Since version 32 (version 31 carried `broadcast_held` here). |
 | `parent_id`    | u64  | The thread root of a reply also posted to the channel (REQ-062, §5.10), which a replay of the main scroll carries with it; `0` for a message that is not a reply. Since version 36. |
+| `call_id`      | u64  | The call a call message is about (kind `1`, §5.17); `0` for any other message, and for a missed-call line from before version 49. Since version 49. |
 | `body`         | lstr | Message body (§7).                           |
 
 `broadcast_stored` is the daemon's answer to whether a broadcast mention
@@ -1580,7 +1589,7 @@ Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, in the orde
 | Field       | Type            | Notes                                                |
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
-| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058), `rank` (i64 — the row's relevance, bm25 × 1,000,000 rounded, lower is better; `0` unless sorted by relevance; since protocol 28). |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match, or the body's first 160 bytes for a search with no text), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058), `rank` (i64 — the row's relevance, bm25 × 1,000,000 rounded, lower is better; `0` unless sorted by relevance; since protocol 28), `call_id` (u64) and `line_id` (u64) — a line of a call's transcript, both `0` for a message (§5.17; since protocol 49). |
 | `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
@@ -1908,7 +1917,9 @@ is ready; a daemon whose model did not come up answers whatever waited
 with a `SUMMARY` of status UNAVAILABLE (1, §5.16m) and leaves the name out of every later sign-in. `polls` is always
 present on a daemon that stores polls (§5.16n), so a client offers to make one
 only where it can be kept. `h264-export` is present exactly when the export of a
-video message is running (§5.14d): built in and turned on.
+video message is running (§5.14d): built in and turned on. `call-recording` is
+present exactly when calls may be recorded here (§5.17): built in (`CALLREC=1`),
+not turned off, not a public demo, and the relay up.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -3142,126 +3153,256 @@ conversation; after `MESSAGE_RESTORED` for a restored list; replayed by backfill
 list, so every one carries the list's current state. Adding these frames needed
 no protocol-version bump.
 
-### 5.17 Calls (REQ-150-152, REQ-160, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
+### 5.17 Calls (REQ-150-152, REQ-160, REQ-161, REQ-301-306, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
 the daemon's relay, which runs in its event loop and is handed each
 participant's token as they join, and a call is *set up* over this TCP
-protocol. A conversation has **at most one call**; a call has an id of its own
-(`call_id`), so a later call in the same conversation is a different one. Calls
-are **ephemeral net-thread state** (like presence, ARCH-67): no DB rows, and a
-daemon restart ends them. [CALLS.md](./CALLS.md) is the design, including the
-end-to-end encryption this section carries the keys for.
+protocol. **A call is an object of its own** ([CALLS.md](./CALLS.md) §1): a row
+in `calls` (SCHEMA.md §3bz), whose id is its `call_id` in every frame below, with
+a subject, invitees and participants of its own and no tie to a conversation but
+the one message it leaves in the conversation it was started from, if any. Any
+number of calls run at once. What only a running call has — connections, slots,
+tokens, device keys, the epoch — is net-thread memory; what happened is written
+to the record as it happens. CALLS.md is the design, including the end-to-end
+encryption this section carries the keys for.
 
-`CALL_JOIN`, `CALL_INVITE`, `CALL_SHARE`, `CALL_KEY`, `CALL_CAMERA` and `CALL_VIDEO_SUB` together are limited to
-60 per 10 seconds per connection; one past the limit is refused with a non-fatal
-`SEND_RATE_LIMITED`. `CALL_LEAVE`, `CALL_DECLINE` and `CALL_END` are not limited:
-each changes the caller's own state once, and refusing one would strand them in
-the call.
+`CALL_START`, `CALL_JOIN`, `CALL_INVITE`, `CALL_SUBJECT`, `CALL_SHARE`, `CALL_KEY`, `CALL_CAMERA` and
+`CALL_VIDEO_SUB` together are limited to 60 per 10 seconds per connection; one
+past the limit is refused with a non-fatal `SEND_RATE_LIMITED`. `CALL_LEAVE`,
+`CALL_DECLINE` and `CALL_END` are not limited: each changes the caller's own
+state once, and refusing one would strand them in the call.
 
 A **participant** is a user on one connection, with a **slot** (0-255, the low
 byte of every SFrame KID it sends under) and its **device key** (an X25519
 public key). A connection is in at most one call, and a user in a call from one
 device: joining from a second moves them. The **epoch** starts at 1 and goes up
-by one on every join and every leave. The cap is ten (`OC_CALL_MAX`; in
-development mode `OPENCHIME_DEV_CALL_MAX` sets it, 2 to 32), announced on `WORKSPACE_INFO` as `call_max`.
+by one on every join and every leave. An **invitee** is someone asked to the
+call, the starter first; being one is what lets a person join the call and be
+told about it, and it lasts — declining or leaving does not undo it. The cap is
+ten (`OC_CALL_MAX`; in development mode `OPENCHIME_DEV_CALL_MAX` sets it, 2 to
+32), announced on `WORKSPACE_INFO` as `call_max`, and counts participants plus
+invitations not yet taken or declined.
 
-**`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
-codecs: u8, n: u16, n × { user_id: u64 } }` — start the conversation's call, or
-join the one there. `codecs` is the video codecs the joiner can decode, as bits:
-`1` VP9 (ARCH-87); a client with no video, `0`. Authorized by the channel-read gate (`ERROR NOT_A_MEMBER`, message "call
-join denied"). A start invites the users named, those of them who may read the
-conversation, keeping participants plus invitations within the cap; joining a
-call already there names nobody, and a name is ignored. A call already at the
-cap is refused with `ERROR CALL_FULL` (3028). A connection already in another
-call leaves it first; one in this call is taken out and put back, with a fresh
-token and slot — how a client whose address changed is relayed again. A relay
-that has exited and could not be restarted refuses the join with
-`ERROR CALL_UNAVAILABLE` (3025); so is a start when the daemon holds as many
-calls as it can. On a public demo (AUTH.md §8.12) a join past the day's call
+**`CALL_START` (C → S), `0x00AE`** `{ from_channel: u64, subject: str,
+device_key: 32 bytes, codecs: u8, n: u16, n × { user_id: u64 } }` — start a call
+and join it. `subject` is required: blank, or longer than 200 bytes, is refused
+with `ERROR CALL_SUBJECT` (3075). `from_channel` is the conversation the call is
+started from, `0` for none; the starter must be able to read it (else
+`ERROR NOT_A_MEMBER`), and it then gets **one message** about the call — a
+`BROADCAST` of kind `1` with the call's `call_id`, authored by the starter, whose
+body reads "alice started a call: Q3 pricing review" — which notifies nobody;
+when the call is renamed or ends the daemon rewrites that body (a `MSG_EDITED`
+to the conversation's members) and once it is over it says how long the call
+lasted. The users named are asked, those of them with an account that is on and
+is not a visitor, at most as many as fit beside the starter; the conversation's
+membership does not matter. `codecs` is the video codecs the starter can
+decode, as bits: `1` VP9 (ARCH-87); a client with no video, `0`. The call's row
+is made, and the starter put in it, as for `CALL_JOIN` below. A `CALL_JOIN`,
+`CALL_LEAVE` or another `CALL_START` from the same connection before the answer
+overtakes it: its call is made with nobody in it, and ends at once. A relay that
+has exited and could not be restarted refuses a start with
+`ERROR CALL_UNAVAILABLE` (3025); so is one when the daemon holds as many calls as
+it can. On a public demo (AUTH.md §8.12) a start or join past the day's call
 limit is refused with `ERROR DEMO_LIMIT` (3037), and a call ends for everyone —
 `CALL_STATE` with `ended` set — twenty minutes after it started
 (`OC_DEMO_CALL_MAX_MS`, `daemon/demolimits.h`).
 
-**`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
-u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
-started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
-u64, slot: u8, device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0
-(`AWAY`) marking one whose connection went and whose seat is held for its rejoin
-(below), bit 1 (`CAMERA`) one whose camera is on (`CALL_CAMERA`) — the joiner's private media endpoint
-(the relay's `udp_port` and a bearer `token`), its slot, and the call as
-it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
-bytes behind the daemon's `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX`, if one is set, and
-`udp_port` is `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
-The client then speaks UDP directly to the relay at the host it connected to,
-over IPv4 when the host has an IPv4 address and over IPv6 when that is all it has: `token ‖ seq(u16) ‖ stream(u8) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
-stream(u8) ‖ payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
-ciphertext (CALLS.md §5.4); an empty one is a keep-alive. `stream` says which of
-the sender's streams the packet is on — `0` audio (with its mute state and the
-viewers' and watchers' control packets), `1` a shared screen, `2` a camera — in
-the clear, so the relay can act on it, and authenticated as the SFrame
-metadata, so the relay cannot change it unnoticed. A packet naming any other
-stream, or too short to name one, is dropped. The relay forwards a camera's
-packets only while its sender's camera is on, and only to the participants
-whose subscription takes it (`CALL_VIDEO_SUB`); audio and a share go to
-everyone.
+**`CALL_JOIN` (C → S), `0x00A0`** `{ call_id: u64, device_key: 32 bytes,
+codecs: u8 }` — join a call. Only its invitees may: anyone else is refused with
+`ERROR NOT_A_MEMBER` ("not invited to this call"), and a call that is not
+running with `ERROR NOT_IN_CALL` (3030). A call already at the cap is refused
+with `ERROR CALL_FULL` (3028). A connection already in another call leaves it
+first; one in this call is taken out and put back, with a fresh token and slot
+— how a client whose address changed is relayed again.
 
-**`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
-u64, call_id: u64, epoch: u32, n: u16, n × participant }` — on every join and
-leave, and when a participant's connection goes (it is then marked `AWAY`), each
-in a new epoch; and, to every participant, when a camera goes on or off, in the
-same epoch — nobody came or went, so nobody rekeys. A
-device that finds its own slot gone from the roster is out of the call: its user
-moved to another device if the roster names its user elsewhere, else the relay
-swept it.
+**`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ call_id: u64, udp_port:
+u16, token: bytes, slot: u8, epoch: u32, starter: u64, started_at: u64, n: u16,
+n × participant }`, where a participant is `{ user_id: u64, slot: u8,
+device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0 (`AWAY`) marking
+one whose connection went and whose seat is held for its rejoin (below), bit 1
+(`CAMERA`) one whose camera is on (`CALL_CAMERA`), bit 2 (`RECORDER`) the
+Recorder (below) — the joiner's private media
+endpoint (the relay's `udp_port` and a bearer `token`), its slot, and the call
+as it stands. The token is opaque to the client and 16 to 32 bytes long: 16
+random bytes behind the daemon's `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX`, if one
+is set, and `udp_port` is `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` where that is
+set (AUDIO.md §4). The client then speaks UDP directly to the relay at the host
+it connected to, over IPv4 when the host has an IPv4 address and over IPv6 when
+that is all it has: `token ‖ seq(u16) ‖ stream(u8) ‖ payload` to it,
+`sender_user_id(u64) ‖ seq(u16) ‖ stream(u8) ‖ payload` from it
+(`daemon/audio.h`). Every non-empty payload is an SFrame ciphertext (CALLS.md
+§5.4); an empty one is a keep-alive. `stream` says which of the sender's streams
+the packet is on — `0` audio (with its mute state and the viewers' and watchers'
+control packets), `1` a shared screen, `2` a camera — in the clear, so the
+relay can act on it, and authenticated as the SFrame metadata, so the relay
+cannot change it unnoticed. A packet naming any other stream, or too short to
+name one, is dropped. The relay forwards a camera's packets only while its
+sender's camera is on, and only to the participants whose subscription takes it
+(`CALL_VIDEO_SUB`); audio and a share go to everyone.
 
-**`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call in
-this conversation; naming another conversation does nothing. The last one out
-ends the call. A leave sent while this connection's `CALL_JOIN` to the same
-conversation is still being checked voids that join: its answer, when it comes,
-puts nobody in the call. Of several joins sent before any is answered, only the
-latest can take effect.
+**`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ call_id: u64,
+epoch: u32, n: u16, n × participant }` — on every join and leave, and when a
+participant's connection goes (it is then marked `AWAY`), each in a new epoch;
+and, to every participant, when a camera goes on or off, in the same epoch —
+nobody came or went, so nobody rekeys. A device that finds its own slot gone
+from the roster is out of the call: its user moved to another device if the
+roster names its user elsewhere, else the relay swept it.
 
-**`CALL_INVITE` (C → S), `0x00A4`** `{ channel_id: u64, n: u16, n × { user_id:
-u64 } }` — a participant asks more people, each of whom must be able to read the
-conversation. Participants plus invitations past the cap: `ERROR CALL_FULL`,
-and nobody is added. Not a participant: `ERROR NOT_IN_CALL` (3030).
+**`CALL_LEAVE` (C → S), `0x00A1`** `{ call_id: u64 }` — leave the call; naming
+another call does nothing. The last one out ends the call. It also overtakes a
+`CALL_START` from this connection still being made.
 
-**`CALL_DECLINE` (C → S), `0x00A5`** `{ channel_id: u64 }` — an invitee says
-no. A decline from someone not invited does nothing.
+**`CALL_INVITE` (C → S), `0x00A4`** `{ call_id: u64, n: u16, n × { user_id: u64
+} }` — a participant asks more people: each with an account that is on and is
+not a visitor. Participants plus invitations past the cap: `ERROR CALL_FULL`,
+and nobody is added. Not a participant: `ERROR NOT_IN_CALL`.
 
-**`CALL_END` (C → S), `0x00A6`** `{ channel_id: u64 }` — the starter ends the
-call for everyone. Anyone else: `ERROR NOT_CALL_STARTER` (3029); no call:
-`ERROR NOT_IN_CALL`.
+**`CALL_DECLINE` (C → S), `0x00A5`** `{ call_id: u64 }` — an invitee says no.
+A decline from someone not invited does nothing. The decliner stays an invitee:
+they may still join, and are still told.
 
-**`CALL_STATE` (S → C), `0x00A7`** `{ channel_id: u64, call_id: u64, starter:
-u64, started_at: u64, ended: u8, np: u16, np × { user_id: u64 }, ni: u16,
-ni × { user_id: u64 }, sharer: u64 }` — a call as the Calls section lists it: who
-is in it, who is invited, and who is sharing a screen (`0` nobody). Sent on every change to the conversation's members, its
-invitees and its participants, and at sign-in, after `SNOOZE`, once for each call
-there is. `ended = 1` is the last word on a call.
+**`CALL_END` (C → S), `0x00A6`** `{ call_id: u64 }` — the starter ends the call
+for everyone. Anyone else in it: `ERROR NOT_CALL_STARTER` (3029); no such call,
+or one the sender was never asked to: `ERROR NOT_IN_CALL`.
 
-**`CALL_KEY` (C → S), `0x00A8`** `{ channel_id: u64, call_id: u64, epoch: u32,
-n: u16, n × { recipient: u64, sealed: bytes } }` — a participant's media key for
-the epoch, sealed to each other participant's device key (64 bytes: the HPKE
-`enc` and the sealed 16-byte key with its tag, CALLS.md §5.3). The daemon
-forwards each copy, unread, to its recipient if both are in the call and the
-epoch is the current one; a copy for an earlier epoch is dropped, since its
-sender makes one for the current epoch from the roster it is about to receive.
-The sender is not in the call: `ERROR NOT_IN_CALL`.
+**`CALL_SUBJECT` (C → S), `0x00AF`** `{ call_id: u64, subject: str }` — rename
+the call. Anyone in it may; the rename is on its timeline, with who and when,
+and every invitee is told by `CALL_STATE`. A blank subject, or one longer than
+200 bytes: `ERROR CALL_SUBJECT`. Not a participant: `ERROR NOT_IN_CALL`.
 
-**`CALL_KEY_FOR` (S → C), `0x00A9`** `{ channel_id: u64, call_id: u64, epoch:
-u32, sender: u64, sealed: bytes }` — one sealed key, from its sender.
+**`CALL_STATE` (S → C), `0x00A7`** `{ call_id: u64, subject: str, starter: u64,
+started_at: u64, from_channel: u64, chat_channel: u64, flags: u8, ended: u8, np:
+u16, np × { user_id: u64 }, ni: u16, ni × { user_id: u64 }, sharer: u64 }` — a call
+as Calls home lists it: its subject, the conversation it was started from (`0`
+none), its own chat (below), `flags` bit 0 set while it is being recorded, who is
+in it (the people: never the Recorder), who
+is asked and has not yet joined or declined, and who is sharing a screen (`0`
+nobody). Sent to the call's **invitees — the starter and every participant among
+them — and to nobody else**, on every change to its subject, participants,
+invitations or sharer, and at sign-in, after `SNOOZE`, once for each running
+call the user is asked to. `ended = 1` is the last word on a call.
+
+**`CALL_KEY` (C → S), `0x00A8`** `{ call_id: u64, epoch: u32, n: u16, n × {
+recipient: u64, sealed: bytes } }` — a participant's media key for the epoch,
+sealed to each other participant's device key (64 bytes: the HPKE `enc` and the
+sealed 16-byte key with its tag, CALLS.md §5.3). The daemon forwards each copy,
+unread, to its recipient if both are in the call and the epoch is the current
+one; a copy for an earlier epoch is dropped, since its sender makes one for the
+current epoch from the roster it is about to receive. The sender is not in the
+call: `ERROR NOT_IN_CALL`.
+
+**`CALL_KEY_FOR` (S → C), `0x00A9`** `{ call_id: u64, epoch: u32, sender: u64,
+sealed: bytes }` — one sealed key, from its sender.
+
+**The call's chat** is a conversation the call owns: a DM in kind, made with the
+call, whose members are its invitees — each one asked later becomes a member
+when asked — and which is in no conversation list (`CHANNEL_LIST`, the files'
+conversations). Everything said in it goes by the ordinary frames (`SEND`,
+`HISTORY_REQUEST`, `SEARCH`, uploads) on `chat_channel`, under the ordinary
+membership rules, so it reaches the call's people and nobody else; its messages
+notify as a group DM's do.
 
 **Invitations notify** (REQ-302): the client decides a toast from `CALL_STATE`
-through the shared evaluator with the invitation as a mention, and the daemon
-pushes to the invitee's phones on the same terms, with `"kind":"call"` in the
-contentless payload (§5.16).
+through the shared evaluator with the invitation as a mention — under the
+conversation the call was started from, if any, so its mute applies — and the
+daemon pushes to the invitee's phones on the same terms, with `"kind":"call"`
+in the contentless payload (§5.16).
 
-**Missed calls** (REQ-304): a call that ends with nobody but its starter ever
-having joined, and somebody invited, leaves a message of kind *call event* in the
-conversation, authored by the starter, body "Missed call" — an ordinary
-`BROADCAST` with `kind = 1` (§5.3).
+**Missed calls** (REQ-304) leave no line anywhere since version 49: a call that
+ends with nobody but its starter having joined is a missed call in its record,
+and Calls home shows it as one. Missed-call lines stored before then are
+ordinary kind-`1` messages with `call_id` `0`, and read as they always did.
+
+**`CALL_RECORD` (C → S), `0x00BA`** `{ call_id: u64, on: u8 }` — start (`on = 1`)
+or stop recording the call (CALLS.md §8). Anyone in it may do either. Where
+recording is not offered — the daemon was built without it (`CALLREC=1`), an
+admin turned it off (`OPENCHIME_CALL_RECORDING`), it is a public demo, or the
+recordings already take the space they may (`OPENCHIME_CALL_RECORDING_MAX_MB`) —
+a start is refused with `ERROR RECORDING_UNAVAILABLE` (3076); `CAPABILITIES`
+names `call-recording` exactly where it is offered, and a client shows Record
+only then. Not a participant: `ERROR NOT_IN_CALL`. A start while it records, or a
+stop while it does not, changes nothing.
+
+A recording is made by the **Recorder**, which the daemon runs and which joins the
+call as a participant of its own: on the roster with `RECORDER` set, user id
+`0xFFFFFFFFFFFFFF00` (no account's), a slot, and a device key made for this
+recording and held in memory only; it sends no audio or video, and it is not
+counted toward the cap. It comes in at a new epoch, so every device seals its key
+to it as to anyone in the call — a `CALL_KEY` entry naming it is opened by the
+daemon, which is the Recorder, and forwarded to nobody — and it can open nothing
+said before; it seals a key of its own to each participant (`CALL_KEY_FOR` from
+its user id), under which it sends the viewers' control packets — a NACK, a
+keyframe request — as any viewer does. While it is in the call `CALL_STATE` has
+`flags` bit 0 set and the timeline has who started it. Stopped — by anyone, or by
+the call ending — it leaves at a new epoch, so nothing said from then is sealed
+to it, and the recording is processed (CALLS.md §8): its page shows it as
+processing, then ready, with an attachment to play it from, or failed.
+
+**`CALL_HISTORY` (C → S), `0x00B4`** `{ before_ms: u64, limit: u16 }` — a page
+of the calls this user was asked to, newest first: those started before
+`before_ms` (`0` from the newest), at most `limit` (1–50; `0` or more is 50).
+Answered with **`CALL_HISTORY_PAGE` (S → C), `0x00B5`** `{ n: u16, n × { call_id:
+u64, subject: str, starter: u64, started_at: u64, ended_at: u64, end_reason: u8,
+from_channel: u64, chat_channel: u64, n_people: u16, flags: u8 }, more: u8 }` —
+`ended_at` `0` and `end_reason` `0` while it runs, else `1` the last person left,
+`2` ended for everyone, `3` the daemon stopped; `n_people` how many took part;
+`flags` as this user saw it: bit 0 took part, bit 1 missed (asked, never joined
+nor declined, and it is over), bit 2 declined, bit 3 asked to it while it runs
+and not yet answered, bit 4 it has a recording ready, bit 5 it has a transcript;
+`more` `1` when older calls follow. Calls home is built from it and from
+`CALL_STATE`.
+
+**`CALL_DETAIL` (C → S), `0x00B6`** `{ call_id: u64, line_from: u32 }` — one
+call's page. Only those asked to the call get it — the starter, participants,
+and invitees whether they joined or not; to anyone else, an admin included, it is
+`ERROR NOT_A_MEMBER` ("not invited to this call"), whether the call exists or
+not. Answered with **`CALL_PAGE` (S → C), `0x00B7`** `{ call_id, subject, starter,
+started_at, ended_at, end_reason, from_channel, chat_channel` (as above)`, n:
+u16, n × { user_id: u64, joined_at: u64, left_at: u64 }` — the stays, a rejoin
+within the held seat one stay, at most 128 — `, n: u16, n × { user_id: u64,
+invited_by: u64, invited_at: u64, declined_at: u64 }` — the invitees, at most
+128 — `, n: u16, n × { at: u64, user_id: u64, kind: u8, detail: str }` — the
+timeline, at most 128: `kind` `1` camera on, `2` camera off, `3` share started,
+`4` share stopped, `5` recording started, `6` recording stopped, `7` renamed
+(`detail` the new subject) — `, n: u16, n × { id: u64, state: u8, started_by:
+u64, started_at: u64, stopped_at: u64, duration_ms: u32, bytes: u64,
+attachment_id: u64 }` — the recordings, at most 16: `state` `1` recording, `2`
+processing, `3` ready, `4` failed; a ready one is fetched and played through its
+`attachment_id`, an attachment of the call's chat — `, has_transcript: u8,
+language: str, n_lines_total: u32, line_from: u32, n: u16, n × { id: u64,
+speaker: u64, start_ms: u32, end_ms: u32, text: str } }` — the transcript's
+lines from `line_from`, at most 200 and 24 KiB of text a page; a client asks
+again from where the page stopped for the rest. Times on the page are ms since
+the epoch, a line's from the call's start. Any list past its cap is malformed.
+
+**`CALL_DELETE` (C → S), `0x00B8`** `{ call_id: u64, what: u8, id: u64 }` —
+delete the call's transcript (`what` `1`), an admin's to do, or one of its
+recordings (`what` `2`, `id` the recording's), its starter's or an admin's, once
+it is ready or failed. Anyone else: `ERROR FORBIDDEN`; nothing there:
+`ERROR NOT_IN_CALL`. Done, every connection of those asked to the call, and the
+deleter's, is sent **`CALL_DELETED` (S → C), `0x00B9`**, the same three fields;
+a recording's bytes go with it.
+
+**Transcripts are searched** with `SEARCH` (§5.11): a plain text search's first
+page carries, after the messages and snippets it finds, the transcript lines it
+matches in the calls the searcher was asked to — each a `SEARCH_RESULTS` entry
+with `message_id` `0`, `call_id` and `line_id` set, `channel_id` the call's chat,
+`author_id` the speaker and `server_time` when it was said — which a client
+opens as the call's page at that line. A filtered search, or a later page, is the
+messages' alone.
+
+**The transcript function.** The daemon stores a call's transcript through one
+function (`oc_dbwriter_call_transcript`, `daemon/dbwriter.h`): its language and
+its lines, replacing any it had. Nothing calls it yet; what makes transcripts
+will.
+
+**The record** (SCHEMA.md §3bz): the call's row when it starts and when it ends
+— how: the last person left, it was ended for everyone, or the daemon stopped
+with it open, which a daemon starting over such a row records; each
+participant's stay, from a join to a leave, a rejoin within the held seat being
+the same stay; each invitation and decline; and the timeline — cameras on and
+off, shares started and stopped, renames.
 
 **Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE`, and when
 the relay's silence sweep drops it (the relay runs in the daemon's event loop,
@@ -3286,13 +3427,13 @@ A client rejoins by itself (CALLS.md §4); a rejoin is an ordinary `CALL_JOIN`,
 and a client closing on purpose sends `CALL_LEAVE` first so no seat is held for
 it.
 
-**`CALL_SHARE` (C → S), `0x00AA`** `{ channel_id: u64, on: u8 }` — start
+**`CALL_SHARE` (C → S), `0x00AA`** `{ call_id: u64, on: u8 }` — start
 (`on = 1`) or stop sharing a screen in the call (REQ-161). **One sharer per
 call**: a start takes over from whoever was sharing, who learns it from the
 `CALL_STATE` that follows and stops. A stop from someone not sharing changes
 nothing. Not a participant: `ERROR NOT_IN_CALL`. A sharer who leaves,
 disconnects, is swept by the relay or rejoins is no longer the sharer. Each
-change is a `CALL_STATE`.
+change is a `CALL_STATE`, and on the call's timeline.
 
 **`CALL_MEDIA` (both ways), `0x00AB`** — call media over this connection, for a
 participant whose network passes no UDP to the relay. Offered when the daemon
@@ -3315,13 +3456,13 @@ is dropped, and the loss is recovered as UDP loss is (FEC and concealment for
 audio, resends and keyframes for a share). A client probes UDP first, and falls
 back when the relay does not answer (AUDIO.md §4).
 
-**`CALL_CAMERA` (C → S), `0x00AC`** `{ channel_id: u64, on: u8 }` — turn this
+**`CALL_CAMERA` (C → S), `0x00AC`** `{ call_id: u64, on: u8 }` — turn this
 participant's camera on (`on = 1`) or off in the call (REQ-160). The relay
 carries its camera stream only while it is on, and a change is a `CALL_ROSTER`
-to every participant, marking it `CAMERA`, in the same epoch. Not a participant:
-`ERROR NOT_IN_CALL`.
+to every participant, marking it `CAMERA`, in the same epoch, and on the call's
+timeline. Not a participant: `ERROR NOT_IN_CALL`.
 
-**`CALL_VIDEO_SUB` (C → S), `0x00AD`** `{ channel_id: u64, all: u8, n: u16,
+**`CALL_VIDEO_SUB` (C → S), `0x00AD`** `{ call_id: u64, all: u8, n: u16,
 n × { user_id: u64 } }` — whose cameras the relay sends this participant: every
 one (`all = 1`, and nobody named), or the `n` named (at most 32; more is
 malformed). A participant starts at every one, and at every one again on a
@@ -3714,6 +3855,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3072` | `INVALID_OUT_OF_OFFICE` | profile  | no    | An out-of-office whose end is not after its start, or whose message is over 280 bytes. |
 | `3073` | `EMOJI_ALIAS_LIMIT`   | emoji      | no    | A `RENAME_EMOJI` past the 8 old names an emoji keeps, or the 256 a workspace does. |
 | `3074` | `EXPORT_UNAVAILABLE`  | attachment | no    | An `EXPORT_GET` where export is not running (not built in, or `OPENCHIME_H264_EXPORT` off), or the person's three or the daemon's queue are full (§5.14d). |
+| `3075` | `CALL_SUBJECT`        | call       | no    | A call started, or renamed, with a subject that is blank or longer than 200 bytes (§5.17). |
+| `3076` | `RECORDING_UNAVAILABLE` | call     | no    | A `CALL_RECORD` start where recording is not offered: not built in, turned off by an admin, a public demo, or the recordings' space used up (§5.17). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -3877,21 +4020,30 @@ this table cannot silently gain a shared value.
 | `0x0098` | `STORAGE_STATUS` | S → C | usage + policy + what maintenance reclaimed |
 | `0x0099` | `AUDIT_QUERY` | C → S | owner/admin: page the audit log (REQ-251) |
 | `0x009A` | `AUDIT_PAGE` | S → C | a page of entries, newest first |
-| `0x00A0` | `CALL_JOIN` | C → S | start or join a conversation's call, with the device key, the codecs it decodes and whom a start invites (REQ-150/301) |
+| `0x00A0` | `CALL_JOIN` | C → S | join a call this user is asked to, with the device key and the codecs it decodes (REQ-150/301) |
 | `0x00A1` | `CALL_LEAVE` | C → S | leave the call |
 | `0x00A2` | `CALL_JOINED` | S → C | to the joiner: UDP endpoint/token, slot, epoch, starter, roster with device keys |
 | `0x00A3` | `CALL_ROSTER` | S → C | to participants: roster and epoch changed |
 | `0x00A4` | `CALL_INVITE` | C → S | a participant invites more people (REQ-302) |
 | `0x00A5` | `CALL_DECLINE` | C → S | an invitee declines |
 | `0x00A6` | `CALL_END` | C → S | the starter ends the call for everyone |
-| `0x00A7` | `CALL_STATE` | S → C | a call as the Calls section lists it, on every change and at sign-in (REQ-303) |
+| `0x00A7` | `CALL_STATE` | S → C | a call as Calls home lists it, to its invitees, on every change and at sign-in (REQ-303) |
 | `0x00A8` | `CALL_KEY` | C → S | a participant's media key, sealed to each other participant (ARCH-113) |
 | `0x00A9` | `CALL_KEY_FOR` | S → C | one sealed media key, from its sender |
 | `0x00AA` | `CALL_SHARE` | C → S | start or stop sharing a screen in the call; a start takes over (REQ-161) |
 | `0x00AB` | `CALL_MEDIA` | both | call media over the connection when UDP cannot reach the relay (`calls-tcp`) |
 | `0x00AC` | `CALL_CAMERA` | C → S | turn this participant's camera on or off in the call (REQ-160) |
 | `0x00AD` | `CALL_VIDEO_SUB` | C → S | whose cameras the relay sends this participant (REQ-160) |
+| `0x00AE` | `CALL_START` | C → S | start a call with a subject and invitees, from a conversation or none, and join it (CALLS.md §1) |
+| `0x00AF` | `CALL_SUBJECT` | C → S | rename the call (CALLS.md §1) |
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
+| `0x00B4` | `CALL_HISTORY` | C → S | a page of this user's calls, newest first (CALLS.md §1) |
+| `0x00B5` | `CALL_HISTORY_PAGE` | S → C | the page |
+| `0x00B6` | `CALL_DETAIL` | C → S | one call's page, for those asked to it |
+| `0x00B7` | `CALL_PAGE` | S → C | the call's page: people, times, timeline, recordings, transcript |
+| `0x00B8` | `CALL_DELETE` | C → S | delete a call's transcript (an admin) or a recording (its starter, an admin) |
+| `0x00B9` | `CALL_DELETED` | S → C | it is gone, to those asked to the call |
+| `0x00BA` | `CALL_RECORD` | C → S | start or stop recording the call (CALLS.md §8) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |
 | `0x00B3` | `MENTION_UNRESOLVED` | S → C | to the sender only: which mentioned names reached nobody (REQ-287) |

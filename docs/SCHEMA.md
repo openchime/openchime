@@ -556,7 +556,7 @@ client then renders "no longer available" instead of failing an opaque
 download, and message history (REQ-053) is untouched — only attachment bytes
 are ever removed, never messages.
 
-Migration 0015 adds `reclaim_reason` (1 orphan, 2 aged out, 3 evicted under
+Migration 0015 adds `reclaim_reason` (4, since 0087, a call's recording deleted by its starter or an admin; 1 orphan, 2 aged out, 3 evicted under
 pressure). The table already recorded *when* a blob went; this records *which
 tier took it*, which makes REQ-215's audit trail a query against a table we
 already keep rather than a second, ever-growing log — and eviction is
@@ -1166,11 +1166,12 @@ still shows sense. It is otherwise an ordinary row — unread, backfill, history
 travelling on `BROADCAST` with its kind (PROTOCOL.md §5.3); full-text search and
 read-aloud skip it.
 
-Calls themselves have **no table**: a call, its participants, their device keys
-and its invitations are net-thread memory, ended by a restart like presence
-(ARCH-67/73). A device's public key reaches the daemon on `CALL_JOIN` and is kept
-for the length of that participation; its private key never leaves the device
-(ARCH-113).
+Until migration 0087 calls had **no table**; since it, a call is a row of its own
+(§3bz), and kind `1` is also the one message a call started from a conversation
+leaves there. A missed-call line stored before 0087 names no call
+(`messages.call_id` is NULL) and reads as it always did. A device's public key
+reaches the daemon on `CALL_JOIN` and is kept, in memory only, for the length of
+that participation; its private key never leaves the device (ARCH-113).
 
 ## 3ai. Migration 0044 — identities (AUTH.md §8.4)
 
@@ -2244,3 +2245,105 @@ sweep's reference check, which leaves a copy's blob alone while its row stands.
 *Deleted* by the storage pass: under pressure, least recently used first and
 before any attachment, and, pressure or not, as soon as its video is reclaimed.
 No tombstone: a lost copy costs one transcode.
+
+## 3bz. Migration 0087 — calls (CALLS.md §1, ARCH-73)
+
+```sql
+CREATE TABLE calls (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  subject       TEXT NOT NULL,
+  starter       INTEGER NOT NULL REFERENCES users(id),
+  from_channel  INTEGER REFERENCES channels(id),
+  started_at_ms INTEGER NOT NULL,
+  ended_at_ms   INTEGER,
+  end_reason    TEXT CHECK (end_reason IN ('left','ended','stopped')));
+CREATE INDEX idx_calls_open ON calls(ended_at_ms) WHERE ended_at_ms IS NULL;
+CREATE TABLE call_participants (
+  id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL REFERENCES calls(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  joined_at_ms INTEGER NOT NULL, left_at_ms INTEGER);
+CREATE INDEX idx_call_parts_call ON call_participants(call_id, joined_at_ms);
+CREATE INDEX idx_call_parts_user ON call_participants(user_id, call_id);
+CREATE TABLE call_invitees (
+  call_id INTEGER NOT NULL REFERENCES calls(id), user_id INTEGER NOT NULL REFERENCES users(id),
+  invited_by INTEGER NOT NULL REFERENCES users(id), invited_at_ms INTEGER NOT NULL,
+  declined_at_ms INTEGER, PRIMARY KEY (call_id, user_id)) WITHOUT ROWID;
+CREATE INDEX idx_call_invitees_user ON call_invitees(user_id, call_id);
+CREATE TABLE call_events (
+  id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL REFERENCES calls(id),
+  at_ms INTEGER NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL CHECK (kind IN ('camera_on','camera_off','share_on','share_off',
+                                     'record_on','record_off','subject')),
+  detail TEXT);
+CREATE INDEX idx_call_events_call ON call_events(call_id, at_ms);
+CREATE TABLE call_recordings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL REFERENCES calls(id),
+  started_by INTEGER NOT NULL REFERENCES users(id), started_at_ms INTEGER NOT NULL,
+  stopped_at_ms INTEGER,
+  state TEXT NOT NULL DEFAULT 'recording' CHECK (state IN ('recording','processing','ready','failed')),
+  spool TEXT, attachment_id INTEGER REFERENCES attachments(id), bytes INTEGER,
+  duration_ms INTEGER, error TEXT);
+CREATE INDEX idx_call_recs_call ON call_recordings(call_id);
+CREATE INDEX idx_call_recs_state ON call_recordings(state);
+CREATE TABLE call_transcripts (
+  id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL UNIQUE REFERENCES calls(id),
+  created_at_ms INTEGER NOT NULL, language TEXT);
+CREATE TABLE call_transcript_lines (
+  id INTEGER PRIMARY KEY, transcript_id INTEGER NOT NULL REFERENCES call_transcripts(id),
+  speaker INTEGER REFERENCES users(id), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+  text TEXT NOT NULL);
+CREATE INDEX idx_call_tlines ON call_transcript_lines(transcript_id, start_ms);
+CREATE VIRTUAL TABLE call_transcripts_fts USING fts5(
+  text, content='call_transcript_lines', content_rowid='id');
+-- with an insert and a delete trigger keeping it in step, as messages_fts's do
+ALTER TABLE channels ADD COLUMN call_id INTEGER REFERENCES calls(id);
+CREATE UNIQUE INDEX idx_channels_call ON channels(call_id) WHERE call_id IS NOT NULL;
+ALTER TABLE messages ADD COLUMN call_id INTEGER REFERENCES calls(id);
+CREATE INDEX idx_messages_call ON messages(call_id) WHERE call_id IS NOT NULL;
+```
+
+*A call is a row of its own* (CALLS.md §1): until this migration a call lived only
+in the net loop's memory. The live parts of a call — its participants'
+connections, slots, tokens and device keys, its epoch — are still the loop's and
+nothing else's; what is kept is what happened.
+
+- **`calls`** — the subject, who started it, the conversation it was started from
+  (`from_channel`, NULL from Calls home; the call has no other tie to it), its
+  start and end, and how it ended: `left` (the last person left), `ended` (ended
+  for everyone) or `stopped` (the daemon stopped with it open). Its `id` is the
+  call's id everywhere, in the frames and in the HPKE info that binds each sealed
+  key (CALLS.md §5.3), so the column is `AUTOINCREMENT`: an id is never used twice.
+  *Written* when a call starts (`CALL_START`) and when it ends (`CALL_LOG` END);
+  a rename changes `subject` (`CALL_LOG` SUBJECT). A writer starting over a row
+  with no end closes it as `stopped`, at the last moment the call recorded — its
+  latest join, leave or event, else its start — with every stay still open.
+- **`call_participants`** — one row per stay: a join to its leave. A connection
+  that drops keeps its seat for the rejoin grace (PROTOCOL.md §5.17), and a rejoin
+  within it is the same stay, so it writes nothing; a seat dropped past the grace
+  is a leave.
+- **`call_invitees`** — who was asked, by whom and when, and whether they declined.
+  The starter is the first invitee, asked by themself, so *being an invitee is
+  what lets a person see the call* — its page, its chat, its recording and its
+  transcript — whether or not they joined; only an invitee may join.
+- **`call_events`** — the timeline: a camera on or off, a share started or stopped,
+  recording started or stopped, and each rename (`subject`, with the new subject
+  in `detail`), each with who and when.
+- **`call_recordings`** — one row per recording, made while the Recorder is in the
+  call (`recording`), processed from its spool (`processing`) into one file
+  (`ready`, with `attachment_id`, `bytes` and `duration_ms`) or not (`failed`,
+  with `error`). The file is an attachment of the call's chat, so it is fetched
+  and played as a video message is, by the call's people only. `spool` is the
+  recording's directory under the data directory, kept until processing removes
+  it.
+- **`call_transcripts`** and **`call_transcript_lines`** — at most one transcript a
+  call: lines of speaker, start and end (milliseconds from the call's start) and
+  text, indexed by `call_transcripts_fts` for search. Nothing makes a transcript
+  yet; the daemon's transcript function stores one.
+- **`channels.call_id`** — the call's chat is a conversation the call owns: a
+  `kind='dm'` channel with no `dm_key`, marked with its call (at most one per
+  call), its members the call's invitees. Messaging, history, files and search
+  reach it through membership as for any DM; every conversation list leaves it
+  out.
+- **`messages.call_id`** — the one message (kind `1`) a call started from a
+  conversation leaves there, naming its call. A missed-call line from before this
+  migration names none.

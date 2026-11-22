@@ -574,14 +574,29 @@ void oc_client_voice_preview(oc_client *c, const char *voice_id);
 uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
                             const int16_t *pcm, size_t samples);
 
-/* Calls (REQ-150, REQ-301-305, docs/CALLS.md). Start a call in a conversation,
- * inviting `invite` (the members, up to the cap, or the starter's pick); join the
- * call already there; leave it; decline an invitation; end it for everyone (the
- * starter only); invite more people. The daemon's answers fold into the model:
- * `calls` for the Calls section, `call` / `in_call` for the one this client is
- * in, `call_error` for a refusal. */
-void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n);
-void oc_client_call_join(oc_client *c, uint64_t channel_id);
+/* Calls (REQ-150, REQ-301-305, docs/CALLS.md §1). Start a call with a subject,
+ * inviting `invite`, from the conversation `from_channel` (0 for none: that
+ * conversation gets one message about the call); join a call this user is
+ * invited to; leave it; decline an invitation; end it for everyone (the
+ * starter only); invite more people; rename it. The daemon's answers fold into
+ * the model: `calls` for Calls home, `call` / `in_call` for the one this client
+ * is in, `call_error` for a refusal. */
+void oc_client_call_start(oc_client *c, uint64_t from_channel, const char *subject,
+                          const uint64_t *invite, int n);
+void oc_client_call_join(oc_client *c, uint64_t call_id);
+void oc_client_call_subject(oc_client *c, uint64_t call_id, const char *subject);
+/* Start (on) or stop recording the call (CALLS.md §8), where the daemon
+ * offers it; the model's `call.recording` follows CALL_STATE. */
+void oc_client_call_record(oc_client *c, uint64_t call_id, int on);
+/* The call history (CALLS.md §1): a page of this user's calls started before
+ * `before_ms`, 0 from the newest, into the model's `call_hist`. */
+void oc_client_call_history(oc_client *c, uint64_t before_ms);
+/* A call's page into the model's `call_page`, its transcript from line
+ * `line_from` (0 the page afresh; the held count to have the next lines). */
+void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from);
+/* An admin deletes a call's transcript (`what` OC_CALL_DEL_TRANSCRIPT) or its
+ * recording `rec_id` (OC_CALL_DEL_RECORDING). */
+void oc_client_call_delete(oc_client *c, uint64_t call_id, uint8_t what, uint64_t rec_id);
 
 /* Encrypted DMs (PRIVATE-DM.md, client/core/pdm.h), opened with
  * oc_client_open_dm(.., 1). What comes of each session is told as OC_EV_PDM and
@@ -592,21 +607,21 @@ void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_close(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id);
-void oc_client_call_leave(oc_client *c, uint64_t channel_id);
-void oc_client_call_decline(oc_client *c, uint64_t channel_id);
-void oc_client_call_end(oc_client *c, uint64_t channel_id);
-void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n);
+void oc_client_call_leave(oc_client *c, uint64_t call_id);
+void oc_client_call_decline(oc_client *c, uint64_t call_id);
+void oc_client_call_end(oc_client *c, uint64_t call_id);
+void oc_client_call_invite(oc_client *c, uint64_t call_id, const uint64_t *uids, int n);
 /* Start (on) or stop sharing a screen in the call this client is in (REQ-161).
  * The daemon's CALL_STATE names the sharer; the media engine sends once it is
  * this device. */
-void oc_client_call_share(oc_client *c, uint64_t channel_id, int on);
+void oc_client_call_share(oc_client *c, uint64_t call_id, int on);
 /* Turn this device's camera on or off in the call (REQ-160). The roster marks
  * whose cameras are on (oc_call_view.camera); the media engine sends once it
  * marks this device's. */
-void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on);
+void oc_client_call_camera(oc_client *c, uint64_t call_id, int on);
 /* Whose cameras the relay sends this client: every one (`all`), or the `n`
  * users named -- what the call view shows (REQ-160). */
-void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n);
+void oc_client_call_video_sub(oc_client *c, uint64_t call_id, int all, const uint64_t *users, int n);
 /* Where the audio goes (callsig.h): a frontend that does calls plugs in its
  * media engine before offering them. NULL removes it; on return nothing is
  * calling into the old one. */

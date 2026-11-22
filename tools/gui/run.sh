@@ -130,15 +130,16 @@ fi
 # The daemon with the web client compiled in (WEB=1) and the Windows client,
 # as their own make with REMEMBER=0: build/.features, which a later `make
 # openchimed` or `make run` reads, is neither read nor rewritten. The switches
-# it remembers for read-aloud, voice input and summaries are passed as they
-# are, so a daemon with speech keeps it and one without is not given it.
+# it remembers for read-aloud, voice input, summaries and recording calls are
+# passed as they are, so a daemon with speech keeps it and one without is not
+# given it.
 # remembered <switch>: its remembered value; 0 (off) when there is none.
 remembered() { local v; v="$(sed -n "s/^$1=//p" "$HERE/build/.features" 2>/dev/null | head -1)"; echo "${v:-0}"; }
 if [ "$build" = 1 ]; then
   # And, for the web, the two helpers features/web_pages.sh presents tokens
   # and mints an invitation with.
   targets="daemon"; uses win32 && targets="$targets windows"; uses web && targets="$targets build/signin build/demo_client"
-  BUILD=(make -C "$HERE" REMEMBER=0 TTS="$(remembered TTS)" STT="$(remembered STT)" SUM="$(remembered SUM)" WEB=1 $targets)
+  BUILD=(make -C "$HERE" REMEMBER=0 TTS="$(remembered TTS)" STT="$(remembered STT)" SUM="$(remembered SUM)" CALLREC="$(remembered CALLREC)" WEB=1 $targets)
   echo "run.sh: building: ${BUILD[*]}"
   if ! "${BUILD[@]}" > "$LOGS/build.log" 2>&1; then
     tail -20 "$LOGS/build.log" >&2
@@ -177,6 +178,8 @@ fi
 #            back. Asked as voice.sh asks: a daemon built without them takes
 #            neither argument (asked once a run).
 #   ffmpeg   ffmpeg and ffprobe, to read back what was recorded
+#   callrec  the daemon built with the codecs a call's recording is made with
+#            (CALLREC=1): features/calls.sh records a call and plays it back
 speech=""
 unmet() {
   local out
@@ -191,6 +194,10 @@ unmet() {
       why="no speech data in ./openchimed"; [ "$speech" = no ] ;;
     ffmpeg)
       why="no ffmpeg"; ! { command -v ffmpeg && command -v ffprobe; } >/dev/null ;;
+    callrec)
+      # The engine names itself in the binary (daemon/callrec_engine.c).
+      why="./openchimed records no calls (make CALLREC=1)"
+      ! grep -q 'libvpx-vp9-1280x720@15-450k' "$HERE/openchimed" 2>/dev/null ;;
     *) why="needs $1, which run.sh cannot check"; return 0 ;;
   esac
 }

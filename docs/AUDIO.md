@@ -1,7 +1,7 @@
 # OpenChime — Audio
 
 How a voice call's audio works: the media path, the client audio engine, and
-acoustic echo cancellation. The feature — the Calls section, invitations, ending,
+acoustic echo cancellation. The feature — Calls home, invitations, ending,
 missed calls — and the end-to-end encryption are [CALLS.md](./CALLS.md). This is
 cross-referenced from ARCHITECTURE.md (ARCH-18, ARCH-28, ARCH-31, ARCH-73,
 ARCH-113), REQUIREMENTS.md (§6.2, REQ-150–152, REQ-301–306), PROTOCOL.md (§5.17),
@@ -17,7 +17,7 @@ the UDP relay, which runs in the daemon's event loop (`daemon/relay.c`); the cli
 in the core (`client/core/callsig.c`, on the network thread); and the media
 engine (`client/core/call/`): capture through the echo canceller and speexdsp's
 preprocessor, Opus, SFrame, the relay socket, a jitter buffer and decoder per
-sender, and the mixer. The Win32 client and the web client carry it (the browser, with no UDP, over its connection; §4); the TUI has no calls (§8).
+sender, and the mixer. The Win32 client and the web client carry it (the browser, with no UDP, over its connection; §4); the TUI lists calls and shows their pages, but has no audio (§8).
 
 ---
 
@@ -70,12 +70,19 @@ stream, and that mix is exactly the far-end reference the echo canceller needs
 ### 1.2 What the client does not have to build
 
 Already done, server-side: the SFU relay, roster maintenance and fan-out,
-per-join tokens, authorization via the ordinary channel-read gate, participant
+per-join tokens, authorization against the call's invitees (CALLS.md §1), participant
 drop on TCP disconnect, and the media-side silence timeout. NAT traversal also
 falls out of the existing design — the client sends an initial packet (empty
 payload allowed) so the relay learns its UDP source address, which creates the
 outbound mapping. An empty payload — a keepalive — is answered to its sender
 alone, so a client knows the relay can hear it.
+
+**The recording gate** (CALLS.md §8.4) is the engine's, beside mute: a device
+that comes into a call whose roster has the Recorder treats its microphone as
+muted and holds its camera until the frontend says the user acknowledged "This
+call is being recorded." (`oc_call_engine_ack_recording`); it lifts by itself if
+the recording stops. A device already in the call when recording starts is not
+held. The Recorder is, to the engine, one more peer its key is sealed to.
 
 ---
 
@@ -386,7 +393,7 @@ Signaling is ordinary protocol work on the network thread (`client/core/callsig.
 `OC_CMD_CALL_JOIN/INVITE/LEAVE/DECLINE/END/SHARE` out, and `CALL_JOINED`, `CALL_ROSTER`,
 `CALL_STATE`, `CALL_KEY_FOR` and `CALL_MEDIA` in. It keeps the device key, makes and seals the
 media key on every epoch and opens the others' (CALLS.md §5), and folds the call
-into the model as `OC_EV_CALL_*`: the Calls section's list, the call this client
+into the model as `OC_EV_CALL_*`: Calls home's list, the call this client
 is in, a refusal. The media endpoint, the token and every key go to the engine
 through the **`oc_call_media` seam** — start, roster, the key to send with, a
 sender's key, stop, who is sharing, the connection transport, a lost path — and
@@ -509,12 +516,12 @@ switch.
 | HPKE and SFrame | `shared/e2e_hpke.c`, `shared/e2e_sframe.c` |
 | Call state, invitations, keys forwarded, missed calls | `daemon/netloop.c`, `daemon/dbwriter.c` |
 | Relay | `daemon/relay.c`, driven by `daemon/netloop.c` |
-| Calls section, call view, strip, toasts, keys | `client/gui/app/app.c` |
+| Calls home, call page, call view, strip, toasts, keys | `client/gui/app/app.c` |
 
 ## 8. TUI surface
 
-The TUI has no calls: it links the core without the engine and offers nothing
-of them. **There are no slash commands** (ARCH-83), so if it gains calls, joining
+The TUI joins no calls: it links the core without the engine. It lists them —
+**Calls** in the launcher, the history, and a call's page and chat (CALLS.md §2). **There are no slash commands** (ARCH-83), so if it gains joining a call, joining
 and leaving are actions in the Ctrl+K command palette and the channel action
 menu, the roster renders in the Members panel with speaking and muted marks, mute
 is a key binding rather than a menu item — it is used mid-sentence — and

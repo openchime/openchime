@@ -149,6 +149,9 @@ typedef struct {
      * who marked each done, as the daemon last said. A frontend shows it in
      * place of the "/todo" body. */
     oc_todo_view   *todo;
+    /* A call's message in the conversation it was started from (CALLS.md §1):
+     * the call. 0 for any other, and for a missed call stored before. */
+    uint64_t        call_id;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -222,6 +225,9 @@ typedef struct {
      * texts are wiped from memory when it is forgotten, which also takes it out
      * of the sidebar. */
     uint8_t  e2e, forgotten;
+    /* A call's own chat (CALLS.md §1): the call's id. In no conversation list;
+     * reached from the call's view and its page. */
+    uint64_t call_id;
     uint32_t info_seq;     /* bumped by every CHANNEL_INFO for it: a roster on screen
                             * asks again when it moves, since an invite or a removal
                             * is answered with one and nothing else says so */
@@ -890,24 +896,38 @@ typedef struct {
         uint32_t total_seq;
     } unresolved;
 
-    /* Calls (REQ-150, REQ-301-305, CALLS.md). `calls` is the Calls section: every
-     * call in a conversation this user belongs to or is invited to, as CALL_STATE
-     * last said, ended ones removed; the daemon sends them all again after a
-     * reconnect. `call` is the one this client is in, while `in_call`, with each
-     * participant's slot. `call_pending` is a start or join on its way. */
+    /* Calls (REQ-150, REQ-301-305, CALLS.md §1). `calls` is Calls home's
+     * running calls: every call this user is invited to, as CALL_STATE last
+     * said, ended ones removed; the daemon sends them all again after a
+     * reconnect. `call` is the one this client is in, while `in_call`, with
+     * each participant's slot. `call_pending` is set while a start or join is
+     * on its way. */
     oc_call_view calls[OC_MAX_CALLS_LISTED];
     size_t       n_calls;
     uint8_t      call_max;              /* the daemon's cap on a call (REQ-305) */
     uint64_t     max_video_size;        /* the daemon's cap on a video message (REQ-164); 0 until WORKSPACE_INFO */
     uint8_t      in_call;
     oc_call_view call;
-    uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */
-    /* Getting back into the call in this channel (0 = not), after the
+    uint8_t      call_pending;          /* a start or join on its way */
+    /* Getting back into this call (0 = not), after the
      * connection or the media path went (PROTOCOL.md §5.17); `call` still says
      * what it was. `call_back_seq` bumps when that succeeds, `call_lost_seq`
      * when it is given up -- each once, for a frontend to say so. */
     uint64_t     call_rejoining;
     uint32_t     call_back_seq, call_lost_seq;
+    /* The call history (CALLS.md §1): the pages fetched so far, newest first
+     * (heap, `n_call_hist` of them); `call_hist_more` while older ones are
+     * there to ask for (oc_client_call_history with the oldest's start).
+     * `call_hist_seq` bumps per page. */
+    oc_call_hist_view *call_hist;
+    size_t             n_call_hist;
+    uint8_t            call_hist_more, call_hist_loaded;
+    uint32_t           call_hist_seq;
+    /* The call page last fetched (heap, NULL none): its transcript's lines
+     * gathered page by page as oc_client_call_detail asks from the next.
+     * `call_page_seq` bumps per page and per delete. */
+    oc_call_page_view *call_page;
+    uint32_t           call_page_seq;
     /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
      * error line's does. */
     uint16_t     call_error;
@@ -1373,8 +1393,11 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
  * table (the oldest go first, finished ones before any still running). */
 const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);
 
-/* Calls (REQ-301-305). The Calls section's entry for a conversation, or NULL. */
-const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id);
+/* Calls (REQ-301-305, CALLS.md §1). A running call this user is invited to,
+ * by its id, or NULL; and the one started from conversation `channel_id`, or
+ * NULL -- what that conversation's call button joins rather than starts. */
+const oc_call_view *oc_model_call(const oc_model *m, uint64_t call_id);
+const oc_call_view *oc_model_call_from(const oc_model *m, uint64_t channel_id);
 /* Is `user_id` invited to `v` and not yet in it? */
 int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);
 /* Drain the invitations worth a toast: each is a mention of this user, so a

@@ -185,6 +185,10 @@ typedef struct {
      * carries it: OPENCHIME_H264_EXPORT, off unless the operator holds the
      * licence turning it on needs. */
     struct { int enabled; } export_h264;
+    /* Recording calls (CALLS.md §8), in a build that carries it: on unless an
+     * admin turned it off; recordings kept `days` (0: as long as the call is)
+     * and held to `max_mb` megabytes in all (0: no cap). */
+    struct { int enabled; int days; uint64_t max_mb; } call_recording;
     /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;

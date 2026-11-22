@@ -51,6 +51,18 @@ int  oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t
 /* Stop without a file. */
 void oc_mp4_writer_abort(oc_mp4_writer *w);
 
+#if !defined(_WIN32)
+/* The same file, made on disk rather than in memory, for what is too long to
+ * hold -- a call's recording (CALLS.md §8): the samples go to `path`.part as
+ * they are written, and finishing writes ftyp and moov to `path` and the
+ * samples after them, then removes the part. The profile's bounds hold as for
+ * any file of it. NULL on failure, with nothing left. */
+oc_mp4_writer *oc_mp4_writer_open_file(const char *path, int width, int height);
+/* Finish a writer opened on a file: 0 with the file's size and the longer
+ * track's duration; -1 with nothing left. Frees `w` either way. */
+int oc_mp4_writer_finish_file(oc_mp4_writer *w, uint64_t *bytes, uint32_t *duration_ms);
+#endif
+
 /* ---- the export writer (ARCH-135, docs/VIDEO-MESSAGES.md "Export") --------------
  *
  * A video message re-encoded for players that do not open VP9: one H.264 track

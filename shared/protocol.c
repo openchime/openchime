@@ -449,6 +449,7 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u8(w, m->kind);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_u64(w, m->parent_id);               /* a reply also in the channel (REQ-062), else 0 */
+    oc_w_u64(w, m->call_id);                 /* a call message's call (CALLS.md §1), else 0 */
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -1664,6 +1665,10 @@ const char *oc_error_text(uint16_t code) {
         return "that emoji has kept as many old names as it can: add it again under the new name instead";
     case OC_ERR_EXPORT_UNAVAILABLE:
         return "a copy for other players isn't available here right now";
+    case OC_ERR_CALL_SUBJECT:
+        return "a call needs a subject, of at most 200 bytes";
+    case OC_ERR_RECORDING_UNAVAILABLE:
+        return "calls can't be recorded here right now";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2229,24 +2234,131 @@ static void r_u64s(oc_rbuf *p, uint16_t *count, uint64_t *v, uint16_t cap) {
     *count = n;
 }
 
-oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {
-    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
-    oc_w_u64(w, m->channel_id);
+oc_result oc_encode_call_start(oc_wbuf *w, uint16_t version, const oc_call_start *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_START);
+    oc_w_u64(w, m->from_channel);
+    oc_w_str(w, m->subject);
     w_raw(w, m->device_key, OC_CALL_DEVICE_KEY_LEN);
     oc_w_u8(w, m->codecs);
     w_u64s(w, m->n_invite, m->invite);
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
+    oc_w_u64(w, m->call_id);
+    w_raw(w, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    oc_w_u8(w, m->codecs);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_record(oc_wbuf *w, uint16_t version, const oc_call_record *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_RECORD);
+    oc_w_u64(w, m->call_id);
+    oc_w_u8(w, m->on);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_history(oc_wbuf *w, uint16_t version, const oc_call_history *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_HISTORY);
+    oc_w_u64(w, m->before_ms);
+    oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_history_page(oc_wbuf *w, uint16_t version, const oc_call_history_page *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_HISTORY_PAGE);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_call_hist_entry *e = &m->entries[i];
+        oc_w_u64(w, e->call_id);
+        oc_w_str(w, e->subject);
+        oc_w_u64(w, e->starter);
+        oc_w_u64(w, e->started_at);
+        oc_w_u64(w, e->ended_at);
+        oc_w_u8(w, e->end_reason);
+        oc_w_u64(w, e->from_channel);
+        oc_w_u64(w, e->chat_channel);
+        oc_w_u16(w, e->n_people);
+        oc_w_u8(w, e->flags);
+    }
+    oc_w_u8(w, m->more);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_detail(oc_wbuf *w, uint16_t version, const oc_call_detail *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_DETAIL);
+    oc_w_u64(w, m->call_id);
+    oc_w_u32(w, m->line_from);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_page(oc_wbuf *w, uint16_t version, const oc_call_page *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_PAGE);
+    oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
+    oc_w_u64(w, m->starter);
+    oc_w_u64(w, m->started_at);
+    oc_w_u64(w, m->ended_at);
+    oc_w_u8(w, m->end_reason);
+    oc_w_u64(w, m->from_channel);
+    oc_w_u64(w, m->chat_channel);
+    oc_w_u16(w, m->n_stays);
+    for (uint16_t i = 0; i < m->n_stays; i++) {
+        oc_w_u64(w, m->stays[i].user_id); oc_w_u64(w, m->stays[i].joined_at); oc_w_u64(w, m->stays[i].left_at);
+    }
+    oc_w_u16(w, m->n_invitees);
+    for (uint16_t i = 0; i < m->n_invitees; i++) {
+        oc_w_u64(w, m->invitees[i].user_id); oc_w_u64(w, m->invitees[i].invited_by);
+        oc_w_u64(w, m->invitees[i].invited_at); oc_w_u64(w, m->invitees[i].declined_at);
+    }
+    oc_w_u16(w, m->n_events);
+    for (uint16_t i = 0; i < m->n_events; i++) {
+        oc_w_u64(w, m->events[i].at); oc_w_u64(w, m->events[i].user_id);
+        oc_w_u8(w, m->events[i].kind); oc_w_str(w, m->events[i].detail);
+    }
+    oc_w_u16(w, m->n_recordings);
+    for (uint16_t i = 0; i < m->n_recordings; i++) {
+        const oc_call_recording *r = &m->recordings[i];
+        oc_w_u64(w, r->id); oc_w_u8(w, r->state); oc_w_u64(w, r->started_by); oc_w_u64(w, r->started_at);
+        oc_w_u64(w, r->stopped_at); oc_w_u32(w, r->duration_ms); oc_w_u64(w, r->bytes); oc_w_u64(w, r->attachment_id);
+    }
+    oc_w_u8(w, m->has_transcript);
+    oc_w_str(w, m->transcript_lang);
+    oc_w_u32(w, m->n_lines_total);
+    oc_w_u32(w, m->line_from);
+    oc_w_u16(w, m->n_lines);
+    for (uint16_t i = 0; i < m->n_lines; i++) {
+        oc_w_u64(w, m->lines[i].id); oc_w_u64(w, m->lines[i].speaker);
+        oc_w_u32(w, m->lines[i].start_ms); oc_w_u32(w, m->lines[i].end_ms); oc_w_str(w, m->lines[i].text);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_delete(oc_wbuf *w, uint16_t version, uint16_t type, const oc_call_delete *m) {
+    if (type != OC_MSG_CALL_DELETE && type != OC_MSG_CALL_DELETED) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->call_id);
+    oc_w_u8(w, m->what);
+    oc_w_u64(w, m->id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_subject(oc_wbuf *w, uint16_t version, const oc_call_subject *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SUBJECT);
+    oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_LEAVE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOINED);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u16(w, m->udp_port);
     oc_w_bytes(w, m->token);
@@ -2260,7 +2372,6 @@ oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_join
 
 oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_ROSTER);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     w_call_parts(w, m->count, m->parts);
@@ -2269,29 +2380,32 @@ oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_rost
 
 oc_result oc_encode_call_invite(oc_wbuf *w, uint16_t version, const oc_call_invite *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_INVITE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     w_u64s(w, m->count, m->users);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_decline(oc_wbuf *w, uint16_t version, const oc_call_decline *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_DECLINE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_end(oc_wbuf *w, uint16_t version, const oc_call_end *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_END);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_STATE);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
     oc_w_u64(w, m->starter);
     oc_w_u64(w, m->started_at);
+    oc_w_u64(w, m->from_channel);
+    oc_w_u64(w, m->chat_channel);
+    oc_w_u8(w, m->flags);
     oc_w_u8(w, m->ended);
     w_u64s(w, m->n_parts, m->parts);
     w_u64s(w, m->n_invited, m->invited);
@@ -2301,7 +2415,6 @@ oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state
 
 oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_KEY);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     oc_w_u16(w, m->count);
@@ -2314,7 +2427,6 @@ oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m)
 
 oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_KEY_FOR);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     oc_w_u64(w, m->sender);
@@ -2362,7 +2474,7 @@ oc_result oc_encode_pdm_end(oc_wbuf *w, uint16_t version, const oc_pdm_end *m) {
 
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SHARE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->on);
     return oc_frame_end(w, off);
 }
@@ -2386,21 +2498,22 @@ oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_
 
 oc_result oc_encode_call_camera(oc_wbuf *w, uint16_t version, const oc_call_camera *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_CAMERA);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->on);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_video_sub(oc_wbuf *w, uint16_t version, const oc_call_video_sub *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_VIDEO_SUB);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->all);
     w_u64s(w, m->count, m->users);
     return oc_frame_end(w, off);
 }
 
-oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+oc_result oc_decode_call_start(oc_rbuf *p, oc_call_start *m, uint64_t *invite, uint16_t cap) {
+    m->from_channel = oc_r_u64(p);
+    m->subject = oc_r_str(p);
     r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
     m->codecs = oc_r_u8(p);
     m->n_invite = 0;
@@ -2409,13 +2522,127 @@ oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uin
     return r_done(p);
 }
 
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m) {
+    m->call_id = oc_r_u64(p);
+    r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    m->codecs = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_record(oc_rbuf *p, oc_call_record *m) {
+    m->call_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_history(oc_rbuf *p, oc_call_history *m) {
+    m->before_ms = oc_r_u64(p);
+    m->limit = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_history_page(oc_rbuf *p, oc_call_history_page *m, oc_call_hist_entry *entries, uint16_t cap) {
+    uint16_t n = oc_r_u16(p);
+    m->count = 0;
+    m->entries = entries;
+    if (n > cap) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        oc_call_hist_entry *e = &entries[i];
+        e->call_id = oc_r_u64(p);
+        e->subject = oc_r_str(p);
+        e->starter = oc_r_u64(p);
+        e->started_at = oc_r_u64(p);
+        e->ended_at = oc_r_u64(p);
+        e->end_reason = oc_r_u8(p);
+        e->from_channel = oc_r_u64(p);
+        e->chat_channel = oc_r_u64(p);
+        e->n_people = oc_r_u16(p);
+        e->flags = oc_r_u8(p);
+    }
+    m->count = n;
+    m->more = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_detail(oc_rbuf *p, oc_call_detail *m) {
+    m->call_id = oc_r_u64(p);
+    m->line_from = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_page(oc_rbuf *p, oc_call_page *m, oc_call_stay *stays, oc_call_invitee *invitees,
+                              oc_call_event *events, oc_call_recording *recordings, oc_call_tline *lines) {
+    memset(m, 0, sizeof *m);
+    m->stays = stays; m->invitees = invitees; m->events = events; m->recordings = recordings; m->lines = lines;
+    m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
+    m->starter = oc_r_u64(p);
+    m->started_at = oc_r_u64(p);
+    m->ended_at = oc_r_u64(p);
+    m->end_reason = oc_r_u8(p);
+    m->from_channel = oc_r_u64(p);
+    m->chat_channel = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_STAYS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        stays[i].user_id = oc_r_u64(p); stays[i].joined_at = oc_r_u64(p); stays[i].left_at = oc_r_u64(p);
+    }
+    m->n_stays = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_INVITEES) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        invitees[i].user_id = oc_r_u64(p); invitees[i].invited_by = oc_r_u64(p);
+        invitees[i].invited_at = oc_r_u64(p); invitees[i].declined_at = oc_r_u64(p);
+    }
+    m->n_invitees = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_EVENTS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        events[i].at = oc_r_u64(p); events[i].user_id = oc_r_u64(p);
+        events[i].kind = oc_r_u8(p); events[i].detail = oc_r_str(p);
+    }
+    m->n_events = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_RECORDINGS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        oc_call_recording *r = &recordings[i];
+        r->id = oc_r_u64(p); r->state = oc_r_u8(p); r->started_by = oc_r_u64(p); r->started_at = oc_r_u64(p);
+        r->stopped_at = oc_r_u64(p); r->duration_ms = oc_r_u32(p); r->bytes = oc_r_u64(p); r->attachment_id = oc_r_u64(p);
+    }
+    m->n_recordings = n;
+    m->has_transcript = oc_r_u8(p);
+    m->transcript_lang = oc_r_str(p);
+    m->n_lines_total = oc_r_u32(p);
+    m->line_from = oc_r_u32(p);
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_LINES) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        lines[i].id = oc_r_u64(p); lines[i].speaker = oc_r_u64(p);
+        lines[i].start_ms = oc_r_u32(p); lines[i].end_ms = oc_r_u32(p); lines[i].text = oc_r_str(p);
+    }
+    m->n_lines = n;
+    return r_done(p);
+}
+
+oc_result oc_decode_call_delete(oc_rbuf *p, oc_call_delete *m) {
+    m->call_id = oc_r_u64(p);
+    m->what = oc_r_u8(p);
+    m->id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_subject(oc_rbuf *p, oc_call_subject *m) {
+    m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *parts, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->udp_port = oc_r_u16(p);
     m->token = oc_r_bytes(p);
@@ -2430,7 +2657,6 @@ oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *par
 }
 
 oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *parts, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     m->count = 0;
@@ -2440,7 +2666,7 @@ oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *par
 }
 
 oc_result oc_decode_call_invite(oc_rbuf *p, oc_call_invite *m, uint64_t *users, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->count = 0;
     m->users = users;
     r_u64s(p, &m->count, users, cap);
@@ -2448,21 +2674,24 @@ oc_result oc_decode_call_invite(oc_rbuf *p, oc_call_invite *m, uint64_t *users, 
 }
 
 oc_result oc_decode_call_decline(oc_rbuf *p, oc_call_decline *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_end(oc_rbuf *p, oc_call_end *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, uint16_t pcap,
                                uint64_t *invited, uint16_t icap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
     m->starter = oc_r_u64(p);
     m->started_at = oc_r_u64(p);
+    m->from_channel = oc_r_u64(p);
+    m->chat_channel = oc_r_u64(p);
+    m->flags = oc_r_u8(p);
     m->ended = oc_r_u8(p);
     m->n_parts = m->n_invited = 0;
     m->parts = parts;
@@ -2474,7 +2703,6 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
 }
 
 oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     uint16_t n = oc_r_u16(p);
@@ -2490,7 +2718,6 @@ oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entr
 }
 
 oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     m->sender = oc_r_u64(p);
@@ -2543,7 +2770,7 @@ oc_result oc_decode_pdm_end(oc_rbuf *p, oc_pdm_end *m) {
 }
 
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->on = oc_r_u8(p);
     return r_done(p);
 }
@@ -2565,13 +2792,13 @@ oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m) {
 }
 
 oc_result oc_decode_call_camera(oc_rbuf *p, oc_call_camera *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->on = oc_r_u8(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_video_sub(oc_rbuf *p, oc_call_video_sub *m, uint64_t *users, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->all = oc_r_u8(p);
     m->count = 0;
     m->users = users;
@@ -2991,6 +3218,8 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_str(w, m->entries[i].snippet);
         oc_w_u8(w, m->entries[i].action);
         oc_w_u64(w, (uint64_t)m->entries[i].rank);  /* 28 */
+        oc_w_u64(w, m->entries[i].call_id);         /* a transcript's hit (CALLS.md §1) */
+        oc_w_u64(w, m->entries[i].line_id);
     }
     oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
@@ -3193,6 +3422,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->broadcast_stored = oc_r_u8(p);
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->parent_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -4348,7 +4578,10 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
         oc_slice snip = oc_r_str(p);
         uint8_t act = oc_r_u8(p);
         int64_t rank = (int64_t)oc_r_u64(p);
+        uint64_t call = oc_r_u64(p), line = oc_r_u64(p);
         if (i < cap) {
+            entries[i].call_id = call;
+            entries[i].line_id = line;
             entries[i].message_id = mid;
             entries[i].channel_id = ch;
             entries[i].author_id = author;

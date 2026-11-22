@@ -13,7 +13,7 @@ TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_I
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 # Sorted: the daemon and the text layout both carry utf8proc, compiled once.
 TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
-                $(TTSKIT_SRC) $(NNKIT_SRC) $(SUMKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(EXPORT_TEST_SRC))
+                $(TTSKIT_SRC) $(NNKIT_SRC) $(SUMKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(EXPORT_TEST_SRC) $(CALLREC_TEST_SRC))
 # One object per source, in a tree of its own (mk/sources.mk, "Objects"),
 # compiled with the flags the binary always had; the link takes them in the
 # sorted order above, then SQLite and Argon2 (the daemon's own objects) and the

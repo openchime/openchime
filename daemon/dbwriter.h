@@ -104,7 +104,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Notification preferences (REQ-130/131). */
        OC_JOB_SET_NOTIFY_PREF = 37, /* 38 was SET_DND, retired with REQ-131's window */
        OC_JOB_LIST_NOTIFY_PREFS = 39,
-       /* Audio call join authorization (REQ-150): read job, channel access gate. */
+       /* Who may be invited to a call (CALLS.md §1). Read. */
        OC_JOB_CALL_AUTH = 40,
        /* Synced client settings bucket. SET upserts/deletes one key; LIST reads a
         * client_type bucket. Both answer with a CLIENT_SETTINGS snapshot. */
@@ -195,13 +195,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * turning a spoken "at Name" into a mention. user_id, channel_id,
         * stt_mode, stt_req. Read. */
        OC_JOB_STT_PREP = 103,
-       /* Calls (REQ-301-305). CALL_AUTH (40, above) answers a join or an
-        * invitation: may the actor read the conversation, which of `call_uids`
-        * may, and who are its members. CALL_EVENT writes a call event -- a
-        * missed call -- as a message of kind OC_MSG_KIND_CALL, authored by
-        * user_id in channel_id, body in body/body_len; the net thread raises it
-        * with no connection behind it. Write. */
-       OC_JOB_CALL_EVENT = 104,
+       /* 104 was CALL_EVENT, the missed-call line: a call now writes its own
+        * record (CALL_START, CALL_LOG). */
        /* Catch-up: advance every one of a user's memberships (OC_MSG_MARK_ALL_READ).
         * A write, and on the writer for the same reason CLIENT_ACK is. */
        OC_JOB_MARK_ALL_READ = 105,
@@ -355,7 +350,48 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * OC_RES_EXPORT_META -- the source to transcode, or the copy already made --
         * or OC_RES_EXPORT_ERR. EXPORT_STORE writes a finished copy's row,
         * EXPORT_TOUCH marks one served: write, fire and forget. */
-       OC_JOB_EXPORT_LOOKUP = 164, OC_JOB_EXPORT_STORE = 165, OC_JOB_EXPORT_TOUCH = 166 };
+       OC_JOB_EXPORT_LOOKUP = 164, OC_JOB_EXPORT_STORE = 165, OC_JOB_EXPORT_TOUCH = 166,
+       /* A call's record (CALLS.md §1, SCHEMA.md `calls`). CALL_START: user_id
+        * the starter, call_subject, channel_id the conversation it is started
+        * from (0 none), call_uids the people asked; makes the row and its
+        * invitees (the starter the first), answered OC_RES_CALL_STARTED with
+        * the call's id and the invitees taken, or OC_RES_CALL_ERR. CALL_LOG:
+        * one change to call_id, call_log the OC_CALL_LOG_* -- write, fire and
+        * forget. */
+       OC_JOB_CALL_START = 244, OC_JOB_CALL_LOG = 245,
+       /* Calls home and a call's page (CALLS.md §1). CALL_HISTORY (read):
+        * user_id, call_before_ms, call_limit; answered OC_RES_CALL_FRAME.
+        * CALL_DETAIL (read): user_id, call_id, call_line_from; answered
+        * OC_RES_CALL_FRAME, or OC_RES_CALL_ERR to anyone not asked to it.
+        * CALL_DELETE (write): user_id, call_id, call_del_what, call_del_id;
+        * answered OC_RES_CALL_DELETED or OC_RES_CALL_ERR. CALL_TRANSCRIPT
+        * (write, fire and forget): a transcript stored, oc_dbwriter_call_transcript. */
+       OC_JOB_CALL_HISTORY = 246, OC_JOB_CALL_DETAIL = 247, OC_JOB_CALL_DELETE = 248,
+       OC_JOB_CALL_TRANSCRIPT = 249,
+       /* A call's recording (CALLS.md §8). RECORDING_START (write): call_id,
+        * user_id who started it, call_spool the directory its spool is made in
+        * (as <call_spool>/<rec_id>),
+        * call_cap_bytes the recordings' cap (0 none); answered
+        * OC_RES_RECORDING_STARTED with rec_id, or OC_RES_CALL_ERR at the cap.
+        * RECORDING_STOP (write, fire and forget): rec_id stopped, to process. */
+       OC_JOB_RECORDING_START = 250, OC_JOB_RECORDING_STOP = 251,
+       /* RECORDINGS_PENDING (read): the recordings waiting to be processed,
+        * answered OC_RES_RECORDINGS_PENDING with `rec_ids`/`rec_spools`.
+        * RECORDING_DONE (write): rec_id made (call_spool the blob key,
+        * exp_bytes, exp_duration_ms) or not (rec_failed, body the reason);
+        * answered OC_RES_RECORDING_DONE with the message it posts in the
+        * call's chat, or OC_RES_OK. */
+       OC_JOB_RECORDINGS_PENDING = 252, OC_JOB_RECORDING_DONE = 253 };
+
+/* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
+ * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
+ * EVENT adds call_event (OC_CALL_EV_*) by user_id; SUBJECT sets call_subject
+ * and adds its event; END ends the call (call_reason, OC_CALL_END_*) and every
+ * stay still open. */
+enum { OC_CALL_LOG_JOIN = 1, OC_CALL_LOG_LEAVE = 2, OC_CALL_LOG_INVITE = 3, OC_CALL_LOG_DECLINE = 4,
+       OC_CALL_LOG_EVENT = 5, OC_CALL_LOG_SUBJECT = 6, OC_CALL_LOG_END = 7 };
+enum { OC_CALL_END_LEFT = 0, OC_CALL_END_ENDED = 1, OC_CALL_END_STOPPED = 2 };
+/* call_event is OC_CALL_EV_* (protocol.h). */
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -685,6 +721,7 @@ typedef struct oc_job {
      * caller has, 0/0 for the first page (REQ-143). */
     uint64_t       files_before_ms, files_before_id;
     uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
+    uint32_t       maint_rec_days;    /* STORAGE_MAINT: delete calls' recordings this old (0 = keep) */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
     /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
     uint64_t       stt_req;
@@ -696,6 +733,25 @@ typedef struct oc_job {
     uint16_t       n_call_uids;
     uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
     uint8_t        call_codecs;                        /* a join's decodable codecs, echoed */
+    /* CALL_START / CALL_LOG: the call, its subject (heap), the change. */
+    uint64_t       call_id;
+    char          *call_subject;
+    uint8_t        call_log, call_reason, call_event;
+    /* RECORDING_START / _STOP: the spool (heap), the cap, the recording. */
+    char          *call_spool;
+    uint64_t       call_cap_bytes;
+    uint64_t       rec_id;
+    uint8_t        rec_failed;
+    /* CALL_HISTORY, CALL_DETAIL, CALL_DELETE. */
+    uint64_t       call_before_ms;
+    uint16_t       call_limit;
+    uint32_t       call_line_from;
+    uint8_t        call_del_what;
+    uint64_t       call_del_id;
+    /* CALL_TRANSCRIPT: the language (heap) and the lines (heap, each text heap). */
+    char          *tr_lang;
+    struct oc_transcript_line *tr_lines;
+    size_t         n_tr_lines;
     /* ALERT_* (REQ-263): heap strings; the entry acknowledged. */
     char          *alert_key, *alert_message;
     uint64_t       alert_id;
@@ -716,9 +772,9 @@ typedef struct oc_job {
     uint64_t       ooo_start, ooo_end;   /* SET_OUT_OF_OFFICE */
 } oc_job;
 
-/* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
- * invitation from someone already in the call. */
-enum { OC_CALL_OP_JOIN = 0, OC_CALL_OP_INVITE = 1 };
+/* CALL_AUTH's question: who of call_uids may be invited to call_id (CALLS.md
+ * §1) -- each an account that is on and not a visitor. */
+enum { OC_CALL_OP_INVITE = 1 };
 
 /* --- Results (writer -> net thread) ------------------------------------- */
 
@@ -749,7 +805,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_WEBHOOK_DELETED = 42,
        /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
        OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44,
-       /* Call join authorized (net thread then updates in-memory call state) / denied. */
+       /* Who may be invited to a call (CALL_AUTH) / a call request refused. */
        OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46,
        /* Synced client settings bucket snapshot (also fanned as a device-sync push). */
        OC_RES_CLIENT_SETTINGS = 47,
@@ -804,8 +860,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Voice input (ARCH-112): the STT_PREP answer -- err_code 0 and the
         * member names, or the refusal. stt_req names the segment. */
        OC_RES_STT_PREP = 93,
-       /* A call event written (REQ-304): the SEND-shaped fields and `members`,
-        * which the net thread broadcasts with kind OC_MSG_KIND_CALL. */
+       /* A call's message in the conversation it was started from (CALLS.md
+        * §1), changed as the call is renamed or ends: the SEND-shaped fields
+        * and `members`, which the net thread sends as MSG_EDITED. */
        OC_RES_CALL_EVENT = 94,
        /* A channel's description: the answer to a fetch (to the asker only) and,
         * with ch_fanout, the announcement of a change (to every member). The
@@ -910,7 +967,35 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * described by exp_blob_key/exp_bytes/exp_duration_ms; otherwise
         * exp_src_key/exp_src_size is the video to transcode. EXPORT_ERR carries
         * err_code. attachment_id is echoed either way. */
-       OC_RES_EXPORT_META = 138, OC_RES_EXPORT_ERR = 139 };
+       OC_RES_EXPORT_META = 138, OC_RES_EXPORT_ERR = 139,
+       /* A call's row made (OC_JOB_CALL_START): call_id, server_time its start,
+        * call_uids the invitees taken; and when it was started from a
+        * conversation, the message it left there -- the SEND-shaped fields and
+        * `members` -- which the net thread broadcasts with kind
+        * OC_MSG_KIND_CALL. */
+       OC_RES_CALL_STARTED = 140,
+       /* An answer the writer encoded whole (frame/frame_len), for the asker:
+        * CALL_HISTORY_PAGE or CALL_PAGE. */
+       OC_RES_CALL_FRAME = 141,
+       /* A call's transcript or recording deleted: call_id, call_del_what,
+        * call_del_id; `members` the call's invitees, who are told; `reclaim`
+        * what bytes go. */
+       OC_RES_CALL_DELETED = 142,
+       /* A recording's row made: call_id, rec_id, user_id who started it. */
+       OC_RES_RECORDING_STARTED = 143,
+       /* The recordings to process: rec_ids and rec_spools, n_recs of each. */
+       OC_RES_RECORDINGS_PENDING = 144,
+       /* A recording made: the message carrying it in the call's chat, the
+        * SEND-shaped fields with its attachment, and `members`. */
+       OC_RES_RECORDING_DONE = 145 };
+
+/* A line of a call's transcript as the daemon's transcript function takes it:
+ * the speaker (0 unknown), from and to in ms from the call's start, the text. */
+typedef struct oc_transcript_line {
+    uint64_t    speaker;
+    uint32_t    start_ms, end_ms;
+    char       *text;
+} oc_transcript_line;
 
 /* The usage figures (REQ-043), as USAGE carries them; the channels' names are
  * held here, since the frame only points at them. */
@@ -1068,7 +1153,8 @@ enum { OC_AUDIT_ADMIN = 1, OC_AUDIT_ACCOUNT = 2,
        OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4 };
 
 enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
-       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3 };
+       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3,
+       OC_RECLAIM_DELETED = 4 };   /* deleted by someone allowed to: a call's recording */
 
 typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
 
@@ -1173,6 +1259,8 @@ typedef struct {
      * thread replays it as a COLLAPSED_UPDATED down this connection. */
     uint8_t  collapsed;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
+    uint64_t call_id;      /* a call message's call (CALLS.md §1), 0 for none */
+    uint64_t call_line;    /* SEARCH: a transcript line's id (its hit), 0 for a message */
     /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
      * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
     uint8_t  broadcast_stored;
@@ -1619,6 +1707,17 @@ typedef struct oc_dbres {
     size_t                  n_call_uids;
     uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
     uint8_t                 call_codecs;
+    uint64_t                call_id;         /* OC_RES_CALL_STARTED, OC_RES_CALL_EVENT */
+    char                   *call_subject;    /* OC_RES_CALL_STARTED: the subject, heap */
+    uint8_t                *frame;           /* OC_RES_CALL_FRAME: the encoded answer, heap */
+    size_t                  frame_len;
+    uint64_t                rec_id;          /* OC_RES_RECORDING_STARTED */
+    uint64_t               *rec_ids;         /* OC_RES_RECORDINGS_PENDING, heap */
+    char                  **rec_spools;      /* ...each heap */
+    size_t                  n_recs;
+    uint8_t                 call_del_what;   /* OC_RES_CALL_DELETED */
+    uint64_t                call_del_id;
+    uint64_t                call_chat;       /* OC_RES_CALL_STARTED: the call's chat */
 
     /* Critical failures (REQ-263). On AUTH_OK for an owner or admin, and on
      * OC_RES_ALERTS_SUMMARY: `alerts_admin` set, and the counts. On
@@ -1894,5 +1993,12 @@ int        oc_dbwriter_sum_take(oc_dbwriter *w, int64_t row);
 /* Pop the next completed result, or NULL when drained. Caller frees it. */
 oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
 void       oc_dbres_free(oc_dbres *r);
+
+/* The daemon's transcript function (CALLS.md §1): store the transcript of call
+ * `call_id`, replacing any it had -- its language (NULL for none) and `n`
+ * lines, copied -- searchable by the call's people. What makes transcripts
+ * calls it; nothing does yet. Returns 0 when queued for the writer. */
+int oc_dbwriter_call_transcript(oc_dbwriter *w, uint64_t call_id, const char *language,
+                                const oc_transcript_line *lines, size_t n);
 
 #endif /* OPENCHIME_DBWRITER_H */

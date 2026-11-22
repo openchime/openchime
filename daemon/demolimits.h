@@ -21,6 +21,9 @@ typedef enum {
     OC_DL_N
 } oc_dl_kind;
 
+/* What a demo does not do at all: record a call (CALLS.md §8). */
+#define OC_DEMO_RECORDING 0
+
 /* The bounds a demo's limits do not count, but cap. */
 #define OC_DEMO_MAX_UPLOAD   (10u * 1024u * 1024u)    /* bytes in one file */
 #define OC_DEMO_CALL_MAX_MS  (20u * 60u * 1000u)      /* how long one call may last */

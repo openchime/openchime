@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 86);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video */
+    CHECK(oc_schema_version(db) == 87);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -116,7 +116,10 @@ static void test_embedded_schema(void) {
                              "profile_fields", "profile_field_values",
                              "channel_managers",
                              "custom_emoji_aliases",
-                             "todo_lists", "todo_tasks" };
+                             "todo_lists", "todo_tasks",
+                             "calls", "call_participants", "call_invitees", "call_events",
+                             "call_recordings", "call_transcripts", "call_transcript_lines",
+                             "call_transcripts_fts" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -407,6 +410,59 @@ static void test_also_channel(void) {
     sqlite3_close(db);
 }
 
+/* Calls as objects (0087), from 0086: the call tables are made, channels and
+ * messages gain call_id, and a missed-call line already stored is untouched --
+ * still kind 1, its body as written, naming no call. A transcript line is
+ * found by its index and leaves it when deleted. */
+static void test_calls_0087(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 86, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 86);
+    CHECK(!table_exists(db, "calls"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(2,'iss|b',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,kind) VALUES(7,1,1,'Missed call',5,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 87);
+    const char *tables[] = { "calls", "call_participants", "call_invitees", "call_events",
+                             "call_recordings", "call_transcripts", "call_transcript_lines",
+                             "call_transcripts_fts" };
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) CHECK(table_exists(db, tables[i]));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM messages WHERE id=7 AND kind=1 AND body='Missed call' "
+                     "AND author_id=1 AND call_id IS NULL;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM channels WHERE call_id IS NULL;") == 1);
+    /* A call, its chat and the message it left, its people and timeline. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO calls(id,subject,starter,from_channel,started_at_ms) VALUES(1,'Q3 pricing',1,1,10);"
+        "INSERT INTO call_invitees(call_id,user_id,invited_by,invited_at_ms) VALUES(1,1,1,10),(1,2,1,10);"
+        "INSERT INTO call_participants(call_id,user_id,joined_at_ms) VALUES(1,1,10);"
+        "INSERT INTO call_events(call_id,at_ms,user_id,kind,detail) VALUES(1,11,1,'subject','Q3 pricing review');"
+        "INSERT INTO channels(id,kind,is_public,created_at_ms,call_id) VALUES(2,'dm',0,10,1);"
+        "INSERT INTO messages(channel_id,author_id,body,created_at_ms,kind,call_id) VALUES(1,1,'a call',10,1,1);"
+        "INSERT INTO call_recordings(call_id,started_by,started_at_ms) VALUES(1,1,12);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT state='recording' FROM call_recordings WHERE call_id=1;") == 1);
+    /* How a call ended is one of three; a second chat for one call is refused. */
+    CHECK(sqlite3_exec(db, "UPDATE calls SET ended_at_ms=20, end_reason='gone' WHERE id=1;", NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "UPDATE calls SET ended_at_ms=20, end_reason='stopped' WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO channels(id,kind,created_at_ms,call_id) VALUES(3,'dm',10,1);", NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO call_events(call_id,at_ms,user_id,kind) VALUES(1,1,1,'dance');", NULL, NULL, NULL) != SQLITE_OK);
+    /* The transcript's index. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO call_transcripts(id,call_id,created_at_ms) VALUES(1,1,30);"
+        "INSERT INTO call_transcript_lines(id,transcript_id,speaker,start_ms,end_ms,text) "
+        "VALUES(1,1,2,0,900,'the margin on the enterprise tier');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT rowid FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'margin';") == 1);
+    CHECK(sqlite3_exec(db, "DELETE FROM call_transcript_lines WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'margin';") == 0);
+    sqlite3_close(db);
+}
+
 /* The first column of `sql`'s first row, as text, into `out`. */
 static void text_of(sqlite3 *db, const char *sql, char *out, size_t cap) {
     out[0] = '\0';
@@ -474,6 +530,7 @@ int run_migrate_tests(void) {
     test_user_kind();
     test_spoilers_reindexed();
     test_also_channel();
+    test_calls_0087();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

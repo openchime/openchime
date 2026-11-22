@@ -1232,33 +1232,49 @@ where one exists.
   remains; a TCP disconnect holds the participant's seat for 15 s before it is
   dropped. The client rejoins by itself — after a reconnect, a sweep or a moved
   media path — with a fresh `CALL_JOIN`, and says so while it does (ARCH-73).
-- **REQ-301.** A user has been able to **start a call** from a conversation's
-  header or the **+** on the Calls section. Starting in a channel or a group DM
-  has invited every member up to the cap, and where the members outnumber it the
-  starter has picked, with the most recently active ticked; a DM has invited the
-  other person. The starter has been taken to the call. The call has ended when
-  its last participant left, or when its **starter ended it for everyone**.
+- **REQ-301.** A user has been able to **start a call** with a **subject**, from
+  Calls home (asking anyone in the workspace) or from a conversation's call
+  button, which has opened the same picker with the conversation's subject
+  suggested and its people ticked, up to the cap, the most recently active
+  first. The starter has been taken to the call, and a call started from a
+  conversation has posted one message there that follows it. A call has been an
+  object of its own: its subject, who was in it and when, who was asked, its
+  timeline, a **chat** of its own, and — where the daemon offers it — a
+  **recording** any participant starts and stops, made by the daemon into one
+  video in the call's chat. The call has ended when its last participant left,
+  or when its **starter ended it for everyone** (ARCH-73, ARCH-136).
 - **REQ-302.** An invitation has been **listed and notified** — a toast with
   Join and Decline on the desktop, a push on a phone — through the same decision
   as a mention (REQ-281, ARCH-103), so a muted conversation, the schedule and a
   pause have silenced it. There has been no ringing loop. An invitation has
   lasted until taken, declined or the call ended, and anyone in a call has been
-  able to invite anyone who can read the conversation.
-- **REQ-303.** The Home sidebar has had a **Calls** section beside Channels and
-  Direct messages, listing the active calls in conversations the user belongs
-  to and every call they are invited to, each opening a **call view**: who is
-  in it, with speaking and muted marks and a volume for each, and Mute, push to
-  talk, the microphone and speaker with a live level, noise suppression, Invite,
-  Leave and — for the starter — End.
-- **REQ-304.** A call that ended with nobody but its starter having joined has
-  left a **"Missed call"** line in the conversation's history, a call event
-  rather than a message (ARCH-90), not searched, not read aloud and not
-  notifying.
+  able to invite anyone in the workspace. Only those asked have been able to
+  join a call, see it, or open its page, chat, recording or transcript.
+- **REQ-303.** The Home sidebar has had a **Calls** row opening **Calls home**:
+  the calls going on that the user was asked to, with Join and Decline, their
+  past calls a page at a time, and **New call**. A call has had a **page** — its
+  people and their times, who was asked, its timeline, its chat, its recording
+  to play and its transcript — and a **call view**: its subject, who is in it,
+  with speaking and muted marks and a volume for each, its chat beside it, and
+  Mute, push to talk, the microphone and speaker with a live level, noise
+  suppression, Invite, Record, Leave and — for the starter — End. The terminal
+  client has listed past calls and shown a call's page and chat.
+- **REQ-304.** A call started from a conversation has left **one message** there,
+  a call event rather than a message (ARCH-90), not searched, not read aloud and
+  not notifying, which says what the call is about and follows it — Join while
+  it runs, its page after. A call the user was asked to and missed has been
+  listed as **missed** in their history; missed-call lines stored before have
+  still read as they did.
 - **REQ-305.** A call has held at most **ten** people (`OC_CALL_MAX`); a join
-  or invitation past it has been refused as full.
-- **REQ-306.** A call has been **end-to-end encrypted**: the daemon, the relay
-  and the network have carried audio only the participants' devices could
-  decrypt, with keys that change on every join and leave (ARCH-113).
+  or invitation past it has been refused as full. The Recorder has not counted.
+- **REQ-306.** A call has been **end-to-end encrypted** unless a participant
+  records it: the daemon, the relay and the network have carried audio only the
+  participants' devices could decrypt, with keys that change on every join and
+  leave (ARCH-113). While a participant records it the daemon's Recorder is in
+  it — readable by the daemon from the epoch it joined at to the one it left
+  at, and shown to everyone in the call — and someone joining a recorded call
+  has sent nothing until they acknowledged "This call is being recorded."
+  (ARCH-136).
 
 ### 6.3 Video — camera video and screenshare in calls, and video messages
 

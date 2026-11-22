@@ -1034,6 +1034,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
+                e->call_id = b.call_id;          /* a call's message: which call (CALLS.md §1) */
                 e->broadcast_stored = b.broadcast_stored;
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
@@ -2819,8 +2820,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
             } else if (err.code == OC_ERR_CALL_UNAVAILABLE || err.code == OC_ERR_CALL_FULL ||
                        err.code == OC_ERR_NOT_CALL_STARTER || err.code == OC_ERR_NOT_IN_CALL ||
-                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 16 &&
-                        memcmp(err.message.ptr, "call join denied", 16) == 0)) {
+                       err.code == OC_ERR_CALL_SUBJECT || err.code == OC_ERR_RECORDING_UNAVAILABLE ||
+                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 24 &&
+                        memcmp(err.message.ptr, "not invited to this call", 24) == 0)) {
                 /* A call request refused (REQ-150, REQ-305): the call view says
                  * why, in its own words, rather than a status line. */
                 oc_ev *e = oc_ev_new(OC_EV_CALL_ERROR);
@@ -3708,7 +3710,7 @@ static int run_connection(oc_net *n, int reconnecting,
                     continue;
                 }
             }
-            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_VIDEO_SUB) {
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_DELETE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
                                          ctx_write, &ctx, n->to_ui);
                 oc_cmd_free(c);

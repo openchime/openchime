@@ -47,6 +47,14 @@ const oc_call_media *oc_call_engine_media(void);
 void  oc_call_engine_set_mute(oc_call_engine *e, int muted);
 int   oc_call_engine_muted(const oc_call_engine *e);
 void  oc_call_engine_set_ptt(oc_call_engine *e, int held);
+/* The recording gate (CALLS.md §8). A device that comes into a call already
+ * being recorded sends no audio and no camera -- as if muted, and the camera
+ * held -- until its user acknowledges "This call is being recorded.": the
+ * frontend shows that, and calls ack once they have. One already in the call
+ * when recording starts is not gated; its frontend shows the notice from the
+ * model's `call.recording`. The gate lifts by itself if recording stops. */
+void  oc_call_engine_ack_recording(oc_call_engine *e);
+int   oc_call_engine_recording_gated(const oc_call_engine *e);
 /* One person's volume, 0 (silent) to 2 (twice as loud); 1 is as sent. Kept for
  * that person across calls for the life of the engine. */
 void  oc_call_engine_set_volume(oc_call_engine *e, uint64_t user_id, float gain);
@@ -118,6 +126,7 @@ typedef struct {
     int      mic_error;         /* OC_AUDIO_* opening the microphone, 0 fine */
     int      speaker_error;
     int      muted, ptt;
+    int      rec_gate;          /* waiting for the user to acknowledge the recording */
     int      speaking;          /* this device's voice is going out */
     int      mic_level;         /* peak of the last frame captured, 0-32767 */
     uint32_t sent, keepalives;

@@ -67,14 +67,14 @@ static oc_call_part part(const oc_callsig *cs, uint64_t user, uint8_t slot, uint
 static void joined(oc_callsig *cs, oc_queue *q, uint32_t epoch) {
     oc_call_part parts[2] = { part(cs, ME, 0, 0), part(cs, BOB, 1, 0xB0) };
     static const uint8_t tok[16];
-    oc_call_joined jd = { CH, CALL, 9999, { tok, sizeof tok }, 0, epoch, ME, 1, 2, parts };
+    oc_call_joined jd = { CALL, 9999, { tok, sizeof tok }, 0, epoch, ME, 1, 2, parts };
     uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &jd) == OC_OK);
     feed(cs, q, buf, w.len);
 }
 
 static void roster(oc_callsig *cs, oc_queue *q, const oc_call_part *parts, uint16_t n, uint32_t epoch) {
-    oc_call_roster ro = { CH, CALL, epoch, n, (oc_call_part *)parts };
+    oc_call_roster ro = { CALL, epoch, n, (oc_call_part *)parts };
     uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &ro) == OC_OK);
     feed(cs, q, buf, w.len);
@@ -82,7 +82,8 @@ static void roster(oc_callsig *cs, oc_queue *q, const oc_call_part *parts, uint1
 
 static void state(oc_callsig *cs, oc_queue *q, uint64_t call_id, int ended) {
     uint64_t parts[2] = { ME, BOB };
-    oc_call_state st = { CH, call_id, ME, 1, (uint8_t)ended, (uint16_t)(ended ? 0 : 2), parts, 0, NULL, 0 };
+    oc_call_state st = { call_id, oc_slice_str("standup"), ME, 1, CH, CH + 1, 0, (uint8_t)ended, (uint16_t)(ended ? 0 : 2),
+                         parts, 0, NULL, 0 };
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK);
     feed(cs, q, buf, w.len);
@@ -135,13 +136,14 @@ static void test_reconnect(void) {
     CHECK(g_ev[OC_EV_CALL_LOST] == 1 && !cs.rj.on && g_sent[OC_MSG_CALL_JOIN] == 0);
     oc_callsig_destroy(&cs);
 
-    /* A new call in its place is not the one being got back into. */
+    /* Another call running is not the one being got back into, and changes
+     * nothing: a call is its own, not its conversation's (CALLS.md §1). */
     setup(&cs, &q, 1000);
     oc_callsig_lost(&cs, &q, 2000);
     oc_callsig_authed(&cs, 3000);
     state(&cs, &q, CALL + 1, 0);
     drain(&q);
-    CHECK(g_ev[OC_EV_CALL_LOST] == 1 && g_sent[OC_MSG_CALL_JOIN] == 0);
+    CHECK(g_ev[OC_EV_CALL_LOST] == 0 && g_sent[OC_MSG_CALL_JOIN] == 0 && cs.rj.on);
     oc_callsig_destroy(&cs);
 
     /* ...nor is an old one ending: that changes nothing. */
@@ -186,7 +188,7 @@ static void test_reconnect(void) {
      * not joined. */
     setup(&cs, &q, 1000);
     oc_callsig_lost(&cs, &q, 2000);
-    { oc_cmd c; memset(&c, 0, sizeof c); c.type = OC_CMD_CALL_LEAVE; c.channel_id = CH;
+    { oc_cmd c; memset(&c, 0, sizeof c); c.type = OC_CMD_CALL_LEAVE; c.call_id = CALL;
       CHECK(oc_callsig_command(&cs, &c, NULL, NULL, fake_write, NULL, &q) == 0); }
     oc_callsig_authed(&cs, 3000);
     state(&cs, &q, CALL, 0);

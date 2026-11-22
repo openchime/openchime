@@ -479,6 +479,10 @@ enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
        /* Not a rail item either: a call, reached from the Calls section, the
         * header's call button, the in-call strip or an invitation (REQ-303). */
        VIEW_CALL,
+       /* Calls home (CALLS.md §1): running, invited and past calls, and New
+        * call; and one call's page -- its people, times, timeline, chat,
+        * recording and transcript. Reached from the sidebar's Calls row. */
+       VIEW_CALLS, VIEW_CALLPAGE,
        /* Not a rail item: a private DM (PRIVATE-DM.md), reached from its row in the
         * Home sidebar, a person's profile or an invitation. */
        VIEW_COUNT,
@@ -4898,21 +4902,44 @@ enum { CC_MUTE = 2100, CC_LEAVE, CC_END, CC_JOIN, CC_DECLINE, CC_INVITE, CC_NS,
        /* Cameras (REQ-160): the button, its picker, the grid or the speaker, and
         * the cameras the picker lists. */
        CC_CAMERA = 2544, CC_CAMMENU, CC_LAYOUT, CC_CAM0 = 2484,
+       /* Recording (CALLS.md §8): Record and Stop recording; the notice a
+        * joiner of a recorded call is shown first, its Join and Cancel; the
+        * call view's way to its page; Calls home's New call. */
+       CC_RECORD = 2504, CC_REC_JOIN, CC_REC_CANCEL, CC_PAGE_OPEN, CC_HOME_NEW, CC_HOME_OPEN,
        CC_LAST = 2549 };
+/* Calls home and the call page (CALLS.md §1): a row opens the call's page, its
+ * Join joins and its Decline declines; Show older calls; a recording's Play;
+ * the transcript's next lines. */
+#define CH_ROWS_MAX 64
+enum { CH_MORE = 3100, CH_TMORE, CH_PAGE_JOIN, CH_PLAY0 = 3110, CH_ROW0 = 3130,
+       CH_JOIN0 = CH_ROW0 + CH_ROWS_MAX, CH_DECLINE0 = CH_JOIN0 + CH_ROWS_MAX,
+       CH_LAST = CH_DECLINE0 + CH_ROWS_MAX - 1 };
 #define CC_MAX_DEV   16
 #define CC_MAX_CONV  40
 #define CC_MAX_PICK  64
 
 static oc_call_engine *g_call_engine;       /* one: there is one microphone */
 static oc_client      *g_call_client;       /* the client whose call the engine serves */
-static uint64_t        g_call_view_ch;      /* VIEW_CALL shows this conversation's call */
+static uint64_t        g_call_view_id;      /* VIEW_CALL shows this call; 0 while one starts */
+static uint64_t        g_call_view_ch;      /* ...and beside it its chat (CALLS.md §1) */
+static uint64_t        g_cpage_id;          /* VIEW_CALLPAGE shows this call's page */
+static uint64_t        g_rec_notice_id;     /* the recorded call whose notice is up before joining */
+static uint64_t        g_rec_ack_id;        /* joined after the notice: acknowledged once gated */
+static uint64_t        g_home_ids[CH_ROWS_MAX];   /* Calls home's rows, by call */
+static int             g_n_home;
+static float           g_home_scroll, g_cpage_scroll;
+static field          *g_cpick_subject;     /* the picker's subject */
+static rectf           g_rec_mark;          /* the Recording mark, as drawn */
+static int             g_rec_notice_on;     /* the recorded call's notice is up */
+#define REC_RED 0xE5484D
 static int             g_call_ns = 1;       /* noise suppression and gain (prefs z:) */
 static uint32_t        g_call_mic_h, g_call_spk_h;   /* the chosen devices, by id hash (prefs o:/p:) */
 static oc_audio_device g_call_mics[CC_MAX_DEV], g_call_spks[CC_MAX_DEV];
 static int             g_call_nmics, g_call_nspks;
 static int             g_call_ptt;          /* the talk key is held, in a call */
 static uint64_t        g_call_start_pending;/* a start waiting on the member list */
-static uint64_t        g_cpick_ch;          /* the picker is open for this conversation */
+static int             g_cpick_open;        /* the picker is up in the call view */
+static uint64_t        g_cpick_from;        /* ...for a call from this conversation, 0 from Calls home */
 static int             g_cpick_invite;      /* ...to invite more, rather than to start */
 static uint64_t        g_cpick_uid[CC_MAX_PICK];
 static uint8_t         g_cpick_on[CC_MAX_PICK];
@@ -4929,7 +4956,7 @@ static rectf           g_call_mute_btn;     /* the call view's Mute, for its tip
 static uint32_t        g_call_err_seq;      /* the refusal last seen arrive, and when */
 static uint64_t       g_call_err_at;
 typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
-static call_btn        g_call_btns[CC_MAX_PICK + 48];
+static call_btn        g_call_btns[CC_MAX_PICK + 3 * CH_ROWS_MAX + 64];
 static int             g_n_call_btns;
 
 /* Encrypted DMs (PRIVATE-DM.md): an ordinary DM, shown as one, whose session's
@@ -5016,6 +5043,10 @@ static void call_rects_reset(void) {
     g_call_banner_on = 0;
     g_share_stage = rf(0, 0, 0, 0);
     g_n_cam_drawn = 0;
+    g_rec_mark = rf(0, 0, 0, 0);
+    g_rec_notice_on = 0;
+    g_n_home = 0;
+    if (g_cpick_subject && !(g_view == VIEW_CALL && g_cpick_open)) field_show(g_cpick_subject, 0);
 }
 
 static int call_btn_add(rectf r, int cmd, const char *aid, const char *name) {
@@ -5025,6 +5056,14 @@ static int call_btn_add(rectf r, int cmd, const char *aid, const char *name) {
     snprintf(b->aid, sizeof b->aid, "%s", aid);
     snprintf(b->name, sizeof b->name, "%s", name);
     return 1;
+}
+
+/* The call the call view shows: the one this client is in, or as Calls home
+ * lists it; NULL while a start is on its way. */
+static const oc_call_view *view_call(const oc_model *m) {
+    if (!m || !g_call_view_id) return NULL;
+    if ((m->in_call || m->call_rejoining) && m->call.call_id == g_call_view_id) return &m->call;
+    return oc_model_call(m, g_call_view_id);
 }
 
 /* The engine is in a call for the client on screen. */
@@ -5234,6 +5273,32 @@ static void call_conv_label(const oc_model *m, uint64_t ch, char *out, size_t ca
     else   snprintf(out, cap, "a conversation");
 }
 
+/* The call conversation `ch`'s call button is about (CALLS.md §1): the one this
+ * client is in, if it was started from there, else the running one started
+ * from there that this user is asked to; 0 for none. */
+static uint64_t call_id_from(const oc_model *m, uint64_t ch) {
+    if (!m || !ch) return 0;
+    if ((m->in_call || m->call_rejoining) && m->call.from_channel == ch) return m->call.call_id;
+    const oc_call_view *v = oc_model_call_from(m, ch);
+    return v ? v->call_id : 0;
+}
+
+/* The subject a call started from `ch` is given (CALLS.md §1): a channel's
+ * name, or "Call with" and who the conversation is with. */
+static void call_subject_suggest(const oc_model *m, uint64_t ch, char *out, size_t cap) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, ch);
+    char lbl[OC_CALL_SUBJECT_MAX];
+    call_conv_label(m, ch, lbl, sizeof lbl);
+    const char *name = lbl;
+    if (c && c->kind != OC_CHANNEL_KIND_DM) {
+        if (*name == '#') name++;
+        while (*name == ' ') name++;          /* the label's "# " is the sidebar's, not the name's */
+        snprintf(out, cap, "%s", name);
+    } else {
+        snprintf(out, cap, "Call with %s", lbl);
+    }
+}
+
 /* A labelled button: filled when `on`, with an optional icon. `danger` 1 is the
  * filled red of Leave; 2 an outlined red, for the rarer and wider End. */
 static void call_button(gfx *rt, rectf b, int icon, const char *label, int on, int danger) {
@@ -5261,80 +5326,53 @@ static float call_button_w(const char *label, int icon) {
  * there is no call to list, rather than a heading over "No calls" -- a call is
  * started from the conversation's header, where its people are. */
 static float calls_section_h(const oc_model *m) {
-    if (!m || !oc_model_calls_available(m) || !m->n_calls) return 0;
-    size_t n = m->n_calls;
-    if (n > 6) n = 6;
-    return ROW_H * (float)(1 + n) + 6;
+    return m && oc_model_calls_available(m) ? ROW_H + 6 : 0;
 }
 
+/* The sidebar's Calls row (CALLS.md §1): Calls home, with how many calls are
+ * going on that this user is asked to, and New call beside it. */
 static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0, float sx1) {
     g_n_call_rows = 0;
     g_calls_plus = rf(0, 0, 0, 0);
-    if (!m || !oc_model_calls_available(m) || !m->n_calls) return sy;
-    draw_text(rt, "Calls", g_meta, rf(sx0 + UIS(10), sy, sx1 - 30, sy + ROW_H), OC_COL_FAINT);
+    if (!m || !oc_model_calls_available(m)) return sy;
+    int on = g_view == VIEW_CALLS || g_view == VIEW_CALLPAGE;
+    int invited = 0;
+    for (size_t i = 0; i < m->n_calls; i++) invited += oc_model_call_invited(&m->calls[i], m->user_id);
+    rectf row = rf(sx0, sy + 2, sx1, sy + ROW_H - 2);
+    if (on) fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT);
+    else if (in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+    float ic = UIS(18.0f), iy = sy + (ROW_H - ic) / 2;
+    draw_lucide(rt, OC_ICON_PHONE, rf(sx0 + UIS(10), iy, sx0 + UIS(10) + ic, iy + ic),
+                invited ? OC_COL_ACCENT : OC_COL_MUTED);
     g_calls_plus = rf(sx1 - UIS(28), sy + (ROW_H - UIS(22)) / 2, sx1 - UIS(6), sy + (ROW_H + UIS(22)) / 2);
+    char count[16] = "";
+    if (m->n_calls) snprintf(count, sizeof count, "%zu", m->n_calls);
+    float cw = count[0] ? text_width(count, g_meta) + UIS(12) : 0;
+    draw_text(rt, "Calls", on || invited ? g_ui_b : g_ui, rf(sx0 + UIS(34), sy, g_calls_plus.left - cw - 4, sy + ROW_H),
+              on || invited ? OC_COL_TEXT : OC_COL_MUTED);
+    if (count[0]) {
+        rectf pill = rf(g_calls_plus.left - cw - 4, sy + (ROW_H - UIS(18)) / 2, g_calls_plus.left - 4,
+                        sy + (ROW_H + UIS(18)) / 2);
+        fill_round(rt, pill, UIS(9), invited ? OC_COL_ACCENT : OC_COL_INPUT);
+        int oa = g_meta->align;
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, count, g_meta, pill, invited ? 0xFFFFFF : OC_COL_MUTED);
+        g_meta->align = oa;
+    }
     if (in_rect(g_calls_plus, g_mouse_x, g_mouse_y)) fill_round(rt, g_calls_plus, OC_R_CONTROL, OC_COL_HOVER);
     draw_lucide(rt, OC_ICON_PLUS, rf(g_calls_plus.left + 3, g_calls_plus.top + 3,
                                      g_calls_plus.right - 3, g_calls_plus.bottom - 3), OC_COL_MUTED);
-    sy += ROW_H;
-    for (size_t i = 0; i < m->n_calls && i < 6; i++) {
-        const oc_call_view *v = &m->calls[i];
-        int mine = call_here(m) && m->call.channel_id == v->channel_id;
-        int on = g_view == VIEW_CALL && g_call_view_ch == v->channel_id;
-        int invited = oc_model_call_invited(v, m->user_id);
-        rectf row = rf(sx0, sy + 2, sx1, sy + ROW_H - 2);
-        if (on) fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT);
-        else if (in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
-        float ic = UIS(18.0f), iy = sy + (ROW_H - ic) / 2;
-        /* A call with a screen being shared says so, as Slack's huddle row does. */
-        draw_lucide(rt, v->sharer ? OC_ICON_SCREEN_SHARE : OC_ICON_PHONE,
-                    rf(sx0 + UIS(10), iy, sx0 + UIS(10) + ic, iy + ic),
-                    mine || invited ? OC_COL_ACCENT : OC_COL_MUTED);
-        char lbl[96], count[16];
-        call_conv_label(m, v->channel_id, lbl, sizeof lbl);
-        snprintf(count, sizeof count, "%u", (unsigned)v->n_parts);
-        float cw = text_width(count, g_meta) + UIS(6);
-        /* Its own way in: Join, or Open once you are in it. An invitation is
-         * the accented Join rather than a pill beside a row you must find the
-         * meaning of. */
-        const char *jl = mine ? "Open" : "Join";
-        float jh = ROW_H - UIS(10), jw = text_width(jl, g_meta) + UIS(18);
-        rectf jb = rf(sx1 - UIS(12) - cw - UIS(6) - jw, sy + (ROW_H - jh) / 2, sx1 - UIS(12) - cw - UIS(6),
-                      sy + (ROW_H + jh) / 2);
-        draw_text(rt, lbl, on || mine ? g_ui_b : g_ui,
-                  rf(sx0 + UIS(34), sy, jb.left - UIS(6), sy + ROW_H),
-                  on || mine || invited ? OC_COL_TEXT : OC_COL_MUTED);
-        {
-            int jhov = in_rect(jb, g_mouse_x, g_mouse_y);
-            if (invited) fill_round(rt, jb, OC_R_CONTROL, OC_COL_ACCENT);
-            else {
-                fill_round(rt, jb, OC_R_CONTROL, jhov ? OC_COL_HOVER : OC_COL_INPUT);
-                stroke_round(rt, jb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-            }
-            int oa = g_meta->align;
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, jl, g_meta, jb, invited ? 0xFFFFFF : OC_COL_TEXT);
-            g_meta->align = oa;
-            char aid[48], an[140];
-            snprintf(aid, sizeof aid, "calls.row.join.%llu", (unsigned long long)v->channel_id);
-            snprintf(an, sizeof an, "%s the call in %s", jl, lbl);
-            call_btn_add(jb, CC_ROWJOIN0 + (int)i, aid, an);
-        }
-        g_meta->align = ST_ALIGN_RIGHT;
-        draw_text(rt, count, g_meta, rf(sx1 - UIS(12) - cw, sy, sx1 - UIS(12), sy + ROW_H), OC_COL_MUTED);
-        g_meta->align = ST_ALIGN_LEFT;
-        g_call_rows[g_n_call_rows].r = rf(sx0, sy, sx1, sy + ROW_H);
-        g_call_rows[g_n_call_rows].ch = v->channel_id;
-        g_n_call_rows++;
-        sy += ROW_H;
-    }
-    return sy + 6;
+    char an[80];
+    snprintf(an, sizeof an, "Calls: %zu going on%s", m->n_calls, invited ? ", you are asked to join" : "");
+    call_btn_add(rf(sx0, sy, g_calls_plus.left - 2, sy + ROW_H), CC_HOME_OPEN, "sidebar.calls", an);
+    call_btn_add(g_calls_plus, CC_HOME_NEW, "sidebar.calls.new", "New call");
+    return sy + ROW_H + 6;
 }
 
 /* ---- the in-call strip, at the foot of the sidebar ---------------------------------- */
 
 static float call_strip_h(const oc_model *m) {
-    return (call_here(m) || call_back_here(m)) && !(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)
+    return (call_here(m) || call_back_here(m)) && !(g_view == VIEW_CALL && g_call_view_id == m->call.call_id)
            ? UIS(64.0f) : 0;
 }
 
@@ -5345,8 +5383,8 @@ static void draw_call_strip(gfx *rt, const oc_model *m, float h) {
     float x0 = RAIL_W + 8, x1 = RAIL_W + SIDEBAR_W - 8;
     g_cstrip = rf(x0, h - sh, x1, h - 6);
     fill_round(rt, g_cstrip, OC_R_CONTROL, OC_COL_SELECT);
-    char lbl[96], dur[16], line[140];
-    call_conv_label(m, m->call.channel_id, lbl, sizeof lbl);
+    char lbl[OC_CALL_SUBJECT_MAX + 1], dur[16], line[OC_CALL_SUBJECT_MAX + 64];
+    snprintf(lbl, sizeof lbl, "%s", m->call.subject[0] ? m->call.subject : "Call");
     call_duration(m->call.started_at, dur, sizeof dur);
     if (call_back_here(m)) {
         /* Nothing to mute while out: Leave alone, which stops getting back in. */
@@ -8287,9 +8325,46 @@ enum { MSGLIST_MAIN = 1, MSGLIST_THREAD = 2 };
  * because nobody said it. */
 #define CALL_EVENT_H UIS(34.0f)
 static int call_btn_add(rectf r, int cmd, const char *aid, const char *name);   /* fwd */
+static void call_home_row_add(uint64_t id, rectf r, const char *subject, const char *what);   /* fwd */
 static void draw_call_event(gfx *rt, const oc_model *m, const oc_msg *msg, rectf row) {
-    /* Said from the reader's side: who missed whom. The event is the starter's;
-     * to them it is a call nobody came to. */
+    /* A call started here (CALLS.md §1): its message, which says what it is
+     * about, follows the call -- Join (Open once in it) while it runs, and the
+     * call's page after. */
+    if (msg->call_id && m) {
+        const oc_call_view *v = oc_model_call(m, msg->call_id);
+        int in = (m->in_call || m->call_rejoining) && m->call.call_id == msg->call_id;
+        int live = in || (v && !v->ended);
+        char when[24] = "", line[OC_CALL_SUBJECT_MAX + 80];
+        rel_time(msg->server_time, when, sizeof when);
+        snprintf(line, sizeof line, "%s  \u00B7  %s", msg->body ? msg->body : "A call", when);
+        const char *bl = in ? "Open" : live ? "Join" : "Details";
+        float tw = text_width(line, g_meta), ic = UIS(16.0f), bw = text_width(bl, g_meta) + UIS(18);
+        float x = row.left + 20, cy = (row.top + row.bottom) / 2;
+        if (x + ic + UIS(8) + tw + UIS(12) + bw > row.right - 8) tw = row.right - 8 - bw - UIS(12) - UIS(8) - ic - x;
+        draw_lucide(rt, OC_ICON_PHONE, rf(x, cy - ic / 2, x + ic, cy + ic / 2), live ? OC_COL_ONLINE : OC_COL_MUTED);
+        draw_text(rt, line, g_meta, rf(x + ic + UIS(8), row.top, x + ic + UIS(8) + tw, row.bottom), OC_COL_TEXT);
+        rectf b = rf(x + ic + UIS(8) + tw + UIS(12), cy - UIS(12), x + ic + UIS(8) + tw + UIS(12) + bw, cy + UIS(12));
+        if (live && !in) fill_round(rt, b, OC_R_CONTROL, OC_COL_ACCENT);
+        else {
+            fill_round(rt, b, OC_R_CONTROL, in_rect(b, g_mouse_x, g_mouse_y) ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        }
+        int oa = g_meta->align;
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, bl, g_meta, b, live && !in ? 0xFFFFFF : OC_COL_TEXT);
+        g_meta->align = oa;
+        if (g_n_home < CH_ROWS_MAX) {
+            int k = g_n_home++;
+            g_home_ids[k] = msg->call_id;
+            char aid[48], an[OC_CALL_SUBJECT_MAX + 40];
+            snprintf(aid, sizeof aid, "call.msg.%llu", (unsigned long long)msg->call_id);
+            snprintf(an, sizeof an, "%s: %s", bl, msg->body ? msg->body : "the call");
+            call_btn_add(b, live ? CH_JOIN0 + k : CH_ROW0 + k, aid, an);
+        }
+        return;
+    }
+    /* A missed call stored before calls had their own records: said from the
+     * reader's side, who missed whom. */
     const char *who = oc_model_user_name(m, msg->author_id);
     int mine = m && msg->author_id == m->user_id;
     char when[24] = "", what[160], line[220];
@@ -10227,8 +10302,8 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_CALL_SHARE:
         if (call_here(model())) {
             /* The picker opens under the call's Share button, so the call is shown. */
-            if (!g_share_on && !(g_view == VIEW_CALL && g_call_view_ch == model()->call.channel_id)) {
-                call_open_view(hwnd, model()->call.channel_id);
+            if (!g_share_on && !(g_view == VIEW_CALL && g_call_view_id == model()->call.call_id)) {
+                call_open_view(hwnd, model()->call.call_id);
                 g_share_pick_pending = 1;
             } else {
                 menu_dispatch(hwnd, g_share_on ? CC_SHARE_STOP : CC_SHARE);
@@ -12497,8 +12572,8 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     /* Calls (REQ-301): start one here, or -- lit, with how many are in it --
      * go to the one going on. Only where the daemon carries calls. */
     if (m && oc_model_calls_available(m) && c) {
-        const oc_call_view *cv = oc_model_call_in(m, g_sel);
-        int mine = call_here(m) && m->call.channel_id == g_sel;
+        const oc_call_view *cv = oc_model_call_from(m, g_sel);
+        int mine = call_here(m) && m->call.from_channel == g_sel;
         char cn[8] = "";
         if (cv) snprintf(cn, sizeof cn, "%u", (unsigned)cv->n_parts);
         float bw = UIS(30) + (cn[0] ? text_width(cn, g_meta) + UIS(4) : 0);
@@ -13066,7 +13141,7 @@ static void toast_action_perform(char *p2) {
                 show_and_focus(h);
                 call_join_here(h, cid);
             } else {
-                oc_client_call_decline(g_client, cid);
+                oc_client_call_decline(g_client, call_id_from(model(), cid));
             }
         } else if (!strcmp(verb, "reply") && reply[0]) {
             toast_reply_send((uint64_t)cid, reply);
@@ -15372,8 +15447,8 @@ static void draw_tip_below(gfx *rt, rectf b, const char *name, float lim0, float
 
 /* What the header's phone does here, as its tooltip and its published name. */
 static const char *call_hdr_words(const oc_model *m) {
-    if (m && g_sel && call_here(m) && m->call.channel_id == g_sel) return "Open the call";
-    return m && g_sel && oc_model_call_in(m, g_sel) ? "Join the call" : "Start a call";
+    if (m && g_sel && call_here(m) && m->call.from_channel == g_sel) return "Open the call";
+    return m && g_sel && oc_model_call_from(m, g_sel) ? "Join the call" : "Start a call";
 }
 
 /* Mute's tooltip, in the call view and on the sidebar's strip: the state you are
@@ -16304,7 +16379,7 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_CALL_START: call_start_confirmed(hwnd, g_confirm_id); break;
     case CONF_CALL_END: {
         const oc_model *cm = model();
-        if (cm && call_here(cm) && cm->call.channel_id == g_confirm_id) oc_client_call_end(g_client, g_confirm_id);
+        if (cm && call_here(cm) && cm->call.call_id == g_confirm_id) oc_client_call_end(g_client, g_confirm_id);
         break;
     }
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
@@ -19413,6 +19488,8 @@ static int sidebar_kind(void) {
     case VIEW_THREADS:  return SBK_CHANNELS;
     case VIEW_DIRECTORY: return SBK_CHANNELS;
     case VIEW_CALL:     return SBK_CHANNELS;
+    case VIEW_CALLS:    return SBK_CHANNELS;
+    case VIEW_CALLPAGE: return SBK_CHANNELS;
     case VIEW_DRAFTS:   return SBK_CHANNELS;
     case VIEW_NEWMSG:   return SBK_CHANNELS;
     default:            return SBK_NONE;
@@ -22611,8 +22688,9 @@ static float draw_e2e_strip(gfx *rt, const oc_model *m, float x0, float w, float
  * room beside the call. Drawn and laid out (layout_composer) from this alone. */
 static float call_chat_left(float W) {
     const oc_model *m = model();
-    if (g_view != VIEW_CALL || g_call_chat_hidden || !m || !g_call_view_ch || g_sel != g_call_view_ch ||
-        g_cpick_ch == g_call_view_ch || !oc_model_channel((oc_model *)m, g_call_view_ch))
+    if ((g_view != VIEW_CALL && g_view != VIEW_CALLPAGE) || g_call_chat_hidden || !m || !g_call_view_ch ||
+        g_sel != g_call_view_ch || (g_view == VIEW_CALL && g_cpick_open) ||
+        !oc_model_channel((oc_model *)m, g_call_view_ch))
         return 0;
     float avail = W - (RAIL_W + SIDEBAR_W);
     float pw = avail * 0.36f;
@@ -22630,8 +22708,8 @@ static float call_chat_left(float W) {
 static float draw_call_banner(gfx *rt, const oc_model *m, float x0, float w, float top) {
     g_call_banner_on = 0;
     if (!m || !g_sel || dm_index_view()) return 0;
-    const oc_call_view *v = oc_model_call_in(m, g_sel);
-    int in = call_here(m) && m->call.channel_id == g_sel;
+    const oc_call_view *v = oc_model_call_from(m, g_sel);
+    int in = call_here(m) && m->call.from_channel == g_sel;
     if (!v && !in) return 0;
     g_call_banner_on = 1;
     if (in) v = &m->call;
@@ -22752,15 +22830,279 @@ static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, 
 }
 
 static const char *cam_error_text(int err);   /* fwd: cameras, with the call actions */
+/* ---- Calls home and the call's page (CALLS.md §1) -------------------------------------- */
+
+static void call_home_row_add(uint64_t id, rectf r, const char *subject, const char *what) {
+    if (g_n_home >= CH_ROWS_MAX) return;
+    int k = g_n_home++;
+    g_home_ids[k] = id;
+    char aid[48], an[OC_CALL_SUBJECT_MAX + 120];
+    snprintf(aid, sizeof aid, "calls.row.%llu", (unsigned long long)id);
+    snprintf(an, sizeof an, "%s: %s", subject[0] ? subject : "Call", what);
+    call_btn_add(r, CH_ROW0 + k, aid, an);
+}
+
+/* One row: the call's subject, a line under it, and its buttons on the right
+ * (Join, Open, Decline), each with the call's id in its name. */
+static void call_home_row(gfx *rt, const oc_model *m, rectf row, uint64_t id, const char *subject, const char *line,
+                          int live, int invited, int recorded, int missed) {
+    int k = g_n_home;
+    if (in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+    float ic = UIS(20);
+    draw_lucide(rt, OC_ICON_PHONE, rf(row.left + 10, row.top + 12, row.left + 10 + ic, row.top + 12 + ic),
+                missed ? OC_COL_DANGER : live ? OC_COL_ONLINE : OC_COL_MUTED);
+    float bx = row.right - 10;
+    int mine = live && call_here(m) && m->call.call_id == id;
+    if (live) {
+        const char *jl = mine ? "Open" : "Join";
+        rectf jb = rf(bx - call_button_w(jl, -1), row.top + 10, bx, row.bottom - 10);
+        call_button(rt, jb, -1, jl, invited && !mine, 0);
+        char aid[48], an[OC_CALL_SUBJECT_MAX + 32];
+        snprintf(aid, sizeof aid, "calls.join.%llu", (unsigned long long)id);
+        snprintf(an, sizeof an, "%s %s", jl, subject);
+        call_btn_add(jb, CH_JOIN0 + k, aid, an);
+        bx = jb.left - 8;
+        if (invited && !mine) {
+            rectf db = rf(bx - call_button_w("Decline", -1), row.top + 10, bx, row.bottom - 10);
+            call_button(rt, db, -1, "Decline", 0, 0);
+            snprintf(aid, sizeof aid, "calls.decline.%llu", (unsigned long long)id);
+            snprintf(an, sizeof an, "Decline %s", subject);
+            call_btn_add(db, CH_DECLINE0 + k, aid, an);
+            bx = db.left - 8;
+        }
+    }
+    if (recorded) {
+        rectf mk = rf(bx - UIS(92), row.top + 16, bx, row.bottom - 16);
+        fill_round(rt, rf(mk.left + 4, (mk.top + mk.bottom) / 2 - UIS(4), mk.left + 12, (mk.top + mk.bottom) / 2 + UIS(4)),
+                   UIS(4), REC_RED);
+        draw_text(rt, "Recorded", g_meta, rf(mk.left + 18, mk.top, mk.right, mk.bottom), OC_COL_MUTED);
+        bx = mk.left - 8;
+    }
+    draw_text(rt, subject[0] ? subject : "Call", g_ui_b, rf(row.left + 42, row.top + 6, bx, row.top + 28), OC_COL_TEXT);
+    draw_text(rt, line, g_meta, rf(row.left + 42, row.top + 28, bx, row.bottom - 4), missed ? OC_COL_DANGER : OC_COL_MUTED);
+    call_home_row_add(id, rf(row.left, row.top, bx, row.bottom), subject, line);
+}
+
+static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
+    rectf body = view_header(rt, reg, "Calls", "Calls you were asked to: going on now, and before.");
+    float hh = body.top - reg.top;
+    rectf nb = rf(reg.right - 24 - call_button_w("New call", OC_ICON_PLUS), reg.top + (hh - UIS(32)) / 2,
+                  reg.right - 24, reg.top + (hh + UIS(32)) / 2);
+    call_button(rt, nb, OC_ICON_PLUS, "New call", 1, 0);
+    call_btn_add(nb, CC_HOME_NEW, "calls.new", "New call");
+    float y = body.top + 12 - g_home_scroll, rh = UIS(56), x0 = body.left + 24, x1 = body.right - 24;
+    draw_text(rt, "Going on now", g_meta, rf(x0, y, x1, y + 22), OC_COL_FAINT);
+    y += 26;
+    if (!m->n_calls) {
+        draw_text(rt, "No call is going on that you were asked to.", g_ui, rf(x0 + 10, y, x1, y + 28), OC_COL_MUTED);
+        y += 36;
+    }
+    for (size_t i = 0; i < m->n_calls && y < body.bottom; i++, y += rh) {
+        const oc_call_view *v = &m->calls[i];
+        char line[200], dur[16];
+        call_duration(v->started_at, dur, sizeof dur);
+        const char *st = oc_model_user_name(m, v->starter);
+        int invited = oc_model_call_invited(v, m->user_id);
+        snprintf(line, sizeof line, "Started by %s · %s · %u in it%s", v->starter == m->user_id ? "you" :
+                 (st && st[0]) ? st : "someone", dur, (unsigned)v->n_parts, invited ? " · You are asked to join" : "");
+        call_home_row(rt, m, rf(x0, y, x1, y + rh - 4), v->call_id, v->subject, line, 1, invited, v->recording, 0);
+    }
+    y += 10;
+    draw_text(rt, "Before", g_meta, rf(x0, y, x1, y + 22), OC_COL_FAINT);
+    y += 26;
+    int past = 0;
+    for (size_t i = 0; i < m->n_call_hist && y < body.bottom; i++) {
+        const oc_call_hist_view *h = &m->call_hist[i];
+        if (!h->ended_at) continue;                     /* going on: listed above */
+        char line[200], when[48];
+        rel_time(h->started_at, when, sizeof when);
+        int missed = (h->flags & OC_CALL_HIST_MISSED) != 0;
+        const char *st = oc_model_user_name(m, h->starter);
+        snprintf(line, sizeof line, "%s · %s · %u %s%s", when,
+                 missed ? "You missed it" : (h->flags & OC_CALL_HIST_DECLINED) ? "You declined it" :
+                 h->starter == m->user_id ? "You started it" : (st && st[0]) ? st : "someone",
+                 (unsigned)h->n_people, h->n_people == 1 ? "person" : "people",
+                 (h->flags & OC_CALL_HIST_TRANSCRIPT) ? " · Transcript" : "");
+        call_home_row(rt, m, rf(x0, y, x1, y + rh - 4), h->call_id, h->subject, line, 0, 0,
+                      (h->flags & OC_CALL_HIST_RECORDING) != 0, missed);
+        y += rh;
+        past++;
+    }
+    if (!past && m->call_hist_loaded)
+        draw_text(rt, "No calls before now.", g_ui, rf(x0 + 10, y, x1, y + 28), OC_COL_MUTED), y += 36;
+    else if (!m->call_hist_loaded)
+        draw_text(rt, "Loading…", g_meta, rf(x0 + 10, y, x1, y + 28), OC_COL_FAINT), y += 36;
+    if (m->call_hist_more && y + UIS(40) < body.bottom) {
+        rectf mb = rf(x0, y + 6, x0 + call_button_w("Show older calls", -1), y + 6 + UIS(36));
+        call_button(rt, mb, -1, "Show older calls", 0, 0);
+        call_btn_add(mb, CH_MORE, "calls.more", "Show older calls");
+    }
+}
+
+static const char *call_event_words(uint8_t kind) {
+    switch (kind) {
+    case OC_CALL_EV_CAMERA_ON:  return "turned their camera on";
+    case OC_CALL_EV_CAMERA_OFF: return "turned their camera off";
+    case OC_CALL_EV_SHARE_ON:   return "shared their screen";
+    case OC_CALL_EV_SHARE_OFF:  return "stopped sharing";
+    case OC_CALL_EV_RECORD_ON:  return "started recording";
+    case OC_CALL_EV_RECORD_OFF: return "stopped recording";
+    case OC_CALL_EV_SUBJECT:    return "renamed the call";
+    default:                    return "did something";
+    }
+}
+
+static void clock_text(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    strftime(out, cap, "%H:%M", &tmv);
+}
+
+/* The call's page: who was in it and when, who was asked, the timeline, its
+ * recordings -- each played as a video message is -- and its transcript. Its
+ * chat is beside it, as beside the call. */
+static void draw_call_page(gfx *rt, const oc_model *m, rectf reg) {
+    const oc_call_page_view *p = m->call_page && m->call_page->call_id == g_cpage_id ? m->call_page : NULL;
+    const oc_call_view *live = oc_model_call(m, g_cpage_id);
+    if (!live && (m->in_call || m->call_rejoining) && m->call.call_id == g_cpage_id) live = &m->call;
+    char title[OC_CALL_SUBJECT_MAX + 1], sub[200];
+    snprintf(title, sizeof title, "%s", p && p->subject[0] ? p->subject : live ? live->subject : "Call");
+    if (p) {
+        char when[48], a[16], b[16];
+        rel_time(p->started_at, when, sizeof when);
+        clock_text(p->started_at, a, sizeof a);
+        if (p->ended_at) {
+            clock_text(p->ended_at, b, sizeof b);
+            unsigned mins = (unsigned)((p->ended_at - p->started_at + 59999) / 60000);
+            snprintf(sub, sizeof sub, "%s · %s to %s · %u min", when, a, b, mins);
+        } else {
+            snprintf(sub, sizeof sub, "%s · from %s · going on now", when, a);
+        }
+    } else {
+        snprintf(sub, sizeof sub, "Loading…");
+    }
+    rectf body = view_header(rt, reg, title, sub);
+    float hh = body.top - reg.top;
+    float bx = reg.right - 24;
+    if (oc_model_channel((oc_model *)m, g_call_view_ch)) {
+        const char *cl = g_call_chat_hidden ? "Show chat" : "Hide chat";
+        rectf cb = rf(bx - call_button_w(cl, OC_ICON_MESSAGE), reg.top + (hh - UIS(32)) / 2, bx, reg.top + (hh + UIS(32)) / 2);
+        call_button(rt, cb, OC_ICON_MESSAGE, cl, !g_call_chat_hidden, 0);
+        call_btn_add(cb, CC_CHAT, "callpage.chat", cl);
+        bx = cb.left - 10;
+    }
+    if (live && !live->ended) {
+        int mine = call_here(m) && m->call.call_id == g_cpage_id;
+        const char *jl = mine ? "Open the call" : "Join";
+        rectf jb = rf(bx - call_button_w(jl, OC_ICON_PHONE), reg.top + (hh - UIS(32)) / 2, bx, reg.top + (hh + UIS(32)) / 2);
+        call_button(rt, jb, OC_ICON_PHONE, jl, 1, 0);
+        call_btn_add(jb, CH_PAGE_JOIN, "callpage.join", jl);
+    }
+    if (!p) return;
+    float x0 = body.left + 24, x1 = body.right - 24, y = body.top + 12 - g_cpage_scroll, lh = UIS(24);
+    #define PAGE_HEAD(t) do { y += 8; draw_text(rt, (t), g_meta, rf(x0, y, x1, y + 20), OC_COL_FAINT); y += 24; } while (0)
+    PAGE_HEAD("People");
+    for (uint16_t i = 0; i < p->n_stays && y < body.bottom; i++, y += lh) {
+        const oc_call_stay *s2 = &p->stays[i];
+        const char *nm = oc_model_user_name(m, s2->user_id);
+        char a[16], b[16] = "", line[200];
+        clock_text(s2->joined_at, a, sizeof a);
+        if (s2->left_at) clock_text(s2->left_at, b, sizeof b);
+        snprintf(line, sizeof line, "%s · %s to %s", s2->user_id == m->user_id ? "You" : (nm && nm[0]) ? nm : "someone",
+                 a, s2->left_at ? b : "now");
+        draw_text(rt, line, g_ui, rf(x0 + 10, y, x1, y + lh), OC_COL_TEXT);
+    }
+    {
+        int asked = 0;
+        for (uint16_t i = 0; i < p->n_invitees; i++) {
+            int stayed = 0;
+            for (uint16_t k = 0; k < p->n_stays; k++) if (p->stays[k].user_id == p->invitees[i].user_id) stayed = 1;
+            if (stayed) continue;
+            if (!asked++) PAGE_HEAD("Asked, and not in it");
+            const char *nm = oc_model_user_name(m, p->invitees[i].user_id);
+            char line[160];
+            snprintf(line, sizeof line, "%s%s", (nm && nm[0]) ? nm : "someone",
+                     p->invitees[i].declined_at ? " · declined" : "");
+            draw_text(rt, line, g_ui, rf(x0 + 10, y, x1, y + lh), OC_COL_MUTED);
+            y += lh;
+        }
+    }
+    if (p->n_events) {
+        PAGE_HEAD("Timeline");
+        for (uint16_t i = 0; i < p->n_events && y < body.bottom; i++, y += lh) {
+            const oc_call_event_view *e = &p->events[i];
+            const char *nm = oc_model_user_name(m, e->user_id);
+            char a[16], line[OC_CALL_SUBJECT_MAX + 120];
+            clock_text(e->at, a, sizeof a);
+            if (e->kind == OC_CALL_EV_SUBJECT)
+                snprintf(line, sizeof line, "%s  %s renamed the call “%s”", a, (nm && nm[0]) ? nm : "someone", e->detail);
+            else
+                snprintf(line, sizeof line, "%s  %s %s", a, (nm && nm[0]) ? nm : "someone", call_event_words(e->kind));
+            draw_text(rt, line, g_ui, rf(x0 + 10, y, x1, y + lh), OC_COL_TEXT);
+        }
+    }
+    if (p->n_recordings) {
+        PAGE_HEAD("Recording");
+        for (uint16_t i = 0; i < p->n_recordings && i < 16 && y < body.bottom; i++) {
+            const oc_call_recording *r = &p->recordings[i];
+            const char *nm = oc_model_user_name(m, r->started_by);
+            char line[200];
+            const char *st = r->state == OC_CALL_REC_READY ? "" : r->state == OC_CALL_REC_RECORDING ? " · recording now"
+                           : r->state == OC_CALL_REC_PROCESSING ? " · being made…" : " · could not be made";
+            unsigned secs = r->duration_ms / 1000;
+            if (r->state == OC_CALL_REC_READY)
+                snprintf(line, sizeof line, "Recorded by %s · %u:%02u", (nm && nm[0]) ? nm : "someone", secs / 60, secs % 60);
+            else
+                snprintf(line, sizeof line, "Recorded by %s%s", (nm && nm[0]) ? nm : "someone", st);
+            float rh = UIS(44);
+            fill_round(rt, rf(x0 + 10, y + UIS(15), x0 + 20, y + UIS(25)), UIS(5), REC_RED);
+            draw_text(rt, line, g_ui, rf(x0 + 28, y, x1 - UIS(110), y + rh - 4), OC_COL_TEXT);
+            if (r->state == OC_CALL_REC_READY && r->attachment_id) {
+                rectf pb = rf(x1 - call_button_w("Play", OC_ICON_PLAY), y + 4, x1, y + rh - 4);
+                call_button(rt, pb, OC_ICON_PLAY, "Play", 1, 0);
+                char aid[48];
+                snprintf(aid, sizeof aid, "callpage.play.%llu", (unsigned long long)r->id);
+                call_btn_add(pb, CH_PLAY0 + i, aid, "Play the recording");
+            }
+            y += rh;
+        }
+    }
+    if (p->has_transcript) {
+        PAGE_HEAD("Transcript");
+        for (uint32_t i = 0; i < p->n_lines && y < body.bottom; i++) {
+            const oc_call_line_view *l = &p->lines[i];
+            const char *nm = oc_model_user_name(m, l->speaker);
+            char who[80];
+            snprintf(who, sizeof who, "%u:%02u  %s", l->start_ms / 60000, (l->start_ms / 1000) % 60,
+                     (nm && nm[0]) ? nm : "someone");
+            draw_text(rt, who, g_meta, rf(x0 + 10, y, x0 + UIS(170), y + lh), OC_COL_MUTED);
+            draw_text(rt, l->text ? l->text : "", g_ui, rf(x0 + UIS(176), y, x1, y + lh), OC_COL_TEXT);
+            y += lh;
+        }
+        if (p->n_lines < p->n_lines_total && y + UIS(40) < body.bottom) {
+            rectf mb = rf(x0 + 10, y + 6, x0 + 10 + call_button_w("Show more", -1), y + 6 + UIS(34));
+            call_button(rt, mb, -1, "Show more", 0, 0);
+            call_btn_add(mb, CH_TMORE, "callpage.transcript.more", "Show more of the transcript");
+        }
+    }
+    #undef PAGE_HEAD
+}
+
 static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     /* The buttons are the frame's (call_rects_reset): the sidebar's Calls rows
      * drawn before this keep theirs. */
     g_share_stage = rf(0, 0, 0, 0);
-    char lbl[96], sub[200];
-    call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
-    const oc_call_view *v = oc_model_call_in(m, g_call_view_ch);
-    int in = call_here(m) && m->call.channel_id == g_call_view_ch;
-    int back = !in && call_back_here(m) && m->call.channel_id == g_call_view_ch;
+    char lbl[OC_CALL_SUBJECT_MAX + 1], sub[200];
+    const oc_call_view *v = view_call(m);
+    int in = call_here(m) && g_call_view_id && m->call.call_id == g_call_view_id;
+    int back = !in && call_back_here(m) && g_call_view_id && m->call.call_id == g_call_view_id;
+    snprintf(lbl, sizeof lbl, "%s", g_cpick_open ? (g_cpick_invite ? "Invite to the call" : "New call")
+                                    : v && v->subject[0] ? v->subject : m->call_pending ? "Starting the call" : "Call");
     if (back) {
         snprintf(sub, sizeof sub, "Reconnecting to the call\u2026");
     } else if (in) {
@@ -22776,16 +23118,36 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         snprintf(sub, sizeof sub, "No call here right now");
     }
     rectf body = view_header(rt, reg, lbl, sub);
-    if (g_cpick_ch == g_call_view_ch) { draw_call_picker(rt, m, body); return; }
-    /* The conversation beside the call: shown by default, folded away here. */
+    if (g_cpick_open) { draw_call_picker(rt, m, body); return; }
+    /* The call's chat beside it: shown by default, folded away here; and the
+     * call's page, a press away. */
     if (oc_model_channel((oc_model *)m, g_call_view_ch)) {
-        const char *cl = g_call_chat_hidden ? "Show conversation" : "Hide conversation";
+        const char *cl = g_call_chat_hidden ? "Show chat" : "Hide chat";
         float hh = body.top - reg.top, cw = call_button_w(cl, OC_ICON_MESSAGE);
         rectf cb = rf(reg.right - 24 - cw, reg.top + (hh - UIS(32)) / 2, reg.right - 24, reg.top + (hh + UIS(32)) / 2);
         call_button(rt, cb, OC_ICON_MESSAGE, cl, !g_call_chat_hidden, 0);
         call_btn_add(cb, CC_CHAT, "call.chat", cl);
+        float pw = call_button_w("Details", OC_ICON_INFO);
+        rectf pb = rf(cb.left - 10 - pw, cb.top, cb.left - 10, cb.bottom);
+        call_button(rt, pb, OC_ICON_INFO, "Details", 0, 0);
+        call_btn_add(pb, CC_PAGE_OPEN, "call.page", "The call's page");
+        cb = pb;
+        /* Record (CALLS.md §8), in a call where the daemon records them. */
+        if (in && oc_model_has_capability(m, OC_CAP_CALL_RECORDING)) {
+            const char *rl = m->call.recording ? "Stop recording" : "Record";
+            float rw = call_button_w(rl, -1) + UIS(14);
+            rectf rb = rf(cb.left - 10 - rw, cb.top, cb.left - 10, cb.bottom);
+            call_button(rt, rb, -1, "", m->call.recording, 0);
+            fill_round(rt, rf(rb.left + UIS(12), (rb.top + rb.bottom) / 2 - UIS(5), rb.left + UIS(22),
+                              (rb.top + rb.bottom) / 2 + UIS(5)), UIS(5), REC_RED);
+            draw_text(rt, rl, g_ui, rf(rb.left + UIS(28), rb.top, rb.right - 6, rb.bottom),
+                      m->call.recording ? 0xFFFFFF : OC_COL_TEXT);
+            call_btn_add(rb, CC_RECORD, "call.record", m->call.recording ? "Recording: on. Stop recording"
+                                                                          : "Recording: off. Record the call");
+            cb = rb;
+        }
         /* The grid, or the speaker large (REQ-160): one click between them. */
-        if (call_here(m) && m->call.channel_id == g_call_view_ch) {
+        if (in) {
             const char *ll = g_call_layout ? "Grid view" : "Speaker view";
             float lw = call_button_w(ll, -1);
             rectf lb = rf(cb.left - 10 - lw, cb.top, cb.left - 10, cb.bottom);
@@ -22811,9 +23173,51 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     memset(&st, 0, sizeof st);
     if (in && g_call_engine) oc_call_engine_stats(g_call_engine, &st);
 
+    /* Recorded (CALLS.md §8): the mark, to everyone in it and everyone asked. */
+    if ((in || back) ? m->call.recording : v && v->recording) {
+        rectf mk = rf(body.right - 24 - UIS(118), body.top + 6, body.right - 24, body.top + 6 + UIS(24));
+        fill_round(rt, mk, UIS(12), 0x3A1418);
+        fill_round(rt, rf(mk.left + UIS(9), mk.top + UIS(7), mk.left + UIS(19), mk.top + UIS(17)), UIS(5), REC_RED);
+        draw_text(rt, "Recording", g_meta, rf(mk.left + UIS(26), mk.top, mk.right - 6, mk.bottom), 0xFFB4B4);
+        g_rec_mark = mk;
+    }
+    /* A recorded call, before joining it -- or joined, and nothing sent yet:
+     * the notice, and Join, which says it was seen. */
+    int gated = in && g_call_engine && oc_call_engine_recording_gated(g_call_engine);
+    if ((!in && v && v->recording && g_rec_notice_id == v->call_id) || gated) {
+        rectf card = rf(body.left + 24, body.top + UIS(60), body.right - 24, body.top + UIS(220));
+        if (card.right - card.left > UIS(560)) {
+            float cx = (card.left + card.right) / 2;
+            card.left = cx - UIS(280); card.right = cx + UIS(280);
+        }
+        fill_round(rt, card, OC_R_CONTROL, OC_COL_SELECT);
+        stroke_round(rt, card, OC_R_CONTROL, REC_RED, 1.5f);
+        fill_round(rt, rf(card.left + UIS(20), card.top + UIS(26), card.left + UIS(34), card.top + UIS(40)), UIS(7), REC_RED);
+        draw_text(rt, "This call is being recorded.", g_ui_b,
+                  rf(card.left + UIS(44), card.top + UIS(18), card.right - 20, card.top + UIS(48)), OC_COL_TEXT);
+        /* Two short lines rather than one cut off in a narrow view. */
+        draw_text(rt, gated ? "Your microphone and camera wait." : "Everyone in it is told it is.",
+                  g_meta, rf(card.left + UIS(44), card.top + UIS(48), card.right - 20, card.top + UIS(70)), OC_COL_MUTED);
+        draw_text(rt, "Nothing of yours is sent until you join.",
+                  g_meta, rf(card.left + UIS(44), card.top + UIS(70), card.right - 20, card.top + UIS(92)), OC_COL_MUTED);
+        float jy = card.bottom - UIS(58), jx = card.left + UIS(44);
+        rectf jb = rf(jx, jy, jx + call_button_w("Join", OC_ICON_PHONE), jy + UIS(40));
+        call_button(rt, jb, OC_ICON_PHONE, "Join", 1, 0);
+        call_btn_add(jb, CC_REC_JOIN, "call.rec.join", "Join the recorded call");
+        rectf cb2 = rf(jb.right + 10, jy, jb.right + 10 + call_button_w(gated ? "Leave" : "Cancel", -1), jy + UIS(40));
+        call_button(rt, cb2, -1, gated ? "Leave" : "Cancel", 0, 0);
+        call_btn_add(cb2, gated ? CC_LEAVE : CC_REC_CANCEL, gated ? "call.rec.leave" : "call.rec.cancel",
+                     gated ? "Leave" : "Cancel");
+        g_rec_notice_on = 1;
+        return;
+    }
+
     uint64_t people[OC_MAX_CALL_PARTICIPANTS];
     int np = 0;
-    if (in || back) for (int i = 0; i < m->call.n_parts && np < 32; i++) people[np++] = m->call.parts[i];
+    if (in || back) for (int i = 0; i < m->call.n_parts && np < 32; i++) {
+        if (m->call.recorder[i]) continue;           /* the Recorder is the mark, not a card */
+        people[np++] = m->call.parts[i];
+    }
     else if (v) for (int i = 0; i < v->n_parts && np < 32; i++) people[np++] = v->parts[i];
     float cardw = UIS(176.0f), cardh = UIS(150.0f), gap = UIS(14.0f);
     float gx = body.left + 24, gy = body.top + 36;
@@ -22960,7 +23364,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
             call_btn_add(b, CC_JOIN, "call.start", "Start a call");
             return;
         }
-        int pending = m->call_pending == g_call_view_ch;
+        int pending = m->call_pending && !call_here(m);
         b = rf(x, by, x + call_button_w(pending ? "Joining\u2026" : "Join", OC_ICON_PHONE), by + bh);
         call_button(rt, b, OC_ICON_PHONE, pending ? "Joining\u2026" : "Join", 1, 0);
         call_btn_add(b, CC_JOIN, "call.join", "Join");
@@ -23116,10 +23520,23 @@ static void draw_call_picker(gfx *rt, const oc_model *m, rectf body) {
     int ticked = 0;
     for (int i = 0; i < g_cpick_n; i++) ticked += g_cpick_on[i];
     char head[160];
+    float y0 = body.top;
+    /* A new call's subject (CALLS.md §1): what it is about, named in the
+     * invitation, the history and the call's page. */
+    if (!g_cpick_invite && g_cpick_subject) {
+        draw_text(rt, "Subject", g_meta, rf(body.left + 24, y0 + 10, body.right - 24, y0 + 28), OC_COL_MUTED);
+        rectf fb = rf(body.left + 24, y0 + 30, body.right - 24, y0 + 30 + UIS(34));
+        if (fb.right - fb.left > UIS(520)) fb.right = fb.left + UIS(520);
+        fill_round(rt, fb, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, fb, OC_R_CONTROL, g_focus == g_cpick_subject ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        field_show(g_cpick_subject, 1);
+        field_draw(rt, g_cpick_subject, rf(fb.left + 10, fb.top, fb.right - 10, fb.bottom), OC_COL_TEXT);
+        y0 = fb.bottom + 6;
+    }
     snprintf(head, sizeof head, "%s: %d of %d ticked", g_cpick_invite ? "Invite to the call" : "Who to call",
              ticked, room > 0 ? room : 0);
-    draw_text(rt, head, g_ui_b, rf(body.left + 24, body.top + 10, body.right - 24, body.top + 34), OC_COL_TEXT);
-    float y = body.top + 44, rh = UIS(34);
+    draw_text(rt, head, g_ui_b, rf(body.left + 24, y0 + 10, body.right - 24, y0 + 34), OC_COL_TEXT);
+    float y = y0 + 44, rh = UIS(34);
     for (int i = 0; i < g_cpick_n && y + rh < body.bottom - UIS(70); i++, y += rh) {
         rectf row = rf(body.left + 24, y, body.right - 24, y + rh - 4);
         if (in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
@@ -23136,8 +23553,9 @@ static void draw_call_picker(gfx *rt, const oc_model *m, rectf body) {
     }
     float by = body.bottom - UIS(56), bh = UIS(40), x = body.left + 24;
     const char *go = g_cpick_invite ? "Invite" : "Start the call";
+    int subj_ok = g_cpick_invite || !g_cpick_subject || g_cpick_subject->len > 0;
     rectf b = rf(x, by, x + call_button_w(go, OC_ICON_PHONE), by + bh);
-    call_button(rt, b, OC_ICON_PHONE, go, ticked > 0 && ticked <= room, 0);
+    call_button(rt, b, OC_ICON_PHONE, go, ticked > 0 && ticked <= room && subj_ok, 0);
     call_btn_add(b, CC_PICK_GO, "call.pick.go", go);
     b = rf(b.right + 10, by, b.right + 10 + call_button_w("Cancel", -1), by + bh);
     call_button(rt, b, -1, "Cancel", 0, 0);
@@ -23774,18 +24192,24 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
                 draw_sidebar(rt, m, H);
                 draw_directory(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
-            case VIEW_CALL: {
+            case VIEW_CALLS:
+                draw_sidebar(rt, m, H);
+                draw_calls_home(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
+            case VIEW_CALL:
+            case VIEW_CALLPAGE: {
                 /* The Home sidebar stays, like Threads: the Calls row you came
-                 * from is in it (REQ-303). The conversation sits on the right,
+                 * from is in it (REQ-303). The call's chat sits on the right,
                  * its messages and its composer, unless folded away. */
                 draw_sidebar(rt, m, H);
                 float px = call_chat_left(W);
-                draw_call_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, px > 0 ? px : W, H));
+                if (g_view == VIEW_CALL) draw_call_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, px > 0 ? px : W, H));
+                else draw_call_page(rt, m, rf(RAIL_W + SIDEBAR_W, 0, px > 0 ? px : W, H));
                 if (px > 0) {
                     fill(rt, rf(px, 0, W, H), OC_COL_BASE);
                     fill(rt, rf(px, 0, px + 1, H), OC_COL_BORDER);
-                    char lbl[96];
-                    call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
+                    char lbl[32];
+                    snprintf(lbl, sizeof lbl, "Chat");
                     fill(rt, rf(px + 1, 0, W, HEADER_H), OC_COL_HEADER);
                     draw_text(rt, lbl, g_ui_b, rf(px + 20, 0, W - 20, HEADER_H), OC_COL_TEXT);
                     fill(rt, rf(px + 1, HEADER_H - 1, W, HEADER_H), OC_COL_BORDER);
@@ -27352,6 +27776,8 @@ static const char *view_aid(int act) {
     case VIEW_THREADS:   return "threads";
     case VIEW_DIRECTORY: return "people";
     case VIEW_CALL:      return "call";
+    case VIEW_CALLS:     return "calls";
+    case VIEW_CALLPAGE:  return "callpage";
     case VIEW_DRAFTS:    return "drafts";
     case VIEW_NEWMSG:    return "newmsg";
     default:             return "";
@@ -27647,14 +28073,12 @@ static void a11y_publish_scene(const oc_model *m) {
     /* Calls (REQ-290): the header's button, the Calls section, the in-call strip
      * and the call view's controls, each with its state in its name. */
     if (g_call_hdr_btn.right > g_call_hdr_btn.left && n < OC_ACC_MAX) {
-        const oc_call_view *cv = oc_model_call_in(m, g_sel);
+        const oc_call_view *cv = oc_model_call_from(m, g_sel);
         char cn[64];
         if (cv) snprintf(cn, sizeof cn, "Call going on: %u in it", (unsigned)cv->n_parts);
         else    snprintf(cn, sizeof cn, "Start a call");
         acc_push(items, &n, OC_ACC_BUTTON, "header.call", cn, g_call_hdr_btn, ATOK(AT_MENU, CC_HDR));
     }
-    if (g_calls_plus.right > g_calls_plus.left && n < OC_ACC_MAX)
-        acc_push(items, &n, OC_ACC_BUTTON, "sidebar.calls.new", "Start a call", g_calls_plus, ATOK(AT_MENU, CC_PLUS));
     /* The two icon-only membership buttons, named as their tooltips are. */
     if (g_addppl_btn.right > g_addppl_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.addpeople", "Add people", g_addppl_btn, ATOK(AT_ADDPPL, 0));
@@ -27667,7 +28091,7 @@ static void a11y_publish_scene(const oc_model *m) {
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "members.addgroup", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
     for (int i = 0; i < g_n_call_rows && n < OC_ACC_MAX; i++) {
-        const oc_call_view *cv = oc_model_call_in(m, g_call_rows[i].ch);
+        const oc_call_view *cv = oc_model_call_from(m, g_call_rows[i].ch);
         char aid[OC_ACC_AID_MAX], nm[160], lbl[96];
         call_conv_label(m, g_call_rows[i].ch, lbl, sizeof lbl);
         snprintf(aid, sizeof aid, "sidebar.calls.%llu", (unsigned long long)g_call_rows[i].ch);
@@ -36460,12 +36884,12 @@ static void cam_set(int on) {
         g_cam_on = 1;
         g_cam_err = 0;
         g_cam_err_until = 0;
-        oc_client_call_camera(g_client, m->call.channel_id, 1);
+        oc_client_call_camera(g_client, m->call.call_id, 1);
         oc_a11y_announce("Camera on");
     } else {
         oc_call_engine_camera_stop(g_call_engine);
         g_cam_on = 0;
-        oc_client_call_camera(g_client, m->call.channel_id, 0);
+        oc_client_call_camera(g_client, m->call.call_id, 0);
         oc_a11y_announce("Camera off");
     }
 }
@@ -36482,7 +36906,7 @@ static void cam_tick(void) {
         if (g_call_engine) oc_call_engine_stats(g_call_engine, &st);
         if (!in || st.camera_state == 0) {
             g_cam_on = 0;
-            if (in) oc_client_call_camera(g_client, m->call.channel_id, 0);
+            if (in) oc_client_call_camera(g_client, m->call.call_id, 0);
             if (in && st.camera_error) {
                 g_cam_err = st.camera_error;
                 g_cam_err_until = now_ms() + 8000;
@@ -36520,7 +36944,7 @@ static void cam_tick(void) {
     g_cam_sub_n = all ? 0 : n;
     if (!all) memcpy(g_cam_sub, want, (size_t)n * sizeof want[0]);
     if (g_call_engine) oc_call_engine_camera_subscribe(g_call_engine, all, want, all ? 0 : n);
-    oc_client_call_video_sub(g_client, m->call.channel_id, all, want, all ? 0 : n);
+    oc_client_call_video_sub(g_client, m->call.call_id, all, want, all ? 0 : n);
 }
 
 /* The device a remembered hash names, if this machine has it; else the default. */
@@ -36560,19 +36984,56 @@ static void call_claim(void) {
     if (!g_call_engine || !g_client) return;
     if (g_call_client && g_call_client != g_client) {
         const oc_model *om = oc_client_model(g_call_client);
-        if (om && (om->in_call || om->call_rejoining)) oc_client_call_leave(g_call_client, om->call.channel_id);
+        if (om && (om->in_call || om->call_rejoining)) oc_client_call_leave(g_call_client, om->call.call_id);
         oc_client_set_call_media(g_call_client, NULL, NULL);
     }
     oc_client_set_call_media(g_client, oc_call_engine_media(), g_call_engine);
     g_call_client = g_client;
 }
 
-static void call_open_view(oc_win *hwnd, uint64_t ch) {
+/* The call's chat beside the call or its page (call_chat_left). */
+static void call_chat_select(uint64_t chat) {
+    g_call_view_ch = chat;
+    if (chat && g_sel != chat && oc_model_channel((oc_model *)model(), chat)) select_channel(chat);
+}
+
+/* The call view, for call `id` (0: the one starting). */
+static void call_open_view(oc_win *hwnd, uint64_t id) {
     close_overlays();
-    g_call_view_ch = ch;
-    /* The conversation beside the call is the call's own (call_chat_left). */
-    if (ch && g_sel != ch && oc_model_channel((oc_model *)model(), ch)) select_channel(ch);
+    g_call_view_id = id;
+    g_cpick_open = 0;
+    const oc_call_view *v = view_call(model());
+    call_chat_select(v ? v->chat_channel : 0);
     g_view = VIEW_CALL;
+    layout_composer(hwnd);
+    invalidate();
+}
+
+/* Calls home: the history asked for afresh. */
+static void call_open_home(oc_win *hwnd) {
+    close_overlays();
+    g_view = VIEW_CALLS;
+    g_home_scroll = 0;
+    if (g_client) oc_client_call_history(g_client, 0);
+    layout_composer(hwnd);
+    invalidate();
+}
+
+/* A call's page, fetched; its chat beside it. */
+static void call_open_page(oc_win *hwnd, uint64_t id) {
+    if (!id) return;
+    close_overlays();
+    g_cpage_id = id;
+    g_cpage_scroll = 0;
+    if (g_client) oc_client_call_detail(g_client, id, 0);
+    const oc_model *m = model();
+    uint64_t chat = 0;
+    const oc_call_view *v = oc_model_call(m, id);
+    if (v) chat = v->chat_channel;
+    if (!chat && m && (m->in_call || m->call_rejoining) && m->call.call_id == id) chat = m->call.chat_channel;
+    for (size_t i = 0; !chat && m && i < m->n_call_hist; i++) if (m->call_hist[i].call_id == id) chat = m->call_hist[i].chat_channel;
+    call_chat_select(chat);
+    g_view = VIEW_CALLPAGE;
     layout_composer(hwnd);
     invalidate();
 }
@@ -36584,12 +37045,27 @@ static void call_take_microphone(oc_win *hwnd) {
     if (g_vm) vm_close(hwnd);
 }
 
-static void call_join_here(oc_win *hwnd, uint64_t ch) {
-    if (!g_client || !ch) return;
+/* Join call `id`. A recorded one shows its notice first (CALLS.md §8): its
+ * Join joins, and says the recording was seen. */
+static void call_join_id(oc_win *hwnd, uint64_t id, int seen) {
+    const oc_model *m = model();
+    if (!g_client || !id || !m) return;
+    const oc_call_view *v = oc_model_call(m, id);
+    if (v && v->recording && !seen) {
+        g_rec_notice_id = id;
+        call_open_view(hwnd, id);
+        return;
+    }
+    g_rec_notice_id = 0;
+    g_rec_ack_id = seen ? id : 0;
     call_take_microphone(hwnd);
     call_claim();
-    oc_client_call_join(g_client, ch);
-    call_open_view(hwnd, ch);
+    oc_client_call_join(g_client, id);
+    call_open_view(hwnd, id);
+}
+
+static void call_join_here(oc_win *hwnd, uint64_t ch) {
+    call_join_id(hwnd, call_id_from(model(), ch), 0);
 }
 
 /* Everyone a start in `c` would ask, most recently active first: those who
@@ -36612,12 +37088,26 @@ static int call_candidates(const oc_model *m, const oc_channel *c, uint64_t *out
     return n;
 }
 
+/* The picker, in the call view: to start a call from conversation `ch` (0:
+ * from Calls home) with its subject, or to invite more to the call one is in;
+ * the first `room` of the candidates ticked. */
 static void call_pick_open(oc_win *hwnd, uint64_t ch, int invite, const uint64_t *cand, int n, int room) {
-    g_cpick_ch = ch;
+    const oc_model *m = model();
+    call_open_view(hwnd, invite && m ? m->call.call_id : 0);
+    g_cpick_open = 1;
+    g_cpick_from = ch;
     g_cpick_invite = invite;
     g_cpick_n = n < CC_MAX_PICK ? n : CC_MAX_PICK;
     for (int i = 0; i < g_cpick_n; i++) { g_cpick_uid[i] = cand[i]; g_cpick_on[i] = i < room; }
-    call_open_view(hwnd, ch);
+    if (!invite && g_cpick_subject) {
+        char subject[OC_CALL_SUBJECT_MAX + 1] = "";
+        if (ch && m) call_subject_suggest(m, ch, subject, sizeof subject);
+        field_set(g_cpick_subject, subject);
+        field_select_all(g_cpick_subject);
+        field_show(g_cpick_subject, 1);
+        focus_set(g_cpick_subject);
+    }
+    invalidate();
 }
 
 /* Start a call in `ch` (REQ-301): everyone, up to the cap; the starter picks
@@ -36626,20 +37116,22 @@ static void call_pick_open(oc_win *hwnd, uint64_t ch, int invite, const uint64_t
 static void call_start_here(oc_win *hwnd, uint64_t ch) {
     const oc_model *m = model();
     if (!m || !ch) return;
-    if (oc_model_call_in(m, ch)) { call_join_here(hwnd, ch); return; }
+    if (oc_model_call_from(m, ch)) { call_join_here(hwnd, ch); return; }
     const oc_channel *c = oc_model_channel((oc_model *)m, ch);
     if (!c) return;
     if (c->kind != OC_CHANNEL_KIND_DM && (m->chanmem_channel != ch || m->chanmem_loading)) {
         if (m->chanmem_channel != ch) oc_client_list_members(g_client, ch);
         g_call_start_pending = ch;
-        call_open_view(hwnd, ch);
+        call_open_view(hwnd, 0);
         return;
     }
     g_call_start_pending = 0;
     uint64_t cand[CC_MAX_PICK];
     int n = call_candidates(m, c, cand, CC_MAX_PICK);
     int room = (m->call_max ? m->call_max : 10) - 1;
-    if (n > room) { call_pick_open(hwnd, ch, 0, cand, n, room); return; }
+    /* The picker (CALLS.md §1): the subject, and the conversation's people
+     * ticked -- as many as the call holds, the most recently active first. */
+    if (!g_call_start_ok) { call_pick_open(hwnd, ch, 0, cand, n, room); return; }
     /* A channel with more than one other member asks first, naming how many it
      * will ring: a press on the header's phone is easy to make by mistake, and
      * a call rings everyone in it. A DM rings who you are already talking to. */
@@ -36652,8 +37144,10 @@ static void call_start_here(oc_win *hwnd, uint64_t ch) {
     }
     call_take_microphone(hwnd);
     call_claim();
-    oc_client_call_start(g_client, ch, cand, n);
-    call_open_view(hwnd, ch);
+    char subject[OC_CALL_SUBJECT_MAX + 1];
+    call_subject_suggest(m, ch, subject, sizeof subject);
+    oc_client_call_start(g_client, ch, subject, cand, n < room ? n : room);
+    call_open_view(hwnd, 0);
 }
 
 /* The start's confirmation said yes: the start it asked about goes on. */
@@ -36776,6 +37270,28 @@ static void call_tick(oc_win *hwnd) {
         call_start_here(hwnd, g_call_start_pending);
     /* The talk key held when the call ended lets go of nothing. */
     if (g_call_ptt && !call_here(m)) g_call_ptt = 0;
+    /* A call started from the picker: the view takes its id, and its chat,
+     * once it has them. */
+    if (m && g_view == VIEW_CALL && !g_call_view_id && !g_cpick_open && call_here(m) && m->call.call_id) {
+        g_call_view_id = m->call.call_id;
+        call_chat_select(m->call.chat_channel);
+        layout_composer(hwnd);
+    }
+    /* The call's chat, once the view has it. */
+    if (m && g_view == VIEW_CALL && g_call_view_id && !g_call_view_ch) {
+        const oc_call_view *v = view_call(m);
+        if (v && v->chat_channel && oc_model_channel((oc_model *)m, v->chat_channel)) {
+            call_chat_select(v->chat_channel);
+            layout_composer(hwnd);
+        }
+    }
+    /* Joined from the recorded call's notice: what it said was seen, so the
+     * engine sends (CALLS.md §8). */
+    if (g_rec_ack_id && call_here(m) && m->call.call_id == g_rec_ack_id && g_call_engine &&
+        oc_call_engine_recording_gated(g_call_engine)) {
+        oc_call_engine_ack_recording(g_call_engine);
+        g_rec_ack_id = 0;
+    }
     if (m && m->call_error_seq != g_call_err_seq) {
         g_call_err_seq = m->call_error_seq;
         g_call_err_at = now_ms();
@@ -37020,6 +37536,47 @@ static void call_cmd(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m) return;
     int in = call_here(m);
+    if (cmd >= CH_MORE && cmd <= CH_LAST) {
+        if (cmd == CH_MORE) {
+            if (m->n_call_hist) oc_client_call_history(g_client, m->call_hist[m->n_call_hist - 1].started_at);
+        } else if (cmd == CH_TMORE) {
+            if (m->call_page && m->call_page->call_id == g_cpage_id)
+                oc_client_call_detail(g_client, g_cpage_id, m->call_page->n_lines);
+        } else if (cmd == CH_PAGE_JOIN) {
+            if (in && m->call.call_id == g_cpage_id) call_open_view(hwnd, g_cpage_id);
+            else call_join_id(hwnd, g_cpage_id, 0);
+            return;
+        } else if (cmd >= CH_PLAY0 && cmd < CH_PLAY0 + 16) {
+            /* A recording, played as a video message is (ARCH-110). */
+            const oc_call_page_view *p = m->call_page;
+            int i = cmd - CH_PLAY0;
+            if (p && p->call_id == g_cpage_id && i < p->n_recordings && p->recordings[i].attachment_id) {
+                oc_attachment at;
+                memset(&at, 0, sizeof at);
+                at.id = p->recordings[i].attachment_id;
+                snprintf(at.filename, sizeof at.filename, "Recording of %.100s.mp4", p->subject);
+                snprintf(at.mime, sizeof at.mime, "video/mp4");
+                at.size = p->recordings[i].bytes;
+                vm_open_player(hwnd, &at);
+            }
+        } else if (cmd >= CH_ROW0 && cmd < CH_ROW0 + CH_ROWS_MAX) {
+            int i = cmd - CH_ROW0;
+            if (i < g_n_home) call_open_page(hwnd, g_home_ids[i]);
+            return;
+        } else if (cmd >= CH_JOIN0 && cmd < CH_JOIN0 + CH_ROWS_MAX) {
+            int i = cmd - CH_JOIN0;
+            if (i < g_n_home) {
+                if (in && m->call.call_id == g_home_ids[i]) call_open_view(hwnd, g_home_ids[i]);
+                else call_join_id(hwnd, g_home_ids[i], 0);
+            }
+            return;
+        } else if (cmd >= CH_DECLINE0 && cmd <= CH_LAST) {
+            int i = cmd - CH_DECLINE0;
+            if (i < g_n_home) oc_client_call_decline(g_client, g_home_ids[i]);
+        }
+        invalidate();
+        return;
+    }
     switch (cmd) {
     case CC_MUTE:
         if (g_call_engine && in) {
@@ -37029,27 +37586,58 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         }
         break;
     case CC_LEAVE:
-        if (in || call_back_here(m)) oc_client_call_leave(g_client, m->call.channel_id);
+        if (in || call_back_here(m)) oc_client_call_leave(g_client, m->call.call_id);
         break;
     case CC_END:
         /* Asked first: it ends the call for everyone in it. */
-        if (in) confirm_open(hwnd, CONF_CALL_END, m->call.channel_id, "End the call for everyone?",
+        if (in) confirm_open(hwnd, CONF_CALL_END, m->call.call_id, "End the call for everyone?",
                              "Everyone in it is taken out of the call, not only you.", "End for everyone");
         return;
     case CC_JOIN:
-        if (g_call_view_ch) call_start_here(hwnd, g_call_view_ch);
+        if (g_call_view_id) call_join_id(hwnd, g_call_view_id, 0);
         break;
     case CC_DECLINE:
-        if (g_call_view_ch) oc_client_call_decline(g_client, g_call_view_ch);
+        if (g_call_view_id) oc_client_call_decline(g_client, g_call_view_id);
         break;
+    case CC_RECORD:
+        if (in) oc_client_call_record(g_client, m->call.call_id, !m->call.recording);
+        break;
+    case CC_REC_JOIN:
+        /* The notice's Join: in the call, and the recording seen. */
+        if (in && g_call_engine && oc_call_engine_recording_gated(g_call_engine)) {
+            oc_call_engine_ack_recording(g_call_engine);
+            oc_a11y_announce("Joined. This call is being recorded");
+        } else if (g_rec_notice_id) {
+            call_join_id(hwnd, g_rec_notice_id, 1);
+        }
+        break;
+    case CC_REC_CANCEL:
+        g_rec_notice_id = 0;
+        call_open_home(hwnd);
+        return;
+    case CC_PAGE_OPEN:
+        if (g_call_view_id) call_open_page(hwnd, g_call_view_id);
+        return;
+    case CC_HOME_OPEN:
+        call_open_home(hwnd);
+        return;
+    case CC_HOME_NEW: {
+        /* New call from Calls home: a subject, and anyone in the workspace. */
+        uint64_t cand[CC_MAX_PICK];
+        int n = 0;
+        for (size_t i = 0; i < m->n_users && n < CC_MAX_PICK; i++)
+            if (m->users[i].user_id && m->users[i].user_id != m->user_id) cand[n++] = m->users[i].user_id;
+        call_pick_open(hwnd, 0, 0, cand, n, 0);
+        return;
+    }
     case CC_BANNER_JOIN:
         /* The conversation's banner: into its call, or to it when you are in. */
         if (!g_sel) break;
-        if (in && m->call.channel_id == g_sel) call_open_view(hwnd, g_sel);
+        if (in && m->call.from_channel == g_sel) call_open_view(hwnd, m->call.call_id);
         else call_start_here(hwnd, g_sel);
         break;
     case CC_BANNER_DECLINE:
-        if (g_sel) oc_client_call_decline(g_client, g_sel);
+        if (g_sel) oc_client_call_decline(g_client, call_id_from(m, g_sel));
         break;
     case CC_SETTINGS:
         g_call_settings = !g_call_settings;
@@ -37065,19 +37653,23 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         break;
     case CC_INVITE: {
         if (!in) break;
-        const oc_channel *c = oc_model_channel((oc_model *)m, m->call.channel_id);
-        if (!c) break;
-        if (c->kind != OC_CHANNEL_KIND_DM && m->chanmem_channel != c->channel_id)
+        /* Those of the conversation it was started from, or -- one started
+         * from Calls home -- of the workspace. */
+        const oc_channel *c = oc_model_channel((oc_model *)m, m->call.from_channel);
+        if (c && c->kind != OC_CHANNEL_KIND_DM && m->chanmem_channel != c->channel_id)
             oc_client_list_members(g_client, c->channel_id);
         uint64_t cand[CC_MAX_PICK], keep[CC_MAX_PICK];
-        int n = call_candidates(m, c, cand, CC_MAX_PICK), k = 0;
+        int n = 0, k = 0;
+        if (c) n = call_candidates(m, c, cand, CC_MAX_PICK);
+        else for (size_t i = 0; i < m->n_users && n < CC_MAX_PICK; i++)
+            if (m->users[i].user_id && m->users[i].user_id != m->user_id) cand[n++] = m->users[i].user_id;
         for (int i = 0; i < n; i++) {          /* not those already in it or asked */
             int skip = 0;
             for (int j = 0; j < m->call.n_parts; j++) if (m->call.parts[j] == cand[i]) skip = 1;
             for (int j = 0; j < m->call.n_invited; j++) if (m->call.invited[j] == cand[i]) skip = 1;
             if (!skip) keep[k++] = cand[i];
         }
-        call_pick_open(hwnd, c->channel_id, 1, keep, k, 0);
+        call_pick_open(hwnd, c ? c->channel_id : 0, 1, keep, k, 0);
         break;
     }
     case CC_NS:
@@ -37089,13 +37681,13 @@ static void call_cmd(oc_win *hwnd, int cmd) {
     case CC_SPKMENU: call_open_device_menu(hwnd, 1); return;
     case CC_HDR:
         if (!g_sel) break;
-        if (in && m->call.channel_id == g_sel) call_open_view(hwnd, g_sel);
-        else if (oc_model_call_in(m, g_sel)) call_open_view(hwnd, g_sel);
+        if (in && m->call.from_channel == g_sel) call_open_view(hwnd, m->call.call_id);
+        else if (oc_model_call_from(m, g_sel)) call_open_view(hwnd, oc_model_call_from(m, g_sel)->call_id);
         else call_start_here(hwnd, g_sel);
         break;
     case CC_PLUS: call_open_conv_menu(hwnd); return;
     case CC_OPEN:
-        if (in) call_open_view(hwnd, m->call.channel_id);
+        if (in || call_back_here(m)) call_open_view(hwnd, m->call.call_id);
         break;
     case CC_PICK_GO: {
         uint64_t uids[CC_MAX_PICK];
@@ -37103,17 +37695,20 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         for (int i = 0; i < g_cpick_n; i++) if (g_cpick_on[i]) uids[n++] = g_cpick_uid[i];
         if (!n) break;
         if (g_cpick_invite) {
-            if (in) oc_client_call_invite(g_client, g_cpick_ch, uids, n);
+            if (in) oc_client_call_invite(g_client, m->call.call_id, uids, n);
         } else {
+            if (!g_cpick_subject || !g_cpick_subject->len) break;   /* a call says what it is about */
             call_take_microphone(hwnd);
             call_claim();
-            oc_client_call_start(g_client, g_cpick_ch, uids, n);
+            oc_client_call_start(g_client, g_cpick_from, g_cpick_subject->buf, uids, n);
+            g_call_view_id = 0;                  /* the call's own id comes with it */
         }
-        g_cpick_ch = 0;
+        g_cpick_open = 0;
         break;
     }
     case CC_PICK_CANCEL:
-        g_cpick_ch = 0;
+        g_cpick_open = 0;
+        if (!g_call_view_id) { call_open_home(hwnd); return; }
         break;
     case CC_SHARE:
         if (in && !g_share_on) share_open_picker(hwnd);
@@ -37166,19 +37761,6 @@ static void call_cmd(oc_win *hwnd, int cmd) {
                 uint64_t uid = m->call.parts[i];
                 float g = oc_call_engine_volume(g_call_engine, uid) + (up ? 0.25f : -0.25f);
                 oc_call_engine_set_volume(g_call_engine, uid, g);
-            }
-            break;
-        } else if (cmd >= CC_ROW0 && cmd < CC_ROW0 + 8) {
-            int i = cmd - CC_ROW0;
-            if (i < g_n_call_rows) call_open_view(hwnd, g_call_rows[i].ch);
-            break;
-        } else if (cmd >= CC_ROWJOIN0 && cmd < CC_ROWJOIN0 + 8) {
-            /* A Calls row's own Join: into it, or Open when already in it. */
-            int i = cmd - CC_ROWJOIN0;
-            if (i < g_n_call_rows) {
-                uint64_t ch = g_call_rows[i].ch;
-                if (in && m->call.channel_id == ch) call_open_view(hwnd, ch);
-                else call_join_here(hwnd, ch);
             }
             break;
         } else if (cmd >= CC_PICK0 && cmd < CC_PICK0 + CC_MAX_PICK) {
@@ -37332,7 +37914,7 @@ static int share_begin(oc_win *hwnd, const char *id, const char *name) {
     snprintf(g_share_name, sizeof g_share_name, "%s", name && name[0] ? name : "your screen");
     g_share_on = 1;
     g_share_err_until = 0;
-    oc_client_call_share(g_client, m->call.channel_id, 1);
+    oc_client_call_share(g_client, m->call.call_id, 1);
     sharebar_close();
     sharebar_open(hwnd);
     oc_a11y_announce("You are sharing your screen");
@@ -37345,7 +37927,7 @@ static void share_end(int tell) {
     if (g_call_engine) oc_call_engine_share_stop(g_call_engine);
     /* Told even before the daemon has named this device: the start is on its
      * way, and a stop after it undoes it. A stop from a non-sharer is nothing. */
-    if (tell && g_share_on && call_here(m)) oc_client_call_share(g_client, m->call.channel_id, 0);
+    if (tell && g_share_on && call_here(m)) oc_client_call_share(g_client, m->call.call_id, 0);
     g_share_on = 0;
     sharebar_close();
 }
@@ -37389,7 +37971,7 @@ static void share_tick(oc_win *hwnd) {
             snprintf(t, sizeof t, "%s started sharing their screen", (sn && sn[0]) ? sn : "Someone");
             oc_a11y_announce(t);
             /* A toast only when the call is not on screen: there, the picture says it. */
-            if (!(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)) fb_confirm(t);
+            if (!(g_view == VIEW_CALL && g_call_view_id == m->call.call_id)) fb_confirm(t);
         }
         if (!sharer || sharer == m->user_id) { share_tex_drop(); g_share_full = 0; }
         g_share_actual = 0;
@@ -37449,7 +38031,7 @@ static void notify_call(const char *title, const char *body, const char *source,
 
 static void menu_dispatch(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
-    if (cmd >= CC_MUTE && cmd <= CC_LAST) { call_cmd(hwnd, cmd); return; }
+    if ((cmd >= CC_MUTE && cmd <= CC_LAST) || (cmd >= CH_MORE && cmd <= CH_LAST)) { call_cmd(hwnd, cmd); return; }
     if (cmd >= PD_FIRST && cmd <= PD_LAST) { pdm_cmd(hwnd, cmd); return; }
     switch (cmd) {
     case 88:     /* REQ-310: the header's Summarize menu, from the palette too */
@@ -38970,7 +39552,7 @@ static void test_dump(const char *path) {
                    " mic_level=%d sent=%u keepalives=%u transport=%s tx_epoch=%u loss=%d target_ms=%d mic_err=%d spk_err=%d"
                    " ns=%d cap=%u self=%llu slot=%u inview=%d hdr=%.0f,%.0f,%.0f,%.0f strip=%.0f,%.0f,%.0f,%.0f"
                    " stripmute=%.0f,%.0f,%.0f,%.0f stripleave=%.0f,%.0f,%.0f,%.0f\n",
-                m->in_call, (unsigned long long)m->call.channel_id, (unsigned long long)m->call.call_id,
+                m->in_call, (unsigned long long)m->call.from_channel, (unsigned long long)m->call.call_id,
                 m->call.epoch, (unsigned long long)m->call.starter, (unsigned)m->call.n_parts,
                 (unsigned)m->call.n_invited, (unsigned long long)m->call_pending, (unsigned)m->call_error,
                 m->call_error_seq, (unsigned long long)g_call_view_ch, g_call_engine != NULL, cs.active,
@@ -39076,12 +39658,52 @@ static void test_dump(const char *path) {
         }
         /* The member picker, when a start or an invitation has more people than
          * the call has room for: who is offered, in order, and who is ticked. */
-        if (g_cpick_ch) {
-            fprintf(f, "callpick ch=%llu invite=%d n=%d on=", (unsigned long long)g_cpick_ch,
-                    g_cpick_invite, g_cpick_n);
+        if (g_cpick_open) {
+            fprintf(f, "callpick ch=%llu invite=%d n=%d subject=\"%s\" on=", (unsigned long long)g_cpick_from,
+                    g_cpick_invite, g_cpick_n, g_cpick_subject ? g_cpick_subject->buf : "");
             for (int i = 0; i < g_cpick_n; i++)
                 fprintf(f, "%s%llu:%d", i ? "," : "", (unsigned long long)g_cpick_uid[i], g_cpick_on[i]);
             fprintf(f, "\n");
+        }
+        /* Calls as objects (CALLS.md §1, §8): the call the view shows, its
+         * subject and chat; the Recording mark as drawn and the joiner's notice;
+         * whether the engine waits for the user to say they saw it. */
+        {
+            const oc_call_view *vv = view_call(m);
+            fprintf(f, "callobj view=%llu subject=\"%s\" chat=%llu recording=%d mark=%.0f,%.0f,%.0f,%.0f notice=%d"
+                       " notice_id=%llu gated=%d ack_pending=%llu rec_cap=%d\n",
+                    (unsigned long long)g_call_view_id, vv ? vv->subject : "", (unsigned long long)g_call_view_ch,
+                    vv ? vv->recording : 0, g_rec_mark.left, g_rec_mark.top, g_rec_mark.right, g_rec_mark.bottom,
+                    g_rec_notice_on, (unsigned long long)g_rec_notice_id,
+                    g_call_engine && oc_call_engine_recording_gated(g_call_engine), (unsigned long long)g_rec_ack_id,
+                    oc_model_has_capability(m, OC_CAP_CALL_RECORDING));
+            fprintf(f, "callhome loaded=%d more=%d hist=%zu rows=%d\n", m->call_hist_loaded, m->call_hist_more,
+                    m->n_call_hist, g_n_home);
+            for (size_t i = 0; i < m->n_call_hist; i++) {
+                const oc_call_hist_view *h = &m->call_hist[i];
+                int row = -1;
+                for (int k = 0; k < g_n_home; k++) if (g_home_ids[k] == h->call_id) row = k;
+                fprintf(f, "callhist id=%llu subject=\"%s\" flags=%u people=%u ended=%d chat=%llu row=%d\n",
+                        (unsigned long long)h->call_id, h->subject, (unsigned)h->flags, (unsigned)h->n_people,
+                        h->ended_at != 0, (unsigned long long)h->chat_channel, row);
+            }
+            const oc_call_page_view *pg = m->call_page;
+            if (pg) {
+                fprintf(f, "callpage id=%llu shown=%llu subject=\"%s\" stays=%u invitees=%u events=%u recordings=%u"
+                           " transcript=%d lines=%u/%u chat=%llu\n",
+                        (unsigned long long)pg->call_id, (unsigned long long)g_cpage_id, pg->subject,
+                        (unsigned)pg->n_stays, (unsigned)pg->n_invitees, (unsigned)pg->n_events,
+                        (unsigned)pg->n_recordings, pg->has_transcript, pg->n_lines, pg->n_lines_total,
+                        (unsigned long long)pg->chat_channel);
+                for (uint16_t i = 0; i < pg->n_recordings; i++)
+                    fprintf(f, "callpage.rec id=%llu state=%u by=%llu ms=%u attach=%llu\n",
+                            (unsigned long long)pg->recordings[i].id, (unsigned)pg->recordings[i].state,
+                            (unsigned long long)pg->recordings[i].started_by, pg->recordings[i].duration_ms,
+                            (unsigned long long)pg->recordings[i].attachment_id);
+                for (uint16_t i = 0; i < pg->n_events; i++)
+                    fprintf(f, "callpage.ev kind=%u user=%llu\n", (unsigned)pg->events[i].kind,
+                            (unsigned long long)pg->events[i].user_id);
+            }
         }
         {   /* Encrypted DMs (PRIVATE-DM.md): the sessions; New message's box; and,
              * for the conversation shown, whether it is one, what of the composer
@@ -39108,9 +39730,9 @@ static void test_dump(const char *path) {
             const oc_call_view *v = &m->calls[i];
             float t = 0, b = 0;
             for (int k = 0; k < g_n_call_rows; k++)
-                if (g_call_rows[k].ch == v->channel_id) { t = g_call_rows[k].r.top; b = g_call_rows[k].r.bottom; }
+                if (g_call_rows[k].ch == v->from_channel) { t = g_call_rows[k].r.top; b = g_call_rows[k].r.bottom; }
             fprintf(f, "calls[%zu] ch=%llu id=%llu starter=%llu parts=%u invited=%u me_invited=%d row=%.0f-%.0f\n",
-                    i, (unsigned long long)v->channel_id, (unsigned long long)v->call_id,
+                    i, (unsigned long long)v->from_channel, (unsigned long long)v->call_id,
                     (unsigned long long)v->starter, (unsigned)v->n_parts, (unsigned)v->n_invited,
                     oc_model_call_invited(v, m->user_id), t, b);
         }
@@ -40535,21 +41157,41 @@ static void test_poll(oc_win *hwnd) {
          *   call mute | unmute | ptt-down | ptt-up | ns on|off
          *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go
          *   call share <device id or name> | share pick | share stop | share full | share actual
-         *   call camera on | off | pick | <device id or name> | layout grid | speaker */
+         *   call camera on | off | pick | <device id or name> | layout grid | speaker
+         *   call home | new | page <id> | join-id <id> | open-id <id> | decline-id <id> | subject <text>
+         *   call record on|off | rec-join | rec-cancel | play <i> | more | tmore | row-open <i> */
         char sc[32] = "", rest[256] = "";
         sscanf(arg, "%31s %255[^\n]", sc, rest);
         const oc_model *cm = model();
-        uint64_t ch = rest[0] ? strtoull(rest, NULL, 10) : (g_view == VIEW_CALL ? g_call_view_ch : g_sel);
+        uint64_t ch = rest[0] ? strtoull(rest, NULL, 10) : g_sel;
+        uint64_t rid = strtoull(rest, NULL, 10);
         int ok = cm != NULL;
         if (!ok) {}
         else if (!strcmp(sc, "start"))    call_start_here(hwnd, ch);
         else if (!strcmp(sc, "join"))     call_join_here(hwnd, ch);
-        else if (!strcmp(sc, "open"))     call_open_view(hwnd, ch);
+        else if (!strcmp(sc, "open"))     { uint64_t id = call_id_from(cm, ch); ok = id != 0; if (ok) call_open_view(hwnd, id); }
+        else if (!strcmp(sc, "home"))     call_cmd(hwnd, CC_HOME_OPEN);
+        else if (!strcmp(sc, "new"))      call_cmd(hwnd, CC_HOME_NEW);
+        else if (!strcmp(sc, "page"))     { ok = rid != 0; if (ok) call_open_page(hwnd, rid); }
+        else if (!strcmp(sc, "join-id"))  { ok = rid != 0; if (ok) call_join_id(hwnd, rid, 0); }
+        else if (!strcmp(sc, "open-id"))  { ok = rid != 0; if (ok) call_open_view(hwnd, rid); }
+        else if (!strcmp(sc, "decline-id")) { ok = rid != 0; if (ok) oc_client_call_decline(g_client, rid); }
+        else if (!strcmp(sc, "subject"))  { ok = g_cpick_open && g_cpick_subject; if (ok) field_set(g_cpick_subject, rest); }
+        else if (!strcmp(sc, "record"))   {
+            ok = call_here(cm);
+            if (ok && cm->call.recording != !strcmp(rest, "on")) call_cmd(hwnd, CC_RECORD);
+        }
+        else if (!strcmp(sc, "rec-join"))   call_cmd(hwnd, CC_REC_JOIN);
+        else if (!strcmp(sc, "rec-cancel")) call_cmd(hwnd, CC_REC_CANCEL);
+        else if (!strcmp(sc, "play"))     { int i = atoi(rest); ok = i >= 0 && i < 16; if (ok) call_cmd(hwnd, CH_PLAY0 + i); }
+        else if (!strcmp(sc, "more"))     call_cmd(hwnd, CH_MORE);
+        else if (!strcmp(sc, "tmore"))    call_cmd(hwnd, CH_TMORE);
+        else if (!strcmp(sc, "row-open")) { int i = atoi(rest); ok = i >= 0 && i < g_n_home; if (ok) call_cmd(hwnd, CH_ROW0 + i); }
         else if (!strcmp(sc, "leave"))    call_cmd(hwnd, CC_LEAVE);
         /* `end` is the request End for everyone's confirmation makes, so a
          * script can see the daemon's answer to it; `end-press` presses the
          * button, which asks first (answered with Enter or Esc). */
-        else if (!strcmp(sc, "end"))      { ok = call_here(cm); if (ok) oc_client_call_end(g_client, cm->call.channel_id); }
+        else if (!strcmp(sc, "end"))      { ok = call_here(cm); if (ok) oc_client_call_end(g_client, cm->call.call_id); }
         else if (!strcmp(sc, "end-press")) call_cmd(hwnd, CC_END);
         /* The interface's other presses, each as its button makes it. */
         else if (!strcmp(sc, "banner-join"))    call_cmd(hwnd, CC_BANNER_JOIN);
@@ -40557,8 +41199,8 @@ static void test_poll(oc_win *hwnd) {
         else if (!strcmp(sc, "settings"))       call_cmd(hwnd, CC_SETTINGS);
         else if (!strcmp(sc, "chat"))           call_cmd(hwnd, CC_CHAT);
         else if (!strcmp(sc, "callback"))       call_cmd(hwnd, CC_CALLBACK);
-        else if (!strcmp(sc, "row-join"))       { int i = atoi(rest); ok = i >= 0 && i < g_n_call_rows; if (ok) call_cmd(hwnd, CC_ROWJOIN0 + i); }
-        else if (!strcmp(sc, "decline"))  oc_client_call_decline(g_client, ch);
+        else if (!strcmp(sc, "row-join"))       { int i = atoi(rest); ok = i >= 0 && i < g_n_home; if (ok) call_cmd(hwnd, CH_JOIN0 + i); }
+        else if (!strcmp(sc, "decline"))  oc_client_call_decline(g_client, call_id_from(cm, ch));
         else if (!strcmp(sc, "pick-go"))  call_cmd(hwnd, CC_PICK_GO);
         else if (!strcmp(sc, "mute") || !strcmp(sc, "unmute")) {
             ok = g_call_engine && call_here(cm);
@@ -40575,7 +41217,7 @@ static void test_poll(oc_win *hwnd) {
             for (char *t = strtok(rest, " "); t && n < (int)OC_MAX_CALL_INVITES; t = strtok(NULL, " "))
                 ids[n++] = strtoull(t, NULL, 10);
             ok = call_here(cm) && n > 0;
-            if (ok) oc_client_call_invite(g_client, cm->call.channel_id, ids, n);
+            if (ok) oc_client_call_invite(g_client, cm->call.call_id, ids, n);
         }
         else if (!strcmp(sc, "share")) {
             if (!strcmp(rest, "pick"))        call_cmd(hwnd, CC_SHARE);
@@ -41749,7 +42391,9 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
 /* Every drawn field, made once with the window: its placeholder, its keys and
  * its change hook. */
 static void fields_create(void) {
-    static field find, ffind, efind, dir, srch, pal, pick, si[3];
+    static field find, ffind, efind, dir, srch, pal, pick, si[3], csubj;
+    field_init(&csubj, "What is the call about?", 0, 0);
+    csubj.maxlen = OC_CALL_SUBJECT_MAX; g_cpick_subject = &csubj;
     field_init(&find, "Find a conversation", 0, 0);
     find.key = find_key; find.changed = find_changed; find.maxlen = 63; g_find = &find;
     field_init(&ffind, "Search files", 0, 0);

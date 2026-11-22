@@ -363,12 +363,22 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0, 0, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
         CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
         CHECK(slice_eq_str(out.body, "hello channel"));
+        CHECK(out.call_id == 0);
+    }
+    {
+        /* A call's message names its call (CALLS.md §1). */
+        oc_broadcast in = { 1002, 7, 42, 1751200500000ull, OC_MSG_KIND_CALL,
+                            oc_slice_str("alice started a call: standup"), 0, {{0}}, {0}, 0, 0, 55 };
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.kind == OC_MSG_KIND_CALL && out.call_id == 55 && slice_eq_str(out.body, "alice started a call: standup"));
     }
     {
         oc_client_ack in = { 7, 1001 };
@@ -421,7 +431,7 @@ static void test_broadcast_stored_frames(void) {
     for (uint8_t stored = 0; stored <= 1; stored++) {
         {
             oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("@channel standup"),
-                                0, {{0}}, {0}, stored, 0 };
+                                0, {{0}}, {0}, stored, 0, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -430,7 +440,7 @@ static void test_broadcast_stored_frames(void) {
         }
         {   /* The tail behind it: a name, so a zero attachment count first. */
             oc_broadcast in = { 1002, 7, 42, 1751200500000ull, 0, oc_slice_str("@here"),
-                                0, {{0}}, oc_slice_str("CI"), stored, 0 };
+                                0, {{0}}, oc_slice_str("CI"), stored, 0, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -438,14 +448,14 @@ static void test_broadcast_stored_frames(void) {
             CHECK(slice_eq_str(out.author_name, "CI"));
         }
         {
-            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored, 0 };
+            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored, 0, 0 };
             ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
             CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@everyone back"));
         }
         {   /* Not tied to the body: an edit may have taken the broadcast out. */
-            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored, 0 };
+            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored, 0, 0 };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -468,7 +478,7 @@ static void test_broadcast_stored_frames(void) {
     /* A byte that is not a flag. BROADCAST's sits after four u64s and `kind`;
      * THREAD_REPLY's after five u64s, `reply_count` and `participant`. */
     {
-        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1, 0 };
+        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1, 0, 0 };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
         CHECK(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
         CHECK(frame[OC_HEADER_SIZE + 33] == 1);
@@ -1192,7 +1202,7 @@ static void test_action_frames(void) {
         CHECK(out[1].preview_action == 0 && slice_eq_str(out[1].preview, "/me"));
     }
     {
-        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1, 0 } };
+        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1, 0, 0, 0 } };
         oc_search_results in = { 1, ents, 0 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
         oc_search_result_entry out[1]; uint16_t n = 0; uint8_t trunc = 9;
@@ -1578,7 +1588,7 @@ static void test_admin_frames(void) {
               slice_eq_str(out.text, "echo hi\n"));
     }
     {   /* ...and carried on a message with them, beside an ordinary file. */
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str(""), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str(""), 0, {{0}}, {0}, 0, 0, 0 };
         in.n_attach = 2;
         in.attach[0].id = 81; in.attach[0].filename = oc_slice_str("deploy.sh.txt");
         in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 8;
@@ -1675,8 +1685,9 @@ static void test_search_frames(void) {
     }
     {
         oc_search_result_entry ents[2] = {
-            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0, -2500000 },
-            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0, -1250000 },
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0, -2500000, 0, 0 },
+            /* a line of a call's transcript (CALLS.md §1) */
+            { 0,    7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0, -1250000, 55, 9 },
         };
         oc_search_results in = { 2, ents, 1 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
@@ -1685,8 +1696,9 @@ static void test_search_frames(void) {
         CHECK(n == 2 && trunc == 1);
         CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
         CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
-        CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
+        CHECK(out[1].message_id == 0 && slice_eq_str(out[1].snippet, "deploy again"));
         CHECK(out[0].rank == -2500000 && out[1].rank == -1250000);
+        CHECK(out[0].call_id == 0 && out[0].line_id == 0 && out[1].call_id == 55 && out[1].line_id == 9);
     }
 }
 
@@ -2072,30 +2084,48 @@ static void test_call_frames(void) {
     pa[0].codecs = OC_CALL_CODEC_VP9; pa[1].codecs = 0x03;
     pa[1].flags = OC_CALL_PART_AWAY;   /* the second's connection went: its seat is held */
     {
+        /* A start: the conversation it is started from, the subject, the
+         * starter's key and codecs, and who is asked. */
         uint64_t inv[3] = { 20, 30, 40 };
-        oc_call_join in = { 7, {0}, 3, inv, OC_CALL_CODEC_VP9 };
+        oc_call_start in = { 7, oc_slice_str("Q3 pricing review"), {0}, OC_CALL_CODEC_VP9, 3, inv };
         memset(in.device_key, 0x5C, OC_CALL_DEVICE_KEY_LEN);
-        ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
-        oc_call_join out; uint64_t got[4];
-        CHECK(oc_decode_call_join(&p, &out, got, 4) == OC_OK && out.channel_id == 7);
+        ROUNDTRIP(oc_encode_call_start(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_START, h, p);
+        oc_call_start out; uint64_t got[4];
+        CHECK(oc_decode_call_start(&p, &out, got, 4) == OC_OK && out.from_channel == 7);
+        CHECK(out.subject.len == 17 && memcmp(out.subject.ptr, "Q3 pricing review", 17) == 0);
         CHECK(out.device_key[0] == 0x5C && out.device_key[31] == 0x5C);
         CHECK(out.n_invite == 3 && got[0] == 20 && got[2] == 40 && out.codecs == OC_CALL_CODEC_VP9);
         /* A list longer than the caller's room is malformed, not cut short. */
         oc_rbuf_init(&p, w.data + OC_HEADER_SIZE, w.len - OC_HEADER_SIZE);
-        CHECK(oc_decode_call_join(&p, &out, got, 2) == OC_E_MALFORMED);
+        CHECK(oc_decode_call_start(&p, &out, got, 2) == OC_E_MALFORMED);
     }
     {
-        oc_call_leave in = { 7 };
+        oc_call_join in = { 99, {0}, OC_CALL_CODEC_VP9 };
+        memset(in.device_key, 0x5D, OC_CALL_DEVICE_KEY_LEN);
+        ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
+        oc_call_join out;
+        CHECK(oc_decode_call_join(&p, &out) == OC_OK && out.call_id == 99 && out.codecs == OC_CALL_CODEC_VP9);
+        CHECK(out.device_key[0] == 0x5D && out.device_key[31] == 0x5D);
+    }
+    {
+        oc_call_subject in = { 99, oc_slice_str("Q4") };
+        ROUNDTRIP(oc_encode_call_subject(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_SUBJECT, h, p);
+        oc_call_subject out;
+        CHECK(oc_decode_call_subject(&p, &out) == OC_OK && out.call_id == 99);
+        CHECK(out.subject.len == 2 && memcmp(out.subject.ptr, "Q4", 2) == 0);
+    }
+    {
+        oc_call_leave in = { 99 };
         ROUNDTRIP(oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_LEAVE, h, p);
-        oc_call_leave out; CHECK(oc_decode_call_leave(&p, &out) == OC_OK && out.channel_id == 7);
+        oc_call_leave out; CHECK(oc_decode_call_leave(&p, &out) == OC_OK && out.call_id == 99);
     }
     {
         uint8_t tok[16]; for (int i = 0; i < 16; i++) tok[i] = (uint8_t)(i + 1);
-        oc_call_joined in = { 7, 99, 41234, { tok, 16 }, 3, 5, 10, 1751200500000ull, 2, pa };
+        oc_call_joined in = { 99, 41234, { tok, 16 }, 3, 5, 10, 1751200500000ull, 2, pa };
         ROUNDTRIP(oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOINED, h, p);
         oc_call_joined out; oc_call_part got[8];
         CHECK(oc_decode_call_joined(&p, &out, got, 8) == OC_OK);
-        CHECK(out.channel_id == 7 && out.call_id == 99 && out.udp_port == 41234);
+        CHECK(out.call_id == 99 && out.udp_port == 41234);
         CHECK(out.token.len == 16 && out.slot == 3 && out.epoch == 5 && out.starter == 10);
         CHECK(out.started_at == 1751200500000ull && out.count == 2);
         CHECK(got[0].user_id == 10 && got[1].user_id == 20 && got[1].slot == 3);
@@ -2104,7 +2134,7 @@ static void test_call_frames(void) {
         CHECK(got[0].flags == 0 && got[1].flags == OC_CALL_PART_AWAY);
     }
     {
-        oc_call_roster in = { 7, 99, 6, 2, pa };
+        oc_call_roster in = { 99, 6, 2, pa };
         ROUNDTRIP(oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_ROSTER, h, p);
         oc_call_roster out; oc_call_part got[8];
         CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2 && out.epoch == 6);
@@ -2113,28 +2143,30 @@ static void test_call_frames(void) {
     }
     {
         uint64_t users[2] = { 30, 40 };
-        oc_call_invite in = { 7, 2, users };
+        oc_call_invite in = { 99, 2, users };
         ROUNDTRIP(oc_encode_call_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_INVITE, h, p);
         oc_call_invite out; uint64_t got[4];
-        CHECK(oc_decode_call_invite(&p, &out, got, 4) == OC_OK && out.count == 2 && got[1] == 40);
+        CHECK(oc_decode_call_invite(&p, &out, got, 4) == OC_OK && out.call_id == 99 && out.count == 2 && got[1] == 40);
     }
     {
-        oc_call_decline in = { 7 };
+        oc_call_decline in = { 99 };
         ROUNDTRIP(oc_encode_call_decline(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_DECLINE, h, p);
-        oc_call_decline out; CHECK(oc_decode_call_decline(&p, &out) == OC_OK && out.channel_id == 7);
+        oc_call_decline out; CHECK(oc_decode_call_decline(&p, &out) == OC_OK && out.call_id == 99);
     }
     {
-        oc_call_end in = { 7 };
+        oc_call_end in = { 99 };
         ROUNDTRIP(oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_END, h, p);
-        oc_call_end out; CHECK(oc_decode_call_end(&p, &out) == OC_OK && out.channel_id == 7);
+        oc_call_end out; CHECK(oc_decode_call_end(&p, &out) == OC_OK && out.call_id == 99);
     }
     {
         uint64_t parts[2] = { 10, 20 }, inv[1] = { 30 };
-        oc_call_state in = { 7, 99, 10, 1751200500000ull, 1, 2, parts, 1, inv, 20 };
+        oc_call_state in = { 99, oc_slice_str("standup"), 10, 1751200500000ull, 7, 8, OC_CALL_STATE_RECORDING, 1, 2, parts, 1, inv, 20 };
         ROUNDTRIP(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_STATE, h, p);
         oc_call_state out; uint64_t gp[4], gi[4];
         CHECK(oc_decode_call_state(&p, &out, gp, 4, gi, 4) == OC_OK);
-        CHECK(out.call_id == 99 && out.starter == 10 && out.ended == 1);
+        CHECK(out.call_id == 99 && out.starter == 10 && out.ended == 1 && out.from_channel == 7 && out.chat_channel == 8);
+        CHECK(out.flags == OC_CALL_STATE_RECORDING);
+        CHECK(out.subject.len == 7 && memcmp(out.subject.ptr, "standup", 7) == 0);
         CHECK(out.n_parts == 2 && gp[1] == 20 && out.n_invited == 1 && gi[0] == 30);
         CHECK(out.sharer == 20);
     }
@@ -2142,7 +2174,7 @@ static void test_call_frames(void) {
         uint8_t s1[OC_CALL_SEALED_LEN], s2[OC_CALL_SEALED_LEN];
         memset(s1, 1, sizeof s1); memset(s2, 2, sizeof s2);
         oc_call_key_entry e[2] = { { 20, { s1, sizeof s1 } }, { 30, { s2, sizeof s2 } } };
-        oc_call_key in = { 7, 99, 6, 2, e };
+        oc_call_key in = { 99, 6, 2, e };
         ROUNDTRIP(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY, h, p);
         oc_call_key out; oc_call_key_entry got[4];
         CHECK(oc_decode_call_key(&p, &out, got, 4) == OC_OK && out.count == 2 && out.epoch == 6);
@@ -2150,7 +2182,7 @@ static void test_call_frames(void) {
     }
     {
         uint8_t s1[OC_CALL_SEALED_LEN]; memset(s1, 9, sizeof s1);
-        oc_call_key_for in = { 7, 99, 6, 10, { s1, sizeof s1 } };
+        oc_call_key_for in = { 99, 6, 10, { s1, sizeof s1 } };
         ROUNDTRIP(oc_encode_call_key_for(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY_FOR, h, p);
         oc_call_key_for out;
         CHECK(oc_decode_call_key_for(&p, &out) == OC_OK && out.sender == 10 && out.epoch == 6);
@@ -2160,7 +2192,7 @@ static void test_call_frames(void) {
         oc_call_share in = { 7, 1 };
         ROUNDTRIP(oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_SHARE, h, p);
         oc_call_share out;
-        CHECK(oc_decode_call_share(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
+        CHECK(oc_decode_call_share(&p, &out) == OC_OK && out.call_id == 7 && out.on == 1);
     }
     {
         /* CALL_MEDIA both ways: up carries no sender, down carries the relay's. */
@@ -2190,7 +2222,7 @@ static void test_call_frames(void) {
         oc_call_camera in = { 7, 1 };
         ROUNDTRIP(oc_encode_call_camera(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_CAMERA, h, p);
         oc_call_camera out;
-        CHECK(oc_decode_call_camera(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
+        CHECK(oc_decode_call_camera(&p, &out) == OC_OK && out.call_id == 7 && out.on == 1);
     }
     {
         /* Whose cameras: every one, or those named -- and more than the cap is
@@ -2201,7 +2233,7 @@ static void test_call_frames(void) {
         oc_call_video_sub out; uint64_t users[OC_MAX_CALL_PARTICIPANTS];
         oc_rbuf keep = p;
         CHECK(oc_decode_call_video_sub(&p, &out, users, OC_MAX_CALL_PARTICIPANTS) == OC_OK);
-        CHECK(out.channel_id == 7 && !out.all && out.count == 3 && out.users[0] == 11 && out.users[2] == 13);
+        CHECK(out.call_id == 7 && !out.all && out.count == 3 && out.users[0] == 11 && out.users[2] == 13);
         CHECK(oc_decode_call_video_sub(&keep, &out, users, 2) == OC_E_MALFORMED);
     }
     {
@@ -2209,6 +2241,71 @@ static void test_call_frames(void) {
         oc_call_video_sub out; uint64_t users[OC_MAX_CALL_PARTICIPANTS];
         ROUNDTRIP(oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &all), OC_MSG_CALL_VIDEO_SUB, h, p);
         CHECK(oc_decode_call_video_sub(&p, &out, users, OC_MAX_CALL_PARTICIPANTS) == OC_OK && out.all && out.count == 0);
+    }
+    {
+        /* Calls home's history (CALLS.md §1): the asking, and a page. */
+        oc_call_history in = { 1751200500000ull, 20 };
+        ROUNDTRIP(oc_encode_call_history(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_HISTORY, h, p);
+        oc_call_history out;
+        CHECK(oc_decode_call_history(&p, &out) == OC_OK && out.before_ms == 1751200500000ull && out.limit == 20);
+    }
+    {
+        oc_call_hist_entry e[2] = {
+            { 99, oc_slice_str("standup"), 10, 1000, 0, OC_CALL_RUNNING, 7, 8, 2, OC_CALL_HIST_PENDING },
+            { 98, oc_slice_str("Q3"), 11, 500, 900, OC_CALL_ENDED_ALL, 0, 6, 3,
+              OC_CALL_HIST_JOINED | OC_CALL_HIST_RECORDING | OC_CALL_HIST_TRANSCRIPT },
+        };
+        oc_call_history_page pg = { 2, e, 1 };
+        ROUNDTRIP(oc_encode_call_history_page(&w, OC_PROTOCOL_VERSION, &pg), OC_MSG_CALL_HISTORY_PAGE, h, p);
+        oc_call_history_page got; oc_call_hist_entry ge[4];
+        oc_rbuf keep = p;
+        CHECK(oc_decode_call_history_page(&p, &got, ge, 4) == OC_OK && got.count == 2 && got.more == 1);
+        CHECK(ge[0].call_id == 99 && slice_eq_str(ge[0].subject, "standup") && ge[0].flags == OC_CALL_HIST_PENDING);
+        CHECK(ge[1].ended_at == 900 && ge[1].end_reason == OC_CALL_ENDED_ALL && ge[1].chat_channel == 6 && ge[1].n_people == 3);
+        CHECK(oc_decode_call_history_page(&keep, &got, ge, 1) == OC_E_MALFORMED);   /* more than room */
+    }
+    {
+        /* A call's page: its people, timeline, recordings and transcript. */
+        oc_call_detail in = { 99, 200 };
+        ROUNDTRIP(oc_encode_call_detail(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_DETAIL, h, p);
+        oc_call_detail dout;
+        CHECK(oc_decode_call_detail(&p, &dout) == OC_OK && dout.call_id == 99 && dout.line_from == 200);
+    }
+    {
+        oc_call_stay st[1] = { { 10, 1000, 2000 } };
+        oc_call_invitee iv[2] = { { 10, 10, 1000, 0 }, { 20, 10, 1000, 1500 } };
+        oc_call_event ev[1] = { { 1200, 10, OC_CALL_EV_SUBJECT, oc_slice_str("Q4") } };
+        oc_call_recording rc[1] = { { 3, OC_CALL_REC_READY, 10, 1100, 1900, 800, 123456, 77 } };
+        oc_call_tline ln[1] = { { 5, 20, 100, 900, oc_slice_str("the margin") } };
+        oc_call_page pg = { 99, oc_slice_str("Q4"), 10, 1000, 2000, OC_CALL_ENDED_LEFT, 7, 8,
+                            1, st, 2, iv, 1, ev, 1, rc, 1, oc_slice_str("en"), 40, 0, 1, ln };
+        ROUNDTRIP(oc_encode_call_page(&w, OC_PROTOCOL_VERSION, &pg), OC_MSG_CALL_PAGE, h, p);
+        static oc_call_stay gs[OC_CALL_PAGE_STAYS]; static oc_call_invitee gi[OC_CALL_PAGE_INVITEES];
+        static oc_call_event gev[OC_CALL_PAGE_EVENTS]; static oc_call_recording gr[OC_CALL_PAGE_RECORDINGS];
+        static oc_call_tline gl[OC_CALL_PAGE_LINES];
+        oc_call_page out;
+        CHECK(oc_decode_call_page(&p, &out, gs, gi, gev, gr, gl) == OC_OK);
+        CHECK(out.call_id == 99 && slice_eq_str(out.subject, "Q4") && out.end_reason == OC_CALL_ENDED_LEFT);
+        CHECK(out.n_stays == 1 && gs[0].left_at == 2000 && out.n_invitees == 2 && gi[1].declined_at == 1500);
+        CHECK(out.n_events == 1 && gev[0].kind == OC_CALL_EV_SUBJECT && slice_eq_str(gev[0].detail, "Q4"));
+        CHECK(out.n_recordings == 1 && gr[0].state == OC_CALL_REC_READY && gr[0].attachment_id == 77 && gr[0].bytes == 123456);
+        CHECK(out.has_transcript && slice_eq_str(out.transcript_lang, "en") && out.n_lines_total == 40);
+        CHECK(out.n_lines == 1 && gl[0].speaker == 20 && gl[0].end_ms == 900 && slice_eq_str(gl[0].text, "the margin"));
+    }
+    {
+        oc_call_delete in = { 99, OC_CALL_DEL_RECORDING, 3 };
+        ROUNDTRIP(oc_encode_call_delete(&w, OC_PROTOCOL_VERSION, OC_MSG_CALL_DELETE, &in), OC_MSG_CALL_DELETE, h, p);
+        oc_call_delete out;
+        CHECK(oc_decode_call_delete(&p, &out) == OC_OK && out.call_id == 99 && out.what == OC_CALL_DEL_RECORDING && out.id == 3);
+    }
+    {
+        oc_call_record rin = { 99, 1 };
+        { ROUNDTRIP(oc_encode_call_record(&w, OC_PROTOCOL_VERSION, &rin), OC_MSG_CALL_RECORD, h, p);
+          oc_call_record rout; CHECK(oc_decode_call_record(&p, &rout) == OC_OK && rout.call_id == 99 && rout.on == 1); }
+        oc_call_delete in = { 99, OC_CALL_DEL_TRANSCRIPT, 0 };
+        ROUNDTRIP(oc_encode_call_delete(&w, OC_PROTOCOL_VERSION, OC_MSG_CALL_DELETED, &in), OC_MSG_CALL_DELETED, h, p);
+        oc_call_delete out;
+        CHECK(oc_decode_call_delete(&p, &out) == OC_OK && out.what == OC_CALL_DEL_TRANSCRIPT);
     }
 }
 
@@ -2313,7 +2410,7 @@ static void test_group_frames(void) {
         CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
     }
     {
-        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0, 0, 0 };
         ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
@@ -2521,7 +2618,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0, 0, 0 };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -2536,7 +2633,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0, 0, 0 };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -2546,7 +2643,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0, 0 };
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0, 0, 0 };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);

@@ -1786,6 +1786,121 @@ static const char MIGRATION_0086[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX exported_video_lru ON exported_video(last_used_ms);";
 
+static const char MIGRATION_0087[] =
+    /* Calls as objects of their own (CALLS.md §1): until now a call lived only
+     * in the net loop's memory and left nothing behind but a missed-call line.
+     *
+     * `calls` is the call: its subject, who started it, the conversation it was
+     * started from (NULL for one started from Calls home; the call has no other
+     * tie to it), when it started and ended, and how -- 'left' (the last person
+     * left), 'ended' (ended for everyone) or 'stopped' (the daemon stopped with
+     * it open). Its id is the call's id everywhere, the HPKE info included, so
+     * AUTOINCREMENT: an id is never used twice. A row with no end is a call
+     * running, or one the daemon stopped on, which its next start closes. */
+    "CREATE TABLE calls ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  subject       TEXT NOT NULL,"
+    "  starter       INTEGER NOT NULL REFERENCES users(id),"
+    "  from_channel  INTEGER REFERENCES channels(id),"
+    "  started_at_ms INTEGER NOT NULL,"
+    "  ended_at_ms   INTEGER,"
+    "  end_reason    TEXT CHECK (end_reason IN ('left','ended','stopped'))"
+    ");"
+    "CREATE INDEX idx_calls_open ON calls(ended_at_ms) WHERE ended_at_ms IS NULL;"
+    /* A participant's stays: one row from a join to its leave. A reconnect
+     * within the held seat is the same stay, so it writes nothing. */
+    "CREATE TABLE call_participants ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  call_id       INTEGER NOT NULL REFERENCES calls(id),"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  joined_at_ms  INTEGER NOT NULL,"
+    "  left_at_ms    INTEGER"
+    ");"
+    "CREATE INDEX idx_call_parts_call ON call_participants(call_id, joined_at_ms);"
+    "CREATE INDEX idx_call_parts_user ON call_participants(user_id, call_id);"
+    /* Who was asked, by whom and when, and whether they said no. The starter
+     * is the first invitee, asked by themself: being an invitee is what lets
+     * anyone see the call, its chat, recording and transcript. */
+    "CREATE TABLE call_invitees ("
+    "  call_id        INTEGER NOT NULL REFERENCES calls(id),"
+    "  user_id        INTEGER NOT NULL REFERENCES users(id),"
+    "  invited_by     INTEGER NOT NULL REFERENCES users(id),"
+    "  invited_at_ms  INTEGER NOT NULL,"
+    "  declined_at_ms INTEGER,"
+    "  PRIMARY KEY (call_id, user_id)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX idx_call_invitees_user ON call_invitees(user_id, call_id);"
+    /* The timeline: cameras, shares, recording and renames, each with who and
+     * when; a rename's `detail` is the new subject. */
+    "CREATE TABLE call_events ("
+    "  id       INTEGER PRIMARY KEY,"
+    "  call_id  INTEGER NOT NULL REFERENCES calls(id),"
+    "  at_ms    INTEGER NOT NULL,"
+    "  user_id  INTEGER NOT NULL REFERENCES users(id),"
+    "  kind     TEXT NOT NULL CHECK (kind IN ('camera_on','camera_off','share_on','share_off',"
+    "                                         'record_on','record_off','subject')),"
+    "  detail   TEXT"
+    ");"
+    "CREATE INDEX idx_call_events_call ON call_events(call_id, at_ms);"
+    /* A recording: made while the Recorder is in the call ('recording'),
+     * processed from its spool ('processing') into one file ('ready'), or not
+     * ('failed', with why). The file is an attachment of the call's chat, so it
+     * is fetched and played as a video message is. `spool` is the directory its
+     * streams were kept in, under the data directory, until processing removes
+     * it. */
+    "CREATE TABLE call_recordings ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  call_id       INTEGER NOT NULL REFERENCES calls(id),"
+    "  started_by    INTEGER NOT NULL REFERENCES users(id),"
+    "  started_at_ms INTEGER NOT NULL,"
+    "  stopped_at_ms INTEGER,"
+    "  state         TEXT NOT NULL DEFAULT 'recording'"
+    "                CHECK (state IN ('recording','processing','ready','failed')),"
+    "  spool         TEXT,"
+    "  attachment_id INTEGER REFERENCES attachments(id),"
+    "  bytes         INTEGER,"
+    "  duration_ms   INTEGER,"
+    "  error         TEXT"
+    ");"
+    "CREATE INDEX idx_call_recs_call ON call_recordings(call_id);"
+    "CREATE INDEX idx_call_recs_state ON call_recordings(state);"
+    /* A call's transcript, made by the system: lines of speaker, start, end
+     * (from the call's start) and text, indexed for search. Nothing makes one
+     * yet; the place for it is here. */
+    "CREATE TABLE call_transcripts ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  call_id       INTEGER NOT NULL UNIQUE REFERENCES calls(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  language      TEXT"
+    ");"
+    "CREATE TABLE call_transcript_lines ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  transcript_id INTEGER NOT NULL REFERENCES call_transcripts(id),"
+    "  speaker       INTEGER REFERENCES users(id),"
+    "  start_ms      INTEGER NOT NULL,"
+    "  end_ms        INTEGER NOT NULL,"
+    "  text          TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_call_tlines ON call_transcript_lines(transcript_id, start_ms);"
+    "CREATE VIRTUAL TABLE call_transcripts_fts USING fts5("
+    "  text, content='call_transcript_lines', content_rowid='id');"
+    "CREATE TRIGGER call_transcripts_fts_ai AFTER INSERT ON call_transcript_lines BEGIN"
+    "  INSERT INTO call_transcripts_fts(rowid, text) VALUES (new.id, new.text);"
+    "END;"
+    "CREATE TRIGGER call_transcripts_fts_ad AFTER DELETE ON call_transcript_lines BEGIN"
+    "  INSERT INTO call_transcripts_fts(call_transcripts_fts, rowid, text) VALUES('delete', old.id, old.text);"
+    "END;"
+    /* The call's chat is a conversation the call owns: a DM-kind channel whose
+     * members are its invitees, marked with the call, and in no conversation
+     * list. */
+    "ALTER TABLE channels ADD COLUMN call_id INTEGER REFERENCES calls(id);"
+    "CREATE UNIQUE INDEX idx_channels_call ON channels(call_id) WHERE call_id IS NOT NULL;"
+    /* The one message a call started from a conversation leaves there (kind
+     * OC_MSG_KIND_CALL), naming its call. A missed-call line from before has
+     * none, and reads as it always did. */
+    "ALTER TABLE messages ADD COLUMN call_id INTEGER REFERENCES calls(id);"
+    "CREATE INDEX idx_messages_call ON messages(call_id) WHERE call_id IS NOT NULL;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1873,6 +1988,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 84, MIGRATION_0084 },
     { 85, MIGRATION_0085 },
     { 86, MIGRATION_0086 },
+    { 87, MIGRATION_0087 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

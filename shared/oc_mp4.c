@@ -71,6 +71,9 @@ typedef struct { wsample *s; uint32_t n, cap; } wtrack;
 
 struct oc_mp4_writer {
     bbuf     data;                  /* sample bytes, in the order written: mdat's payload */
+    FILE    *spill;                 /* ...or, opened on a file, where they go instead */
+    char    *path;                  /* that file's: the finished file's path */
+    uint64_t spilled;
     int      width, height;         /* 0 × 0: audio-only */
     unsigned input_rate;            /* dOps input sample rate */
     wtrack   video, audio;
@@ -107,14 +110,21 @@ oc_mp4_writer *oc_mp4_writer_open_audio(unsigned input_rate) {
 }
 
 static int data_append(oc_mp4_writer *w, const uint8_t *data, size_t len, uint64_t *off) {
-    if (len == 0 || len > OC_MP4_MAX_FILE || w->data.n + len > OC_MP4_MAX_FILE) return -1;
     if (w->video.n + w->audio.n >= OC_MP4_MAX_SAMPLES) return -1;
+    if (w->spill) {
+        if (len == 0 || w->spilled + len > OC_MP4_MAX_FILE) return -1;
+        if (fwrite(data, 1, len, w->spill) != len) return -1;
+        *off = w->spilled;
+        w->spilled += len;
+        return 0;
+    }
+    if (len == 0 || len > OC_MP4_MAX_FILE || w->data.n + len > OC_MP4_MAX_FILE) return -1;
     *off = w->data.n;
     bytes(&w->data, data, len);
     return w->data.bad ? -1 : 0;
 }
 
-uint64_t oc_mp4_writer_bytes(const oc_mp4_writer *w) { return w ? w->data.n : 0; }
+uint64_t oc_mp4_writer_bytes(const oc_mp4_writer *w) { return w ? (w->spill ? w->spilled : w->data.n) : 0; }
 
 int oc_mp4_write_video(oc_mp4_writer *w, const uint8_t *data, size_t len, int64_t pts_us, int keyframe) {
     if (!w || !data || w->width == 0) return -1;
@@ -317,20 +327,84 @@ static void build_moov(bbuf *b, const oc_mp4_writer *w, uint64_t data_base) {
 
 void oc_mp4_writer_abort(oc_mp4_writer *w) {
     if (!w) return;
+    if (w->spill) {
+        fclose(w->spill);
+        char part[4200];
+        snprintf(part, sizeof part, "%s.part", w->path ? w->path : "");
+        remove(part);
+    }
+    free(w->path);
     free(w->data.d); free(w->video.s); free(w->audio.s);
     free(w);
 }
 
+static void ftyp_box(bbuf *file) {
+    size_t ftyp = box_begin(file, "ftyp");
+    fourcc(file, "isom"); u32(file, 0x200);
+    fourcc(file, "isom"); fourcc(file, "iso6"); fourcc(file, "mp41");
+    box_end(file, ftyp);
+}
+
+static uint32_t writer_duration_ms(const oc_mp4_writer *w) {
+    uint64_t vms = track_duration(&w->video) * 1000 / OC_MP4_VIDEO_TIMESCALE;
+    uint64_t adur = track_duration(&w->audio);
+    uint64_t ams = (adur > OC_MP4_OPUS_PRESKIP ? adur - OC_MP4_OPUS_PRESKIP : 0) * 1000 / OC_MP4_AUDIO_TIMESCALE;
+    return (uint32_t)(vms > ams ? vms : ams);
+}
+
+#if !defined(_WIN32)
+oc_mp4_writer *oc_mp4_writer_open_file(const char *path, int width, int height) {
+    if (!path || strlen(path) > 4000) return NULL;
+    oc_mp4_writer *w = oc_mp4_writer_open(width, height);
+    if (!w) return NULL;
+    char part[4200];
+    snprintf(part, sizeof part, "%s.part", path);
+    w->path = strdup(path);
+    w->spill = w->path ? fopen(part, "w+b") : NULL;
+    if (!w->spill) { oc_mp4_writer_abort(w); return NULL; }
+    return w;
+}
+
+int oc_mp4_writer_finish_file(oc_mp4_writer *w, uint64_t *bytes, uint32_t *duration_ms) {
+    if (!w || !w->spill || w->video.n == 0 || fflush(w->spill) != 0) { oc_mp4_writer_abort(w); return -1; }
+    bbuf head = {0};
+    ftyp_box(&head);
+    bbuf probe = {0};
+    build_moov(&probe, w, 0);
+    size_t moov_len = probe.n;
+    int bad = probe.bad;
+    free(probe.d);
+    uint64_t data_base = head.n + moov_len + 8;
+    if (bad || data_base + w->spilled > OC_MP4_MAX_FILE) { free(head.d); oc_mp4_writer_abort(w); return -1; }
+    build_moov(&head, w, data_base);
+    u32(&head, (uint32_t)(8 + w->spilled)); fourcc(&head, "mdat");
+    FILE *out = head.bad ? NULL : fopen(w->path, "wb");
+    int ok = out && fwrite(head.d, 1, head.n, out) == head.n;
+    free(head.d);
+    /* The samples, after the index: copied from the part. */
+    ok = ok && fseek(w->spill, 0, SEEK_SET) == 0;
+    uint8_t buf[65536];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof buf, w->spill)) > 0) ok = fwrite(buf, 1, n, out) == n;
+    ok = ok && !ferror(w->spill);
+    if (out && fclose(out) != 0) ok = 0;
+    if (!ok && out) remove(w->path);
+    if (ok) {
+        if (bytes) *bytes = data_base + w->spilled;
+        if (duration_ms) *duration_ms = writer_duration_ms(w);
+    }
+    oc_mp4_writer_abort(w);   /* closes and removes the part */
+    return ok ? 0 : -1;
+}
+#endif
+
 int oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t *duration_ms) {
     int empty = w && (w->width ? w->video.n == 0 : w->audio.n == 0);
-    if (!w || !out || !len || empty || w->data.bad) { oc_mp4_writer_abort(w); return -1; }
+    if (!w || !out || !len || empty || w->data.bad || w->spill) { oc_mp4_writer_abort(w); return -1; }
     *out = NULL; *len = 0;
 
     bbuf file = {0};
-    size_t ftyp = box_begin(&file, "ftyp");
-    fourcc(&file, "isom"); u32(&file, 0x200);
-    fourcc(&file, "isom"); fourcc(&file, "iso6"); fourcc(&file, "mp41");
-    box_end(&file, ftyp);
+    ftyp_box(&file);
     size_t ftyp_len = file.n;
 
     /* moov's size does not depend on the offsets it holds (stco is fixed width),
@@ -352,10 +426,7 @@ int oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t 
     }
     if (bad) { free(file.d); oc_mp4_writer_abort(w); return -1; }
 
-    uint64_t vms = track_duration(&w->video) * 1000 / OC_MP4_VIDEO_TIMESCALE;
-    uint64_t adur = track_duration(&w->audio);
-    uint64_t ams = (adur > OC_MP4_OPUS_PRESKIP ? adur - OC_MP4_OPUS_PRESKIP : 0) * 1000 / OC_MP4_AUDIO_TIMESCALE;
-    if (duration_ms) *duration_ms = (uint32_t)(vms > ams ? vms : ams);
+    if (duration_ms) *duration_ms = writer_duration_ms(w);
     *out = file.d; *len = file.n;
     oc_mp4_writer_abort(w);                                /* frees the tables and sample copy */
     return 0;

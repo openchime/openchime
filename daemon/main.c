@@ -26,6 +26,7 @@
 #include "migrate.h"
 #include "netloop.h"
 #include "export_render.h"   /* oc_export_codecs_builtin (ARCH-135) */
+#include "callrec_render.h"  /* oc_callrec_codecs_builtin (CALLS.md §8) */
 #include "oidcrp.h"
 #include "push.h"
 #include "relaykeys.h"
@@ -644,6 +645,9 @@ int main(int argc, char **argv) {
         oc_netloop_set_export(oc_export_codecs_builtin());   /* NULL unless built with EXPORT=1 */
     }
 #endif
+    /* The codecs a call's recording is made with (CALLS.md §8): NULL unless
+     * built with CALLREC=1, and then nobody records a call here. */
+    oc_netloop_set_callrec(oc_callrec_codecs_builtin());
 #ifdef OC_STT
     /* Voice input's engine (ARCH-112): the recognizer built into this binary,
      * its data beside it in a directory of its own. Absent data turns voice input

@@ -1385,7 +1385,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_REMIND_AT, ACT_REMIND_CLEAR,
        /* blocks and DM privacy: block or unblock a person, who may start a DM
         * with me, my blocked people (each an Unblock), and an admin's list */
-       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
+       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN, ACT_CALLS,
        ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
        /* a member's profile, the workspace's own fields with it */
        ACT_PROFILE_OF,
@@ -1615,6 +1615,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Channel", "Upload a file",       NULL, NULL, ACT_UPLOAD },
     { "Messages","Search messages",     NULL, "Ctrl+F", ACT_SEARCH },
     { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
+    { "You",     "Calls",               NULL, NULL, ACT_CALLS },
     { "You",     "Set away",            NULL, NULL, ACT_AWAY },
     { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
     { "You",     "Change display name", NULL, NULL, ACT_NICK },
@@ -2395,6 +2396,100 @@ static void draw_blocks(const oc_model *m, int W, int H) {
     }
     tk_rect r = modal_frame(W, H, cw, n, "Blocks  ·  Esc closes");
     for (int i = 0; i < n && i < r.h; i++) tk_text(r.x, r.y + i, r.x + r.w, L[i], th->fg, th->bg);
+    tb_present();
+}
+
+/* Calls (CALLS.md §1): the call history, newest first -- each call's subject,
+ * when, how many were in it, and whether it was missed, recorded or has a
+ * transcript -- with the selection's row marked. Enter opens its page. */
+static void draw_calls(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->call_hist_loaded || !m->n_call_hist) {
+        const char *e = !m->call_hist_loaded ? "Loading…" : "No calls yet.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Calls  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    static char L[64][OC_CALL_SUBJECT_MAX + 96];
+    int n = 0, cw = 0;
+    for (size_t i = 0; i < m->n_call_hist && n < 64; i++, n++) {
+        const oc_call_hist_view *h = &m->call_hist[i];
+        time_t t = (time_t)(h->started_at / 1000);
+        char day[32] = "";
+        const struct tm *tm = localtime(&t);   /* the UI thread's alone */
+        if (tm) strftime(day, sizeof day, "%Y-%m-%d %H:%M", tm);
+        snprintf(L[n], sizeof L[n], "%s  %s  %u %s%s%s%s%s", day, h->subject[0] ? h->subject : "Call",
+                 (unsigned)h->n_people, h->n_people == 1 ? "person" : "people",
+                 !h->ended_at ? "  · going on" : "",
+                 (h->flags & OC_CALL_HIST_MISSED) ? "  · missed" : "",
+                 (h->flags & OC_CALL_HIST_RECORDING) ? "  · recorded" : "",
+                 (h->flags & OC_CALL_HIST_TRANSCRIPT) ? "  · transcript" : "");
+        int w = tk_str_width(L[n]) + 2;
+        if (w > cw) cw = w;
+    }
+    tk_rect r = modal_frame(W, H, cw, n, "Calls  ·  Enter opens  ·  Esc closes");
+    int top = sel >= r.h ? sel - r.h + 1 : 0;
+    for (int i = top; i < n && i - top < r.h; i++) {
+        int on = i == sel;
+        tk_text(r.x, r.y + i - top, r.x + r.w, on ? "> " : "  ", th->accent, th->bg);
+        tk_text(r.x + 2, r.y + i - top, r.x + r.w, L[i],
+                (m->call_hist[i].flags & OC_CALL_HIST_MISSED) ? th->err : on ? th->fg : th->muted, th->bg);
+    }
+    tb_present();
+}
+
+/* A call's page: who was in it and when, its recordings, and its transcript;
+ * 'c' opens its chat, 'm' the transcript's next lines. */
+static void draw_call_page(const oc_model *m, int W, int H, uint64_t id) {
+    const tk_theme *th = tk_theme_active();
+    const oc_call_page_view *p = m->call_page && m->call_page->call_id == id ? m->call_page : NULL;
+    if (!p) {
+        tk_rect r = modal_frame(W, H, 20, 1, "Call  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, "Loading…", th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    enum { MAXL = 260 };
+    static char L[MAXL][OC_CALL_SUBJECT_MAX + 160];
+    static int  dim[MAXL];
+    int n = 0, cw = 0;
+    #define LINE(d, ...) do { if (n < MAXL) { snprintf(L[n], sizeof L[n], __VA_ARGS__); dim[n] = (d); \
+                              int w_ = tk_str_width(L[n]); if (w_ > cw) cw = w_; n++; } } while (0)
+    LINE(1, "People");
+    for (uint16_t i = 0; i < p->n_stays; i++) {
+        const char *nm = oc_model_user_name((oc_model *)m, p->stays[i].user_id);
+        char a[16] = "", b[16] = "now";
+        time_t t1 = (time_t)(p->stays[i].joined_at / 1000), t2 = (time_t)(p->stays[i].left_at / 1000);
+        const struct tm *tm = localtime(&t1);
+        if (tm) strftime(a, sizeof a, "%H:%M", tm);
+        if (p->stays[i].left_at && (tm = localtime(&t2))) strftime(b, sizeof b, "%H:%M", tm);
+        LINE(0, "  %s  %s to %s", nm && nm[0] ? nm : "someone", a, b);
+    }
+    for (uint16_t i = 0; i < p->n_recordings; i++) {
+        if (!i) LINE(1, "Recording");
+        const oc_call_recording *r = &p->recordings[i];
+        const char *nm = oc_model_user_name((oc_model *)m, r->started_by);
+        const char *st = r->state == OC_CALL_REC_READY ? "ready" : r->state == OC_CALL_REC_RECORDING ? "recording now"
+                       : r->state == OC_CALL_REC_PROCESSING ? "being made" : "could not be made";
+        LINE(0, "  by %s  %u:%02u  %s%s", nm && nm[0] ? nm : "someone", r->duration_ms / 60000,
+             (r->duration_ms / 1000) % 60, st, r->state == OC_CALL_REC_READY ? " (in the call's chat: c)" : "");
+    }
+    if (p->has_transcript) {
+        LINE(1, "Transcript");
+        for (uint32_t i = 0; i < p->n_lines; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, p->lines[i].speaker);
+            LINE(0, "  %u:%02u %s: %s", p->lines[i].start_ms / 60000, (p->lines[i].start_ms / 1000) % 60,
+                 nm && nm[0] ? nm : "someone", p->lines[i].text ? p->lines[i].text : "");
+        }
+        if (p->n_lines < p->n_lines_total) LINE(1, "  … %u more lines (m)", p->n_lines_total - p->n_lines);
+    }
+    #undef LINE
+    char title[OC_CALL_SUBJECT_MAX + 64];
+    snprintf(title, sizeof title, "%s  ·  c chat  ·  Esc closes", p->subject[0] ? p->subject : "Call");
+    if (cw > W - 6) cw = W - 6;
+    tk_rect r = modal_frame(W, H, cw, n, title);
+    for (int i = 0; i < n && i < r.h; i++) tk_text(r.x, r.y + i, r.x + r.w, L[i], dim[i] ? th->accent : th->fg, th->bg);
     tb_present();
 }
 
@@ -3736,6 +3831,8 @@ int main(int argc, char **argv) {
     int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int blocks_open = 0;                      /* an admin's list of blocks */
+    int calls_open = 0, csel = 0;             /* the call history (CALLS.md §1) */
+    uint64_t cpage_id = 0;                    /* ...and a call's page, open */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
     int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
@@ -4044,6 +4141,8 @@ int main(int argc, char **argv) {
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (blocks_open) draw_blocks(oc_client_model(cl), tb_width(), tb_height());
+        if (cpage_id) draw_call_page(oc_client_model(cl), tb_width(), tb_height(), cpage_id);
+        else if (calls_open) draw_calls(oc_client_model(cl), tb_width(), tb_height(), csel);
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
@@ -4260,6 +4359,30 @@ int main(int argc, char **argv) {
             else if (ev.ch == 'G') sv_top = sv_lines - page;
             if (sv_top > sv_lines - page) sv_top = sv_lines - page;
             if (sv_top < 0) sv_top = 0;
+            continue;
+        }
+        if (cpage_id) {                        /* a call's page: c its chat, m more lines, any other key back */
+            const oc_model *cm = oc_client_model(cl);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.ch == 'm' && cm->call_page && cm->call_page->call_id == cpage_id)
+                oc_client_call_detail(cl, cpage_id, cm->call_page->n_lines);
+            else if (ev.ch == 'c' && cm->call_page && cm->call_page->call_id == cpage_id) {
+                /* The call's chat, as any conversation is shown. */
+                for (size_t i = 0; i < cm->n_channels; i++)
+                    if (cm->channels[i].channel_id == cm->call_page->chat_channel) focus = i;
+                cpage_id = 0; calls_open = 0;
+            } else cpage_id = 0;
+            continue;
+        }
+        if (calls_open) {                      /* the history: j/k or arrows, Enter opens, Esc closes */
+            const oc_model *cm = oc_client_model(cl);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN || ev.ch == 'j') { if (csel + 1 < (int)cm->n_call_hist) csel++; }
+            else if (ev.key == TB_KEY_ARROW_UP || ev.ch == 'k') { if (csel > 0) csel--; }
+            else if (ev.key == TB_KEY_ENTER && csel < (int)cm->n_call_hist) {
+                cpage_id = cm->call_hist[csel].call_id;
+                oc_client_call_detail(cl, cpage_id, 0);
+            } else calls_open = 0;
             continue;
         }
         if (blocks_open) {                     /* the blocks overlay: any key closes */
@@ -4526,6 +4649,7 @@ int main(int argc, char **argv) {
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                 else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                else if (id == ACT_CALLS) { oc_client_call_history(cl, 0); calls_open = 1; csel = 0; }
                 else if (id == ACT_DMPRIV)
                     oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
                 else if (id == ACT_BLOCKED) {
@@ -4660,6 +4784,7 @@ int main(int argc, char **argv) {
                     else if (id == ACT_DMPRIV)
                         oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
                     else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                    else if (id == ACT_CALLS) { oc_client_call_history(cl, 0); calls_open = 1; csel = 0; }
                     else if (id == ACT_BLOCKED) {
                         menu_build_blocked(oc_client_model(cl));
                         action_menu.sel = action_menu.top = 0;

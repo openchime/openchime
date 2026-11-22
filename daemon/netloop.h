@@ -172,6 +172,16 @@ struct oc_tts_engine;
  * worker runs only when OPENCHIME_H264_EXPORT is on as well. */
 struct oc_export_codecs;
 void oc_netloop_set_export(const struct oc_export_codecs *codecs);
+/* The engine that makes a call's recording from its spool (CALLS.md §8),
+ * when the daemon carries one (CALLREC=1); NULL, the default: calls are not
+ * recorded here, and CAPABILITIES names no call-recording. Set before the loop
+ * runs; a test that sets it later has the worker started by the first
+ * recording that stops. */
+struct oc_callrec_codecs;
+void oc_netloop_set_callrec(const struct oc_callrec_codecs *codecs);
+/* Tests: hold the recordings' worker (1) so a spool can be read before it is
+ * made into the recording, and let it go (0). */
+void oc_netloop_hold_callrec(int on);
 void oc_netloop_set_tts(const struct oc_tts_engine *engine);
 
 /* Wire voice input's recognizer (REQ-296-300, ARCH-112). The daemon passes the

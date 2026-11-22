@@ -12749,10 +12749,125 @@ static void test_muted_people(void) {
     cleanup_db(path);
 }
 
+/* A call's recording in the database (CALLS.md §8): made, it is a video in
+ * the call's chat -- an attachment with its media row, carried by a message
+ * from who started it -- and the recording is ready with it; not made, it is
+ * failed with why. Those stopped and not yet made are listed for a start. And
+ * past OPENCHIME_CALL_RECORDING_DAYS from its call's end, the storage pass
+ * deletes it, its bytes reclaimed. */
+static void test_call_recordings(void) {
+    const char *path = tdb("callrec.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw-alice", OC_ROLE_MEMBER), bob = reg(w, "bob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    oc_job *j = oc_job_new(OC_JOB_CALL_START, 80);
+    j->user_id = alice;
+    j->call_subject = strdup("Weekly review");
+    j->call_uids = calloc(1, sizeof *j->call_uids);
+    j->call_uids[0] = bob; j->n_call_uids = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CALL_STARTED && r->call_id && r->call_chat);
+    const uint64_t call = r ? r->call_id : 0, chat = r ? r->call_chat : 0;
+    oc_dbres_free(r);
+
+    /* Two recordings, by bob, both stopped. */
+    uint64_t rec[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        j = oc_job_new(OC_JOB_RECORDING_START, 81);
+        j->user_id = bob; j->call_id = call; j->call_spool = strdup("/var/lib/oc/recordings");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_RECORDING_STARTED && r->rec_id);
+        rec[i] = r ? r->rec_id : 0;
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
+        j->rec_id = rec[i];
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    /* Both wait to be made, with their spools. */
+    j = oc_job_new(OC_JOB_RECORDINGS_PENDING, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDINGS_PENDING && r->n_recs == 2);
+    if (r && r->n_recs == 2) {
+        char want[64];
+        snprintf(want, sizeof want, "/var/lib/oc/recordings/%llu", (unsigned long long)rec[1]);
+        CHECK(r->rec_ids[0] == rec[0] && r->rec_ids[1] == rec[1] && strcmp(r->rec_spools[1], want) == 0);
+    }
+    oc_dbres_free(r);
+
+    /* The first made: the message in the chat, to its people, with the file. */
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec[0]; j->call_spool = strdup("ca11_0000000000000001");
+    j->exp_bytes = 123456; j->exp_duration_ms = 61000;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDING_DONE && r->channel_id == chat && r->author_id == bob && r->n_attach == 1);
+    CHECK(r && r->body_len == strlen("Recording of Weekly review") && !memcmp(r->body, "Recording of Weekly review", r->body_len));
+    CHECK(r && r->n_members == 2);
+    const uint64_t mid = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings r JOIN attachments a ON a.id = r.attachment_id"
+                           " JOIN attachment_media m ON m.attachment_id = a.id"
+                           " WHERE r.id = ?1 AND r.state = 'ready' AND r.spool IS NULL AND r.bytes = 123456"
+                           " AND r.duration_ms = 61000 AND a.storage_key = 'ca11_0000000000000001' AND a.mime = 'video/mp4'"
+                           " AND a.size = 123456 AND m.kind = 1 AND m.width = 1280 AND m.height = 720"
+                           " AND m.duration_ms = 61000;", rec[0]) == 1);
+    CHECK(e2e_scalar(path, "SELECT channel_id FROM messages WHERE id = ?1;", mid) == (int64_t)chat);
+    /* The second not: failed, with why, and nothing in the chat. */
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec[1]; j->rec_failed = 1;
+    oc_job_set_body(j, "a picture's spool is damaged", strlen("a picture's spool is damaged"));
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OK);
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings WHERE id = ?1 AND state = 'failed' AND spool IS NULL"
+                           " AND attachment_id IS NULL AND error = 'a picture''s spool is damaged';", rec[1]) == 1);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id = ?1;", chat) == 1);
+    /* Nothing waits now. */
+    j = oc_job_new(OC_JOB_RECORDINGS_PENDING, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDINGS_PENDING && r->n_recs == 0);
+    oc_dbres_free(r);
+
+    /* Kept 30 days: the call ended 29 days ago, kept; 31, deleted. */
+    for (int days = 29; days <= 31; days += 2) {
+        sqlite3 *db = NULL;
+        CHECK(raw_open(path, &db) == SQLITE_OK);
+        char sql[200];
+        snprintf(sql, sizeof sql, "UPDATE calls SET ended_at_ms = %llu, end_reason = 'left' WHERE id = %llu;",
+                 (unsigned long long)((uint64_t)time(NULL) * 1000 - (uint64_t)days * 86400000ull), (unsigned long long)call);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+        j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        j->maint_grace_ms = 3600000;
+        j->maint_batch = 8;
+        j->maint_rec_days = 30;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_STORAGE_MAINT);
+        int reclaimed = 0;
+        for (size_t i = 0; r && i < r->n_reclaim; i++)
+            if (r->reclaim[i].storage_key && strcmp(r->reclaim[i].storage_key, "ca11_0000000000000001") == 0) reclaimed = 1;
+        CHECK(reclaimed == (days == 31));
+        oc_dbres_free(r);
+        CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings WHERE id = ?1;", rec[0]) == (days == 31 ? 0 : 1));
+    }
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_call_recordings();
     test_usage();
     test_muted_people();
     test_change_password();

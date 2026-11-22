@@ -90,6 +90,8 @@ int run_sttkit_tests(void);
 int run_recognizer_parity_tests(void);
 int run_tts_worker_tests(void);
 int run_export_tests(void);
+int run_callrec_tests(void);
+int run_callrec_media_tests(void);
 int run_export_wire_tests(void);
 int run_export_media_tests(void);
 int run_summary_tests(void);
@@ -323,6 +325,7 @@ static const struct suite {
     S(run_listen_tests,          FAST, PLAIN),
     S(run_media_tests,           FULL, WALK),
     S(run_export_media_tests,    FULL, WALK),
+    S(run_callrec_media_tests,   FULL, WALK),
     S(run_video_media_tests,     FAST, THREADS),
     S(run_emoji_tests,           FAST, PLAIN),
     S(run_tls_tests,             FAST, THREADS),
@@ -347,6 +350,7 @@ static const struct suite {
     S(run_ttskit_tests,          FAST, PLAIN),
     S(run_tts_worker_tests,      FAST, THREADS),
     S(run_export_tests,          FAST, THREADS),
+    S(run_callrec_tests,         FAST, THREADS),
     S(run_export_wire_tests,     FAST, THREADS),
     S(run_summary_tests,         FAST, WALK),
     S(run_voice_pick_tests,      FAST, PLAIN),

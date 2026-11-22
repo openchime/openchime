@@ -172,6 +172,11 @@ struct oc_call_engine {
     int         n_vols;
 
     atomic_int  muted, ptt, ns, reopen_mic, reopen_spk;
+    /* The recording gate (CALLS.md §8): set when this device came into a call
+     * already being recorded, until its user acknowledges it (or the
+     * recording stops); while set, no audio and no camera go out.
+     * `rec_first` is set from a start until its first roster. */
+    atomic_int  rec_gate, rec_first;
     atomic_int  mic_level, speaking, mic_error, spk_error, loss_pct;
     atomic_uint sent, keepalives;
     atomic_llong last_send;   /* written by every sender, read by the I/O thread */
@@ -620,7 +625,7 @@ static void *capture_main(void *arg) {
         /* What a camera frame captured now is stamped with (lip sync). */
         atomic_store(&e->mic_pts_us, frame_pts);
         atomic_store(&e->mic_frame, f);
-        int open = !atomic_load(&e->muted) || atomic_load(&e->ptt);
+        int open = (!atomic_load(&e->muted) || atomic_load(&e->ptt)) && !atomic_load(&e->rec_gate);
         atomic_store(&e->speaking, open && lvl > SPEAK_LEVEL);
         if (!open) {
             int64_t t = now_ms();
@@ -931,6 +936,7 @@ static void *cam_main(void *arg) {
         int kbps = confirmed ? oc_share_tx_kbps(&e->ctx, t) : OC_CAM_KBPS_START;
         oc_mutex_unlock(&e->share_mu);
         if (!confirmed) { was_confirmed = 0; continue; }   /* the roster does not mark it on yet */
+        if (atomic_load(&e->rec_gate)) { was_confirmed = 0; continue; }   /* not acknowledged: nothing out */
         int w, h, fps;
         int step = oc_cam_ladder_pick(&ladder, kbps, t, f.width, f.height, mw, mh, mfps, &w, &h, &fps);
         /* The step's frame rate: a frame no sooner than its interval allows,
@@ -1335,6 +1341,8 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     forget_call(e);
     oc_mutex_unlock(&e->mu);
     forget_share(e);
+    atomic_store(&e->rec_gate, 0);
+    atomic_store(&e->rec_first, 1);
     if (!host || !token || token_len == 0 || token_len > sizeof e->token || !port) return -1;
 
     oc_sock_startup();
@@ -1426,6 +1434,13 @@ static void m_roster(void *ctx, uint32_t epoch, const oc_call_part *parts, int n
     oc_call_engine *e = ctx;
     uint64_t gone[MAX_PEERS];
     int n_gone = 0;
+    /* Recorded when the Recorder is in it. Coming into a call that is: gated
+     * until acknowledged. Recording started later: a notice, not a gate. Not
+     * recorded any more: nothing to acknowledge. */
+    int recorded = 0;
+    for (int k = 0; k < n; k++) if (parts[k].flags & OC_CALL_PART_RECORDER) recorded = 1;
+    if (atomic_exchange(&e->rec_first, 0)) atomic_store(&e->rec_gate, recorded);
+    else if (!recorded) atomic_store(&e->rec_gate, 0);
     oc_mutex_lock(&e->mu);
     e->epoch = epoch;
     /* Forget whoever left, with every key they gave; welcome whoever came. */
@@ -1541,6 +1556,8 @@ static void m_rx_key(void *ctx, uint64_t user, uint8_t slot, uint32_t epoch, con
 
 static void m_stop(void *ctx) {
     oc_call_engine *e = ctx;
+    atomic_store(&e->rec_gate, 0);
+    atomic_store(&e->rec_first, 0);
     stop_threads(e);
     oc_mutex_lock(&e->mu);
     forget_call(e);
@@ -1726,6 +1743,10 @@ int oc_call_engine_camera_frame(oc_call_engine *e, uint64_t user, oc_frame *dst,
 }
 
 void oc_call_engine_set_mute(oc_call_engine *e, int muted) { atomic_store(&e->muted, muted ? 1 : 0); }
+void oc_call_engine_ack_recording(oc_call_engine *e) { if (e) atomic_store(&e->rec_gate, 0); }
+int  oc_call_engine_recording_gated(const oc_call_engine *e) {
+    return e ? atomic_load(&((oc_call_engine *)e)->rec_gate) : 0;
+}
 int  oc_call_engine_muted(const oc_call_engine *e) { return atomic_load(&((oc_call_engine *)e)->muted); }
 void oc_call_engine_set_ptt(oc_call_engine *e, int held) { atomic_store(&e->ptt, held ? 1 : 0); }
 void oc_call_engine_set_noise_suppression(oc_call_engine *e, int on) { atomic_store(&e->ns, on ? 1 : 0); }
@@ -1793,6 +1814,7 @@ void oc_call_engine_stats(oc_call_engine *e, oc_call_stats *out) {
     out->mic_error = atomic_load(&e->mic_error);
     out->speaker_error = atomic_load(&e->spk_error);
     out->muted = atomic_load(&e->muted);
+    out->rec_gate = atomic_load(&e->rec_gate);
     out->ptt = atomic_load(&e->ptt);
     out->speaking = atomic_load(&e->speaking);
     out->mic_level = atomic_load(&e->mic_level);

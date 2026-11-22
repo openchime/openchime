@@ -351,6 +351,24 @@ framework.
   H.264 Constrained Baseline and one MP3 stream at the source's size and
   duration, a flash and a click within a frame of each other, and the transcode's
   peak memory under 96 MB. Run it here with `OC_TEST_ONLY=export_media`.
+- **A call's recording** (CALLS.md §8, ARCH-136) — in `make test`,
+  `tests/test_callrec.c`: a spool written as the Recorder writes one, made into a
+  recording with stub codecs and read back — the voices mixed, each where it was
+  said (after a silence, and after a device counted its frames afresh), the
+  speaker large and the others in the strip, a shared screen large while shared;
+  a cancelled, a damaged, an empty and an over-long spool; the file-backed MP4
+  writer byte for byte against the in-memory one; and the worker storing the
+  recording under its key, removing the spool, and finishing on its next start one
+  it was stopped in the middle of. `tests/test_dbwriter.c`: a recording made (an
+  attachment of the call's chat with its media row and digest, and the message
+  carrying it) and failed, the list a start resumes, and the retention.
+  `tests/test_client_core.c` (full): the Recorder through the real daemon and
+  relay at 10% loss, the spool, the recording made and sent to the call's people,
+  the call history and page through the core, a transcript and its delete, and a
+  joiner held back until it acknowledges. In the full suite,
+  `tests/test_callrec_media.c` (`callrec_media`) makes a recording of a synthetic
+  two-person call with libvpx and libopus and decodes it: the picture and the
+  voices where they were. Run it here with `OC_TEST_ONLY=callrec_media`.
 - **Screen recording** (`tests/test_media.c`, REQ-162) — the camera box's geometry
   and the frame views that draw it; the screen front end repeating a still screen
   at the frame rate; recordings of the synthetic screen with the camera boxed into
@@ -477,7 +495,14 @@ framework.
   rows for the poll asked about only -- and the live run posts, votes and asks who
   voted between two clients through the real daemon. `tools/gui/features/polls.sh`
   drives the card in both GUI clients (tools/gui/README.md).
-- **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113) — `tests/test_e2e.c`: SFrame
+- **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tools/gui/features/calls.sh`
+  and `callhome.sh` (`# needs: callrec`), on Win32 and in the browser: the picker
+  with its subject and people ticked, the call's message in its conversation,
+  Calls home going on and before, its Join and Decline, the call view's subject
+  and chat, Record and the mark both people see, the joiner's notice, a missed
+  call in Calls home, New call from Calls home, the call's page and the recording
+  played on it; run them against `make openchimed WEB=1 CALLREC=1` (`run.sh`
+  passes the remembered `CALLREC` through). `tests/test_e2e.c`: SFrame
   against RFC 9605's vectors (every header encoding, suite 0x0004's key, salt and
   ciphertext), HPKE Auth mode against RFC 9180 A.1.3 (the ephemeral, receiver and
   sender keys, the sealed message), then what vectors do not cover — altered

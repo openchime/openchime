@@ -61,7 +61,7 @@ since the epoch in UTC, server-assigned (REQ-050); ids are the daemon's own.
 | Field | Meaning |
 |---|---|
 | `seq` | The capture sequence number; the cursor. |
-| `kind` | `message`, `edit`, `deletion`, `draft`, `file`, `channel` or `user`. |
+| `kind` | `message`, `edit`, `deletion`, `draft`, `file`, `channel`, `user` or `call`. |
 | `op` | What happened to it (per kind, below), or `baseline`. |
 | `at_ms` | When the change happened. |
 | `actor_id` | Who made the change; absent for the daemon's own (an eviction, a baseline). |
@@ -80,6 +80,7 @@ since the epoch in UTC, server-assigned (REQ-050); ids are the daemon's own.
 | file | `stored`, `unavailable` | `file_id`, `message_id`, `channel_id`, `uploader_id`, `filename`, `content_type`, `size`, `sha256`, and the content (§3, §6) |
 | channel | `created`, `changed`, `archived`, `unarchived`, `member_added`, `member_removed` | `channel_id`, `channel_kind` (`channel` or `dm`), `visibility` (`public` or `private`), `name`, `topic`, `description`, `created_at_ms`, `encrypted`, `members` (user ids, on `created` and `baseline`), `member_id` (on a membership change) |
 | user | `created`, `changed`, `removed` | `user_id`, `username` (a local account's), `display_name`, `role`, `address`, `address_source` (§4), `created_at_ms`, `disabled` |
+| call | `started`, `invited`, `joined`, `left`, `event`, `recorded`, `transcribed`, `ended` | `call_id`, `subject`, `starter_id`, `from_channel` (absent for one started from Calls home), `chat_channel`, `started_at_ms`; per op: `user_id` and `invited_by` (`invited`), `user_id` and `at_ms` (`joined`, `left`), `event_kind` and `detail` (`event`: cameras, shares, recording and renames), `recording_id`, `file_id`, `duration_ms` (`recorded`), `language` and `lines` (`transcribed`: each `speaker_id`, `start_ms`, `end_ms`, `text`), `ended_at_ms` and `end_reason` (`ended`) |
 
 **What each kind means in practice.**
 
@@ -101,11 +102,19 @@ since the epoch in UTC, server-assigned (REQ-050); ids are the daemon's own.
   read. Its conversation, participants, ids, authors and times are captured.
 - What a **DLP webhook** (REQ-277) rewrote is captured as stored. The original
   was never stored, so there is nothing else to capture.
+- A **call** (CALLS.md §1) is captured as it happens: who started it and asked
+  whom, each person's joins and leaves, its timeline, and how it ended. Its
+  **chat** is a channel (`channel_kind` `dm`, with the call's id) whose messages
+  and files are captured as any; its **recording** is a file of that chat, so
+  its bytes go out with that file's `stored` record, and the `recorded` record
+  names it. A **transcript** is captured whole when it is stored. What was
+  *said* in a call nobody recorded is not captured: the daemon never had it
+  (REQ-306).
 
 **Not records in this design (proposal):** reactions, pins, saved items,
-mentions, read state, polls' votes and calls. REQ-276 names messages, threads,
-files, channels and users; these can be added as kinds later without changing
-the envelope.
+mentions, read state and polls' votes. REQ-276 names messages, threads, files,
+channels and users, and calls are captured beside them; the rest can be added
+as kinds later without changing the envelope.
 
 ## 3. Address mapping
 
