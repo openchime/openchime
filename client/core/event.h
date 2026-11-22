@@ -101,6 +101,7 @@ typedef struct {
     uint64_t from_channel, call_id, starter, started_at;
     uint64_t chat_channel;   /* the call's own chat: a conversation in no list */
     uint8_t  recording;      /* it is being recorded (CALLS.md §8) */
+    uint64_t rec_by;         /* ...started by this user; 0 when not recorded */
     char     subject[OC_CALL_SUBJECT_MAX + 1];
     uint32_t epoch;
     uint8_t  ended;
@@ -121,6 +122,8 @@ typedef struct {
     uint64_t call_id, starter, started_at, ended_at, from_channel, chat_channel;
     uint8_t  end_reason, flags;
     uint16_t n_people;
+    uint8_t  n_faces;                           /* who took part, first joined first */
+    uint64_t faces[OC_CALL_HIST_FACES];
     char     subject[OC_CALL_SUBJECT_MAX + 1];
 } oc_call_hist_view;
 /* One page of the history: `before_ms` what was asked for (0 the newest). */

@@ -2281,6 +2281,9 @@ oc_result oc_encode_call_history_page(oc_wbuf *w, uint16_t version, const oc_cal
         oc_w_u64(w, e->chat_channel);
         oc_w_u16(w, e->n_people);
         oc_w_u8(w, e->flags);
+        uint8_t nf = e->n_faces <= OC_CALL_HIST_FACES ? e->n_faces : (uint8_t)OC_CALL_HIST_FACES;
+        oc_w_u8(w, nf);
+        for (uint8_t k = 0; k < nf; k++) oc_w_u64(w, e->faces[k]);
     }
     oc_w_u8(w, m->more);
     return oc_frame_end(w, off);
@@ -2410,6 +2413,7 @@ oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state
     w_u64s(w, m->n_parts, m->parts);
     w_u64s(w, m->n_invited, m->invited);
     oc_w_u64(w, m->sharer);
+    oc_w_u64(w, m->rec_by);
     return oc_frame_end(w, off);
 }
 
@@ -2558,6 +2562,9 @@ oc_result oc_decode_call_history_page(oc_rbuf *p, oc_call_history_page *m, oc_ca
         e->chat_channel = oc_r_u64(p);
         e->n_people = oc_r_u16(p);
         e->flags = oc_r_u8(p);
+        e->n_faces = oc_r_u8(p);
+        if (e->n_faces > OC_CALL_HIST_FACES) { p->underflow = 1; break; }
+        for (uint8_t k = 0; k < e->n_faces; k++) e->faces[k] = oc_r_u64(p);
     }
     m->count = n;
     m->more = oc_r_u8(p);
@@ -2699,6 +2706,7 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
     r_u64s(p, &m->n_parts, parts, pcap);
     r_u64s(p, &m->n_invited, invited, icap);
     m->sharer = oc_r_u64(p);
+    m->rec_by = oc_r_u64(p);
     return r_done(p);
 }
 

@@ -928,6 +928,16 @@ typedef struct {
      * `call_page_seq` bumps per page and per delete. */
     oc_call_page_view *call_page;
     uint32_t           call_page_seq;
+    /* Missed calls not yet seen (CALLS.md §2): calls this user was asked to,
+     * neither joined nor declined, and over -- from CALL_STATE as they end, and
+     * from history rows newer than `call_missed_seen_ms`. The sidebar marks
+     * them; oc_client_calls_seen clears them. `call_joined` remembers the calls
+     * this user has been in, so a call they took is not counted. */
+    uint64_t           call_missed[OC_MAX_CALLS_LISTED];
+    size_t             n_call_missed;
+    uint64_t           call_missed_seen_ms;
+    uint64_t           call_joined[OC_MAX_CALLS_LISTED];
+    size_t             n_call_joined;
     /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
      * error line's does. */
     uint16_t     call_error;
@@ -1397,6 +1407,9 @@ const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);
  * by its id, or NULL; and the one started from conversation `channel_id`, or
  * NULL -- what that conversation's call button joins rather than starts. */
 const oc_call_view *oc_model_call(const oc_model *m, uint64_t call_id);
+/* The missed calls are seen: cleared, and none older than `seen_ms` counted
+ * again (CALLS.md §2). */
+void oc_model_calls_seen(oc_model *m, uint64_t seen_ms);
 const oc_call_view *oc_model_call_from(const oc_model *m, uint64_t channel_id);
 /* Is `user_id` invited to `v` and not yet in it? */
 int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);

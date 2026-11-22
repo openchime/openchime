@@ -59,6 +59,9 @@ struct oc_callrec {
     raudio          audio[OC_MAX_CALL_PARTICIPANTS * 4];
     int             n_audio;
     oc_callrec_stats st;
+    FILE           *people;                 /* who each person is, for the picture */
+    uint64_t        known[OC_MAX_CALL_PARTICIPANTS * 8];
+    int             n_known;
     struct { uint64_t sender, kid, at; uint8_t stream; size_t len; uint8_t *ct; } held[REC_HELD];
     int             n_held;
 };
@@ -114,9 +117,11 @@ oc_callrec *oc_callrec_start(uint64_t call_id, uint64_t recording_id, const char
     }
     FILE *m = spool_open(r, "meta");
     r->timeline = spool_open(r, "timeline");
-    if (!m || !r->timeline) {
+    r->people = spool_open(r, "people");
+    if (!m || !r->timeline || !r->people) {
         if (m) fclose(m);
         if (r->timeline) fclose(r->timeline);
+        if (r->people) fclose(r->people);
         oc_e2e_wipe(r, sizeof *r);
         free(r);
         return NULL;
@@ -306,6 +311,30 @@ void oc_callrec_camera(oc_callrec *r, uint64_t user, int on, uint64_t now_ms) {
     timeline(r, now_ms, on ? OC_CALLREC_TL_CAMERA_ON : OC_CALLREC_TL_CAMERA_OFF, user);
 }
 
+int oc_callrec_knows(const oc_callrec *r, uint64_t user) {
+    for (int i = 0; r && i < r->n_known; i++) if (r->known[i] == user) return 1;
+    return 0;
+}
+
+/* A `people` record: user u64, name length u8, the name, key length u8, the key. */
+void oc_callrec_person(oc_callrec *r, uint64_t user, const char *name, const char *avatar_key) {
+    if (!r || !user || !r->people || oc_callrec_knows(r, user) ||
+        r->n_known == (int)(sizeof r->known / sizeof r->known[0])) return;
+    size_t nl = name ? strlen(name) : 0, kl = avatar_key ? strlen(avatar_key) : 0;
+    if (nl > OC_CALLREC_NAME_MAX) nl = OC_CALLREC_NAME_MAX;
+    if (kl > OC_CALLREC_AVKEY_MAX) kl = 0;            /* a key too long is no key */
+    uint8_t h[9];
+    be64(h, user);
+    h[8] = (uint8_t)nl;
+    fwrite(h, 1, sizeof h, r->people);
+    if (nl) fwrite(name, 1, nl, r->people);
+    uint8_t k = (uint8_t)kl;
+    fwrite(&k, 1, 1, r->people);
+    if (kl) fwrite(avatar_key, 1, kl, r->people);
+    fflush(r->people);
+    r->known[r->n_known++] = user;
+}
+
 void oc_callrec_presence(oc_callrec *r, uint64_t user, int joined, uint64_t now_ms) {
     if (r) timeline(r, now_ms, joined ? OC_CALLREC_TL_JOIN : OC_CALLREC_TL_LEAVE, user);
 }
@@ -414,6 +443,7 @@ void oc_callrec_stop(oc_callrec *r) {
         if (r->cams[i].used) { oc_share_rx_free(&r->cams[i].rx); if (r->cams[i].f) fclose(r->cams[i].f); }
     for (int i = 0; i < r->n_audio; i++) if (r->audio[i].f) fclose(r->audio[i].f);
     if (r->timeline) fclose(r->timeline);
+    if (r->people) fclose(r->people);
     for (int i = 0; i < r->n_held; i++) { free(r->held[i].ct); r->st.unopened++; }   /* never had its key */
     r->n_held = 0;
     for (int i = 0; i < REC_KEYS; i++) oc_sframe_key_wipe(&r->keys[i].key);

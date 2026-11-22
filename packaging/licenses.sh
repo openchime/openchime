@@ -15,13 +15,16 @@
 # and the recognizer; for a daemon built without one, run this with
 # TTS=0, STT=0 or SUM=0. The export of a video message (EXPORT, ARCH-135) brings
 # libavc, LAME, libvpx and Opus; for a daemon built without it, EXPORT=0.
+# Recording calls (CALLREC, CALLS.md §8) brings libvpx and Opus; for a daemon
+# built without it, CALLREC=0. Every daemon draws a recording's people with
+# stb_image and stb_truetype and the Noto Sans font, compiled in.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
 # program, in the container image only, never linked into openchimed nor in
 # the tarball this file describes. Its own LICENSE travels beside it in the
 # image (packaging/image-context.sh, /usr/share/doc/litestream/LICENSE).
 #
-#   [TTS=0] [STT=0] [SUM=0] [EXPORT=0] licenses.sh <mbedtls-dir>
+#   [TTS=0] [STT=0] [SUM=0] [EXPORT=0] [CALLREC=0] licenses.sh <mbedtls-dir>
 #
 # LICENSES_LIST=1 prints the path of each text it would include, one per line,
 # and nothing else: scripts/test/fast/notices.sh compares that list with what the
@@ -33,6 +36,7 @@ TTS="${TTS:-1}"
 STT="${STT:-1}"
 SUM="${SUM:-1}"
 EXPORT="${EXPORT:-1}"
+CALLREC="${CALLREC:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 LIST="${LICENSES_LIST:-0}"
@@ -98,6 +102,11 @@ in full here, as those licences require.
                                 third_party/ca-roots in the repository above
   SQLite 3.53.4    Public       the message database
                    domain
+  stb_image,       Public       decoding avatars and drawing names in a
+    stb_truetype   domain or    call's recording
+                   MIT
+  Noto Sans        SIL OFL 1.1  the font a call's recording names people in,
+                                embedded as data
 HEADER
 
 if [ "$TTS" = 1 ]; then
@@ -135,6 +144,17 @@ licence):
 HEADER
 fi
 
+if [ "$CALLREC" = 1 ]; then
+  header <<'HEADER'
+
+and, for recording calls (built into the binary; used unless the operator turns
+OPENCHIME_CALL_RECORDING off):
+
+  libvpx 1.17.0        BSD-3-Clause encoding and decoding a recording's VP9
+  Opus 1.6.1           BSD-3-Clause encoding and decoding its audio
+HEADER
+fi
+
 if [ "$SUM" = 1 ]; then
   header <<'HEADER'
 
@@ -158,6 +178,8 @@ emit "picohttpparser -- MIT License" "${root}/third_party/picohttpparser/LICENSE
 emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LICENSE"
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
+emit "stb_image and stb_truetype -- Public Domain or MIT License" "${root}/third_party/stb/LICENSE"
+emit "Noto Sans -- SIL Open Font License 1.1" "${root}/third_party/fonts/OFL.txt"
 
 if [ "$TTS" = 1 ]; then
   emit "The voice model -- Apache License 2.0" "${root}/ttskit/data/VOICE-LICENSE"
@@ -174,5 +196,11 @@ if [ "$EXPORT" = 1 ]; then
   emit "libvpx 1.17.0 -- BSD 3-Clause License" "${root}/third_party/libvpx/LICENSE"
   emit "libvpx 1.17.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libvpx/PATENTS"
   # Opus once, whichever feature brought it.
+  [ "$TTS" = 1 ] || emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
+fi
+if [ "$CALLREC" = 1 ] && [ "$EXPORT" != 1 ]; then
+  # libvpx and Opus once, whichever feature brought them.
+  emit "libvpx 1.17.0 -- BSD 3-Clause License" "${root}/third_party/libvpx/LICENSE"
+  emit "libvpx 1.17.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libvpx/PATENTS"
   [ "$TTS" = 1 ] || emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
 fi

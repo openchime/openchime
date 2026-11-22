@@ -20,7 +20,9 @@ OBJ_DIR ?= build$(BUILD_SUFFIX)/obj
 # daemon built without Emscripten still links, and says it has no client.
 WEBAPP_RES := $(GEN_DIR)/webapp_res.c
 PWLIST_RES := $(GEN_DIR)/pw_common.c
-SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES) $(PWLIST_RES)
+# The font a call's recording names people in (CALLS.md §8): Noto Sans, SIL OFL.
+CALLREC_FONT_RES := $(GEN_DIR)/callrec_font.c
+SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES) $(PWLIST_RES) $(CALLREC_FONT_RES)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
 # --- Objects -------------------------------------------------------------------
@@ -73,7 +75,7 @@ INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/js
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
-APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES)
+APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES) $(CALLREC_FONT_RES)
 # e2e_client is a black-box tool of its own (its own main), not part of the
 # single in-process test binary.
 # The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test

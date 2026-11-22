@@ -2096,11 +2096,47 @@ size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
  * over. An invitation this user did not hold before is queued for the toast
  * pass, under the conversation it was started from (whose mute and level
  * apply), if any. */
+/* A call this user has been in: remembered, oldest forgotten first. */
+static void call_joined_note(oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_joined; i++) if (m->call_joined[i] == call_id) return;
+    if (m->n_call_joined == OC_MAX_CALLS_LISTED) {
+        memmove(m->call_joined, m->call_joined + 1, (OC_MAX_CALLS_LISTED - 1) * sizeof m->call_joined[0]);
+        m->n_call_joined--;
+    }
+    m->call_joined[m->n_call_joined++] = call_id;
+}
+
+static int call_was_joined(const oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_joined; i++) if (m->call_joined[i] == call_id) return 1;
+    return 0;
+}
+
+/* A missed call not yet seen: counted once, the newest kept. */
+static void call_missed_note(oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_missed; i++) if (m->call_missed[i] == call_id) return;
+    if (m->n_call_missed == OC_MAX_CALLS_LISTED) {
+        memmove(m->call_missed, m->call_missed + 1, (OC_MAX_CALLS_LISTED - 1) * sizeof m->call_missed[0]);
+        m->n_call_missed--;
+    }
+    m->call_missed[m->n_call_missed++] = call_id;
+}
+
+void oc_model_calls_seen(oc_model *m, uint64_t seen_ms) {
+    if (!m) return;
+    m->n_call_missed = 0;
+    if (seen_ms > m->call_missed_seen_ms) m->call_missed_seen_ms = seen_ms;
+}
+
 static void call_state_fold(oc_model *m, const oc_call_view *v) {
     size_t i = 0;
     while (i < m->n_calls && m->calls[i].call_id != v->call_id) i++;
     int had_invite = i < m->n_calls && oc_model_call_invited(&m->calls[i], m->user_id);
+    for (uint16_t k = 0; k < v->n_parts; k++) if (v->parts[k] == m->user_id) call_joined_note(m, v->call_id);
     if (v->ended) {
+        /* Still asked when it ended -- a decline takes you off the list -- and
+         * never in it: missed. */
+        if (had_invite && !call_was_joined(m, v->call_id) && v->started_at > m->call_missed_seen_ms)
+            call_missed_note(m, v->call_id);
         if (i < m->n_calls) m->calls[i] = m->calls[--m->n_calls];
         return;
     }
@@ -2170,6 +2206,9 @@ static void call_history_apply(oc_model *m, const oc_call_history_view *v) {
     m->call_hist = g;
     m->n_call_hist = keep;
     for (uint16_t i = 0; i < v->count; i++) {
+        const oc_call_hist_view *h = &v->rows[i];
+        if ((h->flags & OC_CALL_HIST_MISSED) && h->started_at > m->call_missed_seen_ms) call_missed_note(m, h->call_id);
+        if (h->flags & OC_CALL_HIST_JOINED) call_joined_note(m, h->call_id);
         int dup = 0;
         for (size_t k = 0; k < keep && !dup; k++) dup = g[k].call_id == v->rows[i].call_id;
         if (!dup) g[m->n_call_hist++] = v->rows[i];
@@ -3584,6 +3623,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             m->call.from_channel = e->call->from_channel;
             m->call.chat_channel = e->call->chat_channel;
             m->call.recording = e->call->recording;
+            m->call.rec_by = e->call->rec_by;
             memcpy(m->call.subject, e->call->subject, sizeof m->call.subject);
             memcpy(m->call.invited, e->call->invited, e->call->n_invited * sizeof e->call->invited[0]);
         }
@@ -3596,6 +3636,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         m->in_call = 1;
         m->call = *e->call;
+        call_joined_note(m, e->call->call_id);
         /* What Calls home already knows of it: the joined frame carries no
          * subject or conversation. */
         const oc_call_view *known = oc_model_call(m, e->call->call_id);
@@ -3603,6 +3644,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             m->call.from_channel = known->from_channel;
             m->call.chat_channel = known->chat_channel;
             m->call.recording = known->recording;
+            m->call.rec_by = known->rec_by;
             memcpy(m->call.subject, known->subject, sizeof m->call.subject);
         }
         m->call_pending = 0;

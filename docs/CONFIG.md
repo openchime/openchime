@@ -239,6 +239,7 @@ Read by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.m
 | `OPENCHIME_DEV_MIC_ECHO` | *(unset)* | Clients: the speaker echoed into the microphone (`1`), or alone (`only`). |
 | `OPENCHIME_DEV_CAPTURE` | *(unset)* | Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`. |
 | `OPENCHIME_DEV_SCREEN_GONE_MS` | *(unset)* | Clients: the synthetic screen ends after this many ms. |
+| `OPENCHIME_DEV_CALL_HISTORY_PAGE` | *(unset)* | Clients: how many calls a page of the call history asks for (1 to 50; 50 unset), so a test reaches the next page with a few calls. |
 | `OPENCHIME_DEV_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
 | `OPENCHIME_DEV_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
 | `OPENCHIME_DEV_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |

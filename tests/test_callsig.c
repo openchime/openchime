@@ -83,7 +83,7 @@ static void roster(oc_callsig *cs, oc_queue *q, const oc_call_part *parts, uint1
 static void state(oc_callsig *cs, oc_queue *q, uint64_t call_id, int ended) {
     uint64_t parts[2] = { ME, BOB };
     oc_call_state st = { call_id, oc_slice_str("standup"), ME, 1, CH, CH + 1, 0, (uint8_t)ended, (uint16_t)(ended ? 0 : 2),
-                         parts, 0, NULL, 0 };
+                         parts, 0, NULL, 0, 0 };
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK);
     feed(cs, q, buf, w.len);

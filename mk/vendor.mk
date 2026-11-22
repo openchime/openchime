@@ -49,6 +49,11 @@ $(LIBAVC_A):
 $(LAME_A):
 	scripts/build/lame.sh
 
+# The font a call's recording names people in (daemon/callrec_render.c), compiled in.
+$(CALLREC_FONT_RES): third_party/fonts/NotoSans-Regular.ttf scripts/build/embed_res.py
+	@mkdir -p $(dir $@)
+	python3 scripts/build/embed_res.py $@ oc_callrec_font=third_party/fonts/NotoSans-Regular.ttf
+
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py
 	@mkdir -p $(dir $@)

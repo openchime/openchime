@@ -68,13 +68,41 @@ typedef enum {
     OC_CALLREC_FAILED,         /* the spool is damaged, or decoding, encoding or writing failed */
 } oc_callrec_status;
 
+/* Where the recording's picture finds people's avatars (CALLS.md §8): `load`
+ * gives the bytes stored under `key` (heap, freed by the caller), 0, or -1.
+ * NULL: no avatars, each person their initials on their colour. */
+typedef struct {
+    int  (*load)(void *ctx, const char *key, uint8_t **data, size_t *len);
+    void *ctx;
+} oc_callrec_assets;
+
 /* Make the recording of the spool in `spool_dir` at `out_path` with `c`. On
  * OC_CALLREC_OK the file is there and `*bytes`, `*duration_ms` describe it; on
  * anything else no file is left. `cancel` (if non-NULL) is checked between
  * frames. */
-oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *spool_dir, const char *out_path,
+oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const oc_callrec_assets *assets,
+                                    const char *spool_dir, const char *out_path,
                                     const volatile int *cancel, uint64_t *bytes, uint32_t *duration_ms,
                                     char *err, size_t errcap);
+
+/* How a person is drawn without a camera (CALLS.md §8): in their box, a circle
+ * holding their avatar -- or their initials on their own colour -- with their
+ * name under it; the speaker in the large area, the rest in the strip; a ring
+ * round the box of whoever is speaking. The layout of a box, `tile` -1 the
+ * large one and 0.. the strip's: */
+typedef struct { int x, y, w, h, cx, cy, r, name_y, name_px; } oc_callrec_layout;
+void oc_callrec_face_layout(int tile, oc_callrec_layout *out);
+#define OC_CALLREC_RING_Y 95       /* the speaking ring: the clients' accent blue */
+#define OC_CALLREC_RING_U 192
+#define OC_CALLREC_RING_V 75
+#define OC_CALLREC_RING_W 6
+/* One frame as it draws people with no camera and no share, for a test:
+ * faces[0] large, the rest in the strip, into an OC_CALLREC_WIDTH ×
+ * OC_CALLREC_HEIGHT I420 buffer. An avatar is a PNG or JPEG's bytes. */
+typedef struct { uint64_t user; const char *name; const uint8_t *avatar; size_t avatar_len; int speaking; } oc_callrec_face;
+int oc_callrec_compose(uint8_t *i420, const oc_callrec_face *faces, int n);
+/* The colour a person without an avatar is drawn in. */
+void oc_callrec_person_colour(uint64_t user, uint8_t *y, uint8_t *u, uint8_t *v);
 
 /* A stand-in for the codecs, for tests (callrec_render.c). An Opus "packet" is
  * its frame's sample value, one byte, decoded as a frame of that value; a VP9

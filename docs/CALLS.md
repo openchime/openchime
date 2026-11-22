@@ -28,16 +28,20 @@ the history and on its page.
   invitees alone. Being a member of the conversation it was started from gives nothing.
   There is no ringing and no answering: a call is **there**, listed for its invitees, until
   it ends.
-- **Starting.** From Calls home's **New call** (a subject, and anyone in the workspace), or
-  from a conversation's call button, which opens the same picker with the subject the
-  conversation suggests — a channel's name, or "Call with" and who a DM is with — and its
-  people ticked, as many as the call holds, the most recently active first. The subject is
-  required (at most `OC_CALL_SUBJECT_MAX`, 200 bytes) and anyone in the call may rename it.
+- **Starting.** Every call starts from **New Call**, one dialog wherever it is opened from
+  (§2): the Calls panel's **New**, the sidebar's **+**, a conversation's call button and
+  Ctrl+Shift+L. From a conversation it opens with the subject the conversation suggests — a
+  channel's name, or "Call with" and who a DM is with — and its people asked, as many as the
+  call holds, the most recently active first. A subject left blank becomes "Call with" and
+  the people asked. It is at most `OC_CALL_SUBJECT_MAX` (200 bytes), and anyone in the call
+  may rename it.
 - **The call's message.** A call started from a conversation posts one message there,
   readable by any client ("alice started a call: Weekly review"), which carries the call's
-  id: a client draws it as the call — **Join** while it runs, **Open** once you are in it,
-  the call's page after. It notifies nobody (the invitation does that) and follows the call
-  as it goes, edited in place. A call started from Calls home posts nothing anywhere.
+  id: a client draws it as the call's **summary card** (§2), which follows the call — who
+  is in it and **Join** (**Open** once you are in it) while it runs; who took part, for how
+  long, the recording's **Play** and **Details** after. It notifies nobody (the invitation
+  does that) and is edited in place as the call goes. A call started from the Calls panel
+  posts nothing anywhere.
 - **The call's chat.** Every call has a conversation of its own, made with it: a DM in
   kind, marked with the call's id, its members the call's invitees and participants. No
   conversation list shows it; it is reached from the call view and the call's page.
@@ -55,8 +59,10 @@ the history and on its page.
   is the same stay), each invitation and its answer, and the timeline — cameras, shares,
   recordings and renames, each with who and when — are kept, and are the call's page.
 - **Missed calls.** A call you were asked to, never joined nor declined, and that is over is
-  in your history as **missed**. Nothing is written in the conversation for it. Missed-call
-  lines stored before calls had records still read as they did.
+  in your history as **missed**, and marked on the sidebar's Calls row until you open the
+  Calls panel; when you last did is kept with the preferences, so a missed call is marked on
+  every device until it is seen on one. Nothing is written in the conversation for it.
+  Missed-call lines stored before calls had records still read as they did.
 - **The cap.** At most ten people in a call (`OC_CALL_MAX`; development mode may set
   `OPENCHIME_DEV_CALL_MAX`, 2 to 32). A join or an invitation past it is refused with
   `CALL_FULL`. The Recorder (§8) is not counted. In a public demo a call ends after twenty
@@ -75,34 +81,70 @@ is in the database, and stays after a restart.
 
 ## 2. Calls home
 
-The Home sidebar has a **Calls** row above Channels and Direct messages, with how many calls
-are going on that you were asked to (accented while one waits for your answer) and **+**,
-New call. It opens **Calls home**:
+One Calls panel, one New Call, one pre-join screen and one call record: whichever way a
+person comes to a call, it is the same place, and the same words.
 
-- **Going on now**: each running call you were asked to — its subject, who started it, for
-  how long and how many are in it — with **Join** (accented while you are asked) and
+**The sidebar** has a **Calls** row above Channels and Direct messages, with how many calls
+are going on that you were asked to (accented while one waits for your answer), a mark for
+missed calls not yet seen, and **+**, New Call. A conversation with a call going on that was
+started from it carries a phone beside its name, as it would a count.
+
+**The Calls panel** (Calls home) is one scrolling list:
+
+- **Active** first, its heading staying in view while the rest scrolls: each running call
+  you were asked to, with its subject, who is in it (up to three faces), for how long, the
+  recording mark when it is recorded, and **Join** (accented while you are asked) and
   **Decline**, or **Open** once you are in it;
-- **Before**: your past calls, newest first, a page at a time (**Show older calls**) — when,
-  who started it or "You missed it" / "You declined it", how many were in it, and marks for
-  a recording and a transcript;
-- **New call**, top right: the picker, with a subject to give and the people to ask.
+- then **Past**, newest first, under date headings — Today, Yesterday, This week, then by
+  month — each row with up to three faces of who took part, its subject, when and for how
+  long, the recording mark, and missed calls drawn as missed with **Call back**, which
+  opens New Call with the same people and subject. Older calls load as the list scrolls;
+- **All**, **Joined** and **Missed** filter it, and **New** at the top opens New Call.
 
-A row opens the call's **page** (below).
+Selecting a call opens its **page**: beside the list on a wide window, in place of it on a
+narrow one, with **Back**.
 
-**In the conversation** a call was started from, its message is the way in: Join, Open, or
-the page once it is over. While it runs, a banner under the header says who is in it and for
-how long, with **Join** (**Open** once you are in it) and, when you were asked, **Decline**.
-The header's phone button says what it will do on hover — "Start a call" or "Join the call";
-pressed with no call going on, it opens the picker.
+**New Call** is one dialog. It has the **subject**, a **search** that adds people, user
+groups and conversations (a group or a conversation adds everyone in it) as chips — a chip's
+× takes its person off — and, under it, **suggestions**: the conversation's people, then
+those called recently. A **counter** stands against the call's cap and refuses past it,
+saying how many the call holds. Beside it a **preview** of the camera and the microphone's
+level, with the microphone, speaker and camera pickers. From a conversation it opens filled
+in, with nothing focused but **Start**, so Enter starts the call. In a call, **Invite** opens
+it to invite: **Invite** asks who is picked into the call going on.
+
+**The pre-join screen** comes before every join — from the panel, the card, the banner, the
+call view and an invitation's toast. It says who is already in the call and whether it is
+end-to-end encrypted or being recorded ("This call is being recorded.", §8.4), shows a
+preview of the camera with the microphone's level and the microphone, speaker and camera
+pickers, and lets you join with the microphone off and the camera on or off. Nothing of yours
+is sent until you press **Join**, and **Cancel** leaves you out. A camera that cannot start
+is said there; the camera cannot be turned on, and you join with audio only.
+
+**In the conversation** a call was started from, its **summary card** is the way in. While
+the call runs: its subject, who is in it, for how long and **Join** (**Open** once you are
+in it). After: who took part, for how long, the recording mark and **Play** when it was
+recorded, and **Details**, its page. While it runs, a banner under the header says who is
+in it and for how long, with **Join** (**Open** once you are in it) and, when you were
+asked, **Decline**. The header's phone button says what it will do on hover — "Start a
+call" or "Join the call"; pressed with no call going on, it opens New Call.
+
+**The recording mark** is one red mark wherever a recording shows — the call view, the strip
+while in a call elsewhere, the Calls panel, the summary card and the call's page. While a
+recording goes on it names who started it ("alice is recording", "You are recording"), from
+`CALL_STATE`'s `rec_by`, and in the call it marks, **Stop** is on it; over, it says
+"Recorded".
 
 **The call view** shows the call's subject and how long it has run, and the roster: each
 person's card, sized to fill the stage, with their avatar, a ring while they speak (the
 accent colour, not the presence dot's green), a mark when they are muted, and a volume for
 each, with its value as a percentage. The call's chat — its messages and composer — is in a
 panel on the right, open by default and folded away with **Hide chat**; **Details** opens
-the call's page. While the call is recorded a **Recording** mark is at the top right of the
+the call's page. While the call is recorded the recording mark is at the top right of the
 stage, for everyone in it and everyone asked, and **Record** (§8) — **Stop recording** while
-it is — is beside Details where the daemon records calls. The controls are one bar:
+it is — is beside Details where the daemon records calls. **Self-view** shrinks your own
+picture to a corner of the stage, hides it, or shows it among the others again; the choice
+is kept with the preferences. The controls are one bar:
 **Mute** (with the microphone's level on it, and a tooltip saying "You are currently muted"
 or "You are currently not muted", and Ctrl+Shift+M), **Camera**, **Share screen**,
 **Invite**, **Settings** and **Leave**; **End for everyone**, for the starter alone, sits
@@ -112,16 +154,19 @@ everyone says "End"; each keeps its full name for a screen reader. **Settings** 
 panel holding the **microphone**, **speaker** and **camera** pickers, the microphone's level
 and **Noise suppression**.
 
-**Joining a recorded call** shows "This call is being recorded." first, with **Join** and
-**Cancel**: nothing of yours is sent until you press Join (§8.4).
+**A screen reader is told**, once each, when a recording starts ("alice started
+recording") or stops, when someone joins or leaves the call you are in, and, joining a
+recorded call, that it is being recorded and by whom.
 
-**The call's page** — from a row in Calls home, Details in the call view, or the call's
-message once it is over — shows its subject, when it ran, and: **People**, each with when
-they were in it; **Asked, and not in it**, with who declined; the **Timeline**; the
-**Recording**, each with who started it, its length and **Play**, which plays it as a video
-message is played (or that it is being made, or could not be); and the **Transcript**, line
-by line with who said it and when, a page at a time. The call's chat is beside it, as beside
-the call. A page of a call still going on offers **Join** or **Open the call**.
+**The call's page** — from a row in the Calls panel, Details in the call view, or the
+summary card once the call is over — shows its subject and when it ran, then, in this
+order: the **Recording**, each with the recording mark, who started it, its length and
+**Play**, which plays it as a video message is played (or that it is being made, or could
+not be); **Who was there when**, a strip with a bar for each person across the call's
+length and the recording's span marked over them; **People**, each with when they were in
+it; **Asked, and not in it**, with who declined; the **Timeline**; and the **Transcript**,
+line by line with who said it and when, a page at a time. The call's chat is beside it, as
+beside the call. A page of a call still going on offers **Join** or **Open the call**.
 
 **Cameras** (REQ-160, §7). **Camera** turns yours on and off; while it is on the button is
 filled and says **Stop camera**. Your own card shows it at once, mirrored as a mirror shows
@@ -138,13 +183,14 @@ remembered with the preferences. Under a shared screen the strip is tiles too, e
 or a face. The view takes only the cameras it draws — every card in the grid, the large one
 and the strip's tiles otherwise, none while another view is on screen — and tells the relay
 when that changes (`CALL_VIDEO_SUB`, §7.4). The controls are `call.camera`,
-`call.camera.picker` and `call.layout` to a screen reader and the harness, as every call
-control is. Above the bar is the push-to-talk hint, whatever route the audio takes. Before
-joining the view shows who is in the call and **Join** (and **Decline** for an invitation).
+`call.camera.picker`, `call.layout` and `call.selfview` to a screen reader and the harness,
+as every call control is. Above the bar is the push-to-talk hint, whatever route the audio
+takes. Before joining the view shows who is in the call and **Join** (and **Decline** for an
+invitation), which opens the pre-join screen.
 
 **While in a call elsewhere**, a strip at the foot of the sidebar shows the call's subject and
-its length — or who is sharing a screen — with Mute (and its tooltip), Leave, and a way back
-to the call view.
+its length — or who is sharing a screen — and the recording mark while it is recorded, with
+Mute (and its tooltip), Leave, and a way back to the call view.
 
 **Sharing a screen** (REQ-161): anyone in the call can share a screen or a window, one
 person at a time — starting a share takes over from whoever was sharing. The others see it
@@ -157,17 +203,22 @@ what is shared. §6 is the design.
 (push to talk) — voice input's chord; in a call the call owns the microphone, so the two
 never compete. **Ctrl+Shift+S** shares your screen, or stops sharing it.
 
-**Devices, noise suppression and the layout** are remembered with the other preferences:
+**Devices, noise suppression, the layout and self-view** are remembered with the other preferences:
 the microphone, the speaker and the camera by a hash of their ids, so another machine,
 which has other ids, uses its own defaults.
 
 **Invitation toasts** carry **Join** and **Decline**, and the call sound.
 
 **Every control has a name** for a screen reader and the harness: `sidebar.calls`,
-`sidebar.calls.new`, `calls.new`, `calls.more`, `calls.row.<id>`, `calls.join.<id>`,
-`calls.decline.<id>`, `call.msg.<id>`, `call.pick.<user>`, `call.pick.go`, `call.page`,
-`call.record`, `call.rec.join`, `call.rec.cancel`, `callpage.join`, `callpage.chat`,
-`callpage.play.<recording>` and `callpage.transcript.more`, beside the call view's own.
+`sidebar.calls.new`, `calls.new`, `calls.filter.all`, `calls.filter.joined`,
+`calls.filter.missed`, `calls.row.<id>`, `calls.join.<id>`, `calls.decline.<id>`,
+`calls.callback.<id>`, `callpage.back`, `call.msg.<id>`, `call.msg.<id>.play`,
+`call.pick.<user>`, `call.pick.group.<id>`, `call.pick.conv.<id>`, `call.pick.chip.<user>`,
+`prejoin.mic`, `prejoin.camera`, `call.page`, `call.record`, `<where>.recmark.stop` (`call`,
+`strip`, `home`, `card` or `page`), `call.selfview`, `call.rec.join`, `call.rec.cancel`,
+`callpage.join`, `callpage.chat`, `callpage.play.<recording>` and
+`callpage.transcript.more`, beside the call view's own. New Call's and the pre-join
+screen's Start, Invite, Join and Cancel are the dialog's buttons.
 
 **The terminal client** has no calls to join, but lists them: **Calls**, from the launcher,
 is the history, newest first, with each call's subject, when, how many were in it and
@@ -820,8 +871,10 @@ and an X25519 key pair made for this recording and wiped when it leaves. It join
 epoch**, marked `RECORDER` on the roster and not counted toward the cap, so every device
 seals its next key to it as to anyone (§5.3): it can read what is said from that epoch on,
 and nothing before. Stopping — anyone in the call may — takes it out at a new epoch, so
-nothing said after is sealed to it. `CALL_STATE` carries the recorded flag, and every client
-shows the **Recording** mark while it is set. The call ending, or the daemon stopping,
+nothing said after is sealed to it. `CALL_STATE` carries the recorded flag and who started
+it (`rec_by`), and every client shows the recording mark, naming them, while it is set (§2).
+Starting, the Recorder writes a `people` file to the spool — each person's id, name and
+avatar's key, from the writer's user rows — and adds whoever joins later. The call ending, or the daemon stopping,
 stops it.
 
 The relay hands the Recorder every packet relayed in a recorded call (a hook beside the
@@ -844,8 +897,10 @@ timeline of joins, leaves, cameras and shares. Stopping hands the spool to a wor
   frame concealed, mixed and softly limited, into one mono Opus track at 48 kHz;
 - **the picture**: the call view's speaker layout — whoever is speaking large, staying until
   someone else speaks, everyone else in a strip below; a shared screen large while it is
-  shared, everyone in the strip; each person their camera while it is on, else a tile of
-  their own colour — in VP9 at 1280×720, 15 fps, 450 kbps;
+  shared, everyone in the strip; each person their camera while it is on, else their avatar
+  (or their initials on their own colour, without one) with their name under it, and a ring
+  round whoever is speaking — in VP9 at 1280×720, 15 fps, 450 kbps. Avatars are decoded
+  with stb_image, names drawn with stb_truetype in Noto Sans, compiled in (VENDORS.md);
 - in the restricted MP4 the clients play (`shared/oc_mp4.c`), written to a file as it goes.
 
 The recording goes into the store and is a **message in the call's chat**, from who started
@@ -860,9 +915,9 @@ A longer recording is marked **failed**, with that reason, rather than made wron
 
 ### 8.4 Joining a recorded call
 
-A client that joins a call already being recorded shows "This call is being recorded."
-before it joins, with **Join** and **Cancel**: nothing of its user's is sent unless they
-press Join. The engine holds the same line (`client/core/call/call_engine.c`): a device
+A client that joins a call already being recorded says "This call is being recorded." on
+the pre-join screen (§2), with **Join** and **Cancel**: nothing of its user's is sent unless
+they press Join. The engine holds the same line (`client/core/call/call_engine.c`): a device
 that comes into a call whose roster has the Recorder sends no audio and no camera until its
 user acknowledges, and the hold lifts by itself if the recording stops. Someone already in
 the call when recording starts is not held back; they see the mark.
@@ -884,7 +939,8 @@ recording past `OPENCHIME_CALL_RECORDING_DAYS` is deleted by the storage pass.
 
 - `tests/test_callrec.c` (in `make test`): a spool made into a recording with stand-in
   codecs — the voices mixed and each where it was said, after a silence and after a device
-  counted afresh; the speaker layout following who spoke; a share large while shared; the
+  counted afresh; the speaker layout following who spoke; a share large while shared; a
+  person drawn as their avatar with their name under it and the ring on the speaker; the
   worker storing it under its key and removing the spool, finishing on its next start one
   it was stopped in the middle of, and failing a damaged spool with why.
 - `tests/test_callrec_media.c` (`OC_TEST_ONLY=callrec_media`): the same through libvpx and
@@ -898,5 +954,6 @@ recording past `OPENCHIME_CALL_RECORDING_DAYS` is deleted by the storage pass.
   not counted toward the cap, the recording's row and spool, and an empty one failed.
 - `tests/test_dbwriter.c`: a recording made and failed in the database, the list a start
   resumes, and the retention.
-- `tools/gui/features/calls.sh` and `callhome.sh`: Record, the mark both people see, the
-  joiner's notice, and the recording played on the call's page (TESTING.md).
+- `tools/gui/features/calls.sh`, `callhome.sh` and `prejoin.sh`: Record, the mark naming
+  who records and its Stop, the announcements, the pre-join screen's notice, the summary
+  card's Play, and the recording played on the call's page (TESTING.md).

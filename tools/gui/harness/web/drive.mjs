@@ -36,7 +36,8 @@ const log = (s) => fs.appendFileSync(path.join(dir, 'drive.log'), `${new Date().
 
 const url = new URL(baseUrl);
 const pass = ['OPENCHIME_DEV_AUDIO', 'OPENCHIME_DEV_MIC_ECHO', 'OPENCHIME_DEV_CAPTURE', 'OPENCHIME_DEV_TONE',
-              'OPENCHIME_DEV_VIDEO_CAP_MS', 'OPENCHIME_DEV_SCREEN_GONE_MS', 'OPENCHIME_DEV_MIC_LEAD_MS'];
+              'OPENCHIME_DEV_VIDEO_CAP_MS', 'OPENCHIME_DEV_SCREEN_GONE_MS', 'OPENCHIME_DEV_MIC_LEAD_MS',
+              'OPENCHIME_DEV_CALL_HISTORY_PAGE'];
 for (const k of pass) if (process.env[k]) url.searchParams.append('env', `${k}=${process.env[k]}`);
 const mic = process.env.OPENCHIME_DEV_MIC;
 if (mic) { url.searchParams.append('env', 'OPENCHIME_DEV_MIC=/mic.wav'); url.searchParams.set('mic', 'mic.wav'); }
@@ -169,6 +170,15 @@ async function serve(line) {
     }, evs);
     // Dispatched, not yet taken: the client takes the batch on a frame of its
     // own, so what follows polls for the state the chord leads to.
+    writeAck('ok');
+    return;
+  }
+  // The window's size, as `size` sets it on Windows: here the window is the
+  // viewport (fill-document), so the viewport is resized.
+  if (verb === 'size') {
+    const [w, h] = arg.split(/\s+/).map((n) => parseInt(n, 10));
+    if (!(w > 0 && h > 0)) { writeAck('ERR size: <w> <h>'); return; }
+    await page.setViewportSize({ width: w, height: h });
     writeAck('ok');
     return;
   }

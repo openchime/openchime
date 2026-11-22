@@ -127,7 +127,7 @@ static void test_render(void) {
     oc_test_path(out, sizeof out, dir, "rec.mp4");
     make_spool(spool);
     uint64_t bytes = 0; uint32_t dur = 0; char err[200] = "";
-    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_OK);
+    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, NULL, spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_OK);
     size_t len = 0;
     uint8_t *file = slurp(out, &len);
     CHECK(file && len == bytes);
@@ -177,7 +177,7 @@ static void test_render(void) {
     /* Cancelled in the middle: no file, the spool as it was. */
     unlink(out);
     volatile int cancel = 1;
-    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, spool, out, &cancel, &bytes, &dur, err, sizeof err) == OC_CALLREC_CANCELLED);
+    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, NULL, spool, out, &cancel, &bytes, &dur, err, sizeof err) == OC_CALLREC_CANCELLED);
     CHECK(access(out, F_OK) != 0 && dir_exists(spool));
 
     /* A damaged spool: a voice cut off in the middle of a frame. */
@@ -185,7 +185,7 @@ static void test_render(void) {
     snprintf(apath, sizeof apath, "%s/audio.%u", spool, UA);
     FILE *f = fopen(apath, "ab");
     if (f) { uint8_t half[7] = { 0 }; fwrite(half, 1, sizeof half, f); fclose(f); }
-    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_FAILED);
+    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, NULL, spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_FAILED);
     CHECK(access(out, F_OK) != 0 && err[0]);
     /* An empty one: nothing to make. */
     char empty[400];
@@ -194,7 +194,7 @@ static void test_render(void) {
     FILE *m = spool_file(empty, "meta");
     uint8_t h[30]; memcpy(h, "OCREC1", 6); w64(h + 6, 1); w64(h + 14, 1); w64(h + 22, T0);
     if (m) { fwrite(h, 1, sizeof h, m); fclose(m); }
-    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, empty, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_EMPTY);
+    CHECK(oc_callrec_render(&oc_callrec_stub_codecs, NULL, empty, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_EMPTY);
     /* Longer than the profile holds (about 51 minutes): refused, and said so,
      * before any of it is made. */
     {
@@ -212,7 +212,7 @@ static void test_render(void) {
         }
         if (la) fclose(la);
         err[0] = '\0';
-        CHECK(oc_callrec_render(&oc_callrec_stub_codecs, longs, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_FAILED);
+        CHECK(oc_callrec_render(&oc_callrec_stub_codecs, NULL, longs, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_FAILED);
         /* contract: the reason the recording's row carries, as the page shows it */
         CHECK(strstr(err, "51 minutes") != NULL && access(out, F_OK) != 0);
     }
@@ -301,9 +301,66 @@ static void test_file_writer(void) {
     oc_test_rmtree(dir);
 }
 
+/* A 4×4 PNG, all red: an avatar. In BT.601 studio range red is Y 82, U 91, V 240. */
+static const uint8_t RED_PNG[] = {
+    0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x04,
+    0x08,0x02,0x00,0x00,0x00,0x26,0x93,0x09,0x29,0x00,0x00,0x00,0x10,0x49,0x44,0x41,0x54,0x78,0x9c,0x63,0xf8,0xcf,0xc0,0x00,
+    0x47,0x0c,0xc4,0x71,0x00,0xae,0x93,0x0f,0xf1,0xd0,0x5f,0x23,0x9e,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,
+    0x82 };
+
+#define PX(buf, x, y)  ((buf)[(size_t)(y) * OC_CALLREC_WIDTH + (size_t)(x)])
+#define PU(buf, x, y)  ((buf)[OC_CALLREC_WIDTH * OC_CALLREC_HEIGHT + (size_t)((y) / 2) * (OC_CALLREC_WIDTH / 2) + (size_t)((x) / 2)])
+/* The brightest luma in a box: white text, where there is any. */
+static int brightest(const uint8_t *buf, int x0, int y0, int x1, int y1) {
+    int m = 0;
+    for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) if (PX(buf, x, y) > m) m = PX(buf, x, y);
+    return m;
+}
+
+/* How people are drawn (CALLS.md §8): alice, speaking, large, as her avatar
+ * with her name under it and the ring round her box; bob in the strip as his
+ * initials on his colour, with his name; a name the font has no letters for
+ * drawn as the colour alone, no initials and no name. */
+static void test_faces(void) {
+    uint8_t *f = malloc((size_t)OC_CALLREC_WIDTH * OC_CALLREC_HEIGHT * 3 / 2);
+    CHECK(f != NULL);
+    if (!f) return;
+    const oc_callrec_face faces[3] = {
+        { UA, "alice", RED_PNG, sizeof RED_PNG, 1 },
+        { UB, "Bob Builder", NULL, 0, 0 },
+        { 33, "\xe6\x9d\x8e\xe6\x98\x8e", NULL, 0, 0 },     /* 李明 */
+    };
+    CHECK(oc_callrec_compose(f, faces, 3) == 0);
+    oc_callrec_layout L, S0, S1;
+    oc_callrec_face_layout(-1, &L);
+    oc_callrec_face_layout(0, &S0);
+    oc_callrec_face_layout(1, &S1);
+    /* alice: her avatar in the circle, */
+    int py = L.cy - L.r * 7 / 10;
+    CHECK(abs(PX(f, L.cx, py) - 82) <= 2 && abs(PU(f, L.cx, py) - 91) <= 2);
+    /* her name under it, */
+    CHECK(brightest(f, L.cx - 60, L.name_y, L.cx + 60, L.name_y + L.name_px) > 200);
+    /* and the ring round her box, the clients' accent. */
+    CHECK(PX(f, L.x + 2, L.y + L.h / 2) == OC_CALLREC_RING_Y && PU(f, L.x + 2, L.y + L.h / 2) == OC_CALLREC_RING_U);
+    /* bob: his colour, his initials on it, his name, and no ring. */
+    uint8_t by, bu, bv;
+    oc_callrec_person_colour(UB, &by, &bu, &bv);
+    CHECK(PX(f, S0.cx, S0.cy - S0.r * 7 / 10) == by);
+    CHECK(brightest(f, S0.cx - S0.r / 2, S0.cy - S0.r / 2, S0.cx + S0.r / 2, S0.cy + S0.r / 2) > 200);
+    CHECK(brightest(f, S0.x + 8, S0.name_y, S0.x + S0.w - 8, S0.name_y + S0.name_px) > 200);
+    CHECK(PX(f, S0.x + 2, S0.y + S0.h / 2) == 16);
+    /* 李明: the colour alone -- no letters the font cannot draw. */
+    uint8_t ly, lu, lv;
+    oc_callrec_person_colour(33, &ly, &lu, &lv);
+    CHECK(PX(f, S1.cx, S1.cy) == ly);
+    CHECK(brightest(f, S1.x + 8, S1.name_y, S1.x + S1.w - 8, S1.name_y + S1.name_px) == 16);
+    free(f);
+}
+
 int run_callrec_tests(void) {
     printf("test_callrec: the recording from a spool -- mix, speaker layout, share; the worker; a damaged spool\n");
     test_file_writer();
+    test_faces();
     test_render();
     test_worker();
     return failures;

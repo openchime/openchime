@@ -141,6 +141,7 @@ const cfg_row OC_CFG[] = {
     CLIENT("OPENCHIME_DEV_MIC_ECHO", CFG_DEV, G_DEV, "Clients: the speaker echoed into the microphone (`1`), or alone (`only`)."),
     CLIENT("OPENCHIME_DEV_CAPTURE", CFG_DEV, G_DEV, "Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`."),
     CLIENT("OPENCHIME_DEV_SCREEN_GONE_MS", CFG_DEV, G_DEV, "Clients: the synthetic screen ends after this many ms."),
+    CLIENT("OPENCHIME_DEV_CALL_HISTORY_PAGE", CFG_DEV, G_DEV, "Clients: how many calls a page of the call history asks for (1 to 50; 50 unset), so a test reaches the next page with a few calls."),
     CLIENT("OPENCHIME_DEV_VIDEO_CAP_MS", CFG_DEV, G_DEV, "Clients: a shorter video message cap, in ms."),
     CLIENT("OPENCHIME_DEV_CALL_TIMERS", CFG_DEV, G_DEV, "Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset."),
     CLIENT("OPENCHIME_DEV_SUFFIX", CFG_DEV, G_DEV, "Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14)."),

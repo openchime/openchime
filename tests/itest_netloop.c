@@ -6693,6 +6693,7 @@ static void test_call_recording(int port, const uint8_t *pin) {
     CHECK(got == 1 && e1 > epoch0 && count == 3);
     do { CHECK(read_state(&a, &st, sp, si) == 0); } while (!(st.flags & OC_CALL_STATE_RECORDING));
     CHECK(st.n_parts == 2);                                /* the people: the Recorder is not one */
+    CHECK(st.rec_by == ub);                                /* and who is recording it */
     char q[300];
     snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_recordings WHERE call_id=%llu AND state='recording' "
              "AND started_by=%llu AND spool LIKE '%%/recordings/' || id;", (unsigned long long)id, (unsigned long long)ub);
@@ -6706,6 +6707,10 @@ static void test_call_recording(int port, const uint8_t *pin) {
         snprintf(path, sizeof path, "%s/recordings/%d/meta", tpath("data"), main_db_int(q));
         struct stat sb;
         CHECK(stat(path, &sb) == 0 && sb.st_size == 30);
+        /* ...and who is in it and asked, for its picture: both of them, by name
+         * (oc_callrec_person: user, name length, name, key length, key). */
+        snprintf(path, sizeof path, "%s/recordings/%d/people", tpath("data"), main_db_int(q));
+        CHECK(WAIT_UNTIL(stat(path, &sb) == 0 && sb.st_size >= 2 * (9 + 1), 5000));
     }
     /* Not counted toward the cap (three here): carol, asked, gets in beside
      * the two people and the Recorder. */
@@ -6723,6 +6728,7 @@ static void test_call_recording(int port, const uint8_t *pin) {
     for (int i = 0; i < 6 && got != 0; i++) got = roster_recorder(&b, &e1, &count);
     CHECK(got == 0 && count == 3);
     do { CHECK(read_state(&b, &st, sp, si) == 0); } while (st.flags & OC_CALL_STATE_RECORDING);
+    CHECK(st.rec_by == 0);
     snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_recordings WHERE call_id=%llu AND state='processing' "
              "AND stopped_at_ms >= started_at_ms;", (unsigned long long)id);
     CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));

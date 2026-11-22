@@ -2160,7 +2160,7 @@ static void test_call_frames(void) {
     }
     {
         uint64_t parts[2] = { 10, 20 }, inv[1] = { 30 };
-        oc_call_state in = { 99, oc_slice_str("standup"), 10, 1751200500000ull, 7, 8, OC_CALL_STATE_RECORDING, 1, 2, parts, 1, inv, 20 };
+        oc_call_state in = { 99, oc_slice_str("standup"), 10, 1751200500000ull, 7, 8, OC_CALL_STATE_RECORDING, 1, 2, parts, 1, inv, 20, 10 };
         ROUNDTRIP(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_STATE, h, p);
         oc_call_state out; uint64_t gp[4], gi[4];
         CHECK(oc_decode_call_state(&p, &out, gp, 4, gi, 4) == OC_OK);
@@ -2168,7 +2168,7 @@ static void test_call_frames(void) {
         CHECK(out.flags == OC_CALL_STATE_RECORDING);
         CHECK(out.subject.len == 7 && memcmp(out.subject.ptr, "standup", 7) == 0);
         CHECK(out.n_parts == 2 && gp[1] == 20 && out.n_invited == 1 && gi[0] == 30);
-        CHECK(out.sharer == 20);
+        CHECK(out.sharer == 20 && out.rec_by == 10);
     }
     {
         uint8_t s1[OC_CALL_SEALED_LEN], s2[OC_CALL_SEALED_LEN];
@@ -2251,9 +2251,9 @@ static void test_call_frames(void) {
     }
     {
         oc_call_hist_entry e[2] = {
-            { 99, oc_slice_str("standup"), 10, 1000, 0, OC_CALL_RUNNING, 7, 8, 2, OC_CALL_HIST_PENDING },
+            { 99, oc_slice_str("standup"), 10, 1000, 0, OC_CALL_RUNNING, 7, 8, 2, OC_CALL_HIST_PENDING, 1, { 10 } },
             { 98, oc_slice_str("Q3"), 11, 500, 900, OC_CALL_ENDED_ALL, 0, 6, 3,
-              OC_CALL_HIST_JOINED | OC_CALL_HIST_RECORDING | OC_CALL_HIST_TRANSCRIPT },
+              OC_CALL_HIST_JOINED | OC_CALL_HIST_RECORDING | OC_CALL_HIST_TRANSCRIPT, 3, { 11, 12, 13 } },
         };
         oc_call_history_page pg = { 2, e, 1 };
         ROUNDTRIP(oc_encode_call_history_page(&w, OC_PROTOCOL_VERSION, &pg), OC_MSG_CALL_HISTORY_PAGE, h, p);
@@ -2262,6 +2262,7 @@ static void test_call_frames(void) {
         CHECK(oc_decode_call_history_page(&p, &got, ge, 4) == OC_OK && got.count == 2 && got.more == 1);
         CHECK(ge[0].call_id == 99 && slice_eq_str(ge[0].subject, "standup") && ge[0].flags == OC_CALL_HIST_PENDING);
         CHECK(ge[1].ended_at == 900 && ge[1].end_reason == OC_CALL_ENDED_ALL && ge[1].chat_channel == 6 && ge[1].n_people == 3);
+        CHECK(ge[0].n_faces == 1 && ge[0].faces[0] == 10 && ge[1].n_faces == 3 && ge[1].faces[2] == 13);
         CHECK(oc_decode_call_history_page(&keep, &got, ge, 1) == OC_E_MALFORMED);   /* more than room */
     }
     {

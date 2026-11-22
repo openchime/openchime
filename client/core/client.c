@@ -424,6 +424,10 @@ void oc_client_call_history(oc_client *c, uint64_t before_ms) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_calls_seen(oc_client *c, uint64_t seen_ms) {
+    if (c) oc_model_calls_seen(&c->model, seen_ms);
+}
+
 void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from) {
     oc_cmd *cmd = c && call_id ? oc_cmd_new(OC_CMD_CALL_DETAIL) : NULL;
     if (!cmd) return;

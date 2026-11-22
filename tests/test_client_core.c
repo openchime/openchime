@@ -484,6 +484,54 @@ static void test_emoji_aliases(void) {
     oc_model_free(&m);
 }
 
+/* One CALL_STATE as the core turns it into an event: call `id`, started at
+ * `at`, with `in` in it and `asked` asked (0 for nobody), or ended. */
+static void call_state_ev(oc_model *m, uint64_t id, uint64_t at, uint64_t in, uint64_t asked, int ended) {
+    oc_ev *e = oc_ev_new(OC_EV_CALL_STATE);
+    if (!e || !(e->call = calloc(1, sizeof *e->call))) { oc_ev_free(e); return; }
+    e->call->call_id = id; e->call->starter = 7; e->call->started_at = at; e->call->ended = (uint8_t)ended;
+    if (in) { e->call->parts[0] = in; e->call->n_parts = 1; }
+    if (asked) { e->call->invited[0] = asked; e->call->n_invited = 1; }
+    oc_model_apply(m, e);
+    oc_ev_free(e);
+}
+
+/* Missed calls not yet seen (CALLS.md §2): a call this user was asked to and
+ * that ended without them is counted; one they took, or declined (which takes
+ * them off the asked list), is not; a history row marked missed counts when it
+ * is newer than what was last seen; seeing them clears the count, and nothing
+ * older than that is counted again. */
+static void test_missed_calls_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 5;
+    call_state_ev(&m, 1, 1000, 7, 5, 0);   /* asked */
+    call_state_ev(&m, 1, 1000, 0, 0, 1);   /* ...and over: missed */
+    CHECK(m.n_call_missed == 1 && m.call_missed[0] == 1);
+    call_state_ev(&m, 2, 2000, 7, 5, 0);   /* asked, */
+    call_state_ev(&m, 2, 2000, 5, 0, 0);   /* joined, */
+    call_state_ev(&m, 2, 2000, 0, 0, 1);   /* over: not missed */
+    call_state_ev(&m, 3, 3000, 7, 5, 0);   /* asked, */
+    call_state_ev(&m, 3, 3000, 7, 0, 0);   /* declined: off the list, */
+    call_state_ev(&m, 3, 3000, 0, 0, 1);   /* over: not missed */
+    CHECK(m.n_call_missed == 1);
+    call_state_ev(&m, 1, 1000, 0, 0, 1);   /* the same end again: counted once */
+    CHECK(m.n_call_missed == 1);
+    /* Seen: cleared, and history older than then is not counted again. */
+    oc_model_calls_seen(&m, 3500);
+    CHECK(m.n_call_missed == 0 && m.call_missed_seen_ms == 3500);
+    oc_ev *e = oc_ev_new(OC_EV_CALL_HISTORY);
+    if (e && (e->call_hist = calloc(1, sizeof *e->call_hist))) {
+        e->call_hist->count = 3;
+        e->call_hist->rows[0] = (oc_call_hist_view){ .call_id = 9, .started_at = 4000, .ended_at = 4100, .flags = OC_CALL_HIST_MISSED };
+        e->call_hist->rows[1] = (oc_call_hist_view){ .call_id = 8, .started_at = 3900, .ended_at = 3950, .flags = OC_CALL_HIST_JOINED };
+        e->call_hist->rows[2] = (oc_call_hist_view){ .call_id = 1, .started_at = 1000, .ended_at = 1100, .flags = OC_CALL_HIST_MISSED };
+        oc_model_apply(&m, e);
+    }
+    oc_ev_free(e);
+    CHECK(m.n_call_missed == 1 && m.call_missed[0] == 9);
+    oc_model_free(&m);
+}
+
 static void test_capabilities(void) {
     oc_model m; oc_model_init(&m);
     CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
@@ -6961,6 +7009,7 @@ int run_client_core_tests(void) {
     }
 
     test_group_dm_title();
+    test_missed_calls_model();
     test_snippet_offer();
     test_action_pairing();
     test_groups_model();

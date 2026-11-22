@@ -263,7 +263,7 @@
  * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
  * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
  * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
-#define OC_PROTOCOL_VERSION 49u
+#define OC_PROTOCOL_VERSION 50u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1914,7 +1914,8 @@ typedef struct { uint64_t call_id; oc_slice subject; } oc_call_subject;
 typedef struct { uint64_t call_id; oc_slice subject; uint64_t starter; uint64_t started_at;
                  uint64_t from_channel; uint64_t chat_channel; uint8_t flags;
                  uint8_t ended; uint16_t n_parts; const uint64_t *parts;
-                 uint16_t n_invited; const uint64_t *invited; uint64_t sharer; } oc_call_state;
+                 uint16_t n_invited; const uint64_t *invited; uint64_t sharer;
+                 uint64_t rec_by; } oc_call_state;   /* rec_by: who started the recording going on, 0 none */
 /* oc_call_state.flags: the call is being recorded (CALLS.md §8). */
 #define OC_CALL_STATE_RECORDING 0x01u
 /* Start (on = 1) or stop recording the call; anyone in it may (CALLS.md §8). */
@@ -1967,9 +1968,12 @@ typedef struct { uint64_t before_ms; uint16_t limit; } oc_call_history;
 #define OC_CALL_HIST_PENDING    0x08u   /* running, and this user is asked and has not answered */
 #define OC_CALL_HIST_RECORDING  0x10u   /* it has a recording ready */
 #define OC_CALL_HIST_TRANSCRIPT 0x20u   /* it has a transcript */
+/* `faces`: up to OC_CALL_HIST_FACES of who took part, in the order they first
+ * joined, for a row's faces. */
+#define OC_CALL_HIST_FACES 3u
 typedef struct { uint64_t call_id; oc_slice subject; uint64_t starter; uint64_t started_at; uint64_t ended_at;
                  uint8_t end_reason; uint64_t from_channel; uint64_t chat_channel; uint16_t n_people;
-                 uint8_t flags; } oc_call_hist_entry;
+                 uint8_t flags; uint8_t n_faces; uint64_t faces[OC_CALL_HIST_FACES]; } oc_call_hist_entry;
 typedef struct { uint16_t count; const oc_call_hist_entry *entries; uint8_t more; } oc_call_history_page;
 /* CALL_DETAIL: one call's page, its transcript's lines from `line_from`. */
 typedef struct { uint64_t call_id; uint32_t line_from; } oc_call_detail;

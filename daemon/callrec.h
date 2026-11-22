@@ -91,6 +91,15 @@ void oc_callrec_sharer(oc_callrec *r, uint64_t sharer, uint64_t now_ms);
 void oc_callrec_camera(oc_callrec *r, uint64_t user, int on, uint64_t now_ms);
 /* A participant came or went: a timeline entry. */
 void oc_callrec_presence(oc_callrec *r, uint64_t user, int joined, uint64_t now_ms);
+/* Who someone in the recording is, for its picture (CALLS.md §8): their name
+ * and the store key of their avatar ("" for none), from the writer's user
+ * rows, written once each to the spool's `people` file. oc_callrec_knows says
+ * whether one has been, so the loop asks the writer only for those it has not:
+ * someone asked after the recording started, say. */
+#define OC_CALLREC_NAME_MAX  80
+#define OC_CALLREC_AVKEY_MAX 64
+void oc_callrec_person(oc_callrec *r, uint64_t user, const char *name, const char *avatar_key);
+int  oc_callrec_knows(const oc_callrec *r, uint64_t user);
 /* One packet of the call, as the relay hands it over. */
 void oc_callrec_packet(oc_callrec *r, uint64_t sender, uint16_t seq, uint8_t stream,
                        const uint8_t *ct, size_t len, uint64_t now_ms, const oc_callrec_io *io);

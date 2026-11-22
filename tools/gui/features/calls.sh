@@ -123,6 +123,10 @@ banner() { [ "$(f b 'callui ' banner)" = 1 ] && has b '^a11yitem call\.banner\.j
 check "bob's #general shows the call's banner, with Join and Decline" waitfor 10 seen b banner
 msg_join() { has b "^a11yitem call\.msg\.$ID "; }
 check "...and the call's message, with its Join" msg_join
+live_card() { has b "^callcard id=$ID live=1 faces=1 "; }
+check "...a summary card of the call going on, with alice's face" live_card
+live_mark() { has b "^callcards .*marked=$CH( |\$)"; }
+check "bob's sidebar marks #general as having a call going on" live_mark
 hdrtip() { has b '^callui .*hdrtip="Join the call"'; }
 check "the header's phone says \"Join the call\"" hdrtip
 act b shot calls_banner
@@ -133,6 +137,10 @@ act b shot calls_home_invited
 act b view home
 act b channel $CH
 act b call banner-join
+pj_up() { has b '^prejoin open=1'; }   # every join goes through the pre-join screen
+waitfor 10 seen b pj_up || gui_abort "bob's pre-join screen did not open"
+act b shot calls_prejoin
+act b call prejoin-join
 two_a()     { [ "$(f a 'call ' parts)" = 2 ]; }
 two_b()     { [ "$(f b 'call ' parts)" = 2 ]; }
 a_hears_b() { gt "$(peer a packets)" 50 && gt "$(peer a level)" 2000; }
@@ -239,6 +247,10 @@ act a call record on
 marked() { has "$1" "^callobj view=$ID .* recording=1 mark=[0-9]*,[0-9]*,[1-9]"; }
 check "alice records: her call view shows the Recording mark" waitfor 10 seen a marked a
 check "...and so does bob's" waitfor 10 seen b marked b
+named() { has a '^recmark where=call label="You are recording" stop=1$' && has b '^recmark where=call label="alice is recording" stop=1$'; }
+check "the mark names who is recording -- \"You are recording\", \"alice is recording\" -- with Stop on it" named
+said_rec() { has b '^call\.said .*"alice started recording"'; }
+check "bob's screen reader is told alice started recording" said_rec
 act a shot calls_recording
 act b shot calls_recording_bob
 # bob, already in it, was not held back; out and back in, he is.
@@ -246,13 +258,17 @@ act b call leave
 b_gone() { [ "$(f b 'call ' in)" = 0 ]; }
 waitfor 8 seen b b_gone || gui_abort "bob did not leave"
 act b call join $CH
-noticed() { has b "^callobj view=$ID .* notice=1 notice_id=$ID"; }
-check "joining again, bob is shown \"This call is being recorded.\" first" waitfor 10 seen b noticed
+noticed() { has b "^prejoin open=1 id=$ID recorded=1 "; }
+check "joining again, bob's pre-join screen says \"This call is being recorded.\"" waitfor 10 seen b noticed
 act b shot calls_recorded_notice
 not_yet() { [ "$(f b 'call ' in)" = 0 ]; }
 check "...and is not in it until he says so" not_yet
 a_no_b() { [ "$(f a 'call ' parts)" = 2 ]; }   # alice and the Recorder
 check "...so alice's call has nobody of his: herself and the Recorder" seen a a_no_b
+said_left() { has a '^call\.said .*"bob left"'; }
+check "alice's screen reader was told bob left" said_left
+n_said() { seen a true; grep -m1 '^call\.said ' "$(dfile a)" | grep -o 'n=[0-9]*' | cut -d= -f2; }
+SAID0="$(n_said)"
 act b call rec-join
 three_b() { [ "$(f b 'call ' parts)" = 3 ]; }   # alice, bob and the Recorder
 check "his Join puts him in it" waitfor 10 seen b three_b
@@ -260,10 +276,14 @@ check "his Join puts him in it" waitfor 10 seen b three_b
 check "...and, having said he saw it, alice hears him" waitfor 15 seen a a_hears_b
 ungated() { has b "^callobj .* gated=0 "; }
 check "...his engine sends" ungated
-act a call record off
+said_joined() { [ "$(n_said)" = $((SAID0 + 1)) ] && has a '^call\.said .*"bob joined"$'; }
+check "...and alice's that he joined, once" said_joined
+press a call.recmark.stop || gui_abort "the mark's Stop was not there"
 unmarked() { has "$1" "^callobj view=$ID .* recording=0 mark=0,0,0,0"; }
 check "alice stops it: the mark is gone for both" waitfor 10 seen a unmarked a
 check "...for bob too" waitfor 10 seen b unmarked b
+said_stop() { has b '^call\.said .*"Recording stopped"'; }
+check "the mark's Stop stopped it, and bob's screen reader was told" said_stop
 
 step "alice turns bob down"
 gui_snap a || gui_abort "alice's client did not dump"
@@ -341,6 +361,18 @@ a_out() { [ "$(f a 'call ' in)" = 0 ] && [ "$(f a calls n)" = 0 ]; }
 b_out() { [ "$(f b 'call ' in)" = 0 ] && [ "$(f b calls n)" = 0 ]; }
 check "confirmed, alice ends it: she is in no call and lists none" waitfor 8 seen a a_out
 check "...and neither is bob" waitfor 8 seen b b_out
+# Over: the card says who took part and for how long; recorded, it plays.
+over_card() { act b call home; act b view home; act b channel $CH; gui_snap b && has b "^callcard id=$ID live=0 faces=2 play=1"; }
+check "#general's card, the call over: who took part, and Play for its recording" waitfor 40 over_card
+card_mark() { has b '^recmark where=card label="Recorded" stop=0$'; }
+check "...with the same recording mark: \"Recorded\"" card_mark
+no_mark() { ! has b "^callcards .*marked=$CH( |\$)"; }
+check "...and the sidebar's mark is gone" no_mark
+act b shot calls_card
+press b "call.msg.$ID.play" || gui_abort "the card's Play was not there"
+card_plays() { gt "$(f b vm= play_dur)" 1000; }
+check "the card's Play plays the recording" waitfor 20 seen b card_plays
+act b key esc
 none_going() { has b '^calls n=0 '; }
 check "with no call going on, bob's Calls row counts none" waitfor 5 seen b none_going
 
@@ -372,6 +404,8 @@ waitfor 10 seen b b_invited || gui_abort "bob was not invited to alice's new cal
 # one, which on a Windows client with saved workspaces need not be the first.
 BWS="$(grep -m1 '^workspaces=' "$DB" | grep -o 'active=[0-9]*' | cut -d= -f2)"
 act b toastaction "join|${BWS:-0}|$CH|"
+waitfor 10 seen b pj_up || gui_abort "the toast's Join did not open the pre-join screen"
+act b call prejoin-join
 check "the toast's Join puts bob in the call" waitfor 10 seen b two_b
 act a call end
 waitfor 8 seen b b_out || gui_abort "alice's End did not end the call for bob"

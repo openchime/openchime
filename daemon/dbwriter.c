@@ -911,6 +911,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->call_subject);
     for (size_t i = 0; i < r->n_recs; i++) free(r->rec_spools ? r->rec_spools[i] : NULL);
     free(r->rec_ids); free(r->rec_spools);
+    free(r->rec_people);
     free(r->frame);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
@@ -9940,6 +9941,19 @@ static oc_dbres *process_call_history(sqlite3 *db, const oc_job *j) {
         }
     }
     sqlite3_finalize(st);
+    /* Each row's faces: who took part, in the order they first joined. */
+    st = NULL;
+    if (n && sqlite3_prepare_v2(db, "SELECT user_id FROM call_participants WHERE call_id=?1 GROUP BY user_id"
+                                    " ORDER BY MIN(joined_at_ms), user_id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        for (uint16_t i = 0; i < n; i++) {
+            sqlite3_reset(st);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)ents[i].call_id);
+            sqlite3_bind_int(st, 2, (int)OC_CALL_HIST_FACES);
+            while (ents[i].n_faces < OC_CALL_HIST_FACES && sqlite3_step(st) == SQLITE_ROW)
+                ents[i].faces[ents[i].n_faces++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
     uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
     if (buf) {
         oc_wbuf w; oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
@@ -10275,6 +10289,33 @@ static oc_dbres *process_recording_stop(sqlite3 *db, const oc_job *j) {
     sqlite3_int64 v[2] = { (sqlite3_int64)j->rec_id, (sqlite3_int64)dbw_now_ms() };
     call_exec(db, "UPDATE call_recordings SET stopped_at_ms=?2, state='processing' "
                   "WHERE id=?1 AND state='recording';", 2, v, 0, NULL);
+    return r;
+}
+
+/* Who people in a recording are: each one's name (its display name) and the
+ * store key of their avatar, while its bytes are there. Read. */
+static oc_dbres *process_rec_people(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_REC_PEOPLE;
+    r->call_id = j->call_id;
+    if (!j->n_call_uids || !(r->rec_people = calloc(j->n_call_uids, sizeof *r->rec_people))) return r;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(u.display_name, ''),"
+            "       COALESCE((SELECT a.storage_key FROM attachments a WHERE a.id = u.avatar_attachment_id"
+            "                 AND a.reclaimed_at_ms = 0), '')"
+            "  FROM users u WHERE u.id = ?1;", -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return r; }
+    for (uint16_t i = 0; i < j->n_call_uids; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_uids[i]);
+        if (sqlite3_step(st) != SQLITE_ROW) continue;
+        oc_rec_person *p = &r->rec_people[r->n_rec_people++];
+        p->user = j->call_uids[i];
+        snprintf(p->name, sizeof p->name, "%s", (const char *)sqlite3_column_text(st, 0));
+        snprintf(p->avatar_key, sizeof p->avatar_key, "%s", (const char *)sqlite3_column_text(st, 1));
+    }
+    sqlite3_finalize(st);
     return r;
 }
 
@@ -13331,7 +13372,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_EMOJI || type == OC_JOB_GET_CHANNEL_DESCRIPTION ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH || type == OC_JOB_CALL_HISTORY || type == OC_JOB_CALL_DETAIL ||
-           type == OC_JOB_RECORDINGS_PENDING ||
+           type == OC_JOB_RECORDINGS_PENDING || type == OC_JOB_REC_PEOPLE ||
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
@@ -13382,6 +13423,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_CALL_HISTORY)   return process_call_history(rdb, j);
     if (j->type == OC_JOB_CALL_DETAIL)    return process_call_detail(rdb, j);
     if (j->type == OC_JOB_RECORDINGS_PENDING) return process_recordings_pending(rdb, j);
+    if (j->type == OC_JOB_REC_PEOPLE)         return process_rec_people(rdb, j);
     return NULL;
 }
 

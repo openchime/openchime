@@ -1927,7 +1927,8 @@ static size_t call_encode_state(const call_t *c, int ended, uint8_t *buf, size_t
                          c->chat_channel, (uint8_t)(!ended && c->rec ? OC_CALL_STATE_RECORDING : 0),
                          (uint8_t)(ended ? 1 : 0),
                          (uint16_t)(ended ? 0 : np), parts, (uint16_t)(ended ? 0 : c->n_inv), c->invited,
-                         ended || !c->sharer_conn ? 0 : call_sharer(c) };
+                         ended || !c->sharer_conn ? 0 : call_sharer(c),
+                         !ended && c->rec ? c->rec_by : 0 };
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
     return oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK ? w.len : 0;
 }
@@ -2225,6 +2226,19 @@ static int call_add_invites(call_t *c, const uint64_t *uids, size_t n, uint64_t 
  * participant of its own -- a slot, its key, marked RECORDER, no connection --
  * at a new epoch, so the devices seal their keys to it from now on and never
  * for anything said before. The relay hands it the call's packets from now. */
+/* Who these people are, for the recording's picture: asked of the writer for
+ * those the Recorder does not know yet (oc_callrec_person). */
+static void call_rec_people(call_t *c, const uint64_t *users, int n) {
+    if (!c->rec || !g_call_dbw || n <= 0) return;
+    oc_job *j = oc_job_new(OC_JOB_REC_PEOPLE, 0);
+    if (!j || !(j->call_uids = calloc((size_t)n, sizeof *j->call_uids))) { oc_job_free(j); return; }
+    j->call_id = c->call_id;
+    for (int i = 0; i < n; i++)
+        if (users[i] && !oc_callrec_knows(c->rec, users[i])) j->call_uids[j->n_call_uids++] = users[i];
+    if (!j->n_call_uids) { oc_job_free(j); return; }
+    oc_dbwriter_submit(g_call_dbw, j);
+}
+
 static void call_rec_begin(int ep, conn **conns, call_t *c, uint64_t rec_id, uint64_t by) {
     c->rec_pending = 0;
     if (c->rec || c->n >= (int)OC_MAX_CALL_PARTICIPANTS) return;
@@ -2254,6 +2268,13 @@ static void call_rec_begin(int ep, conn **conns, call_t *c, uint64_t rec_id, uin
         if (c->parts[k].camera) oc_callrec_camera(c->rec, c->parts[k].user_id, 1, now);
     }
     if (g_relay) oc_relay_set_recorded(g_relay, c->call_id, 1);
+    {   /* Everyone in it and everyone asked: who each is, for its picture. */
+        uint64_t who[OC_MAX_CALL_PARTICIPANTS + OC_MAX_CALL_INVITES];
+        int nw = 0;
+        for (int k = 0; k < c->n; k++) if (!c->parts[k].recorder) who[nw++] = c->parts[k].user_id;
+        for (int k = 0; k < c->n_inv && nw < (int)(sizeof who / sizeof who[0]); k++) who[nw++] = c->invited[k];
+        call_rec_people(c, who, nw);
+    }
     call_log_event(c, OC_CALL_EV_RECORD_ON, by);
     call_send_roster(ep, conns, c, 0, 0);   /* the Recorder is given the roster, and makes its key */
     call_send_state(ep, conns, c, 0);
@@ -2402,7 +2423,7 @@ static void call_join_conn(int ep, conn **conns, call_t *c, conn *jc, const uint
     c->epoch++;
     call_uninvite(c, uid);
     if (!same_stay) call_log(c, OC_CALL_LOG_JOIN, uid);
-    if (c->rec) oc_callrec_presence(c->rec, uid, 1, wall_ms());
+    if (c->rec) { oc_callrec_presence(c->rec, uid, 1, wall_ms()); call_rec_people(c, &uid, 1); }
     /* Register the participant + token with the relay (ARCH-31). */
     audio_authorize(c->call_id, pt->user_id, pt->conn_id, token);
     oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
@@ -9666,6 +9687,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             oc_job *j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
             if (j) { j->rec_id = r->rec_id; oc_dbwriter_submit(g_call_dbw, j); }
         }
+        break;
+    }
+    case OC_RES_REC_PEOPLE: {
+        call_t *c = call_find(r->call_id);
+        for (size_t i = 0; c && c->rec && i < r->n_rec_people; i++)
+            oc_callrec_person(c->rec, r->rec_people[i].user, r->rec_people[i].name, r->rec_people[i].avatar_key);
         break;
     }
     case OC_RES_RECORDINGS_PENDING: {

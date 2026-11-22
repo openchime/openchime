@@ -136,7 +136,7 @@ int run_callrec_media_tests(void) {
     CHECK(picture(spool, "share", UB, 60, 2000, 4000) == 0);
 
     uint64_t bytes = 0; uint32_t dur = 0; char err[200] = "";
-    CHECK(oc_callrec_render(oc_callrec_codecs_real(), spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_OK);
+    CHECK(oc_callrec_render(oc_callrec_codecs_real(), NULL, spool, out, NULL, &bytes, &dur, err, sizeof err) == OC_CALLREC_OK);
     if (err[0]) printf("  %s\n", err);
     size_t len = 0;
     uint8_t *file = slurp(out, &len);

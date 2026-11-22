@@ -381,7 +381,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * exp_bytes, exp_duration_ms) or not (rec_failed, body the reason);
         * answered OC_RES_RECORDING_DONE with the message it posts in the
         * call's chat, or OC_RES_OK. */
-       OC_JOB_RECORDINGS_PENDING = 252, OC_JOB_RECORDING_DONE = 253 };
+       OC_JOB_RECORDINGS_PENDING = 252, OC_JOB_RECORDING_DONE = 253,
+       /* REC_PEOPLE (read): who call_uids are -- a name and an avatar's store
+        * key each -- for call_id's recording; answered OC_RES_REC_PEOPLE. */
+       OC_JOB_REC_PEOPLE = 254 };
 
 /* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
  * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
@@ -987,7 +990,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_RECORDINGS_PENDING = 144,
        /* A recording made: the message carrying it in the call's chat, the
         * SEND-shaped fields with its attachment, and `members`. */
-       OC_RES_RECORDING_DONE = 145 };
+       OC_RES_RECORDING_DONE = 145,
+       /* Who people in a recording are: call_id, rec_people (n_rec_people). */
+       OC_RES_REC_PEOPLE = 146 };
 
 /* A line of a call's transcript as the daemon's transcript function takes it:
  * the speaker (0 unknown), from and to in ms from the call's start, the text. */
@@ -1273,6 +1278,10 @@ typedef struct {
     /* SEARCH only: the row's relevance, bm25 × 1,000,000 (0 unless sorted so). */
     int64_t  rank;
 } oc_replay_msg;
+
+/* Who someone in a recording is (OC_RES_REC_PEOPLE): their name, and their
+ * avatar's store key, "" for none. */
+typedef struct oc_rec_person { uint64_t user; char name[81]; char avatar_key[65]; } oc_rec_person;
 
 typedef struct oc_dbres {
     struct oc_dbres *next;
@@ -1714,6 +1723,8 @@ typedef struct oc_dbres {
     uint64_t                rec_id;          /* OC_RES_RECORDING_STARTED */
     uint64_t               *rec_ids;         /* OC_RES_RECORDINGS_PENDING, heap */
     char                  **rec_spools;      /* ...each heap */
+    struct oc_rec_person   *rec_people;      /* OC_RES_REC_PEOPLE, heap */
+    size_t                  n_rec_people;
     size_t                  n_recs;
     uint8_t                 call_del_what;   /* OC_RES_CALL_DELETED */
     uint64_t                call_del_id;

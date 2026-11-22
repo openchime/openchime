@@ -41,7 +41,8 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON); client app-core (`client/core/summary.c`) | https://github.com/zserge/jsmn | MIT |
 | **picohttpparser** | commit-pinned | HTTP/1.1 request line and header parsing for the daemon's one HTTP stack (ARCH-32) | Daemon (`daemon/http.c`) | https://github.com/h2o/picohttpparser | MIT (or the Perl licence; we use it under MIT) |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire on the desktops (the browser's is `client/gui/platform/web/audio_web.c`, not miniaudio) | Client media library (`client/core/media/audio_ma.c`, the desktop backend under `audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
-| **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster, and PNG encode in the app (stb_image_write); stb_image.h is committed but nothing compiles it | Client media library (`client/core/media/recorder.c`) and `client/gui/app/app.c` | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
+| **stb_image_write**, **stb_image**, **stb_truetype** | commit-pinned (stb_truetype v1.28) | JPEG encode of a video message's poster, and PNG encode in the app (stb_image_write); decoding avatars (PNG and JPEG only) and drawing names in a call's recording (stb_image, stb_truetype, CALLS.md §8) | Client media library (`client/core/media/recorder.c`), `client/gui/app/app.c`, and the daemon's `daemon/callrec_render.c` | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
+| **Noto Sans** Regular | commit-pinned (unhinted TTF, SHA-256 `f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8`) | The font a call's recording names people in: Latin, Greek and Cyrillic; compiled into the daemon as data (`build/gen/callrec_font.c`) | `daemon/callrec_render.c` | https://github.com/notofonts/latin-greek-cyrillic | SIL Open Font License 1.1 (`third_party/fonts/OFL.txt`) |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a C library on its own) | Voice input in the graphical clients, Win32 and web (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
 | **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, central, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
@@ -178,7 +179,7 @@ exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
 utf8proc/utf8proc_data.c, qrcodegen/qrcodegen.{c,h} (with its LICENSE), jsmn/jsmn.h, miniaudio/miniaudio.h,
-stb/stb_image_write.h, stb/stb_image.h}`, libfvad's `include/` and `src/` trees
+stb/stb_image_write.h, stb/stb_image.h, stb/stb_truetype.h, fonts/NotoSans-Regular.ttf}`, libfvad's `include/` and `src/` trees
 (its `LICENSE`, `AUTHORS` and `PATENTS` beside them, compiled in one translation
 unit, `fvad_unit.c`, with our warnings held off vendored code), and **each carries
 its licence file**:
@@ -188,7 +189,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_ma.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/`, `opus/`, `libvpx/`, `mbedtls/` and `lucide/`
+`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `fonts/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/`, `speexdsp/`, `opus/`, `libvpx/`, `mbedtls/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the build directories and what the build fetches — stays ignored.
 
@@ -563,7 +564,8 @@ paths ship; nothing is fetched at runtime.
 | **MIT** | Moonshine Tiny Streaming (the recognizer) | Converted and committed (`sttkit/data/`), shipped as data, **daemon only** (ARCH-112) |
 | **Apache-2.0** | Qwen3.5 2B (the summary model) | Fetched from Qwen and converted by the daemon on first start, never shipped; its licence kept beside it (ARCH-116) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
-| **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
+| **MIT / Public Domain** | stb_image_write, stb_image, stb_truetype | Vendored, committed; stb_image_write in the client, stb_image and stb_truetype in the daemon's call recordings |
+| **SIL OFL 1.1** | Noto Sans Regular | Vendored, committed; compiled into the daemon as data, for a call recording's names |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Committed and static-linked: both into the graphical clients, Win32 and web (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |

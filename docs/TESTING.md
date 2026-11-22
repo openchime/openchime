@@ -496,12 +496,25 @@ framework.
   voted between two clients through the real daemon. `tools/gui/features/polls.sh`
   drives the card in both GUI clients (tools/gui/README.md).
 - **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tools/gui/features/calls.sh`
-  and `callhome.sh` (`# needs: callrec`), on Win32 and in the browser: the picker
-  with its subject and people ticked, the call's message in its conversation,
-  Calls home going on and before, its Join and Decline, the call view's subject
-  and chat, Record and the mark both people see, the joiner's notice, a missed
-  call in Calls home, New call from Calls home, the call's page and the recording
-  played on it; run them against `make openchimed WEB=1 CALLREC=1` (`run.sh`
+  and `callhome.sh` (`# needs: callrec`), `newcall.sh`, `prejoin.sh` and
+  `camera.sh`, on Win32 and in the browser. `calls.sh`: New Call opened from a
+  conversation with its subject and people asked, the summary card while the
+  call runs and after (who took part, Play), the sidebar's mark of a call going
+  on, the Calls panel's Join and Decline, the call view's subject and chat, Record
+  and the recording mark naming who records with its Stop, the screen-reader
+  announcements of the recording and of joins and leaves, and the pre-join
+  screen's notice of a recorded call. `callhome.sh`: the Calls panel's one list —
+  Active pinned, Past under date headings, older calls loading as it scrolls, the
+  filters, faces, the page beside the list or in place of it with Back, the
+  sidebar's missed mark and its clearing, Call back — and the call's page in
+  order, with the timeline strip's bars and the recording's span
+  (`OPENCHIME_DEV_CALL_HISTORY_PAGE` makes the history's pages small).
+  `newcall.sh`: every way into New Call, its preview, search by person, group and
+  channel, the cap refused, chips, a blank subject filled in, Enter from a
+  conversation, and Invite. `prejoin.sh`: the pre-join screen before every join,
+  Cancel, joining muted, joining with the camera on, and audio only when the
+  camera cannot start. `camera.sh`: self-view shrunk, hidden and shown, kept in
+  the preferences. Run them against `make openchimed WEB=1 CALLREC=1` (`run.sh`
   passes the remembered `CALLREC` through). `tests/test_e2e.c`: SFrame
   against RFC 9605's vectors (every header encoding, suite 0x0004's key, salt and
   ciphertext), HPKE Auth mode against RFC 9180 A.1.3 (the ephemeral, receiver and

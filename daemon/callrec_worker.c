@@ -86,12 +86,30 @@ static int store_file(oc_blobstore *bs, const char *path, const char *key, uint6
     return ok ? 0 : -1;
 }
 
+/* An avatar's bytes, from the store, for the recording's picture: at most 8 MB. */
+static int load_blob(void *ctx, const char *key, uint8_t **data, size_t *len) {
+    uint64_t size = 0;
+    oc_blob_reader *rd = oc_blob_get_begin((oc_blobstore *)ctx, key, &size);
+    if (!rd) return -1;
+    uint8_t *buf = size && size <= (8u << 20) ? malloc((size_t)size) : NULL;
+    size_t at = 0;
+    long k;
+    while (buf && at < size && (k = oc_blob_get_chunk(rd, buf + at, (size_t)size - at)) > 0) at += (size_t)k;
+    oc_blob_get_close(rd);
+    if (!buf || at != size) { free(buf); return -1; }
+    *data = buf;
+    *len = at;
+    return 0;
+}
+
 static void run_one(oc_callrec_worker *w, job *j, oc_callrec_result *r) {
     char path[4200], err[200] = "";
     snprintf(path, sizeof path, "%s/" TMP_PREFIX "%016llx" TMP_SUFFIX, w->tmp_dir, (unsigned long long)j->rec_id);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    r->status = oc_callrec_render(w->codecs, j->spool, path, &w->stopping, &r->bytes, &r->duration_ms, err, sizeof err);
+    oc_callrec_assets assets = { load_blob, w->bs };
+    r->status = oc_callrec_render(w->codecs, &assets, j->spool, path, &w->stopping, &r->bytes, &r->duration_ms,
+                                  err, sizeof err);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (r->status == OC_CALLREC_OK) {
         oc_callrec_blob_key(j->rec_id, r->key, sizeof r->key);

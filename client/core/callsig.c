@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include "env.h"           /* oc_env_dev */
 #include <string.h>
 
 void oc_callsig_init(oc_callsig *cs) {
@@ -327,7 +328,11 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
         break;
     }
     case OC_CMD_CALL_HISTORY: {
-        oc_call_history h = { c->start_ms, OC_CALL_HISTORY_PAGE };
+        /* A page at a time; development mode may make it smaller, so a test
+         * reaches the next page with a handful of calls. */
+        const char *dev = oc_env_dev("OPENCHIME_DEV_CALL_HISTORY_PAGE");
+        int lim = dev ? atoi(dev) : 0;
+        oc_call_history h = { c->start_ms, (uint16_t)(lim > 0 && lim <= (int)OC_CALL_HISTORY_PAGE ? (unsigned)lim : OC_CALL_HISTORY_PAGE) };
         rc = oc_encode_call_history(&w, OC_PROTOCOL_VERSION, &h);
         break;
     }
@@ -420,6 +425,8 @@ static int history_page(oc_rbuf *p, oc_queue *to_ui) {
         r->call_id = x->call_id; r->starter = x->starter; r->started_at = x->started_at; r->ended_at = x->ended_at;
         r->from_channel = x->from_channel; r->chat_channel = x->chat_channel;
         r->end_reason = x->end_reason; r->flags = x->flags; r->n_people = x->n_people;
+        r->n_faces = x->n_faces <= OC_CALL_HIST_FACES ? x->n_faces : (uint8_t)OC_CALL_HIST_FACES;
+        memcpy(r->faces, x->faces, sizeof r->faces);
         copy_str(r->subject, sizeof r->subject, x->subject);
     }
     free(ent);
@@ -592,6 +599,7 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
             v->from_channel = st.from_channel;
             v->chat_channel = st.chat_channel;
             v->recording = (st.flags & OC_CALL_STATE_RECORDING) != 0;
+            v->rec_by = v->recording ? st.rec_by : 0;
             v->call_id = st.call_id;
             size_t sl = st.subject.len < OC_CALL_SUBJECT_MAX ? st.subject.len : OC_CALL_SUBJECT_MAX;
             if (sl) memcpy(v->subject, st.subject.ptr, sl);

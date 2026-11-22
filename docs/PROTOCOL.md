@@ -215,9 +215,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 49** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 50** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
-> 49 made a call an object of its own (CALLS.md §1, §5.17): `CALL_START` and
+> 50 appended `rec_by` to `CALL_STATE`: who started the recording going on
+> (CALLS.md §8), and `faces` to each `CALL_HISTORY_PAGE` entry: who took part,
+> up to three, first joined first. Version 49 made a call an object of its own (CALLS.md §1, §5.17): `CALL_START` and
 > `CALL_SUBJECT` were added, every call frame names its call by `call_id` and no
 > longer a conversation, `CALL_JOIN` lost its invitees, `CALL_STATE` gained
 > `subject`, `from_channel` and `chat_channel`, and `BROADCAST` gained `call_id` after
@@ -3273,12 +3275,12 @@ and every invitee is told by `CALL_STATE`. A blank subject, or one longer than
 
 **`CALL_STATE` (S → C), `0x00A7`** `{ call_id: u64, subject: str, starter: u64,
 started_at: u64, from_channel: u64, chat_channel: u64, flags: u8, ended: u8, np:
-u16, np × { user_id: u64 }, ni: u16, ni × { user_id: u64 }, sharer: u64 }` — a call
+u16, np × { user_id: u64 }, ni: u16, ni × { user_id: u64 }, sharer: u64, rec_by: u64 }` — a call
 as Calls home lists it: its subject, the conversation it was started from (`0`
 none), its own chat (below), `flags` bit 0 set while it is being recorded, who is
 in it (the people: never the Recorder), who
-is asked and has not yet joined or declined, and who is sharing a screen (`0`
-nobody). Sent to the call's **invitees — the starter and every participant among
+is asked and has not yet joined or declined, who is sharing a screen (`0`
+nobody), and who started the recording going on (`0` while it is not recorded). Sent to the call's **invitees — the starter and every participant among
 them — and to nobody else**, on every change to its subject, participants,
 invitations or sharer, and at sign-in, after `SNOOZE`, once for each running
 call the user is asked to. `ended = 1` is the last word on a call.
@@ -3344,7 +3346,8 @@ of the calls this user was asked to, newest first: those started before
 `before_ms` (`0` from the newest), at most `limit` (1–50; `0` or more is 50).
 Answered with **`CALL_HISTORY_PAGE` (S → C), `0x00B5`** `{ n: u16, n × { call_id:
 u64, subject: str, starter: u64, started_at: u64, ended_at: u64, end_reason: u8,
-from_channel: u64, chat_channel: u64, n_people: u16, flags: u8 }, more: u8 }` —
+from_channel: u64, chat_channel: u64, n_people: u16, flags: u8, nf: u8, nf × {
+user_id: u64 } }, more: u8 }` — `nf` (at most 3) of who took part, first joined first;
 `ended_at` `0` and `end_reason` `0` while it runs, else `1` the last person left,
 `2` ended for everyone, `3` the daemon stopped; `n_people` how many took part;
 `flags` as this user saw it: bit 0 took part, bit 1 missed (asked, never joined

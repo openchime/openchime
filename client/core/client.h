@@ -591,6 +591,10 @@ void oc_client_call_record(oc_client *c, uint64_t call_id, int on);
 /* The call history (CALLS.md §1): a page of this user's calls started before
  * `before_ms`, 0 from the newest, into the model's `call_hist`. */
 void oc_client_call_history(oc_client *c, uint64_t before_ms);
+/* The user has seen their missed calls (the Calls panel opened): the model's
+ * `call_missed` is cleared, and none started before `seen_ms` is counted again.
+ * The frontend keeps `seen_ms` across runs and passes it after signing in. */
+void oc_client_calls_seen(oc_client *c, uint64_t seen_ms);
 /* A call's page into the model's `call_page`, its transcript from line
  * `line_from` (0 the page afresh; the held count to have the next lines). */
 void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from);

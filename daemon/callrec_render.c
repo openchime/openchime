@@ -6,6 +6,7 @@
 #include "oc_mp4.h"
 
 #include <dirent.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,23 +229,347 @@ static void blit_fit(oc_frame *dst, int bx, int by, int bw, int bh, const oc_fra
         }
 }
 
-/* A person without a picture: a tile of their own colour. */
-static void person_colour(uint64_t user, uint8_t *Y, uint8_t *U, uint8_t *V) {
+/* ---- people: avatars, initials, names and the speaking ring (CALLS.md §8) ---------- */
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#pragma GCC diagnostic ignored "-Wshadow"
+#pragma GCC diagnostic ignored "-Wcast-qual"
+#pragma GCC diagnostic ignored "-Wdouble-promotion"
+#endif
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_NO_GIF
+#define STBI_NO_BMP
+#define STBI_NO_PSD
+#define STBI_NO_TGA
+#define STBI_NO_HDR
+#define STBI_NO_PIC
+#define STBI_NO_PNM
+#define STBI_NO_STDIO
+#define STBI_NO_LINEAR
+#define STB_TRUETYPE_IMPLEMENTATION
+#define STBTT_STATIC
+#include "../third_party/stb/stb_image.h"
+#include "../third_party/stb/stb_truetype.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+/* The libraries are static to this file, and what of them it does not call
+ * is reported at the end of the file, whatever the state around them: so for
+ * this file, an unused static function is no error. */
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
+/* The font names are drawn in (Noto Sans Regular, SIL OFL), compiled in. */
+extern const unsigned char oc_callrec_font[];
+extern const size_t oc_callrec_font_len;
+
+static stbtt_fontinfo g_font;
+static int g_font_ok;
+static pthread_once_t g_font_once = PTHREAD_ONCE_INIT;
+static void font_init(void) {
+    g_font_ok = oc_callrec_font_len > 0 &&
+                stbtt_InitFont(&g_font, oc_callrec_font, stbtt_GetFontOffsetForIndex(oc_callrec_font, 0)) != 0;
+}
+static int font_ready(void) { pthread_once(&g_font_once, font_init); return g_font_ok; }
+
+/* The next code point of UTF-8 `s` at `*i`; 0 at the end, 0xFFFD for a bad byte. */
+static uint32_t utf8_next(const char *s, size_t *i) {
+    const unsigned char *p = (const unsigned char *)s + *i;
+    if (!p[0]) return 0;
+    uint32_t c = p[0]; int n = 0;
+    if (c < 0x80) n = 0; else if ((c & 0xE0) == 0xC0) { c &= 0x1F; n = 1; }
+    else if ((c & 0xF0) == 0xE0) { c &= 0x0F; n = 2; } else if ((c & 0xF8) == 0xF0) { c &= 0x07; n = 3; }
+    else { (*i)++; return 0xFFFD; }
+    for (int k = 1; k <= n; k++) {
+        if ((p[k] & 0xC0) != 0x80) { *i += (size_t)k; return 0xFFFD; }
+        c = (c << 6) | (p[k] & 0x3F);
+    }
+    *i += (size_t)n + 1;
+    return c;
+}
+
+/* Whether the font draws every character of `s`. */
+static int text_drawable(const char *s) {
+    if (!font_ready() || !s || !*s) return 0;
+    size_t i = 0; uint32_t c;
+    while ((c = utf8_next(s, &i)) != 0) if (c != ' ' && !stbtt_FindGlyphIndex(&g_font, (int)c)) return 0;
+    return 1;
+}
+
+static int text_width(const char *s, float px) {
+    float scale = stbtt_ScaleForPixelHeight(&g_font, px), w = 0;
+    size_t i = 0; uint32_t c, prev = 0;
+    while ((c = utf8_next(s, &i)) != 0) {
+        int adv, lsb;
+        stbtt_GetCodepointHMetrics(&g_font, (int)c, &adv, &lsb);
+        if (prev) w += scale * (float)stbtt_GetCodepointKernAdvance(&g_font, (int)prev, (int)c);
+        w += scale * (float)adv;
+        prev = c;
+    }
+    return (int)(w + 0.5f);
+}
+
+/* `s` in white, `px` high, centred on `cx` with its top at `top`, no wider
+ * than `max_w` -- cut short with an ellipsis when it is. Drawn only when the
+ * font has every character of it. */
+static void draw_text(oc_frame *dst, int cx, int top, int max_w, const char *s, float px) {
+    if (!text_drawable(s)) return;
+    char buf[OC_CALLREC_NAME_MAX * 4 + 8];
+    snprintf(buf, sizeof buf, "%s", s);
+    while (text_width(buf, px) > max_w && strlen(buf) > 1) {
+        /* Drop the last character (and any ellipsis), then add one. */
+        size_t n = strlen(buf);
+        if (n >= 3 && !memcmp(buf + n - 3, "\xE2\x80\xA6", 3)) { buf[n - 3] = '\0'; n -= 3; }
+        while (n > 0 && ((unsigned char)buf[n - 1] & 0xC0) == 0x80) n--;
+        if (n > 0) n--;
+        buf[n] = '\0';
+        if (!n) return;
+        strcat(buf, "\xE2\x80\xA6");
+    }
+    float scale = stbtt_ScaleForPixelHeight(&g_font, px);
+    int ascent, descent, gap;
+    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &gap);
+    int base = top + (int)((float)ascent * scale + 0.5f);
+    float x = (float)(cx - text_width(buf, px) / 2);
+    size_t i = 0; uint32_t c, prev = 0;
+    while ((c = utf8_next(buf, &i)) != 0) {
+        if (prev) x += scale * (float)stbtt_GetCodepointKernAdvance(&g_font, (int)prev, (int)c);
+        int adv, lsb, x0, y0, x1, y1;
+        stbtt_GetCodepointHMetrics(&g_font, (int)c, &adv, &lsb);
+        stbtt_GetCodepointBitmapBox(&g_font, (int)c, scale, scale, &x0, &y0, &x1, &y1);
+        int gw = x1 - x0, gh = y1 - y0;
+        if (gw > 0 && gh > 0 && gw <= 512 && gh <= 512) {
+            uint8_t *bm = malloc((size_t)gw * (size_t)gh);
+            if (bm) {
+                stbtt_MakeCodepointBitmap(&g_font, bm, gw, gh, gw, scale, scale, (int)c);
+                int ox = (int)x + x0, oy = base + y0;
+                for (int r = 0; r < gh; r++) {
+                    int yy = oy + r;
+                    if (yy < 0 || yy >= dst->height) continue;
+                    for (int q = 0; q < gw; q++) {
+                        int xx = ox + q;
+                        if (xx < 0 || xx >= dst->width) continue;
+                        unsigned a = bm[(size_t)r * (size_t)gw + (size_t)q];
+                        if (!a) continue;
+                        uint8_t *Y = dst->plane[0] + (size_t)yy * (size_t)dst->stride[0] + (size_t)xx;
+                        *Y = (uint8_t)(*Y + (235 - *Y) * a / 255);
+                        if (a > 128) {   /* white has no colour */
+                            dst->plane[1][(size_t)(yy / 2) * (size_t)dst->stride[1] + (size_t)(xx / 2)] = 128;
+                            dst->plane[2][(size_t)(yy / 2) * (size_t)dst->stride[2] + (size_t)(xx / 2)] = 128;
+                        }
+                    }
+                }
+                free(bm);
+            }
+        }
+        x += scale * (float)adv;
+        prev = c;
+    }
+}
+
+/* A person's initials: the first letter of their first and last words. */
+static void initials_of(const char *name, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!name) return;
+    size_t i = 0, n = 0; uint32_t c, first = 0, last = 0; int at_word = 1;
+    while ((c = utf8_next(name, &i)) != 0) {
+        if (c == ' ') { at_word = 1; continue; }
+        if (at_word) { if (!first) first = c; else last = c; at_word = 0; }
+    }
+    uint32_t cs[2] = { first, last };
+    for (int k = 0; k < 2 && cs[k]; k++) {
+        uint32_t u = cs[k] >= 'a' && cs[k] <= 'z' ? cs[k] - 32 : cs[k];
+        char e[5]; size_t el = 0;
+        if (u < 0x80) e[el++] = (char)u;
+        else if (u < 0x800) { e[el++] = (char)(0xC0 | (u >> 6)); e[el++] = (char)(0x80 | (u & 0x3F)); }
+        else if (u < 0x10000) { e[el++] = (char)(0xE0 | (u >> 12)); e[el++] = (char)(0x80 | ((u >> 6) & 0x3F)); e[el++] = (char)(0x80 | (u & 0x3F)); }
+        else { e[el++] = (char)(0xF0 | (u >> 18)); e[el++] = (char)(0x80 | ((u >> 12) & 0x3F)); e[el++] = (char)(0x80 | ((u >> 6) & 0x3F)); e[el++] = (char)(0x80 | (u & 0x3F)); }
+        if (n + el + 1 > cap) break;
+        memcpy(out + n, e, el); n += el;
+    }
+    out[n] = '\0';
+}
+
+/* Who someone is, as the picture draws them: their name, and their avatar as
+ * a square I420 picture. */
+#define AV_SIZE 256
+typedef struct { uint64_t user; char name[OC_CALLREC_NAME_MAX + 1]; uint8_t *av; int has_av; } face;
+
+/* An avatar's bytes into a square picture: its middle, scaled. 0, or -1. */
+static int face_avatar(face *f, const uint8_t *data, size_t len) {
+    if (!data || !len || len > (64u << 20)) return -1;
+    int w, h, n;
+    uint8_t *rgb = stbi_load_from_memory(data, (int)len, &w, &h, &n, 3);
+    if (!rgb) return -1;
+    uint8_t *yuv = malloc((size_t)AV_SIZE * AV_SIZE * 3 / 2);
+    if (!yuv) { stbi_image_free(rgb); return -1; }
+    int side = w < h ? w : h, sx = (w - side) / 2, sy = (h - side) / 2;
+    uint8_t *Y = yuv, *U = yuv + AV_SIZE * AV_SIZE, *V = U + AV_SIZE * AV_SIZE / 4;
+    for (int y = 0; y < AV_SIZE; y++)
+        for (int x = 0; x < AV_SIZE; x++) {
+            const uint8_t *p = rgb + ((size_t)(sy + y * side / AV_SIZE) * (size_t)w + (size_t)(sx + x * side / AV_SIZE)) * 3;
+            int r = p[0], g = p[1], b = p[2];
+            Y[y * AV_SIZE + x] = (uint8_t)((66 * r + 129 * g + 25 * b + 128) / 256 + 16);
+            if (!(x & 1) && !(y & 1)) {
+                U[(y / 2) * (AV_SIZE / 2) + x / 2] = (uint8_t)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
+                V[(y / 2) * (AV_SIZE / 2) + x / 2] = (uint8_t)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
+            }
+        }
+    stbi_image_free(rgb);
+    free(f->av);
+    f->av = yuv;
+    f->has_av = 1;
+    return 0;
+}
+
+void oc_callrec_face_layout(int tile, oc_callrec_layout *o) {
+    if (tile < 0) { o->x = 0; o->y = 0; o->w = OC_CALLREC_WIDTH; o->h = MAIN_H; o->name_px = 34; }
+    else {
+        o->x = (OC_CALLREC_WIDTH - STRIP_TILES * TILE_W) / 2 + tile * TILE_W + 4;
+        o->y = MAIN_H + 4; o->w = TILE_W - 8; o->h = TILE_H - 8; o->name_px = 16;
+    }
+    int m = o->w < o->h ? o->w : o->h;
+    o->r = (m / 4) & ~1;
+    o->cx = (o->x + o->w / 2) & ~1;
+    o->cy = (o->y + o->h * 42 / 100) & ~1;
+    o->name_y = o->cy + o->r + o->h / 30;
+}
+
+void oc_callrec_person_colour(uint64_t user, uint8_t *Y, uint8_t *U, uint8_t *V) {
     uint64_t h = user * 0x9E3779B97F4A7C15ull;
     *Y = (uint8_t)(70 + (h >> 56) % 100);
     *U = (uint8_t)(96 + (h >> 40) % 64);
     *V = (uint8_t)(96 + (h >> 24) % 64);
 }
 
-/* One person in a box: their camera, while it is on and has a picture, else
- * their colour. */
-static void draw_person(oc_frame *dst, int x, int y, int w, int h, uint64_t user, const vstream *cam, int cam_on) {
-    fill_rect(dst, x, y, w, h, 16, 128, 128);
-    if (cam && cam_on && cam->have_pic) { blit_fit(dst, x, y, w, h, &cam->pic); return; }
-    uint8_t Y, U, V;
-    person_colour(user, &Y, &U, &V);
-    int iw = (w * 3 / 4) & ~1, ih = (h * 3 / 4) & ~1;
-    fill_rect(dst, (x + (w - iw) / 2) & ~1, (y + (h - ih) / 2) & ~1, iw, ih, Y, U, V);
+/* The circle: the avatar inside it, or the colour. */
+static void draw_disc(oc_frame *dst, int cx, int cy, int r, const face *f, uint64_t user) {
+    uint8_t cY, cU, cV;
+    oc_callrec_person_colour(user, &cY, &cU, &cV);
+    for (int dy = -r; dy < r; dy++) {
+        int yy = cy + dy;
+        if (yy < 0 || yy >= dst->height) continue;
+        for (int dx = -r; dx < r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            int xx = cx + dx;
+            if (xx < 0 || xx >= dst->width) continue;
+            uint8_t Y = cY, U = cU, V = cV;
+            if (f && f->has_av) {
+                int ax = (dx + r) * AV_SIZE / (2 * r), ay = (dy + r) * AV_SIZE / (2 * r);
+                Y = f->av[ay * AV_SIZE + ax];
+                U = f->av[AV_SIZE * AV_SIZE + (ay / 2) * (AV_SIZE / 2) + ax / 2];
+                V = f->av[AV_SIZE * AV_SIZE * 5 / 4 + (ay / 2) * (AV_SIZE / 2) + ax / 2];
+            }
+            dst->plane[0][(size_t)yy * (size_t)dst->stride[0] + (size_t)xx] = Y;
+            if (!(yy & 1) && !(xx & 1)) {
+                dst->plane[1][(size_t)(yy / 2) * (size_t)dst->stride[1] + (size_t)(xx / 2)] = U;
+                dst->plane[2][(size_t)(yy / 2) * (size_t)dst->stride[2] + (size_t)(xx / 2)] = V;
+            }
+        }
+    }
+}
+
+static void draw_ring(oc_frame *dst, int x, int y, int w, int h) {
+    int t = OC_CALLREC_RING_W;
+    fill_rect(dst, x, y, w, t, OC_CALLREC_RING_Y, OC_CALLREC_RING_U, OC_CALLREC_RING_V);
+    fill_rect(dst, x, y + h - t, w, t, OC_CALLREC_RING_Y, OC_CALLREC_RING_U, OC_CALLREC_RING_V);
+    fill_rect(dst, x, y, t, h, OC_CALLREC_RING_Y, OC_CALLREC_RING_U, OC_CALLREC_RING_V);
+    fill_rect(dst, x + w - t, y, t, h, OC_CALLREC_RING_Y, OC_CALLREC_RING_U, OC_CALLREC_RING_V);
+}
+
+/* One person in box `tile` (-1 the large one): their camera while it is on and
+ * has a picture, else their circle; their name under it (or, on a camera, on a
+ * band across its foot); the ring while they speak. */
+static void draw_person(oc_frame *dst, int tile, uint64_t user, const face *f, const vstream *cam, int cam_on,
+                        int speaking) {
+    oc_callrec_layout L;
+    oc_callrec_face_layout(tile, &L);
+    fill_rect(dst, L.x, L.y, L.w, L.h, 16, 128, 128);
+    const char *name = f && f->name[0] ? f->name : NULL;
+    if (cam && cam_on && cam->have_pic) {
+        blit_fit(dst, L.x, L.y, L.w, L.h, &cam->pic);
+        if (name) {
+            int band = ((int)((float)L.name_px * 1.5f)) & ~1;
+            fill_rect(dst, L.x, (L.y + L.h - band) & ~1, L.w, band, 16, 128, 128);
+            draw_text(dst, L.cx, L.y + L.h - band + L.name_px / 5, L.w - 16, name, (float)L.name_px);
+        }
+    } else {
+        draw_disc(dst, L.cx, L.cy, L.r, f, user);
+        if (!(f && f->has_av) && name) {
+            char ini[16];
+            initials_of(name, ini, sizeof ini);
+            float px = (float)L.r * 0.75f;
+            if (ini[0]) draw_text(dst, L.cx, L.cy - (int)(px * 0.6f), 2 * L.r, ini, px);
+        }
+        if (name) draw_text(dst, L.cx, L.name_y, L.w - 16, name, (float)L.name_px);
+    }
+    if (speaking) draw_ring(dst, L.x, L.y, L.w, L.h);
+}
+
+/* The spool's `people` file, and their avatars. */
+static int load_faces(const char *dir, const oc_callrec_assets *assets, face *out, int cap) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/people", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int n = 0;
+    uint8_t h[9];
+    while (n < cap && fread(h, 1, sizeof h, f) == sizeof h) {
+        face *p = &out[n];
+        memset(p, 0, sizeof *p);
+        p->user = be64(h);
+        size_t nl = h[8];
+        if (nl > OC_CALLREC_NAME_MAX || fread(p->name, 1, nl, f) != nl) break;
+        p->name[nl] = '\0';
+        uint8_t kl;
+        char key[OC_CALLREC_AVKEY_MAX + 1];
+        if (fread(&kl, 1, 1, f) != 1 || kl > OC_CALLREC_AVKEY_MAX || fread(key, 1, kl, f) != kl) break;
+        key[kl] = '\0';
+        if (kl && assets && assets->load) {
+            uint8_t *data = NULL; size_t len = 0;
+            if (assets->load(assets->ctx, key, &data, &len) == 0) face_avatar(p, data, len);
+            free(data);
+        }
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static const face *face_of(const face *faces, int n, uint64_t user) {
+    for (int i = 0; i < n; i++) if (faces[i].user == user) return &faces[i];
+    return NULL;
+}
+
+int oc_callrec_compose(uint8_t *i420, const oc_callrec_face *in, int n) {
+    if (!i420 || n < 0) return -1;
+    oc_frame cv;
+    memset(&cv, 0, sizeof cv);
+    cv.width = OC_CALLREC_WIDTH; cv.height = OC_CALLREC_HEIGHT;
+    cv.plane[0] = i420;
+    cv.plane[1] = i420 + OC_CALLREC_WIDTH * OC_CALLREC_HEIGHT;
+    cv.plane[2] = i420 + OC_CALLREC_WIDTH * OC_CALLREC_HEIGHT * 5 / 4;
+    cv.stride[0] = OC_CALLREC_WIDTH; cv.stride[1] = cv.stride[2] = OC_CALLREC_WIDTH / 2;
+    fill_rect(&cv, 0, 0, OC_CALLREC_WIDTH, OC_CALLREC_HEIGHT, 24, 128, 128);
+    for (int i = 0; i < n && i <= STRIP_TILES; i++) {
+        face f;
+        memset(&f, 0, sizeof f);
+        f.user = in[i].user;
+        snprintf(f.name, sizeof f.name, "%s", in[i].name ? in[i].name : "");
+        if (in[i].avatar) face_avatar(&f, in[i].avatar, in[i].avatar_len);
+        draw_person(&cv, i - 1, f.user, &f, NULL, 0, in[i].speaking);
+        free(f.av);
+    }
+    return 0;
 }
 
 /* ---- the render ---------------------------------------------------------------- */
@@ -302,7 +627,15 @@ static person *person_of(person *pp, int *np, uint64_t user) {
     return &pp[(*np)++];
 }
 
-oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *dir, const char *out_path,
+/* Whether `user` is speaking now: their voice above the speaking level. */
+#define SPEAK_LEVEL 150.0
+static int voice_speaking(const voice *vo, int nvo, uint64_t user) {
+    for (int i = 0; i < nvo; i++) if (vo[i].user == user && vo[i].level > SPEAK_LEVEL) return 1;
+    return 0;
+}
+
+oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const oc_callrec_assets *assets,
+                                    const char *dir, const char *out_path,
                                     const volatile int *cancel, uint64_t *bytes, uint32_t *duration_ms,
                                     char *err, size_t errcap) {
     if (!c || !dir || !out_path) { seterr(err, errcap, "bad request"); return OC_CALLREC_FAILED; }
@@ -322,6 +655,9 @@ oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *dir,
     uint8_t *canvas = NULL;
     person people[MAX_PEOPLE];
     int npeople = 0;
+    /* Who each is: their names and avatars (the `people` file). */
+    face *faces = calloc(MAX_PEOPLE * 2, sizeof *faces);
+    int nfaces = faces ? load_faces(dir, assets, faces, MAX_PEOPLE * 2) : 0;
     uint64_t t_end = t0;
     if (!vo || !cams) { seterr(err, errcap, "out of memory"); goto done; }
 
@@ -447,7 +783,7 @@ oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *dir,
          * for a while; the speaker stays until then. */
         double best = 0; uint64_t loud = 0;
         for (int i = 0; i < nvo; i++) if (vo[i].level > best) { best = vo[i].level; loud = vo[i].user; }
-        if (best > 150 && loud != speaker) {
+        if (best > SPEAK_LEVEL && loud != speaker) {
             if (!speaker) speaker = loud;
             else if (loud != rival) { rival = loud; rival_since = t; }
             else if (t - rival_since >= SWITCH_MS) { speaker = loud; rival = 0; }
@@ -483,7 +819,8 @@ oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *dir,
                 const vstream *cam = NULL; int cam_on = 0;
                 for (int i = 0; i < ncam; i++) if (cams[i].user == speaker) cam = &cams[i];
                 for (int i = 0; i < npeople; i++) if (people[i].user == speaker) cam_on = people[i].cam;
-                draw_person(&cv, 0, 0, OC_CALLREC_WIDTH, MAIN_H, speaker, cam, cam_on);
+                draw_person(&cv, -1, speaker, face_of(faces, nfaces, speaker), cam, cam_on,
+                            voice_speaking(vo, nvo, speaker));
             }
             /* The strip: everyone in but the one large. */
             int tile = 0;
@@ -491,8 +828,8 @@ oc_callrec_status oc_callrec_render(const oc_callrec_codecs *c, const char *dir,
                 if (!people[i].in || (!sharing && people[i].user == speaker)) continue;
                 const vstream *cam = NULL;
                 for (int k = 0; k < ncam; k++) if (cams[k].user == people[i].user) cam = &cams[k];
-                int x = (OC_CALLREC_WIDTH - STRIP_TILES * TILE_W) / 2 + tile * TILE_W;
-                draw_person(&cv, x + 4, MAIN_H + 4, TILE_W - 8, TILE_H - 8, people[i].user, cam, people[i].cam);
+                draw_person(&cv, tile, people[i].user, face_of(faces, nfaces, people[i].user), cam, people[i].cam,
+                            voice_speaking(vo, nvo, people[i].user));
                 tile++;
             }
             ec.pts_us = (int64_t)(vframe * 1000000 / OC_CALLREC_FPS);
@@ -525,6 +862,8 @@ done:
     if (share.f) fclose(share.f);
     if (share.dec) c->video_dec_close(share.dec);
     free(share.data); free(share.pic_buf);
+    for (int i = 0; i < nfaces; i++) free(faces[i].av);
+    free(faces);
     free(vo); free(cams); free(tl);
     return st;
 }
@@ -561,10 +900,13 @@ static int stub_venc(void *e, const oc_frame *f, int force_key,
     (void)e; (void)force_key;
     if (!f) return 0;
     uint8_t out[1 + OC_CALLREC_STUB_TILES];
-    out[0] = f->plane[0][(size_t)(MAIN_H / 2) * f->stride[0] + OC_CALLREC_WIDTH / 2];
-    for (int i = 0; i < OC_CALLREC_STUB_TILES; i++) {
-        int x = (OC_CALLREC_WIDTH - STRIP_TILES * TILE_W) / 2 + i * TILE_W + TILE_W / 2;
-        out[1 + i] = i < STRIP_TILES ? f->plane[0][(size_t)(MAIN_H + TILE_H / 2) * f->stride[0] + x] : 0;
+    /* Each box sampled inside the top of its circle: clear of initials and
+     * names, and inside a camera's or a share's picture. */
+    for (int i = -1; i < OC_CALLREC_STUB_TILES; i++) {
+        oc_callrec_layout L;
+        oc_callrec_face_layout(i, &L);
+        int py = L.cy - L.r * 7 / 10;
+        out[1 + i] = i < STRIP_TILES ? f->plane[0][(size_t)py * f->stride[0] + (size_t)L.cx] : 0;
     }
     emit(ctx, out, sizeof out, 1);
     return 0;
