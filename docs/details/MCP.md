@@ -4,7 +4,7 @@ How an AI agent, or a person's own AI client, reads and posts in a workspace
 through the Model Context Protocol (REQ-320–325, ARCH-120). This document is the
 daemon-side design; the decision and what was rejected are ARCH-120, and the
 tools, their paging and the agent token lifecycle are specified in
-[Plans/MCP.md](../plans/MCP.md).
+[plans/MCP.md](../plans/MCP.md).
 
 Nothing here is a setting's name, a table or a frame. Those are written into
 CONFIG.md, SCHEMA.md and PROTOCOL.md with the code that has them.

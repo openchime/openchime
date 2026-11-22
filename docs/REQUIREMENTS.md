@@ -113,7 +113,7 @@ where one exists.
   shape across platforms: the remembered workspaces, an indication of unread
   activity and connection state for each, and an always-present entry for
   signing in to another workspace ("Sign in to a new workspace" in the TUI, "Add a
-  workspace" on Win32). Switching has been possible at any time without restarting
+  workspace" in the graphical client). Switching has been possible at any time without restarting
   the client.
 - **REQ-014.** A client has held sessions to **several workspaces at once**, so
   that activity in a workspace the user is not currently looking at has still
@@ -568,7 +568,7 @@ where one exists.
   each parent channel. A reply has optionally also been **posted to the channel's
   main scroll** rather than only the thread: one message, stored once with a flag
   and never copied, shown in both places, counted once in the channel's unread
-  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bk).
+  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bl).
 - **REQ-282.** A user has been able to **follow every thread in a chosen channel
   or DM** — a per-conversation setting distinct from following one thread
   (REQ-062) — so that every new thread started there, and every reply within it,
@@ -931,6 +931,24 @@ where one exists.
   REQ-284 answers the finer question — a badge counts what would have notified,
   with the schedule and the pause left out — and mute remains the first thing it
   asks.
+- **REQ-385.** A user has been able to **mute a person**: what that person
+  writes, their mentions of the user, their reactions and their thread replies
+  have notified the user of nothing, counted toward none of the user's unread,
+  and been left out of the user's activity feed and reaction counts — in every
+  conversation, the person's messages still shown. Like a conversation's mute it
+  is absolute, a priority person (REQ-135) included, and it is the user's alone:
+  the muted person is not told, and nothing of theirs changes for anyone else
+  (SCHEMA.md §3bp).
+- **REQ-386.** A user has been able to **block a person**, and to say **who may
+  start a direct conversation with them** — anyone, or nobody. A blocked person
+  has been unable to open a DM or group DM naming the blocker; in a conversation
+  the two already share, what the blocked person writes has reached its other
+  members but not the blocker, anywhere — live, in history, search, threads,
+  pins, files and counts — and lifting the block has not brought it back. The
+  person blocked is never told. Channels are untouched: there, muting the person
+  (REQ-385) is the tool. Placing and lifting a block are audited in the
+  moderation family, and an owner or admin may list blocks (SCHEMA.md §3br,
+  PROTOCOL.md §5.20).
 - **REQ-138.** A client has surfaced **OS-native desktop notifications** (a system
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
@@ -1086,13 +1104,14 @@ where one exists.
   precedence order**, and covered by a **truth table** rather than case-by-case
   tests. **The evaluator is** `shared/notify.c` (`oc_notify_decide`, with
   `oc_notify_quiet` for the schedule), which states the precedence — own message never;
-  mute is absolute; a priority person pierces everything else; then the schedule
+  mute is absolute, and so is a person the reader muted (REQ-385), even a
+  priority person; a priority person pierces everything else; then the schedule
   and the pause; then the level, with keywords part of *mentions*. Every input
   feeds that one function: the per-channel level resolved against the global
   default (REQ-130/134), mute (REQ-137), priority people (REQ-135), mention and
   keyword hits (REQ-221/135), thread participation (REQ-061), the schedule
-  (REQ-136) and the pause (REQ-278); follow-every-thread (REQ-282) and the
-  workspace default (REQ-279) will enter through the same inputs.
+  (REQ-136) and the pause (REQ-278). Follow-every-thread (REQ-282) enters as
+  thread participation, and the workspace default (REQ-279) as the schedule.
 
   **This exists because the failure mode is precedence errors assembled
   inline** — silent, and invisible until somebody who muted a conversation is
@@ -1121,7 +1140,7 @@ where one exists.
   message from a fake user.
 
   **Storage and delivery.** A reminder is a saved item with a time
-  (migration 0072: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
+  (migration 0075: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
   through `SAVE_ITEM` and told to the owner's devices in `SAVED_UPDATED`; a
   reminder on an unsaved message saves it. It fires once, within the
   scheduled-message tick of its time (fifteen seconds, the tick scheduled
@@ -1340,9 +1359,9 @@ where one exists.
   capture interface** whose frame format is fixed at the boundary — planar I420,
   BT.709 limited range — so the encoder and the preview see one thing whatever the
   camera delivers. The interface has a backend per platform — Media Foundation
-  (Windows) and `getUserMedia` (web) today; V4L2 (Linux), AVFoundation (macOS),
-  AVCaptureSession (iOS) and Camera2 through the NDK (Android) with those clients.
-  A backend is built together with the client for its platform. **A screen or window
+  (Windows), `getUserMedia` (web), V4L2 (Linux), AVFoundation (macOS),
+  AVCaptureSession (iOS) and Camera2 through the NDK (Android), each built
+  together with the client for its platform. **A screen or window
   is a source behind the same interface** — on Windows, Windows.Graphics.Capture —
   so the camera box is composited and the result encoded exactly as a camera is.
   Microphone, speaker and the computer's own sound have gone through the audio
@@ -1542,7 +1561,7 @@ where one exists.
   and respond in channels under a **bot identity** distinct from human users,
   including **slash-command apps** invoked as `/command` from the composer and
   dispatched to a registered integration endpoint. Install has been role-gated to
-  owner/admin. The design is [Plans/APPS.md](./plans/APPS.md): an app is a
+  owner/admin. The design is [plans/APPS.md](./plans/APPS.md): an app is a
   signed manifest (REQ-376, REQ-377) acting as a bot, a principal of its own
   kind beside agents, either external (code on the developer's server) or
   in-workspace (code the daemon runs, REQ-381), with scopes approved at install
@@ -1557,7 +1576,7 @@ where one exists.
   the signing scheme have been shared** by installed apps and plain outgoing
   webhooks: one set of event names and payloads, following the common
   chat-platform convention, and one `v0=` HMAC-SHA-256 signature over the
-  timestamp and body ([Plans/APPS.md](./plans/APPS.md) §5, ARCH-131).
+  timestamp and body ([plans/APPS.md](./plans/APPS.md) §5, ARCH-131).
 - **REQ-174.** The system has offered **workflow automation** — declarative
   triggers (a message match, a schedule, a form submission) driving actions (post
   a message, call a webhook) — so common routines could run without an external
@@ -1572,7 +1591,7 @@ where one exists.
   catalog** of the apps registered with its daemon; enrolled deployments have
   also seen the **curated catalog** central serves, each entry's signature
   verified by the daemon before it is offered, in the same package format as
-  the local one ([Plans/APPS.md](./plans/APPS.md) §12).
+  the local one ([plans/APPS.md](./plans/APPS.md) §12).
 - **REQ-176.** The system has offered a **third-party API / SDK** — a documented
   programmatic surface for external tools to read and post on a user's or bot's
   (REQ-172) behalf — as the general-purpose complement to the single-purpose
@@ -1584,14 +1603,14 @@ where one exists.
   It has been designed as a **documented HTTP API** for reading history,
   searching and posting, kept beside the MCP surface for agents rather than in
   place of it (ARCH-123, REQ-350–354); the proposal is
-  [Plans/HTTP-API.md](./plans/HTTP-API.md).
+  [plans/HTTP-API.md](./plans/HTTP-API.md).
 - **REQ-376.** An app has been defined by **one manifest**, in OpenChime's own
   schema, kept in the developer's repository: its identity, scopes, commands,
   event subscriptions, endpoints or code, outbound hosts, secrets, schedules and
   providers. No console, catalog or daemon has kept a separate copy of an app's
   definition, and one validator has checked a manifest for both the daemon and
   the developer's tools, with the same plain-language messages
-  ([Plans/APPS.md](./plans/APPS.md) §3, ARCH-130).
+  ([plans/APPS.md](./plans/APPS.md) §3, ARCH-130).
 - **REQ-377.** **Nothing has loaded unsigned**, in any deployment model. An app
   has been installed only when its package's signature verified against a key
   the daemon trusts: the project's, the daemon's own identity key, or a
@@ -1601,7 +1620,7 @@ where one exists.
   description, approved by an owner or admin at install, and every call and
   every event has been checked against them and against the bot's channel
   memberships. An update asking for a new scope has waited for approval again
-  ([Plans/APPS.md](./plans/APPS.md) §4, ARCH-131).
+  ([plans/APPS.md](./plans/APPS.md) §4, ARCH-131).
 - **REQ-379.** Slash commands have been **namespaced by app**, `/<app>/<command>`,
   with an unqualified alias only where exactly one app declares it, and a
   channel-scoped command has resolved only where its app is a member
@@ -1796,8 +1815,8 @@ where one exists.
 - **REQ-190.** The daemon has rate-limited message-send frequency
   per-connection, rejecting excess sends with a distinct error rather than
   silently dropping them. **Mechanism:** a fixed-window counter in the net loop —
-  **30 sends per 3 s per connection** (`OC_SEND_RATE_MAX` /
-  `OC_SEND_RATE_WINDOW_MS`, `daemon/netloop.c`) — over the limit returns the
+  **30 sends per 3 s per connection** (`OC_SEND_RATE_MAX` in
+  `daemon/config.h`, `OC_SEND_RATE_WINDOW_MS` in `daemon/netloop.c`) — over the limit returns the
   non-fatal `SEND_RATE_LIMITED` (3004). A fixed window rather than a token bucket
   because the check runs per frame on the hot path and the window is short enough
   that the boundary burst it permits is irrelevant at these numbers. The values
@@ -2171,6 +2190,18 @@ keeps to its own share of the free space and gives it back under pressure
   block of text or code with optional syntax highlighting — as a first-class
   object distinct from an inline fenced code block (REQ-220), so a long paste has
   not flooded the transcript.
+- **REQ-387.** A user has been able to hide part of a message as a
+  **spoiler** — inline (`>!text!<`) or as a block with an optional label — that
+  a reader sees only when they choose to reveal it, in every client (MARKDOWN.md
+  §1d). What a spoiler hides has been left out of search for everyone, its
+  author included, so searching for a word cannot reveal it.
+- **REQ-388.** A user has been able to post a **to-do list** — a message whose
+  body is a title and a task per line — whose tasks anyone who can read it has
+  been able to mark done or not done and add to, each change shown live with who
+  made it, and whose title its author has been able to rename. A list holds at
+  most 200 tasks, each named once; it is placed, permissioned, moved and deleted
+  as its message is, and an encrypted DM holds none (PROTOCOL.md §5.16o,
+  SCHEMA.md §3bx).
 
 ---
 
@@ -2222,6 +2253,10 @@ keeps to its own share of the free space and gives it back under pressure
 - **REQ-238.** A user has been able to **mark all as read** — clearing unread
   state across the workspace, or catching up channel-by-channel — advancing every
   read cursor to the latest message in one action (REQ-090/235).
+- **REQ-389.** A user has been able to **collapse a message** — fold it away to
+  one line in the transcript, and expand it again — for themselves alone. What
+  they collapsed has stayed collapsed on every device they use, and has been
+  nobody else's business: no one else sees it folded (SCHEMA.md §3bi).
 
 ---
 
@@ -2234,6 +2269,11 @@ messages (author name, ARCH-74).*
   image, title/role text, pronouns, phone, timezone, and the voice their messages are
   read aloud in (REQ-292) — set by the user and shown wherever the user appears. Avatars have been stored as image assets in
   object storage (ARCH-17), not SQLite.
+
+  Beside these fixed fields, a workspace has had **profile fields of its own** —
+  department, location, manager — defined by an owner or admin (at most 20, each
+  text or a link) and filled in by each person for themselves, shown on the
+  profile (SCHEMA.md §3bs).
 
   **One screen owns it.** The fields are edited together on a single Edit
   profile card and committed by one button, rather than scattered across a
@@ -2254,9 +2294,10 @@ messages (author name, ARCH-74).*
   The avatar is an ordinary attachment id (`users.avatar_attachment_id`), so it
   lands in the existing blob store — object storage where one is configured —
   rather than inventing storage; it is readable workspace-wide, and only an
-  attachment the setter uploaded can become one. Edit authority is the user's
-  own: no admin-managed fields, which is the simpler half of the choice and the
-  one a self-hosted deployment can live with.
+  attachment the setter uploaded can become one. Edit authority over a
+  person's profile is their own: an owner or admin defines the workspace's own
+  fields, but never fills in anyone's values, which is the simpler half of the
+  choice and the one a self-hosted deployment can live with.
 - **REQ-289.** A user has been able to **browse the people in the workspace** — a
   directory listing everyone with their avatar, display name, title, custom status
   and presence, searchable by name or title, opening a person's profile. Without
@@ -2388,7 +2429,7 @@ messages (author name, ARCH-74).*
   capture is a differentiator in this segment, not table stakes.
 
   **Settled by ARCH-122**, with the design in
-  [Plans/COMPLIANCE-CAPTURE.md](./plans/COMPLIANCE-CAPTURE.md): the file drop is
+  [plans/COMPLIANCE-CAPTURE.md](./plans/COMPLIANCE-CAPTURE.md): the file drop is
   built first, the pull API second and SMTP journaling after them, all three
   reading one record of what changed. What a captured record holds, who may
   read it and how a person becomes an email address are REQ-340–345.
@@ -2673,7 +2714,9 @@ feature.*
   product adjacent to chat, out of scope for a messaging system.
 - **REQ-272.** *(Excluded by decision)* **Lists / tables / project boards** (structured task/records
   surfaces) have not been supported — project-management territory (the space
-  Pumble's sibling product Plaky occupies), out of scope.
+  Pumble's sibling product Plaky occupies), out of scope. A to-do list posted
+  as a message (REQ-388) is not one: it is a message with tasks, placed and
+  permissioned as its message is, not a board or a record store.
 - **REQ-273.** *(Excluded by decision)* **Clips / asynchronous voice messages** (recording a short
   audio-only clip posted into a conversation) have not been supported. Live audio
   is REQ-150–152 and screenshare REQ-161. **Scoped by ARCH-110:** a recorded
@@ -2698,14 +2741,14 @@ feature.*
   (REQ-170/173) and the MCP surface, not a product feature. Two things this once
   excluded have since been admitted, each under requirements of its own in §7: an
   authenticated MCP surface (REQ-320–325, ARCH-120), and a first-party assistant
-  (REQ-330–334, ARCH-121). The assistant is built, and answers only: it answers a
+  (REQ-330–334, ARCH-121). The assistant answers only: it answers a
   person's questions from what they can read, citing the messages it used, and
   takes no action and posts nothing. It runs locally, on the workspace's own
   server with a local model, and nothing it reads or answers leaves the box.
   Summaries of a channel or DM (REQ-310) are a core feature and are not an
   assistant: they answer no questions, take no actions and post nothing.
 - **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
-  languages has not been provided. It touches every string in three clients, and
+  languages has not been provided. It touches every string in every client, and
   is a separate project to be taken up as one, not a feature added piece by piece.
 - **REQ-316.** *(Excluded by decision)* **Public channels readable without an account** have
   not been offered. Every reader is a member of the workspace (REQ-031); an
