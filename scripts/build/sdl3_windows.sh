@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Cross-build the committed SDL3 (static, Windows) from third_party/SDL3
-# (docs/VENDORS.md §1) with mingw-w64 into third_party/sdl3-<ver>-win/.
+# (docs/details/VENDORS.md §1) with mingw-w64 into third_party/sdl3-<ver>-win/.
 # Nothing is downloaded. SDL's own build is CMake; invoking it here is the same
 # arrangement as invoking mbedTLS's make -- the dependency's build system stays
 # the dependency's business, and this tree's stays make. It builds out of tree,
 # so the committed source is only read. Gitignored output; reproduced by this
 # script.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

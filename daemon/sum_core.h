@@ -1,6 +1,6 @@
 /*
  * OpenChime — channel and DM summaries: the engine-free core (REQ-310, ARCH-116,
- * docs/SUMMARIES.md).
+ * docs/details/SUMMARIES.md).
  *
  * Two steps, both on numbered lines that stand for the messages behind them:
  *   - notes: lines in, notes out in proportion to how much was read

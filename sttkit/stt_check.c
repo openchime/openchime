@@ -1,4 +1,4 @@
-/* stt_check: the recognizer against its references, and timed (docs/STTKIT.md §8).
+/* stt_check: the recognizer against its references, and timed (docs/details/STTKIT.md §8).
  *
  *   stt_check parity DIR FIXTURES   every fixture in FIXTURES/manifest
  *                                   (tests/data/recognizer) heard with DIR's

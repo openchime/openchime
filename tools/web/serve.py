@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the web client's build directory for development (docs/WEB.md).
+"""Serve the web client's build directory for development (docs/details/WEB.md).
 
     tools/web/serve.py [dir] [port]
 

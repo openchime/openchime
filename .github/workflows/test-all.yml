@@ -1,7 +1,7 @@
 name: test-all
 
 # The release-candidate's gate and the full suite's code tests
-# (docs/TESTING.md), in one job on one machine: the gate first, then `make
+# (docs/details/TESTING.md), in one job on one machine: the gate first, then `make
 # build-all` and `make test-all` with PART=plain, then with PART=threads.
 # Called by release-candidate.yml, once per release-candidate, on the staging
 # tip it is cutting, before it builds anything a release ships; nothing else
@@ -147,7 +147,7 @@ jobs:
 
       # --- The tools and the caches, once for both parts ---------------------
       # No MAKEFLAGS: every build compiles one file at a time here as anywhere
-      # (docs/TESTING.md, "One build at a time"), so the timeouts below are twice
+      # (docs/details/TESTING.md, "One build at a time"), so the timeouts below are twice
       # what they were when the runner's two CPUs both compiled.
       - name: Install build deps
         timeout-minutes: 20
@@ -210,7 +210,7 @@ jobs:
         with:
           path: &speexdsp-path third_party/speexdsp-1.2.1
           key: &speexdsp-key speexdsp-1.2.1-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/speexdsp.sh') }}
-      # The web client's libraries (docs/WEB.md): the release daemon carries the
+      # The web client's libraries (docs/details/WEB.md): the release daemon carries the
       # client (WEB=1), so this job builds it too. One cache each, keyed by the
       # pinned Emscripten, the script that builds it for wasm and the native
       # script that pins its version; the same keys as release-candidate.yml's

@@ -1,4 +1,4 @@
-/* A call's video packet logic -- a shared screen's (REQ-161, ARCH-86/87, docs/CALLS.md
+/* A call's video packet logic -- a shared screen's (REQ-161, ARCH-86/87, docs/details/CALLS.md
  * §6.4-§6.6) and each camera's (REQ-160, CALLS.md §7): what the call engine does with
  * their frames between the encoder and SFrame, and between SFrame and the
  * decoder. No sockets, no threads, no codec -- the engine owns those -- so every

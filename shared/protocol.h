@@ -2,9 +2,9 @@
  * OpenChime wire protocol v1 — frame codec.
  *
  * Pure encode/decode of the core-messaging-path frames defined in
- * docs/PROTOCOL.md. No sockets, no threads, no SQLite: this is the leaf the
+ * docs/details/PROTOCOL.md. No sockets, no threads, no SQLite: this is the leaf the
  * event loop and DB writer are built on top of, and it is the first thing to
- * be exhaustively unit-tested (docs/TESTING.md §2.2).
+ * be exhaustively unit-tested (docs/details/TESTING.md §2.2).
  *
  * Encoding is explicit and field-by-field (ARCH-7); nothing is memcpy'd over a
  * struct. All integers are big-endian on the wire, converted at the edges
@@ -573,7 +573,7 @@ typedef enum {
      * type, byte cap, bounds — and stores the rest as display facts. */
     OC_MSG_ATTACH_MEDIA_SET = 0x00DA, /* C->S, mark an upload as a video message */
     OC_MSG_ATTACH_MEDIA_OK  = 0x00DB, /* S->C, accepted */
-    /* Read-aloud (REQ-291-295, ARCH-111, docs/READ-ALOUD.md §6). TTS_INFO after
+    /* Read-aloud (REQ-291-295, ARCH-111, docs/details/READ-ALOUD.md §6). TTS_INFO after
      * authentication says whether this daemon speaks messages and in which
      * voices; a client that never receives it shows nothing of the feature.
      * AUDIO_* then fetch one message's speech, on the shape of the attachment

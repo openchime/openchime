@@ -1,6 +1,6 @@
 /*
  * OpenChime — one read-aloud render: speakable text to an audio-only Opus MP4
- * (ARCH-111, docs/READ-ALOUD.md §4).
+ * (ARCH-111, docs/details/READ-ALOUD.md §4).
  *
  * The synthesizer is behind a small engine interface so the render path, the
  * worker and the daemon above it are tested with a stub that makes a tone of

@@ -1,5 +1,5 @@
 # The vendored libraries the host build links, each fetched and built pinned by
-# a script under scripts/build/ (docs/VENDORS.md §2), and the committed SQLite
+# a script under scripts/build/ (docs/details/VENDORS.md §2), and the committed SQLite
 # amalgamation. A build that takes minutes says so before it starts.
 
 # --- SQLite (vendored, third_party/sqlite-3.53.4) -----------------------------

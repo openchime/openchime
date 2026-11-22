@@ -1,4 +1,4 @@
-/* Call signaling and media keys — see callsig.h and docs/CALLS.md §5. */
+/* Call signaling and media keys — see callsig.h and docs/details/CALLS.md §5. */
 
 #include "callsig.h"
 

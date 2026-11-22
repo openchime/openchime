@@ -1,5 +1,5 @@
 /* OpenChime GUI -- the browser platform (client/gui/platform/platform.h,
- * docs/WEB.md).
+ * docs/details/WEB.md).
  *
  * What a page can do of the contract, and an honest "not available" for the
  * rest, so the application carries on without it. The page's APIs are

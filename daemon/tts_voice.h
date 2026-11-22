@@ -1,6 +1,6 @@
 /*
  * OpenChime — the read-aloud voice model, run by ttskit in plain C (ARCH-111,
- * docs/READ-ALOUD.md §4).
+ * docs/details/READ-ALOUD.md §4).
  *
  * Takes the IPA ttskit produces and returns 24 kHz mono audio in one of the model's
  * eight voices. The model and its voices are one file, voice.bin (ttskit.h), whose

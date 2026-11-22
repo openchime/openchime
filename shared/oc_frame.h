@@ -1,4 +1,4 @@
-/* The one frame format of a video message (ARCH-110, docs/VIDEO-MESSAGES.md §3.1):
+/* The one frame format of a video message (ARCH-110, docs/details/VIDEO-MESSAGES.md §3.1):
  * planar I420, BT.709 limited range, even dimensions. Shared because the clients
  * capture, encode and play it, and the daemon decodes it to export a video
  * message (ARCH-135). The rest of the media types are the clients' (oc_media.h). */

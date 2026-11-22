@@ -1,7 +1,7 @@
 # OpenChime — Testing Strategy
 
 How OpenChime is tested, and the conventions any new test follows. Recorded as
-a decision in [ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-48).
+a decision in [ARCHITECTURE.md](../ARCHITECTURE.md) (ARCH-48).
 
 ## 1. The two suites
 
@@ -90,7 +90,7 @@ image pulls and runs). That is release verification, not a suite: it checks a
 publication, not a change.
 
 **Manual harnesses** live in `tools/` and are run by hand, never by either
-suite: the GUI and browser tests (`tools/gui/`, [tools/gui/README.md](../tools/gui/README.md);
+suite: the GUI and browser tests (`tools/gui/`, [tools/gui/README.md](../../tools/gui/README.md);
 "The GUI and browser tests", below), the TUI demo (`tools/demo/`), the
 capacity benchmark (`tools/bench.sh`) and the toolchain check
 (`tools/toolchains.sh`).
@@ -1397,7 +1397,7 @@ Working from ~45 MB after a sign-in burst + ~100 KB per idle connection:
 - **By memory:** `(256 − 45) MB ÷ 100 KB ≈ 2,000 idle connections` before RAM
   is the constraint in the lean profile (REQ-210). `make run LEAN=1` runs the
   development daemon under that ceiling locally — 256 MB, no swap, one CPU, in
-  a systemd user scope (README, "Local development environment") — an
+  a systemd user scope ([DEVELOPMENT.md](./DEVELOPMENT.md), "Local development environment") — an
   approximation of a small box, not a copy of one.
 - **The fd cap:** `OC_NETLOOP_MAX_FD = 4096` (a compile-time constant in
   `daemon/netloop.c`) caps the daemon at ~4,000 connections whatever the RAM;
@@ -1687,4 +1687,4 @@ runner (`tools/gui/run.sh`). Those checks are run by hand, and in neither suite
 nor CI: a client change is checked with them before it is pushed (the GUI smoke
 first). How to run them, their prerequisites, the harness, the shape every
 feature script keeps, the variables and each test's notes are
-[tools/gui/README.md](../tools/gui/README.md).
+[tools/gui/README.md](../../tools/gui/README.md).

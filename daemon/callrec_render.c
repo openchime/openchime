@@ -1,5 +1,5 @@
 /* Making a call's recording from its spool -- see callrec_render.h and
- * docs/CALLS.md §8. */
+ * docs/details/CALLS.md §8. */
 
 #include "callrec_render.h"
 #include "callrec.h"       /* the spool's layout and timeline kinds */

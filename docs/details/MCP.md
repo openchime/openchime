@@ -4,7 +4,7 @@ How an AI agent, or a person's own AI client, reads and posts in a workspace
 through the Model Context Protocol (REQ-320–325, ARCH-120). This document is the
 daemon-side design; the decision and what was rejected are ARCH-120, and the
 tools, their paging and the agent token lifecycle are specified in
-[Plans/MCP.md](./Plans/MCP.md).
+[Plans/MCP.md](../plans/MCP.md).
 
 Nothing here is a setting's name, a table or a frame. Those are written into
 CONFIG.md, SCHEMA.md and PROTOCOL.md with the code that has them.
@@ -105,8 +105,9 @@ mentions read naturally, and no credential of a person's: no password, no
 identity-provider subject, no sessions, no devices. It cannot sign in to a
 client, has no presence, and is never in a DM or group DM.
 
-An agent authenticates with a **bearer token the daemon minted**. An owner or
-admin creates the agent and mints its tokens from the client; a token is 32
+An agent authenticates with a **bearer token the daemon minted**, carrying the
+scopes chosen for it when it was minted. An owner or admin creates the agent and
+mints its tokens from the client; a token is 32
 random bytes, shown once, stored as its SHA-256 and found by one indexed probe,
 exactly as session and webhook tokens are (ARCH-58/71). An agent may hold
 several, so one can be replaced without a gap. Revoking a token deletes its
@@ -159,7 +160,9 @@ request.
 
 - **An agent reads the channels it is a member of**, and only those — through
   `channel_members`, the effective membership every query already reads
-  (ARCH-114). Being in a channel gives it what being in a channel gives a
+  (ARCH-114) — and only as far as its token's scopes allow: the scopes an owner
+  or admin chose for it from the app platform's catalog (plans/APPS.md §4),
+  checked as a bot's are (ARCH-120). Being in a channel gives it what being in a channel gives a
   member: the channel's history and its threads. It reads no DM, no group DM
   and no channel it has not been added to, public or not; a public channel is
   open for a *person* to join, and an agent joins nothing by itself.

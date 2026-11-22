@@ -36,7 +36,7 @@ TTS="$(dirname "$BINARY")/tts"
 # And voice input's recognizer data in stt/, for the same reason.
 STT="$(dirname "$BINARY")/stt"
 [ -f "$STT/manifest" ] && cp -r "$STT" "$dir/stt"
-# And the web client the daemon serves (docs/WEB.md), the same way: a daemon
+# And the web client the daemon serves (docs/details/WEB.md), the same way: a daemon
 # always serves the client built with it.
 WEB="$(dirname "$BINARY")/web"
 [ -f "$WEB/openchime.wasm" ] && cp -r "$WEB" "$dir/web"
@@ -120,7 +120,7 @@ is statically linked, read-aloud's voice data is in tts/ and voice input's
 recognizer in stt/ beside the binary, so there is nothing further to fetch. That makes this the
 offline install: no package repository, no network.
 
-  Configuration   /etc/openchime/openchimed.env   (every variable: docs/CONFIG.md)
+  Configuration   /etc/openchime/openchimed.env   (every variable: docs/details/CONFIG.md)
   State           /var/lib/openchime/
   Logs            journalctl -u openchimed
 

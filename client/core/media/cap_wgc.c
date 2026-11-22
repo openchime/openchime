@@ -1,5 +1,5 @@
 /* The Windows screen and window backend: Windows.Graphics.Capture
- * (docs/VIDEO-MESSAGES.md §3.2, ARCH-110).
+ * (docs/details/VIDEO-MESSAGES.md §3.2, ARCH-110).
  *
  * WinRT from C. The handful of interfaces this needs are declared here rather
  * than taken from headers -- mingw's declare the capture session and nothing

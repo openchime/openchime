@@ -128,7 +128,7 @@ else ifneq ($(MANIFEST_HOST_BIN),)
 # MANIFEST_HOST_BIN: a daemon already built for this machine, which writes the
 # manifests instead of a host daemon built for the purpose. The
 # release-candidate's arm64 step passes the amd64 release binary it built
-# moments before (docs/CONTRIBUTING.md, "Billed minutes": nothing built twice).
+# moments before (docs/details/CONTRIBUTING.md, "Billed minutes": nothing built twice).
 MANIFEST_BIN := $(MANIFEST_HOST_BIN)
 else
 MANIFEST_DIR := build/manifest-host

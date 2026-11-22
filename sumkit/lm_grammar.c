@@ -1,4 +1,4 @@
-/* The grammars an answer is held to (docs/SUMKIT.md §5): the subset of GBNF
+/* The grammars an answer is held to (docs/details/SUMKIT.md §5): the subset of GBNF
  * that daemon/sum_core.c builds -- rules ("name ::= ..."), string literals,
  * character classes ([...] and [^...], with ranges and \n \t \r \\ \" \]
  * escapes), alternation, grouping, rule references, and ?, *, + and {m},

@@ -1,4 +1,4 @@
-/* The Recorder -- see callrec.h and docs/CALLS.md §8. */
+/* The Recorder -- see callrec.h and docs/details/CALLS.md §8. */
 
 #include "callrec.h"
 

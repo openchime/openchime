@@ -28,7 +28,7 @@
 # cannot send, or has lost its message-loop shortcuts — the failures that make
 # every other test meaningless. It catches nothing subtler, deliberately.
 #
-# IT IS IN NO SUITE AND NOT IN CI: no GUI test is (docs/TESTING.md). Its Win32
+# IT IS IN NO SUITE AND NOT IN CI: no GUI test is (docs/details/TESTING.md). Its Win32
 # run could not be anyway: the daemon is epoll-based, so Linux-only, and
 # GitHub's Windows runners cannot host it. Run it on both platforms with
 # tools/gui/run.sh smoke.

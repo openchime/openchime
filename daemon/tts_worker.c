@@ -164,7 +164,7 @@ static void *run(void *arg) {
             /* Where the wait goes, per render: the model's time and the store's,
              * separately. A single total cannot tell "the model is slow" from
              * "the blob store is", and the answer decides what is worth doing
-             * about it (docs/READ-ALOUD.md §5). */
+             * about it (docs/details/READ-ALOUD.md §5). */
             if (n->r.status == OC_TTS_OK) {
                 double render_ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
                 double store_ms  = (double)(t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6;

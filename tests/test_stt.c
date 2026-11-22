@@ -1,5 +1,5 @@
 /* Tests for voice input's daemon half that need no model (ARCH-112,
- * docs/VOICE-INPUT.md §6): spoken mentions, and the recognition worker with a
+ * docs/details/VOICE-INPUT.md §6): spoken mentions, and the recognition worker with a
  * stub engine -- order, a full queue, the eventfd, opening only when needed and
  * closing when idle. The recognizer itself is tests/test_sttkit.c's. */
 #include "check.h"

@@ -4,7 +4,7 @@
  * Sequential migrations are embedded in the daemon binary as an ordered array,
  * applied automatically against a `schema_version` table on startup — each in
  * its own transaction — before the daemon serves traffic. No separate
- * migration tool or manual operator step. See docs/SCHEMA.md for the schema
+ * migration tool or manual operator step. See docs/details/SCHEMA.md for the schema
  * itself.
  */
 

@@ -1,4 +1,4 @@
-/* build/fuzz/seeds <dir>: the harnesses' seed corpora (docs/TESTING.md,
+/* build/fuzz/seeds <dir>: the harnesses' seed corpora (docs/details/TESTING.md,
  * "Fuzzing"). One frame per encoder, each over a zeroed message, so every
  * message type is in the corpus as the encoder writes it, into <dir>/frame/;
  * and into <dir>/framebuf/, streams of those frames under a few chunkings,

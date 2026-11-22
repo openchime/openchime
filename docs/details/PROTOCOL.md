@@ -2,8 +2,8 @@
 
 This document specifies the OpenChime binary wire protocol at the byte level.
 It is the detailed realization of the frame decisions in
-[ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-6 through ARCH-9, ARCH-30) and of
-the protocol-shaped requirements in [REQUIREMENTS.md](./REQUIREMENTS.md).
+[ARCHITECTURE.md](../ARCHITECTURE.md) (ARCH-6 through ARCH-9, ARCH-30) and of
+the protocol-shaped requirements in [REQUIREMENTS.md](../REQUIREMENTS.md).
 
 **Scope.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
@@ -518,7 +518,7 @@ sent (CLIENT.md §5) and dials that next time. A new frame, so no version bump.
 ### 4.3c `SERVER_BUILD` (server → client), msg_type `0x0106`
 
 Pushed after `WORKSPACE_INFO` (and `WORKSPACE_ADDRESS`, when that is sent), on
-every sign-in. The daemon's build id (docs/UPGRADING.md): the short commit it
+every sign-in. The daemon's build id (docs/details/UPGRADING.md): the short commit it
 was built from, or `dev` from a source build. A client shows it beside its own
 in About OpenChime (CLIENT.md), so a person reporting a problem reads both builds
 off one screen. Sent only once signed in, so an address alone does not learn
@@ -1006,7 +1006,7 @@ Each entry, in wire order:
 `ooo_start` (u64) · `ooo_end` (u64) · `ooo_message` (str) (the three since
 version 41).
 
-`ooo_*` is the person's **out of office** (`SET_OUT_OF_OFFICE`, §5.20), as
+`ooo_*` is the person's **out of office** (`SET_OUT_OF_OFFICE`, §5.21), as
 stored: in force while `ooo_start` ≤ now < `ooo_end`, which the client decides,
 so the mark goes at the end time with nothing sent. `ooo_end` 0 means none.
 
@@ -1710,7 +1710,7 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
 1. **`UPLOAD_BEGIN` (C → S), `0x0080`** `{ channel_id: u64, idempotency_token:
    16B, filename: str, mime: str, total_size: u64, media_kind: u8 }` — the client
    declares an upload targeting a channel/DM it can post to. `media_kind` is 2 for
-   a snippet's text (§5.14b) and 0 otherwise (protocol 44). The server authorizes
+   a snippet's text (§5.14e) and 0 otherwise (protocol 44). The server authorizes
    membership, checks `total_size <= MAX_ATTACHMENT_SIZE` (and, for a snippet,
    at most 1 MiB), allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
@@ -1798,44 +1798,10 @@ belongs to the cancelled transfer and is dropped, never taken for the new one's.
 
 ---
 
-### 5.14b Snippets (REQ-226)
-
-A snippet is an **ordinary attachment** too: a `text/plain` upload of at most
-1 MiB, marked with a title and an optional language, shown as a card with its
-first lines and opened whole with its words coloured (`shared/lexer.h`: C,
-Python, JavaScript, shell, JSON, YAML, SQL and Go; anything else plain). Posting
-it is three steps:
-
-1. Upload the text, `mime` `text/plain`.
-2. **`ATTACH_MEDIA_SET`** with `media_kind` `2` (protocol 39). After the kind
-   byte come `{ title: str, language: str, text: str }` in place of a video's
-   facts: the title (1 to 120 bytes), the language (at most 16 bytes of `a`–`z`,
-   `0`–`9`, `+`, `#`, `-`; empty for plain), and the text's first 64 KiB, for
-   search. Answered `ATTACH_MEDIA_OK`, or `UNKNOWN_ATTACHMENT` as for a video,
-   `MEDIA_TOO_LARGE` past 1 MiB, and `MEDIA_INVALID` for an upload that is not
-   `text/plain`, already sent, untitled, a language outside those characters, or
-   text that is not UTF-8.
-3. `SEND` (or `SEND_REPLY`) with its id in the attachment list.
-
-An attachment entry of kind `2` carries `{ title: str, language: str }` after the
-kind byte, where a video's carries its facts. Search (`SEARCH`) finds a
-message by its snippet's title or text: such hits follow the message hits on the
-first page of a search with words and no filters, newest first, under the same
-read gate, their excerpt "Snippet: <title>". Deleting the message, or the
-storage sweep reclaiming the bytes, takes the snippet out of search.
-
-The size cap is enforced at `UPLOAD_BEGIN`, whose `media_kind` says the upload
-is a snippet, before any of its bytes are sent (`ATTACHMENT_TOO_LARGE`), and again
-at `ATTACH_MEDIA_SET` when it is marked. Clients refuse a longer
-text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
-one.
-
----
-
 ### 5.14a Video messages (REQ-162–165, ARCH-110)
 
 A video message is an **ordinary attachment** — a VP9 and Opus MP4 recorded in the
-client (docs/VIDEO-MESSAGES.md) — plus a **media row** naming its length, size and
+client (docs/details/VIDEO-MESSAGES.md) — plus a **media row** naming its length, size and
 poster. Posting it is four steps, all on frames that already exist but one:
 
 1. Upload the poster JPEG (`UPLOAD_BEGIN` … `UPLOAD_OK`).
@@ -1872,7 +1838,7 @@ The media row then rides every attachment entry — `BROADCAST`, `THREAD_REPLY`,
 backfill, history and `LIST_THREAD` — and `FILE_ENTRY` (§5.9b). Search matches any
 video attachment with `has:video` (§5.11).
 
-### 5.14b Read-aloud (REQ-291–295, ARCH-111)
+### 5.14b Capabilities, workspace settings and read-aloud (REQ-291–295, ARCH-111)
 
 Speech is **not** an attachment: nothing was uploaded, and the daemon makes the
 file itself from the message's text. What the wire carries is therefore the
@@ -1953,7 +1919,7 @@ me". The gate is the one that guards reading the message itself
 3. **`AUDIO_END` (S → C), `0x00E0`** `{ message_id: u64 }` — everything sent.
 
 The payload is an **audio-only MP4** holding one Opus track (the video message
-profile with the video track left out, docs/VIDEO-MESSAGES.md §5), 24 kHz mono at
+profile with the video track left out, docs/details/VIDEO-MESSAGES.md §5), 24 kHz mono at
 24 kbit/s.
 
 A first request **renders**, which takes about six tenths of the spoken duration,
@@ -1994,7 +1960,7 @@ connection stays open (READ-ALOUD.md §6). A client sends them only when
 The client sends a segment of speech it has already cut at a pause. In **push to
 talk** the daemon answers with the words; in **free talk** it posts them as the
 speaker through the ordinary send path — the one `SEND` and `SEND_REPLY` use — so the
-text never travels back to be re-sent. Design in docs/VOICE-INPUT.md. Adding these
+text never travels back to be re-sent. Design in docs/details/VOICE-INPUT.md. Adding these
 frames needed no protocol-version bump (§2).
 
 **`STT_INFO` (S → C), `0x00E3`** `{ model_version: str, lang: str, max_segment_ms:
@@ -2068,6 +2034,40 @@ its bytes have been reclaimed; `UNKNOWN_ATTACHMENT` for an id that is not there 
 not yet sent; and `INTERNAL` when the transcode failed. A client sends it only when
 `CAPABILITIES` lists `h264-export`.
 
+### 5.14e Snippets (REQ-226)
+
+A snippet is an **ordinary attachment** too: a `text/plain` upload of at most
+1 MiB, marked with a title and an optional language, shown as a card with its
+first lines and opened whole with its words coloured (`shared/lexer.h`: C,
+Python, JavaScript, shell, JSON, YAML, SQL and Go; anything else plain). Posting
+it is three steps:
+
+1. Upload the text, `mime` `text/plain`.
+2. **`ATTACH_MEDIA_SET`** with `media_kind` `2` (protocol 39). After the kind
+   byte come `{ title: str, language: str, text: str }` in place of a video's
+   facts: the title (1 to 120 bytes), the language (at most 16 bytes of `a`–`z`,
+   `0`–`9`, `+`, `#`, `-`; empty for plain), and the text's first 64 KiB, for
+   search. Answered `ATTACH_MEDIA_OK`, or `UNKNOWN_ATTACHMENT` as for a video,
+   `MEDIA_TOO_LARGE` past 1 MiB, and `MEDIA_INVALID` for an upload that is not
+   `text/plain`, already sent, untitled, a language outside those characters, or
+   text that is not UTF-8.
+3. `SEND` (or `SEND_REPLY`) with its id in the attachment list.
+
+An attachment entry of kind `2` carries `{ title: str, language: str }` after the
+kind byte, where a video's carries its facts. Search (`SEARCH`) finds a
+message by its snippet's title or text: such hits follow the message hits on the
+first page of a search with words and no filters, newest first, under the same
+read gate, their excerpt "Snippet: <title>". Deleting the message, or the
+storage sweep reclaiming the bytes, takes the snippet out of search.
+
+The size cap is enforced at `UPLOAD_BEGIN`, whose `media_kind` says the upload
+is a snippet, before any of its bytes are sent (`ATTACHMENT_TOO_LARGE`), and again
+at `ATTACH_MEDIA_SET` when it is marked. Clients refuse a longer
+text before uploading it, and offer a paste of more than 40 lines or 4 KiB as
+one.
+
+---
+
 ### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
 
 An incoming webhook lets an uncontrolled third party post a message into one
@@ -2095,9 +2095,12 @@ removes it and replies `WEBHOOK_DELETED` (S → C, `0x005E`) `{ webhook_id: u64 
 
 **HTTP endpoint — `POST /webhook/<hex-token>`.** Reached over the same TLS proto
 port, demultiplexed by ALPN (ARCH-54): a connection that does **not** negotiate
-`oc/1` is served by the HTTP/1.1 handler. The body is either
-`application/json {"text": "..."}` or a raw `text/plain` message, capped at
-`MAX_BODY_SIZE`. The daemon hex-decodes the token, looks it up by hash, and posts
+`oc/1` is served by the HTTP/1.1 handler. The body is a `text/plain` message,
+posted as sent; an `application/json` payload in the common chat-webhook
+format — its `blocks`, or with none its `text`, then its `attachments`; or an
+`application/x-www-form-urlencoded` body whose `payload` field holds that JSON.
+How each part becomes the message, and its markup the message format's, is
+ARCH-71. The text is capped at `MAX_BODY_SIZE`, cut at a character's end. The daemon hex-decodes the token, looks it up by hash, and posts
 the text as a message **authored by the webhook's creator**, carrying the
 webhook's **label as a display-name override** (the `author_name` field on
 `BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
@@ -3599,7 +3602,7 @@ owner or admin (`FORBIDDEN` otherwise).
 
 Adding these frames needed no protocol-version bump.
 
-### 5.20 Out of office (REQ-122)
+### 5.21 Out of office (REQ-122)
 
 **`SET_OUT_OF_OFFICE` (C → S), `0x013A`** — my absence, apart from the custom
 status, which shows beside it.
@@ -4161,7 +4164,7 @@ this table cannot silently gain a shared value.
 | `0x0137` | `SET_PROFILE_FIELD` | C → S | owner or admin: add, rename or delete a workspace profile field |
 | `0x0138` | `PROFILE_FIELDS` | S → C | the workspace's profile fields: after sign-in, and to everyone on a change |
 | `0x0139` | `SET_PROFILE_FIELD_VALUE` | C → S | my value for one profile field; empty clears it; answered with `PROFILE_INFO` |
-| `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.20) |
+| `0x013A` | `SET_OUT_OF_OFFICE` | C → S | my out-of-office span and message; an end of 0 or past clears it (§5.21) |
 | `0x013B` | `CHANNEL_ADD_MANAGER` | C → S | a manager, admin or owner names a member of the channel a manager (§5.7) |
 | `0x013C` | `CHANNEL_REMOVE_MANAGER` | C → S | and takes the role from any manager, the creator included |
 | `0x013D` | `RENAME_EMOJI` | C → S | a custom emoji's new name; the old one stays as an alias (§5.16g) |

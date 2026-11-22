@@ -1,4 +1,4 @@
-/* Choosing each token of an answer (docs/SUMKIT.md §5): greedy, after DRY,
+/* Choosing each token of an answer (docs/details/SUMKIT.md §5): greedy, after DRY,
  * among the tokens the call's grammar allows -- the same choice as the reference implementation's
  * chain of grammar, DRY and greedy samplers, made without masking the whole
  * vocabulary: the candidates are tried best first and the first the grammar

@@ -14,7 +14,7 @@
  *
  * The Makefile passes two bare tokens to windres: OC_BUILD_NUM, the candidate
  * build's run number, and OC_BUILD_ID_TOKEN, the short commit the daemon
- * reports as its build id (docs/UPGRADING.md). A source build leaves them
+ * reports as its build id (docs/details/UPGRADING.md). A source build leaves them
  * unset and gets 0 and "dev", matching the daemon.
  *
  * Only bare tokens cross the command line, and the strings are built here.

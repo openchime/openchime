@@ -40,7 +40,7 @@ setting).
   and remote, after.
 - **Documentation and workflow changes take the same path**: a branch, a pull
   request into `staging`, the same checks. A documentation-only change (`*.md`
-  and `docs/`, except `docs/CONFIG.md`, which follows the daemon's settings,
+  and `docs/`, except `docs/details/CONFIG.md`, which follows the daemon's settings,
   and `LICENSING.md`; the one rule is `scripts/policy/docs_only.sh`) can be
   pushed without `make test`, and once merged can be put on `main` by the
   maintainers without a release (`promote.yml`); anything else, workflows

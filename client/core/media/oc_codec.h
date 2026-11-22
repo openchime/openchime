@@ -1,5 +1,5 @@
 /* Thin wrappers over libvpx (VP9) and libopus for video messages (ARCH-110,
- * docs/VIDEO-MESSAGES.md §4) and calls (CALLS.md §6-§7). The settings live here
+ * docs/details/VIDEO-MESSAGES.md §4) and calls (CALLS.md §6-§7). The settings live here
  * and nowhere else, so the recorder, the player and the call engine never touch
  * a library API directly. */
 #ifndef OC_CODEC_H
@@ -61,7 +61,7 @@ int  oc_opusenc_lookahead(oc_opusenc *e);
 int  oc_opusenc_encode(oc_opusenc *e, const int16_t *pcm, uint8_t *out, size_t cap);
 void oc_opusenc_close(oc_opusenc *e);
 
-/* ---- Opus for calls (docs/CALLS.md §3) --------------------------------------- */
+/* ---- Opus for calls (docs/details/CALLS.md §3) --------------------------------------- */
 
 #define OC_VOICE_RATE   16000
 #define OC_VOICE_FRAME  320              /* 20 ms at 16 kHz */

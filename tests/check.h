@@ -37,7 +37,7 @@ static int failures OC_UNUSED = 0;
 /* Under ThreadSanitizer, which slows code five to fifteen times and unevenly. A
  * verdict never depends on how fast code runs, here or anywhere: a test asserts
  * the mechanism (the work done, a count, a bound), on a clock it injects and
- * moves, or by waiting on an outcome it can observe (docs/TESTING.md §2.3). */
+ * moves, or by waiting on an outcome it can observe (docs/details/TESTING.md §2.3). */
 #if defined(__SANITIZE_THREAD__)
 #define OC_UNDER_TSAN 1
 #elif defined(__has_feature)

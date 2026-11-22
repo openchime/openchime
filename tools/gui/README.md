@@ -4,7 +4,7 @@
 Windows desktop and the web client in a headless Chromium -- against a real
 daemon, and reads what each did from the client's own model dump. Every check
 here is run by hand: none runs in `make test` or `make test-all`, and none in
-CI (docs/TESTING.md says what the two suites are). Run the GUI smoke before
+CI (docs/details/TESTING.md says what the two suites are). Run the GUI smoke before
 pushing a client change, and the feature's own test when a change touches it.
 
 ## Contents
@@ -315,7 +315,7 @@ CONFIG.md "Mode"), and any build will do.
 
 The test binary's own variables share the prefix and are not the harness's:
 `OC_TEST_ONLY`, `OC_TEST_EXCEPT`, `OC_TEST_REPEAT`, `OC_TEST_JOBS`
-(`tests/main.c`) and `OC_TEST_TIMING` (`tests/check.h`), in docs/TESTING.md.
+(`tests/main.c`) and `OC_TEST_TIMING` (`tests/check.h`), in docs/details/TESTING.md.
 
 ## One GUI run at a time
 
@@ -379,7 +379,7 @@ when reading its output.
 | `voice` | win32 web | `speech` | 9680 | voice input, with real recognition | [Reading the voice harness](#reading-the-voice-harness) |
 | `web_client` | web | | 9585 | what only the browser client has: a video message in wasm, the text layer, About, the input method | [Reading the web client harness](#reading-the-web-client-harness) |
 | `web_pages` | web | | 9595 | the daemon's sign-in pages, an invitation link and the client's load, from a real browser | [Reading the web pages harness](#reading-the-web-pages-harness) |
-| `web_signin` | win32 | | 8551 | local accounts signing in in the browser, from the Win32 client | its header; docs/TESTING.md §3.1 |
+| `web_signin` | win32 | | 8551 | local accounts signing in in the browser, from the Win32 client | its header; docs/details/TESTING.md §3.1 |
 | `whatsnew` | win32 | | 9780 | What's new: this build's release notes | its header |
 | `workspaces` | win32 web | | 9790 | the Workspaces dialog | its header |
 
@@ -642,7 +642,7 @@ catches nothing — the failure mode of a slow gate is not that it is slow, it i
 that it stops being run. Verify a feature by driving it, through
 `tools/gui/harness/win32/drive.sh` or a harness scoped to that feature. Do not add it here.
 
-It is not in CI, and in neither suite (docs/TESTING.md): no GUI or browser
+It is not in CI, and in neither suite (docs/details/TESTING.md): no GUI or browser
 check is. Its Win32 run could not be in any case: the daemon is epoll-based so
 it is Linux-only, and GitHub's Windows runners cannot host it (no Linux
 containers). Run it on both platforms with `tools/gui/run.sh smoke`.

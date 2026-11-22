@@ -1,5 +1,5 @@
 /* sdltext's browser backend: the page's 2D canvas measures and rasters text
- * (docs/WEB.md). Pixels leave through the sink, as from every backend. */
+ * (docs/details/WEB.md). Pixels leave through the sink, as from every backend. */
 #ifndef ST_CANVAS_H
 #define ST_CANVAS_H
 #include "sdltext.h"

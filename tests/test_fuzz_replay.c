@@ -1,4 +1,4 @@
-/* The fuzzing tier's corpora and reproducers, replayed (docs/TESTING.md,
+/* The fuzzing tier's corpora and reproducers, replayed (docs/details/TESTING.md,
  * "Fuzzing"): every file under tests/fuzz/corpus/<harness>/ and
  * tests/fuzz/crashes/<harness>/ through its harness. A crash the fuzzer found is
  * checked in under crashes/, and fails here until it is fixed. A harness aborts

@@ -1,4 +1,4 @@
-/* The call's media engine — see oc_call_engine.h and docs/CALLS.md §3-§5. */
+/* The call's media engine — see oc_call_engine.h and docs/details/CALLS.md §3-§5. */
 #include "sock.h"       /* first: winsock2 before anything pulls in windows.h */
 
 #include "oc_call_engine.h"

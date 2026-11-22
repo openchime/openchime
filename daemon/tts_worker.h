@@ -1,5 +1,5 @@
 /*
- * OpenChime — the read-aloud render worker (ARCH-111, docs/READ-ALOUD.md §4).
+ * OpenChime — the read-aloud render worker (ARCH-111, docs/details/READ-ALOUD.md §4).
  *
  * One thread beside the net loop. The net thread submits a render (a request id,
  * the 32-byte handle, a voice, the speakable text) to a bounded queue; the worker

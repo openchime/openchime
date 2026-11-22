@@ -1,4 +1,4 @@
-/* Unit tests for the OpenChime v1 frame codec (docs/PROTOCOL.md, TESTING.md
+/* Unit tests for the OpenChime v1 frame codec (docs/details/PROTOCOL.md, TESTING.md
  * §2.2). Links the codec's object and exercises its public API (TESTING.md
  * §2.1), and a single CHECK macro counts failures. Built and run by `make test`; non-zero exit means failure. */
 

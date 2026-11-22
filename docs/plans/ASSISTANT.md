@@ -173,12 +173,12 @@ conversation as its own piece if people ask for it.
 | Level | Who | What |
 |---|---|---|
 | System | The operator, in the daemon's environment, beside the summary setting | Off (the default) or local. There is no hosted value. Off, or a model that does not come up, and nothing below matters. |
-| Workspace | Owners and admins | On (the default once the system allows it) or off for the workspace. Stored in the daemon's database, changed from the admin settings, and written to the audit log. Off withdraws the capability from every connection at once. |
+| Workspace | Whoever runs the workspace, in its configuration (ARCH-127) | On (the default once the system allows it) or off for the workspace, told to clients read-only in `WORKSPACE_SETTINGS`. Off withdraws the capability from every connection. |
 | Person | Each member, for themselves | Hide Ask. A synced client preference, as sidebar view state is (REQ-234): it hides the button and the action, and changes nothing on the server. |
 
-The workspace setting is the one that needs new storage and a new frame; the
-other two are a setting beside the existing summary one and a preference beside
-the existing ones.
+The system and workspace levels are settings beside the existing summary one
+(the workspace's a registry row its clients are told), and the person's a
+preference beside the existing ones; none needs new storage or a new frame.
 
 ## 8. Tests
 
@@ -215,8 +215,8 @@ Each of these is opened as its own piece of work once this design merges.
    citation check, the queue and the load gate, cancel (§3).
 4. **The protocol:** the capability, `ASK`, `ASK_PART`, `ASK_DONE`,
    `ASK_CANCEL`, documented in PROTOCOL.md (§4).
-5. **Settings:** the system setting, the workspace setting with its storage,
-   frame and audit entry, and the person's preference (§7).
+5. **Settings:** the system setting, the workspace setting as a registry row
+   its clients are told, and the person's preference (§7).
 6. **The GUI's Ask pane** (§5).
 7. **The terminal client's Ask action** (§5).
 8. **The evaluation** (§9), before the model and constants are fixed.

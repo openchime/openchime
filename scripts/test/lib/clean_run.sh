@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test/lib/clean_run.sh <command> [args...]
 #
-# Runs a build or test command under the rules in docs/TESTING.md, "One build
+# Runs a build or test command under the rules in docs/details/TESTING.md, "One build
 # at a time":
 #
 #   - One build at a time. Before the command starts, this takes an exclusive

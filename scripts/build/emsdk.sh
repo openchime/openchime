@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch the pinned Emscripten into third_party/emsdk-<ver>/ -- the "fetched at
-# build" vendoring class (docs/VENDORS.md §2), gitignored, reproduced by this
+# build" vendoring class (docs/details/VENDORS.md §2), gitignored, reproduced by this
 # script. emsdk is a git repository whose tag names the Emscripten release and
 # whose own table pins the SHA-256 of every binary it installs (LLVM, Binaryen,
 # Node, Python); `emsdk install` downloads and checks them. The result needs no

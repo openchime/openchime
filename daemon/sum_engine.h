@@ -1,5 +1,5 @@
 /*
- * OpenChime — the model a summary is written by (ARCH-116, docs/SUMMARIES.md).
+ * OpenChime — the model a summary is written by (ARCH-116, docs/details/SUMMARIES.md).
  *
  * One table of functions, as read-aloud has (tts_render.h): the daemon runs the
  * local model through it (sum_sumkit.c, sumkit linked in), and the tests run a

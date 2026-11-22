@@ -1,4 +1,4 @@
-/* The hosted summary model (sum_engine.h, ARCH-116, docs/SUMMARIES.md §6).
+/* The hosted summary model (sum_engine.h, ARCH-116, docs/details/SUMMARIES.md §6).
  *
  * Each answer is one request to an OpenAI-style chat-completions endpoint: the
  * same system and user prompt the local engine is given, in the fields every

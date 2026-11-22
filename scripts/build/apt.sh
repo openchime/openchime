@@ -18,7 +18,7 @@
 #
 # Only what the runner image lacks is installed: a package already there is
 # left alone, and when every one is there nothing is fetched at all -- no
-# `apt-get update` (docs/CONTRIBUTING.md, "Billed minutes").
+# `apt-get update` (docs/details/CONTRIBUTING.md, "Billed minutes").
 set -euo pipefail
 [ "$#" -gt 0 ] || { echo "usage: apt.sh <package>..." >&2; exit 2; }
 missing=()

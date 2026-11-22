@@ -82,7 +82,7 @@ APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES
 # binary, which replays their corpora, and in each libFuzzer binary
 # (mk/tests.mk, build/fuzz/%). tests/fuzz/main.c and seeds.c are the tools'.
 # This is the one list of them: the full suite runs each (scripts/test/full/
-# fuzz.sh, given the list and the dictionaries by make), and docs/TESTING.md
+# fuzz.sh, given the list and the dictionaries by make), and docs/details/TESTING.md
 # says what each fuzzes. FUZZ_DICT_<harness> is the dictionary a harness
 # takes (tests/fuzz/*.dict), none where unset. FUZZ_RUNS_<harness> is the
 # number of inputs the full suite runs it for, from a fixed seed: the same
@@ -115,7 +115,7 @@ TEST_BIN := build/tests
 # The shared, frontend-agnostic core: the net thread + the two UI<->net queues +
 # the view-model/reducers + the oc_client facade. It has no main of its own -- the
 # headless test (make test) links and drives it against an in-process daemon, and
-# frontends (a TUI first, then native GUIs) link it too. See docs/CLIENT.md.
+# frontends (a TUI first, then native GUIs) link it too. See docs/details/CLIENT.md.
 # signin_web.c is the browser's signin.c (WEB.md): the web core takes it in
 # place of signin.c, the native build leaves it out.
 CORE_SRC := $(filter-out client/core/signin_web.c,$(wildcard client/core/*.c))
@@ -159,7 +159,7 @@ VOICE_SRC  := $(wildcard client/core/voice/*.c)
 VOICE_HDRS := $(wildcard client/core/voice/*.h)
 VOICE_INC  := -Iclient/core/voice -Ithird_party/libfvad/include
 
-# --- Calls (ARCH-113, docs/CALLS.md) -----------------------------------------
+# --- Calls (ARCH-113, docs/details/CALLS.md) -----------------------------------------
 # The media engine behind the core's oc_call_media seam: the microphone through
 # the canceller and speexdsp's preprocessor, Opus, SFrame, the relay socket, the
 # jitter buffers and the mixer. Linked by the Win32 client and the tests; the
@@ -170,8 +170,8 @@ CALL_INC  := -Iclient/core/call
 
 # --- nnkit (the neural network kernels ttskit and sttkit share) ---------------
 # Plain C, no dependencies: the kernels read-aloud's voice model and voice
-# input's recognizer run on. Linked wherever either kit is. See docs/TTSKIT.md
-# §5b and docs/STTKIT.md.
+# input's recognizer run on. Linked wherever either kit is. See docs/details/TTSKIT.md
+# §5b and docs/details/STTKIT.md.
 NNKIT_SRC := $(wildcard nnkit/*.c)
 NNKIT_INC := -Innkit
 NNKIT_HDRS := $(wildcard nnkit/*.h)
@@ -185,7 +185,7 @@ KIT_CFLAGS := -ffp-contract=off
 # --- sttkit (voice input's recognizer, ARCH-112) ----------------------------
 # 16 kHz speech to text: the recognizer in plain C over nnkit, its model one
 # committed, memory-mapped file in sttkit/data. stt_check runs it against its
-# references and times it. See docs/STTKIT.md.
+# references and times it. See docs/details/STTKIT.md.
 STTKIT_SRC := $(filter-out sttkit/stt_check.c,$(wildcard sttkit/*.c))
 STTKIT_INC := -Isttkit $(NNKIT_INC)
 STTKIT_HDRS := $(wildcard sttkit/*.h)
@@ -194,7 +194,7 @@ STTKIT_HDRS := $(wildcard sttkit/*.h)
 # The summary model in plain C over nnkit, its data one memory-mapped file,
 # summary.bin, made by the daemon from Qwen's published files (--summary-pack,
 # daemon/summary_pack.c). sum_check runs it against its references, measures
-# its quantisation and times it. See docs/SUMKIT.md.
+# its quantisation and times it. See docs/details/SUMKIT.md.
 SUMKIT_SRC  := $(filter-out sumkit/sum_check.c,$(wildcard sumkit/*.c))
 SUMKIT_INC  := -Isumkit $(NNKIT_INC)
 SUMKIT_HDRS := $(wildcard sumkit/*.h)
@@ -204,7 +204,7 @@ SUMKIT_HDRS := $(wildcard sumkit/*.h)
 # trained guesser, both committed as memory-mapped data in ttskit/data. Pure C, no
 # dependencies; linked into the daemon and covered by `make test`. tts_pack
 # builds the data files (scripts/build/ttskit_data.sh) and says words with them.
-# See docs/TTSKIT.md.
+# See docs/details/TTSKIT.md.
 TTSKIT_SRC := $(filter-out ttskit/tts_pack.c,$(wildcard ttskit/*.c))
 TTSKIT_INC := -Ittskit $(NNKIT_INC)
 

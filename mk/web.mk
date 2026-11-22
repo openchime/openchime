@@ -1,4 +1,4 @@
-# The browser client (docs/WEB.md): the same application layer as Windows
+# The browser client (docs/details/WEB.md): the same application layer as Windows
 # (client/gui/app) over the browser platform (client/gui/platform/web), the
 # canvas text backend, the core, and stand-ins for what a browser lacks.
 # Emscripten is fetched pinned on first use (mk/toolchains.mk); mbedTLS, SDL3
@@ -66,7 +66,7 @@ $(eval $(call oc_obj_rules,build/wasm/core,WEB_CORE_CC,$(EMCC),$(WEB_MBEDTLS)/li
 # WEB_PREBUILT: a directory holding a web client already built for this build
 # id (build/web from another job, with its .build_id), taken as it is: no
 # Emscripten, no compile, no link. The release-candidate's stage takes the
-# test job's this way, so the client is built once (docs/CONTRIBUTING.md,
+# test job's this way, so the client is built once (docs/details/CONTRIBUTING.md,
 # "Billed minutes"); one built for another id is refused.
 WEB_PREBUILT ?=
 ifneq ($(WEB_PREBUILT),)

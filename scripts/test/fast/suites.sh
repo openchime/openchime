@@ -14,6 +14,6 @@ have build/tests "make test builds it"
 export OC_TEST_ONLY
 OC_TEST_ONLY=$(suites fast ./build/tests)
 # One after another, in one process, whatever the environment says
-# (docs/TESTING.md, "One build at a time").
+# (docs/details/TESTING.md, "One build at a time").
 export OC_TEST_JOBS=1
 exec ./build/tests

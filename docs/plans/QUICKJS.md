@@ -24,7 +24,7 @@ not measured.
 - **The app** used throughout is a listener-style integration of about 30 lines:
   - message, mention, reaction, command, button and modal handlers;
   - a `dispatch(json)` entry point that parses a Bolt-shaped event payload and returns the calls the app makes as JSON.
-- **The event** is a 635-byte message payload in the shape `docs/Plans/BOLT.md` §1.4 describes.
+- **The event** is a 635-byte message payload in the shape `docs/plans/BOLT.md` §1.4 describes.
 - **A minimal context** is `JS_NewContextRaw` plus the base objects, `eval`, RegExp, JSON, Map/Set and Promise. A full context is `JS_NewContext`.
 - **Machine:** 13th Gen Intel Core i5-1335U (12 logical CPUs: 2 performance cores with 2 threads each, 8 efficiency cores), WSL2, 4.9 GB RAM. Times are wall-clock from `CLOCK_MONOTONIC`. Resident sizes come from `/proc/self/statm`, read after `malloc_trim(0)`. Figures vary by machine; the shape of the results is what this note relies on.
 

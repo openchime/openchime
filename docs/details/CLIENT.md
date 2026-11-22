@@ -428,7 +428,7 @@ model; translate input to intents }, stop.
   keeps receiving and counting unread, and the header shows an "N elsewhere"
   badge. `Ctrl+W` (or launcher "Switch workspace") opens the **switcher**: each remembered
   workspace with its connection dot, account, and unread count, plus an
-  always-present **"+ Log in to new workspace"** row; `d` forgets a closed one.
+  always-present **"+ Sign in to a new workspace"** row; `d` forgets a closed one.
   The list comes from the store's **workspace book** (§5) unioned with the open
   sessions, so a workspace with no running client is still offered — selecting it
   reconnects silently on its stored session token, falling back to the login box
@@ -934,7 +934,7 @@ native trees.
 
 The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
 change to it has to keep. How it is driven and checked is
-[tools/gui/README.md](../tools/gui/README.md) ("Driving the Win32 GUI", "Seeing the whole window",
+[tools/gui/README.md](../../tools/gui/README.md) ("Driving the Win32 GUI", "Seeing the whole window",
 "Reading the GUI smoke").
 
 ### The text fields are drawn (every platform)
@@ -1442,8 +1442,8 @@ exactly the case this exists for.
 ### Email notifications (REQ-365–367, ARCH-125)
 
 The Notifications pane will gain the mention email (on or off, and its delay)
-and the digest (on or off, its days and time), and the workspace settings an
-owner's or admin's switches and member defaults for both. Where a level above
+and the digest (on or off, its days and time); the workspace's switches and
+member defaults are its configuration (ARCH-127), shown read-only. Where a level above
 the person's has turned a kind off, the row says which ("this server sends no
 email", "your workspace has turned this off") rather than disappearing. A link
 in a notification email opens the app at a workspace, conversation and message

@@ -473,7 +473,7 @@ Decided: in-workspace apps run **inside the daemon's process**, on QuickJS
 (quickjs-ng, pinned at 0.18.0, recorded in VENDORS.md), as one binary and one
 process (ARCH-28) with no containers (ARCH-36). The protection comes from the
 sandbox (§10.2), not from a separate process. The measurements behind this are
-in `docs/Plans/QUICKJS.md`.
+in `docs/plans/QUICKJS.md`.
 
 - **One QuickJS runtime per app**, since the memory cap, the stack cap and the
   interrupt handler are set per runtime, and contexts in one runtime share a

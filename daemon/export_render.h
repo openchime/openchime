@@ -1,6 +1,6 @@
 /*
  * OpenChime — one export of a video message: its VP9/Opus MP4 to an H.264 + MP3
- * copy (ARCH-135, docs/VIDEO-MESSAGES.md "Export").
+ * copy (ARCH-135, docs/details/VIDEO-MESSAGES.md "Export").
  *
  * The render reads the source once, front to back, as the blob store gives it:
  * the index (ftyp, moov) first, then each sample in the order it lies in mdat,

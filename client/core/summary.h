@@ -1,8 +1,8 @@
 /*
  * OpenChime — a channel or DM summary as a client reads it (REQ-310,
- * docs/SUMMARIES.md §3).
+ * docs/details/SUMMARIES.md §3).
  *
- * The daemon answers SUMMARIZE with the summary as JSON (docs/SUMMARIES.md §1, §3):
+ * The daemon answers SUMMARIZE with the summary as JSON (docs/details/SUMMARIES.md §1, §3):
  *   {"summary": {"overview": {"text", "refs"},
  *                "topics": [{"title", "text", "refs", "count", "people": [names],
  *                            "details": [{"text", "refs"}]}],

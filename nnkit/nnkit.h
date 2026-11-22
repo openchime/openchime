@@ -4,7 +4,7 @@
  *
  * No dependencies, no intrinsics, no threads: ordinary loops the compiler's
  * auto-vectoriser turns into vector code, compiled with -ffp-contract=off so
- * every machine computes the same values (docs/TTSKIT.md §5b, docs/STTKIT.md).
+ * every machine computes the same values (docs/details/TTSKIT.md §5b, docs/details/STTKIT.md).
  *
  * "The reference" below is the engine the voice model's and the recognizer's
  * committed references were made with, before it was withdrawn: its arithmetic

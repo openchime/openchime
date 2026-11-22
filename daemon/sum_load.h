@@ -1,6 +1,6 @@
 /*
  * OpenChime — whether the machine is quiet enough to summarize (REQ-310,
- * ARCH-116, docs/SUMMARIES.md §5).
+ * ARCH-116, docs/details/SUMMARIES.md §5).
  *
  * Summaries are made in idle time only. The worker asks this gate before each
  * piece and every few tokens; while the machine's CPU is busy, its available

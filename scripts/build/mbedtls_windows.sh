@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Cross-build the committed mbedTLS (static, Windows) from third_party/mbedtls
-# (docs/VENDORS.md §1) with mingw-w64 into third_party/mbedtls-<ver>-win/ — a
+# (docs/details/VENDORS.md §1) with mingw-w64 into third_party/mbedtls-<ver>-win/ — a
 # separate tree from the native build so the two don't clobber each other.
 # Nothing is downloaded. Gitignored output; reproduced by this script.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

@@ -1,5 +1,13 @@
 # The HTTP API
 
+**Superseded in its shape.** The API is served in the method form of the common
+chat-platform convention, `/api/<method>`, as decided in [BOLT.md](./BOLT.md) §6
+and designed in [APPS.md](./APPS.md); the REST paths and response shapes below
+are not built. What this proposal says of authentication, rate limits, errors as
+machine-readable codes, keyset paging, auditing and the SDK carries over to the
+method form, and a token's access is its scopes narrowed by its memberships
+(ARCH-123).
+
 A proposal, for review, of the documented HTTP API through which outside tools
 read history, search and post (REQ-176, REQ-350–354). The decision to have it,
 beside the MCP surface, and what was rejected are ARCH-123. Nothing here is

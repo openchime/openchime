@@ -28,7 +28,7 @@ Each kind works only where all three levels allow it (ARCH-125):
 | Level | Who | Where it is held |
 |---|---|---|
 | System | the operator | the email provider, chosen in the environment (§3); fixed to `openchime` by central on a managed box |
-| Workspace | an owner or admin | the workspace's own settings in the database: a switch per kind, and the defaults members start from |
+| Workspace | whoever runs the workspace | its configuration (ARCH-127): a switch per kind, and the defaults members start from |
 | Person | the person | their notification settings, synced to every device (ARCH-72): each kind on or off, the delay, the digest's days and time |
 
 A person's choice overrides the workspace's default, never its switch. The
@@ -165,10 +165,10 @@ in the control plane's own documents, not here.
 The wire, the storage, the settings and the screens are filled in as they are
 built, each in its own document:
 
-- [CONFIG.md](./CONFIG.md): the provider setting (§3);
-- [SCHEMA.md](./SCHEMA.md): the outbox (§4), each person's email settings and
-  the workspace's switches and defaults (§2), and what holds back the next
-  mention email and digest (§6);
-- [PROTOCOL.md](./PROTOCOL.md): the frames that read and set the person's and
-  the workspace's settings, and that tell a client each level's state (§2);
+- [CONFIG.md](./CONFIG.md): the provider setting (§3), and the workspace's
+  switches and defaults (§2);
+- [SCHEMA.md](./SCHEMA.md): the outbox (§4), each person's email settings (§2),
+  and what holds back the next mention email and digest (§6);
+- [PROTOCOL.md](./PROTOCOL.md): the frames that read and set the person's
+  settings, and that tell a client each level's state (§2);
 - [CLIENT.md](./CLIENT.md): the settings screens, and opening a link (§7).

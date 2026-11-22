@@ -1,5 +1,5 @@
 /* The export of a video message with the real codecs (ARCH-135,
- * docs/VIDEO-MESSAGES.md "Export"): a synthetic 1080p recording, made the way a
+ * docs/details/VIDEO-MESSAGES.md "Export"): a synthetic 1080p recording, made the way a
  * client makes one, exported by libvpx/libopus to libavc/LAME, and read back by
  * an independent reader -- ffprobe for what the file is, ffmpeg for where the
  * picture and the sound fall -- with the transcode's own peak memory measured.

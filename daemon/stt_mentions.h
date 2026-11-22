@@ -1,5 +1,5 @@
 /*
- * OpenChime — spoken mentions (ARCH-112, docs/VOICE-INPUT.md §6).
+ * OpenChime — spoken mentions (ARCH-112, docs/details/VOICE-INPUT.md §6).
  *
  * A recognizer writes what it hears: "send it to at Dana" rather than
  * "@dana". Before the text is posted or returned, "at" followed by a name that

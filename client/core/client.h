@@ -574,7 +574,7 @@ void oc_client_voice_preview(oc_client *c, const char *voice_id);
 uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
                             const int16_t *pcm, size_t samples);
 
-/* Calls (REQ-150, REQ-301-305, docs/CALLS.md §1). Start a call with a subject,
+/* Calls (REQ-150, REQ-301-305, docs/details/CALLS.md §1). Start a call with a subject,
  * inviting `invite`, from the conversation `from_channel` (0 for none: that
  * conversation gets one message about the call); join a call this user is
  * invited to; leave it; decline an invitation; end it for everyone (the

@@ -2,7 +2,7 @@
 # scripts/test/fast/clean_run.sh
 #
 # scripts/test/lib/clean_run.sh holds every build to the rules in
-# docs/TESTING.md, "One build at a time". With stub commands, and a lock of
+# docs/details/TESTING.md, "One build at a time". With stub commands, and a lock of
 # its own, this shows:
 #   1. the command's own status comes back;
 #   2. two compilers at once fail the run and are named and stopped, and a

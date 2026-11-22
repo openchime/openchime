@@ -1,6 +1,6 @@
 /*
  * OpenChime wire protocol v1 — frame codec implementation.
- * See protocol.h and docs/PROTOCOL.md.
+ * See protocol.h and docs/details/PROTOCOL.md.
  */
 
 #include "protocol.h"

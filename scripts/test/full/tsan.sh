@@ -2,7 +2,7 @@
 # scripts/test/full/tsan.sh
 #
 # The suites SUITES[] marks THREADS or TIMED (tests/main.c, `--list
-# threads`) under ThreadSanitizer (docs/TESTING.md §2.4); a data race between
+# threads`) under ThreadSanitizer (docs/details/TESTING.md §2.4); a data race between
 # our threads fails it (tests/tsan.supp). This is the only run of a THREADS
 # suite in the full suite: the plain pass (full/suites.sh) leaves it out. The
 # vendored libraries are not instrumented, so a race inside one is not seen.

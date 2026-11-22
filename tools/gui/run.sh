@@ -35,7 +35,7 @@
 # Exits 1 when anything failed or stopped (skipped is not passed, and not a
 # failure), 2 when the run could not start.
 #
-# By hand, never in a suite or CI (docs/TESTING.md): the daemon is Linux's and
+# By hand, never in a suite or CI (docs/details/TESTING.md): the daemon is Linux's and
 # the Windows client needs a desktop.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

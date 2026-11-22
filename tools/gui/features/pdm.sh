@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Encrypted DMs, two clients end to end (docs/PRIVATE-DM.md).
+# Encrypted DMs, two clients end to end (docs/details/PRIVATE-DM.md).
 #
 #   tools/gui/features/pdm.sh            # run; the pair and daemon stop at the end
 #   tools/gui/features/pdm.sh --keep     # ... and leave them running

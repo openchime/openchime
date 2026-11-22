@@ -726,7 +726,7 @@ A **direct connection** signs people in at the operator's own OpenID Connect
 provider — Google Workspace, Entra ID, Okta, Keycloak — with the daemon as the
 relying party and no OpenChime-operated service involved. Each one is a source in
 `AUTH_CHALLENGE`, `oidc-<n>`, drawn with the operator's label. The operator's
-guide to registering the application at each provider is docs/SSO.md.
+guide to registering the application at each provider is docs/details/SSO.md.
 
 **Discovery and keys.** At boot, and daily, the daemon reads
 `<issuer>/.well-known/openid-configuration`, whose `issuer` must equal the
@@ -778,7 +778,7 @@ source is on, with or without the relay.
 **What a direct connection does not have.** Redirect ports: the provider must
 accept any loopback port (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` on
 a host with no IPv4 loopback), which each provider's desktop or native
-application type does (docs/SSO.md); the web client the daemon serves redirects
+application type does (docs/details/SSO.md); the web client the daemon serves redirects
 to `https://<host>/app/` exactly, which the registration must list as well. A terminal: the provider's page needs a browser on the
 machine the client runs on, so a headless terminal signs in by device code
 (§8.11) with a local account.

@@ -1,4 +1,4 @@
-/* A dictation session (REQ-296-300, ARCH-112, docs/VOICE-INPUT.md): the
+/* A dictation session (REQ-296-300, ARCH-112, docs/details/VOICE-INPUT.md): the
  * microphone open for one conversation, in one mode, until stopped.
  *
  * A capture thread reads 20 ms frames at 16 kHz, cancels the client's own

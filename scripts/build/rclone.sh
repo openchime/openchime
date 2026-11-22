@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # rclone, pinned and checksummed, instead of an `apt-get update` for one
-# package (docs/CONTRIBUTING.md, "Billed minutes"): fetched once into the
+# package (docs/details/CONTRIBUTING.md, "Billed minutes"): fetched once into the
 # user's cache and put on the PATH -- GitHub's, in a workflow.
 #
 #   scripts/build/rclone.sh

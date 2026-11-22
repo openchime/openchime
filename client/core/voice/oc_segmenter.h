@@ -1,4 +1,4 @@
-/* Where an utterance ends (ARCH-112, docs/VOICE-INPUT.md §4): 20 ms frames of
+/* Where an utterance ends (ARCH-112, docs/details/VOICE-INPUT.md §4): 20 ms frames of
  * 16 kHz mono in, whole segments of speech out, over libfvad's per-frame
  * speech/not-speech answer.
  *

@@ -2,7 +2,7 @@
 
 For operators: how a version is named, how to upgrade, and what an upgrade
 changes that an operator has to know about. Installing is in the
-[README](../README.md#install-the-daemon); every setting is in
+[INSTALLING.md](./INSTALLING.md); every setting is in
 [CONFIG.md](./CONFIG.md).
 
 ## Versions: a build id and a release number
@@ -34,7 +34,7 @@ integer and only grows.
   `/etc/openchime/openchimed.env` and writes the new default beside it as
   `openchimed.env.new`. It neither checks the settings nor restarts a running
   daemon: run the check below, then `systemctl restart openchimed`.
-- **Container image:** build the new release's image from its tarball (README
+- **Container image:** build the new release's image from its tarball ([INSTALLING.md](./INSTALLING.md),
   "Container") and start it on the same volume.
 - **Clients:** the web client is the daemon's own and updates with it. On
   Windows, run the newer release's `-setup.exe` over the old one. The terminal

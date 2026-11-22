@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The media libraries for the web client (docs/WEB.md): libvpx, libopus and
+# The media libraries for the web client (docs/details/WEB.md): libvpx, libopus and
 # speexdsp built with Emscripten into build/wasm/{libvpx,opus,speexdsp}, from
 # the same sources as natively, committed in third_party/libvpx,
 # third_party/opus and third_party/speexdsp.
@@ -9,7 +9,7 @@
 # nothing to wasm, so it builds the generic C paths with wasm SIMD left to the
 # compiler. Threads are kept: the encoder's row threads run as Web Workers.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

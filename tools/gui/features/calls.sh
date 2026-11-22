@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Calls in the Win32 client, two clients end to end (REQ-150, REQ-301-305,
-# ARCH-113, docs/CALLS.md).
+# ARCH-113, docs/details/CALLS.md).
 #
 #   tools/gui/features/calls.sh            # run; the pair and its daemon stop at the end
 #   tools/gui/features/calls.sh --keep     # ... and leave them running

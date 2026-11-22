@@ -1,4 +1,4 @@
-/* The summary model's forward pass (docs/SUMKIT.md §3): a decoder of the Qwen3.5
+/* The summary model's forward pass (docs/details/SUMKIT.md §3): a decoder of the Qwen3.5
  * family. Each layer is RMS norm, a mixer, a residual add, RMS norm, a gated
  * feed-forward layer and a residual add; the mixer is either
  *

@@ -1,4 +1,4 @@
-/* Tests for the export of a video message (ARCH-135, docs/VIDEO-MESSAGES.md
+/* Tests for the export of a video message (ARCH-135, docs/details/VIDEO-MESSAGES.md
  * "Export"): the file-backed H.264 + MP3 MP4 writer. */
 #define _POSIX_C_SOURCE 200809L
 #include "check.h"

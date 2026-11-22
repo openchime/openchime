@@ -552,7 +552,7 @@ typedef struct oc_job {
     /* A WARMING job: the same cache probe, with nobody waiting for the answer.
      * The eight voices all audition with one sentence, so rendering it once per
      * voice at startup turns every later press of Play into a cache hit
-     * (docs/READ-ALOUD.md §5). */
+     * (docs/details/READ-ALOUD.md §5). */
     uint8_t        tts_warm;
 
     /* The export of a video message (ARCH-135): attachment_id (the upload

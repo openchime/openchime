@@ -1,4 +1,4 @@
-# The toolchains the clients need, pinned and fetched by make (docs/VENDORS.md
+# The toolchains the clients need, pinned and fetched by make (docs/details/VENDORS.md
 # §2, "Toolchains"): Emscripten for the web client, llvm-mingw for the Windows
 # clients. Each is a SHA-checked download under third_party/ made by its script
 # on first use, so the full build needs nothing installed beyond cc, cmake,
@@ -25,7 +25,7 @@ export PATH := $(CURDIR)/$(LLVM_MINGW_DIR)/bin:$(CURDIR)/$(EMSDK_DIR)/upstream/e
 # and every vendor script then take as CC, CXX and AR. gcc 12, not Ubuntu
 # 22.04's default gcc 11: gcc 11 does not vectorise the quantised dot products
 # (nnkit/nn_ops.c), and read-aloud runs about five times slower than real time
-# built with it, against about real time with gcc 12 (docs/TTSKIT.md §5b).
+# built with it, against about real time with gcc 12 (docs/details/TTSKIT.md §5b).
 # The glibc floor is the build machine's: the release builds on Ubuntu 22.04,
 # glibc 2.35
 # (docs/ARCHITECTURE.md, ARCH-20; scripts/test/full/glibc_floor.sh). A cross

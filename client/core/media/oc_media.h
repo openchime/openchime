@@ -1,5 +1,5 @@
 /* Shared types for recorded video messages (REQ-162–166, ARCH-110,
- * docs/VIDEO-MESSAGES.md): the one frame format every capture backend delivers,
+ * docs/details/VIDEO-MESSAGES.md): the one frame format every capture backend delivers,
  * the one clock video and audio are stamped with, and the conversions between
  * the frame format and what cameras and screens actually use.
  *

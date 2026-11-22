@@ -21,18 +21,16 @@ sender, and the mixer. The Win32 client and the web client carry it (the browser
 
 ---
 
-## 1. The model: one call per conversation
+## 1. The model: a call and its participants
 
-A conversation has at most **one call** at a time, with an ephemeral roster of
-up to ten participants (`OC_CALL_MAX`, ARCH-73). Anyone who can read the
-conversation may join it; starting one invites its members; it lasts while one
-participant remains, or until its starter ends it; a dropped participant rejoins
-with a fresh `CALL_JOIN` (CALLS.md §1).
+A call is an object of its own (ARCH-73, CALLS.md §1), with a live roster of up
+to ten participants (`OC_CALL_MAX`). Only its invitees may join it; it lasts
+while one participant remains, or until its starter ends it; a dropped
+participant rejoins with a fresh `CALL_JOIN`.
 
-**A 1:1 call is the degenerate case, not a separate feature.** A DM channel has
-two members, so a call there is a two-person huddle over exactly the same code
-path. There is no pairwise call model anywhere in the system, and none should be
-added.
+**A two-person call is the small case, not a separate feature.** A call with
+two participants runs over exactly the same code path as one with ten. There is
+no pairwise call model anywhere in the system, and none should be added.
 
 ### 1.1 The server is an SFU — it never mixes
 
@@ -530,9 +528,10 @@ sidesteps echo entirely while held.
 
 ## 9. Limits
 
-- **Recording.** There is no call recording. It has obvious compliance weight
-  (REQ-252), and a recording would have to be made by a
-  participant, since nothing else can hear the call (ARCH-113).
+- **Recording** is made by a participant the daemon runs, the Recorder, since
+  nothing else can hear the call (ARCH-113, ARCH-136): it is in the call only
+  while someone records it, and everyone in the call is shown that it is
+  (CALLS.md §8). This engine sees it as one more peer its key is sealed to (§1.2).
 - **IPv6.** A client reaches the relay over IPv4 when the workspace's host has
   an IPv4 address, even where IPv6 would also work (§4); a client whose only
   path to such a host is IPv6 is not heard over UDP.

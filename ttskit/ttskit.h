@@ -1,5 +1,5 @@
 /*
- * ttskit — pronunciation for read-aloud (ARCH-111, docs/TTSKIT.md).
+ * ttskit — pronunciation for read-aloud (ARCH-111, docs/details/TTSKIT.md).
  *
  * Turns English text into the IPA phonemes a neural voice model reads, with no
  * copyleft anywhere in the chain: a dictionary generated from CMUdict, a guesser

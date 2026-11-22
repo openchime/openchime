@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cameras in the call view, two clients end to end (REQ-160, docs/CALLS.md §2, §7).
+# Cameras in the call view, two clients end to end (REQ-160, docs/details/CALLS.md §2, §7).
 #
 #   tools/gui/features/camera.sh            # run; the pair and its daemon stop at the end
 #   tools/gui/features/camera.sh --keep     # ... and leave them running

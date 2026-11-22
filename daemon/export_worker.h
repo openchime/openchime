@@ -1,5 +1,5 @@
 /*
- * OpenChime — the export worker (ARCH-135, docs/VIDEO-MESSAGES.md "Export").
+ * OpenChime — the export worker (ARCH-135, docs/details/VIDEO-MESSAGES.md "Export").
  *
  * One thread beside the net loop, at a lowered priority, so a transcode never
  * starves the conversations the daemon is serving. The net thread submits an

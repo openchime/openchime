@@ -1,4 +1,4 @@
-/* Unit tests for the schema migrations runner (ARCH-27, docs/TESTING.md §2.2).
+/* Unit tests for the schema migrations runner (ARCH-27, docs/details/TESTING.md §2.2).
  * Links migrate.c's object (TESTING.md §2.1) and the vendored SQLite.
  * All tests run against in-memory databases — no files touched. */
 

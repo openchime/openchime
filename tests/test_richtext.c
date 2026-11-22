@@ -3,7 +3,7 @@
  * The parser both frontends render from, so the edge cases ARE the suite. The
  * single most common failure of an in-band dialect is eating text somebody
  * meant literally — `2 * 3 * 4`, `a_variable_name`, a half-typed asterisk — so
- * §2 of docs/MARKDOWN.md gets more checks here than the happy path does. */
+ * §2 of docs/details/MARKDOWN.md gets more checks here than the happy path does. */
 
 #include "check.h"
 #include "richtext.h"

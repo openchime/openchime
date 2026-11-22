@@ -1,7 +1,7 @@
 /* The export's real codecs (export_render.h), in a daemon built with EXPORT=1:
  * VP9 decoded by libvpx and re-encoded as H.264 Constrained Baseline by libavc,
  * Opus decoded by libopus and re-encoded as MP3 by LAME, written by oc_mp4's
- * export writer (ARCH-135, docs/VIDEO-MESSAGES.md "Export").
+ * export writer (ARCH-135, docs/details/VIDEO-MESSAGES.md "Export").
  *
  * Memory is what the managed box allows (ARCH-135): one decoder thread, one
  * encoder core, libavc's reference and search buffers sized to this video

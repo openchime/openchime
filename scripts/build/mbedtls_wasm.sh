@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# mbedTLS for the web client (docs/WEB.md): the native build's configured copy
-# of the committed tree (third_party/mbedtls, docs/VENDORS.md §1), copied and
+# mbedTLS for the web client (docs/details/WEB.md): the native build's configured copy
+# of the committed tree (third_party/mbedtls, docs/details/VENDORS.md §1), copied and
 # built with Emscripten into build/wasm/mbedtls, beside the native build it must
 # not touch. Nothing is downloaded. Run by make (mk/web.mk), which puts the
 # pinned Emscripten on PATH.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

@@ -1,6 +1,6 @@
 /* The restricted MP4 a video message is stored in (ARCH-110,
- * docs/VIDEO-MESSAGES.md §5): one VP9 track and one Opus track, progressive,
- * `moov` before `mdat` — or, for read-aloud (ARCH-111, docs/READ-ALOUD.md §4),
+ * docs/details/VIDEO-MESSAGES.md §5): one VP9 track and one Opus track, progressive,
+ * `moov` before `mdat` — or, for read-aloud (ARCH-111, docs/details/READ-ALOUD.md §4),
  * the same file with the Opus track alone. The writer produces exactly those
  * layouts and the reader accepts exactly those — which is what makes an in-tree
  * implementation reasonable, and what lets the reader reject everything else
@@ -63,7 +63,7 @@ oc_mp4_writer *oc_mp4_writer_open_file(const char *path, int width, int height);
 int oc_mp4_writer_finish_file(oc_mp4_writer *w, uint64_t *bytes, uint32_t *duration_ms);
 #endif
 
-/* ---- the export writer (ARCH-135, docs/VIDEO-MESSAGES.md "Export") --------------
+/* ---- the export writer (ARCH-135, docs/details/VIDEO-MESSAGES.md "Export") --------------
  *
  * A video message re-encoded for players that do not open VP9: one H.264 track
  * and one MP3 track, written to a FILE as it goes -- the daemon's export never

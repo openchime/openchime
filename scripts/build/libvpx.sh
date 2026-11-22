@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the committed libvpx (VP9 only, static) from third_party/libvpx -- the
-# release tarball as WebM published it, committed (docs/VENDORS.md §1) -- into
+# release tarball as WebM published it, committed (docs/details/VENDORS.md §1) -- into
 # third_party/libvpx-<version>[-arch|-win]. Nothing is downloaded.
 #
 #   scripts/build/libvpx.sh            native (Linux; `make test` links it)
@@ -9,7 +9,7 @@
 # The codec is the client's alone (ARCH-87, ARCH-110): the daemon never links it.
 # scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

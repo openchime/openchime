@@ -1,7 +1,7 @@
 /*
  * OpenChime — message formatting (REQ-220, ARCH-100).
  *
- * The parser for the dialect [MARKDOWN.md](../docs/MARKDOWN.md) specifies:
+ * The parser for the dialect [MARKDOWN.md](../docs/details/MARKDOWN.md) specifies:
  * a Slack-compatible subset of inline emphasis extended with real lists.
  *
  * Shared by every frontend and by the daemon. Rendering formatting needs no

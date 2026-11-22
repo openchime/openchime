@@ -1,5 +1,5 @@
 /*
- * OpenChime — summaries in the database (REQ-310, ARCH-116, docs/SUMMARIES.md §4).
+ * OpenChime — summaries in the database (REQ-310, ARCH-116, docs/details/SUMMARIES.md §4).
  *
  * The SQL of summaries, apart from the rest of the writer: reading a channel's
  * messages for a period (the summary worker's own read connection), finding a

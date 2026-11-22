@@ -1,6 +1,6 @@
 /*
  * OpenChime client — call signaling and media keys (REQ-150, REQ-301-305,
- * ARCH-113, docs/CALLS.md §4-§5).
+ * ARCH-113, docs/details/CALLS.md §4-§5).
  *
  * Runs on the network thread, which owns the connection and the credential
  * store: it answers the CALL_* frames, keeps this device's key pair, makes and

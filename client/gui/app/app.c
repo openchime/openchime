@@ -1053,7 +1053,7 @@ static void cap_blit(void *user, const void *bgra, int stride, int pw, int ph,
  * (g_hdr, g_small, g_time, g_ava, g_rail) described a measurement or a single
  * call site, and g_small duly grew to 208 uses spanning timestamps, chips,
  * counts, hints and section headers with no way to change one without changing
- * all of them. Sizes live in FONT_TOKENS; see docs/CLIENT.md. */
+ * all of them. Sizes live in FONT_TOKENS; see docs/details/CLIENT.md. */
 static fmtw *g_display;  /* 17/600 — view + workspace titles */
 static fmtw *g_title;    /* 15/600 — channel header, author names */
 static fmtw *g_body;     /* 15/400 — message text (wrapping) */
@@ -4884,7 +4884,7 @@ static void sidebar_surface(gfx *rt, float h) {
     fill(rt, rf(RAIL_W + SIDEBAR_W - 1, 0, RAIL_W + SIDEBAR_W, h), OC_COL_BORDER);
 }
 
-/* ==== Calls (REQ-150, REQ-301-305, docs/CALLS.md) ======================================
+/* ==== Calls (REQ-150, REQ-301-305, docs/details/CALLS.md) ======================================
  * The Calls section in the Home sidebar, the call view, the in-call strip at the
  * foot of the sidebar, the header's call button and the member picker. The core
  * does the signaling and the keys; the engine (client/core/call) the audio; this
@@ -30246,7 +30246,7 @@ static void palette_accept(oc_win *hwnd) {
 static void download_attachment(oc_win *hwnd, const oc_attachment *a);   /* fwd */
 static void export_video(oc_win *hwnd, uint64_t attachment_id, const char *filename);   /* fwd */
 
-/* ---- video messages (REQ-162–166, ARCH-110, docs/VIDEO-MESSAGES.md §9) -------
+/* ---- video messages (REQ-162–166, ARCH-110, docs/details/VIDEO-MESSAGES.md §9) -------
  *
  * One overlay, two uses. The RECORDING CARD opens from the composer: a live
  * preview, a 3-2-1 countdown, the timer against the five-minute cap, and a review

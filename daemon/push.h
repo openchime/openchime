@@ -4,7 +4,7 @@
  * CA-verified HTTPS, signed with the enrollment key. Central
  * never dials the daemon (ARCH-56); the invitation mail report (invite_mail.h)
  * is the other daemon->central runtime channel, and rides this one's transport. Recipient selection runs on the worker's own read-only SQLite
- * connection, off the net/writer hot path (ARCH-66). See docs/AUTH.md / PUSH.
+ * connection, off the net/writer hot path (ARCH-66). See docs/details/AUTH.md / PUSH.
  */
 #ifndef OPENCHIME_PUSH_H
 #define OPENCHIME_PUSH_H

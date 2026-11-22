@@ -14,7 +14,7 @@ are four ways a dependency enters the build; each row below says which:
 | **Container image** | Base of the container image built from a release tarball; not used for dev or test | Per the image tag |
 
 **License posture:** our own code is AGPL-3.0-or-later throughout
-([LICENSING.md](../LICENSING.md)); every *third-party* component linked into the
+([LICENSING.md](../../LICENSING.md)); every *third-party* component linked into the
 shipping **daemon** and **TUI** is permissive — MIT, Apache-2.0, Public Domain,
 or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later —
 except Mozilla's CA roots, which are data under MPL-2.0, a file-level copyleft,
@@ -48,7 +48,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73); the daemon, to encode read-aloud (ARCH-111) | https://opus-codec.org | BSD-3-Clause |
-| **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
+| **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87); the daemon, built with `EXPORT=1` or `CALLREC=1`, to decode a video message for its export (ARCH-135) and to make a call's recording (ARCH-136) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libavc** | 1.10.0 | H.264 encode (Constrained Baseline), the encoder and the common code it uses | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://github.com/ittiam-systems/libavc | Apache-2.0 |
 | **LAME** | 3.100 | MP3 encode (`libmp3lame` alone) | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://lame.sourceforge.io | LGPL-2.0-or-later |
 | **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
@@ -78,8 +78,9 @@ docs or unit tests, `native` for `make test` (with `OC_ARCH`, another
 architecture's, as `make ARCH=aarch64` asks) and `windows` for the Win32 client,
 into `third_party/libvpx-1.17.0[-win]/` (gitignored); nothing is downloaded. It
 needs **nasm** for its assembly; its mingw build threads through winpthreads,
-which the Win32 link therefore pulls in statically. **The daemon links no
-libvpx**: it stores a video message as opaque bytes (ARCH-110). BSD-3-Clause,
+which the Win32 link therefore pulls in statically. The daemon links
+libvpx only when built with `EXPORT=1` or `CALLREC=1`; otherwise it stores a
+video message as opaque bytes (ARCH-110). BSD-3-Clause,
 whose binary-redistribution clause wants the notice carried with a shipped
 client.
 
@@ -123,7 +124,7 @@ only read: `scripts/build/mbedtls.sh` into `third_party/mbedtls-3.6.7/` (with
 downloaded. Built as **static** libs (`libmbedtls/libmbedx509/libmbedcrypto.a`),
 the native copy with **`MBEDTLS_THREADING`** enabled — the client runs a TLS
 network thread per connection and the tests drive several TLS clients
-concurrently, which races without it (see docs/TLS.md). A bump replaces the tree
+concurrently, which races without it (see docs/details/TLS.md). A bump replaces the tree
 and the version in the three scripts, `mk/sources.mk` and `mk/windows.mk`;
 `make test` refuses a tree and a build that disagree
 (`scripts/test/fast/vendored.sh`).
@@ -207,7 +208,7 @@ makefile and both scripts to one version. Bumping it is replacing the tree in on
 request. zlib-licensed: no notice needs to travel with a shipped binary, so
 `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
-## 2. Fetched at build time — `scripts/build/*.sh` (gitignored output)
+## 2. Fetched, and data made from upstream releases
 
 **Toolchains** come this way too (`mk/toolchains.mk`): make fetches each on
 first use, pinned by version and SHA-256 in its script (Emscripten by its emsdk
@@ -568,7 +569,7 @@ paths ship; nothing is fetched at runtime.
 | **SIL OFL 1.1** | Noto Sans Regular | Vendored, committed; compiled into the daemon as data, for a call recording's names |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
-| **BSD-3-Clause** | libvpx (VP9), libopus | Committed and static-linked: both into the graphical clients, Win32 and web (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
+| **BSD-3-Clause** | libvpx (VP9), libopus | Committed and static-linked: both into the graphical clients, Win32 and web (ARCH-110); libopus into the daemon to encode read-aloud renders (ARCH-111); both into a daemon built with `EXPORT=1` or `CALLREC=1` (ARCH-135, ARCH-136). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the graphical clients, Win32 and web (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **BSD-2-style** | CMUdict (ttskit's pronunciation data) | Generated data, committed with its notice; daemon only |
 | **Apache-2.0** | Kitten TTS mini (data) | Converted and committed (`ttskit/data/voice.bin`, its licence `ttskit/data/VOICE-LICENSE`), shipped beside the daemon |

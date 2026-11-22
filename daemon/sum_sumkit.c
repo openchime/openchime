@@ -1,5 +1,5 @@
 /* The local summary model: sumkit, the summary inference engine, linked in
- * (sum_engine.h, ARCH-116, docs/SUMKIT.md).
+ * (sum_engine.h, ARCH-116, docs/details/SUMKIT.md).
  *
  * One thread does everything: the model runs on the worker's thread for the
  * prompt and for each token, so a summary never takes more than one core. The

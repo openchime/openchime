@@ -1,6 +1,6 @@
 /*
  * OpenChime schema migrations runner + embedded migration set (ARCH-27).
- * See migrate.h and docs/SCHEMA.md.
+ * See migrate.h and docs/details/SCHEMA.md.
  */
 
 #include "migrate.h"
@@ -11,7 +11,7 @@
 
 /* --- Embedded migrations ------------------------------------------------ */
 
-/* 0001: foundational tables for the core messaging path (docs/SCHEMA.md).
+/* 0001: foundational tables for the core messaging path (docs/details/SCHEMA.md).
  * Roles (REQ-030), reactions, threads, FTS5, presence, and attachments are
  * deferred to later migrations. */
 static const char MIGRATION_0001[] =
@@ -58,7 +58,7 @@ static const char MIGRATION_0001[] =
     "  PRIMARY KEY (channel_id, idempotency_token)"
     ");";
 
-/* 0002: authentication data model (docs/AUTH.md, SCHEMA.md §3, ARCH-58/59/60).
+/* 0002: authentication data model (docs/details/AUTH.md, SCHEMA.md §3, ARCH-58/59/60).
  * Adds sessions, local passwords, invites, and a role/avatar on users. */
 static const char MIGRATION_0002[] =
     "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member' "
@@ -1518,7 +1518,7 @@ static const char MIGRATION_0056[] =
     "    AND substr(ltrim(substr(CAST(excerpt AS TEXT), 4), ' '), 1, 1) NOT IN ('', char(9), char(10), char(13));";
 
 static const char MIGRATION_0057[] =
-    /* Channel and DM summaries (REQ-310, ARCH-116, docs/SUMMARIES.md). A summary
+    /* Channel and DM summaries (REQ-310, ARCH-116, docs/details/SUMMARIES.md). A summary
      * is a tree: chunk summaries of whole messages, a thread's summary over its
      * chunks when it is too big for one, sections over a long list of children,
      * and the summary of a period on top. Every node lists what it was built
@@ -1582,7 +1582,7 @@ static const char MIGRATION_0058[] =
 
 /* 0060: nothing to the schema. The step marks the point from which the writer
  * indexes mentions for messages that have none (dbwriter's index_mentions at
- * start): a workspace loaded from a Slack export (as the summary evaluation did, docs/SUMMARIES.md) holds its
+ * start): a workspace loaded from a Slack export (as the summary evaluation did, docs/details/SUMMARIES.md) holds its
  * messages but no `mentions` rows, so the server's unread count, which reads
  * that table, said 0 where the client, which reads the text, counted the
  * @channel and @name lines. A database that is already past this step has had

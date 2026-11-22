@@ -16,16 +16,17 @@ roots, a direct connection's secret).
 where there is anything to configure (`OPENCHIME_TLS=acme:chat.example.com`,
 `OPENCHIME_S3=s3://…`, `OPENCHIME_SUMMARY=cloud:<url>,<model>`), and
 **settings**, values with no feature behind them (the name, the data
-directory, the ports, who may join, the mode). Twenty-three in all. Every path is under one
+directory, the ports, who may join, the mode, and the workspace's own
+policies). Every path is under one
 `OPENCHIME_DATA_DIR` at a fixed name, the deployment model is derived from
 what the box was started with rather than declared, and everything nobody
 varies — session life, worker counts, queue depths, rate limits, the call
 cap — is a constant in `daemon/config.h`, and the storage policy's watermarks
-are set in `daemon/config.c`; none is a row. Seven
-more are a managed box's rows ("A managed box", below), set only with
+are set in `daemon/config.c`; none is a row. A managed
+box has rows of its own ("A managed box", below), set only with
 `OPENCHIME_MANAGED_TICKET`; without it they refuse the start.
-Four more, and twelve the clients read, are development inputs, which only
-development mode reads ("Mode", below).
+The development inputs, the daemon's and the clients', are read only in
+development mode ("Mode", below).
 
 **The daemon is strict about its environment.** A value that does not parse,
 a value outside its range, a name it does not know (a typo, or a name it no
@@ -478,7 +479,7 @@ status 4.
 | `invites` with no `created_by` | At boot, in `local` auth mode, while no owner who can sign in exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). A newer token spends the older ones, and none is redeemed once an owner can sign in. |
 | `users.role` | By owners and admins | `owner` / `admin` / `member` — who may administer the workspace (ARCH-60). |
 | `users.disabled` | By member removal | A removed member cannot sign in and does not count against `OPENCHIME_MANAGED_MAX_USERS` (AUTH.md §2). |
-| `webhooks` | By owners and admins | Incoming webhooks and the channel each posts to (REQ-170). |
+| `webhooks` | By members of each webhook's channel | Incoming webhooks and the channel each posts to (REQ-170). |
 | `custom_emoji` | By members | The workspace's own emoji (REQ-072). |
 
 Each person's preferences are also stored here and steer what the daemon sends

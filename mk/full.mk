@@ -1,4 +1,4 @@
-# The full build and the full suite (docs/TESTING.md): everything a release
+# The full build and the full suite (docs/details/TESTING.md): everything a release
 # ships, built and checked, in CI only, once per release-candidate
 # (release-candidate.yml, which calls test-all.yml for the code tests). The
 # full suite is a superset of the fast one (mk/tests.mk): every suite, the

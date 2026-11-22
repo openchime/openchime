@@ -3,7 +3,7 @@
  * `payload`, the common chat-webhook format's blocks, text and attachments in
  * their order, its link syntax converted to the message format, the fields read
  * past, and the limits. Each expected text is the message format's own
- * (docs/MARKDOWN.md), which is the contract with every client. */
+ * (docs/details/MARKDOWN.md), which is the contract with every client. */
 
 #include "http.h"
 #include "check.h"

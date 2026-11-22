@@ -1,4 +1,4 @@
-/* The call's media engine (docs/CALLS.md §3, AUDIO.md §2-§4): the microphone
+/* The call's media engine (docs/details/CALLS.md §3, AUDIO.md §2-§4): the microphone
  * through the echo canceller and speexdsp's preprocessor, Opus at 16 kHz with
  * FEC and DTX, SFrame (shared/e2e_sframe.h) under keys the core hands it, the
  * relay's UDP socket, a jitter buffer and decoder per sender, and the mixer that

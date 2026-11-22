@@ -4,7 +4,7 @@ The specification the MCP surface is built to: the tools an agent or a
 person's AI client calls, how they page through long channels, the life of an
 agent's token, and the audit row each tool writes. The surface itself — the
 endpoint, the protocol revision, the two principals, what each may read and
-the limits — is [MCP.md](../MCP.md); the decision is ARCH-120, and the
+the limits — is [MCP.md](../details/MCP.md); the decision is ARCH-120, and the
 requirements REQ-320–325.
 
 Where a number is given it is a proposal for review, marked so; everything
@@ -147,11 +147,13 @@ than a client can use, and so that paging through a long channel is exact.
 An owner or admin mints a token for an agent from the agent's page in member
 administration, naming it ("CI runner", "laptop"). The daemon makes 32 random
 bytes and shows the token once, as a fixed prefix and the bytes in base64url,
-so a secret scanner can recognise a leaked one. It stores only:
+so a secret scanner can recognise a leaked one. The minter chooses the token's scopes from the app platform's catalog
+(APPS.md §4); the tools need `channels:history` and its private and DM
+counterparts to read, and `chat:write` to post. It stores only:
 
 - the token's SHA-256, under a unique index, so a request's lookup is one
   probe;
-- the agent it belongs to, its name, who minted it and when;
+- the agent it belongs to, its scopes, its name, who minted it and when;
 - when and from which address it was last used.
 
 An agent may hold several tokens (proposed: at most 10), so a token is replaced

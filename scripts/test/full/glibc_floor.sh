@@ -2,7 +2,7 @@
 # scripts/test/full/glibc_floor.sh <binary>
 #
 # The release binary needs no glibc newer than 2.35. The floor is a shipped
-# promise (README: Ubuntu 22.04+, Debian bookworm+, RHEL 10+; RHEL 9 runs the
+# promise (docs/details/INSTALLING.md: Ubuntu 22.04+, Debian bookworm+, RHEL 10+; RHEL 9 runs the
 # container image), and it is invisible in a passing build: a binary needing
 # 2.38 links and runs perfectly on the build machine, then fails to start on
 # the distro it was built for. The release holds it by building on Ubuntu

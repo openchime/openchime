@@ -6,7 +6,7 @@
  * run against a real daemon is the full suite's (scripts/test/full/e2e.sh).
  *
  * SUITES[] below is the one list of the suites and of where each runs
- * (docs/TESTING.md, "The two suites"): `build/tests --list
+ * (docs/details/TESTING.md, "The two suites"): `build/tests --list
  * fast|full|plain|threads` prints the names the scripts select by. */
 
 #include <pthread.h>
@@ -237,7 +237,7 @@ static int suite_wanted(const char *name) {
 static int g_ran;
 
 /* How long each suite took, printed slowest first at the end: the fast suite
- * has a budget (docs/TESTING.md, "The two suites"), and this says where it
+ * has a budget (docs/details/TESTING.md, "The two suites"), and this says where it
  * goes. */
 static struct { const char *name; double s; } g_times[128];
 static int g_ntimes;

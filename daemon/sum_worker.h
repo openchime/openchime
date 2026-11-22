@@ -1,5 +1,5 @@
 /*
- * OpenChime — the summary worker (REQ-310, ARCH-116, docs/SUMMARIES.md §5).
+ * OpenChime — the summary worker (REQ-310, ARCH-116, docs/details/SUMMARIES.md §5).
  *
  * One thread, at the lowest priority the kernel has (SCHED_IDLE, nice 19), with
  * one model call at a time on one core. Everything it makes goes through one

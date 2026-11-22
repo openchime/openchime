@@ -1,5 +1,5 @@
 /* Tests for nnkit, the neural network kernels read-aloud's voice model and
- * voice input's recognizer run on (nnkit/, docs/TTSKIT.md §5b, docs/STTKIT.md):
+ * voice input's recognizer run on (nnkit/, docs/details/TTSKIT.md §5b, docs/details/STTKIT.md):
  * each kernel against a naive version written from the operator's definition,
  * on random inputs from a fixed seed, and the bits the reference's own
  * approximations give where the models' references depend on them. */

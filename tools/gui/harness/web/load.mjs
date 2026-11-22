@@ -1,4 +1,4 @@
-// The web client's load (docs/WEB.md, "Loading"), from a real browser: the
+// The web client's load (docs/details/WEB.md, "Loading"), from a real browser: the
 // load screen counts the download in bytes, names each stage after it and
 // comes down when the client has drawn; the wasm and the loader arrive
 // gzipped; and a second load in the same browser downloads next to nothing,

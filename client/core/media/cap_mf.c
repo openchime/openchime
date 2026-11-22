@@ -1,5 +1,5 @@
 /* The Windows capture backend: Media Foundation's source reader
- * (docs/VIDEO-MESSAGES.md §3.2). Video processing is enabled so the reader
+ * (docs/details/VIDEO-MESSAGES.md §3.2). Video processing is enabled so the reader
  * converts whatever the camera speaks (YUY2, MJPEG, NV12) to NV12, which is then
  * repacked into I420.
  *

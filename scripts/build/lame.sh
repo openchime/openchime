@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the MP3 encoder of the committed LAME (static) from third_party/lame --
-# the 3.100 release tarball as published, committed (docs/VENDORS.md §1) -- into
+# the 3.100 release tarball as published, committed (docs/details/VENDORS.md §1) -- into
 # third_party/lame-<version>[-arch]. Nothing is downloaded.
 #
 #   scripts/build/lame.sh            native (Linux; `make EXPORT=1` links it)
@@ -9,7 +9,7 @@
 # no shared library. The daemon's export of a video message (ARCH-135) is the
 # only user.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time").
+# One compile at a time (docs/details/TESTING.md, "One build at a time").
 unset MAKEFLAGS MFLAGS
 NO_AUTOTOOLS="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=:"
 

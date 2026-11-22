@@ -44,7 +44,7 @@ if [ -f "$(dirname "$BINARY")/stt/manifest" ]; then
   cp -r "$(dirname "$BINARY")/stt" "$stage/stt"
   with_stt=1
 fi
-# And the web client the daemon serves (docs/WEB.md).
+# And the web client the daemon serves (docs/details/WEB.md).
 with_web=0
 if [ -f "$(dirname "$BINARY")/web/openchime.wasm" ]; then
   cp -r "$(dirname "$BINARY")/web" "$stage/web"

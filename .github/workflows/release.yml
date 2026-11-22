@@ -514,7 +514,7 @@ jobs:
       # The candidate's packages: the .deb, the .rpm and the tarball the
       # release-candidate wrapped under this release number and tested, taken
       # as they are into dist/<platform>/, which is what the publishing steps
-      # below read. Nothing is packaged again (docs/CONTRIBUTING.md, "Billed
+      # below read. Nothing is packaged again (docs/details/CONTRIBUTING.md, "Billed
       # minutes"). Each is named for its own architecture: the publishing steps
       # pool both architectures' files under one prefix.
       - name: The candidate's packages
@@ -878,7 +878,7 @@ jobs:
           # build. Build artifacts expire; a crash report does not.
           # The note tells the truth about the installer's signing status, because
           # the person who meets SmartScreen is the one who needs to know.
-          notes="Release ${VERSION} is build \`${BUILD_ID}\` (${SHA}), which is what \`openchimed --version\` and the Windows clients report. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
+          notes="Release ${VERSION} is build \`${BUILD_ID}\` (${SHA}), which is what \`openchimed --version\` and the Windows clients report. The daemon installs via apt and dnf (see docs/details/INSTALLING.md); the tarballs below are the offline install. The Windows client installer is attached."
           if [ "$SIGN" != true ]; then
             unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
             notes="${notes}"$'\n\n'"${unsigned}"

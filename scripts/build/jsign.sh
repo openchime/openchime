@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch the pinned jsign into third_party/jsign-<ver>.jar -- the "fetched at
-# build" vendoring class (docs/VENDORS.md §2), SHA-256-pinned, gitignored.
+# build" vendoring class (docs/details/VENDORS.md §2), SHA-256-pinned, gitignored.
 # jsign signs Windows executables, installers and MSIX packages from Linux
 # against Azure Trusted Signing (scripts/release/sign_windows.sh), so no
 # Windows machine signs a release. Apache 2.0. Needs curl; running it needs

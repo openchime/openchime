@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the H.264 encoder of the committed libavc (static) from third_party/libavc
 # -- the v1.10.0 release as ittiam-systems published it, committed
-# (docs/VENDORS.md §1) -- into third_party/libavc-<version>[-arch]. Nothing is
+# (docs/details/VENDORS.md §1) -- into third_party/libavc-<version>[-arch]. Nothing is
 # downloaded.
 #
 #   scripts/build/libavc.sh            native (Linux; `make EXPORT=1` links it)

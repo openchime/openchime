@@ -3,7 +3,7 @@
 # every path changed is a Markdown file (*.md) or under docs/; and not
 # documentation, whatever their names: .github/ (workflows change how the
 # repository builds and works), third_party/ (vendored sources),
-# LICENSING.md (what the packages carry), and docs/CONFIG.md (its reference is
+# LICENSING.md (what the packages carry), and docs/details/CONFIG.md (its reference is
 # generated from the daemon's settings and checked against them by
 # scripts/test/fast/config.sh, so it ships with the code).
 #
@@ -30,7 +30,7 @@ else
 fi
 while IFS= read -r -d '' f; do
   case "$f" in
-    .github/*|third_party/*|LICENSING.md|docs/CONFIG.md) printf '%s\n' "$f"; exit 1 ;;
+    .github/*|third_party/*|LICENSING.md|docs/details/CONFIG.md) printf '%s\n' "$f"; exit 1 ;;
     docs/*|*.md) ;;
     *) printf '%s\n' "$f"; exit 1 ;;
   esac

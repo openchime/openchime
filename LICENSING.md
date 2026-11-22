@@ -35,7 +35,7 @@ GPL-3.0: modify and distribute a client, and the source travels with it.
 
 Other people's work under their own licences, unchanged: committed under
 `third_party/`, or fetched pinned by `scripts/build/`. Each component, its
-version, its licence and what uses it are [VENDORS.md](docs/VENDORS.md).
+version, its licence and what uses it are [VENDORS.md](./docs/details/VENDORS.md).
 
 All are compatible with AGPL-3.0-or-later, so none of them
 constrains the choice above. All are permissive but two: Mozilla's CA roots are

@@ -51,7 +51,7 @@ if [ -f "$STT/manifest" ]; then
   find "$stage/usr/share/openchime/stt" -type d -exec chmod 0755 {} +
   find "$stage/usr/share/openchime/stt" -type f -exec chmod 0644 {} +
 fi
-# The web client the daemon serves (docs/WEB.md), the same way.
+# The web client the daemon serves (docs/details/WEB.md), the same way.
 WEB="$(dirname "$BINARY")/web"
 if [ -f "$WEB/openchime.wasm" ]; then
   mkdir -p "$stage/usr/share/openchime"

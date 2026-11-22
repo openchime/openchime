@@ -6,7 +6,7 @@
 #   make run          a dev daemon on 127.0.0.1:8443, alice/bob, and the Linux TUI
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
-# The two suites, what each runs and where, are docs/TESTING.md; each test is
+# The two suites, what each runs and where, are docs/details/TESTING.md; each test is
 # a script in scripts/test/fast/ or scripts/test/full/ that one of these
 # targets calls, and the workflows call only the targets.
 #
@@ -16,7 +16,7 @@
 # `make build` and `make test` build exactly one configuration, whatever was
 # asked before. Every build compiles one file at a time, whatever -j it is
 # given, and only one build runs on a machine at a time (below, and
-# docs/TESTING.md, "One build at a time"). Anything
+# docs/details/TESTING.md, "One build at a time"). Anything
 # else is built by its path, and takes the switches below: `make openchimed
 # TTS=1` (the daemon with read-aloud), `make build/openchime-tui` (the Linux
 # TUI), `make build/web/openchime.js` (the web client). The daemon's switches
@@ -40,7 +40,7 @@
 PUBLIC   := build test build-all test-all run clean distclean
 INTERNAL := daemon fast-build fast-test build-dir linux windows web FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
 
-# --- One build at a time (docs/TESTING.md, "One build at a time") --------------
+# --- One build at a time (docs/details/TESTING.md, "One build at a time") --------------
 # One recipe at a time, in this make and every make it starts, whatever -j or
 # MAKEFLAGS a caller gives: a count in a variable is a count a command line
 # overrides, and this is not one. The vendored libraries' builds are their
@@ -146,7 +146,7 @@ endif
 # Build identity (ARCH-20). The full build passes the short commit it is
 # building (OC_BUILD_ID=a30809b), which is what `--version` and the startup
 # log say; a source build leaves it unset and reports "dev". A release number
-# is a label assigned to a build id afterwards (docs/UPGRADING.md) and is
+# is a label assigned to a build id afterwards (docs/details/UPGRADING.md) and is
 # never compiled in. The daemon, the TUI and both GUI clients take it, through
 # shared/build_id.h; the tests link the same objects and have no use for it.
 OC_BUILD_ID ?=
@@ -195,7 +195,7 @@ include mk/windows.mk
 include mk/tests.mk
 include mk/full.mk
 
-# --- The fast build and the fast suite (docs/TESTING.md) -----------------------
+# --- The fast build and the fast suite (docs/details/TESTING.md) -----------------------
 # One configuration, whatever was asked or remembered: the daemon with no
 # speech, summaries or web client, and the Windows clients; the Linux TUI is
 # the full build's. A make of its own, with the switches on its command line

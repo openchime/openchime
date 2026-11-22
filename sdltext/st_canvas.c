@@ -1,5 +1,5 @@
 /*
- * sdltext — the canvas backend (the web, docs/WEB.md step three).
+ * sdltext — the canvas backend (the web, docs/details/WEB.md step three).
  *
  * The browser's 2D canvas measures and rasterizes text; this file is the
  * layout engine over it, because a canvas gives advances and glyph runs, not

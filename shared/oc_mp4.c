@@ -1,6 +1,6 @@
 /* The restricted MP4 writer and reader (oc_mp4.h).
  *
- * Box layout written (docs/VIDEO-MESSAGES.md §5):
+ * Box layout written (docs/details/VIDEO-MESSAGES.md §5):
  *   ftyp · moov{ mvhd · trak(video) · trak(audio) } · mdat
  * or, audio-only (read-aloud):
  *   ftyp · moov{ mvhd · trak(audio) } · mdat

@@ -1,4 +1,4 @@
-/* One sender's jitter buffer (docs/CALLS.md §3): packets in by frame number,
+/* One sender's jitter buffer (docs/details/CALLS.md §3): packets in by frame number,
  * one frame out every 20 ms, and a decision for each -- decode the packet, rebuild
  * it from the next packet's FEC, conceal it, or play nothing. No codec here, so
  * it can be tested on a simulated network.

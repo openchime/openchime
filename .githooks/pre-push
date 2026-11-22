@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The fast suite is the gate for a push and a pull request (docs/TESTING.md):
+# The fast suite is the gate for a push and a pull request (docs/details/TESTING.md):
 # a pull request runs its policy checks (pr-policy), and no test, and the full
 # suite runs once per release-candidate. So `make test` is the one test every
 # change gets before it lands, and this refuses a push without it:
