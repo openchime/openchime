@@ -394,7 +394,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * + pv_rung, the download's gate; answered OC_RES_PREVIEW_META or
         * OC_RES_PREVIEW_ERR. PREVIEW_TOUCH (write, fire and forget): a rung
         * served, for the least-recently-used reclaim. */
-       OC_JOB_PREVIEW_STORE = 255, OC_JOB_PREVIEW_LOOKUP = 256, OC_JOB_PREVIEW_TOUCH = 257 };
+       OC_JOB_PREVIEW_STORE = 255, OC_JOB_PREVIEW_LOOKUP = 256, OC_JOB_PREVIEW_TOUCH = 257,
+       /* TTS_USE (write): message_id's speech was looked up under tts_handle,
+        * so a removal by age (REQ-250) finds the rendering and deletes it;
+        * answered OC_RES_OK. */
+       OC_JOB_TTS_USE = 258 };
 
 /* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
  * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
@@ -745,6 +749,7 @@ typedef struct oc_job {
     uint64_t       files_before_ms, files_before_id;
     uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
     uint32_t       maint_rec_days;    /* STORAGE_MAINT: delete calls' recordings this old (0 = keep) */
+    uint32_t       maint_retention_days; /* STORAGE_MAINT: delete messages and calls this old (REQ-250; 0 = keep) */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
     /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
     uint64_t       stt_req;

@@ -327,6 +327,20 @@ static void test_max_video_size(void) {
     refuses_removed("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", "167772160", "OPENCHIME_MAX_VIDEO_SIZE");
 }
 
+static void test_retention_days(void) {
+    /* Message retention (REQ-250): off (0) unless set, a number of days up
+     * to a hundred years, anything else refused. */
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    CHECK(oc_config_get()->retention_days == 0);
+    accepts("OPENCHIME_RETENTION_DAYS", "30");
+    CHECK(oc_config_get()->retention_days == 30);
+    accepts("OPENCHIME_RETENTION_DAYS", "36500");
+    CHECK(oc_config_get()->retention_days == 36500);
+    refuses("OPENCHIME_RETENTION_DAYS", "36501");
+    refuses("OPENCHIME_RETENTION_DAYS", "-1");
+    refuses("OPENCHIME_RETENTION_DAYS", "30d");
+}
+
 /* The workspace settings clients are told (CFG_VISIBLE): exactly the rows
  * marked so, by their key, with the effective value; never a secret. */
 static void test_visible(void) {
@@ -502,7 +516,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 46);     /* OPENCHIME_MODE, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING and the six image-preview settings among them */
+    CHECK(operator_rows == 47);     /* OPENCHIME_MODE, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 13);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
@@ -592,6 +606,7 @@ int run_config_tests(void) {
     test_constants();
     test_visible();
     test_max_video_size();
+    test_retention_days();
     test_mode();
     test_reload_and_registry();
     test_env_file();

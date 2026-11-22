@@ -1932,6 +1932,21 @@ static const char MIGRATION_0088[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX attachment_previews_lru ON attachment_previews(last_used_ms);";
 
+static const char MIGRATION_0089[] =
+    /* Which messages each read-aloud rendering was looked up for (REQ-250,
+     * ARCH-111). A rendering is keyed by what was said and in whose voice, not
+     * by message, so a handle worked out again when a message ages out would
+     * miss one made before a rename or a change of voice. Recorded as it is
+     * looked up, so the storage pass deletes every rendering a removed message
+     * was spoken under. Losing a row costs only that: the rendering is then
+     * left to the cache's own reclamation. */
+    "CREATE TABLE rendered_audio_uses ("
+    "  message_id INTEGER NOT NULL REFERENCES messages(id),"
+    "  handle     BLOB NOT NULL,"
+    "  PRIMARY KEY (message_id, handle)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX rendered_audio_uses_handle ON rendered_audio_uses(handle);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -2021,6 +2036,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 86, MIGRATION_0086 },
     { 87, MIGRATION_0087 },
     { 88, MIGRATION_0088 },
+    { 89, MIGRATION_0089 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

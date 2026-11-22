@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 88);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews */
+    CHECK(oc_schema_version(db) == 89);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -410,6 +410,28 @@ static void test_also_channel(void) {
     sqlite3_close(db);
 }
 
+/* Which messages a rendering was looked up for (0089), from 0088: the table
+ * is made, a use is one row per message and handle, and a second use of the
+ * same pair is no second row. */
+static void test_rendered_audio_uses_0089(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
+    CHECK(!table_exists(db, "rendered_audio_uses"));
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 89);
+    CHECK(table_exists(db, "rendered_audio_uses"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(7,1,1,'hello',5);"
+        "INSERT INTO rendered_audio_uses(message_id,handle) VALUES(7,x'01');"
+        "INSERT OR IGNORE INTO rendered_audio_uses(message_id,handle) VALUES(7,x'01');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio_uses;") == 1);
+    sqlite3_close(db);
+}
+
 /* Calls as objects (0087), from 0086: the call tables are made, channels and
  * messages gain call_id, and a missed-call line already stored is untouched --
  * still kind 1, its body as written, naming no call. A transcript line is
@@ -426,8 +448,8 @@ static void test_calls_0087(void) {
         "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
         "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,kind) VALUES(7,1,1,'Missed call',5,1);",
         NULL, NULL, NULL) == SQLITE_OK);
-    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 88);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 87, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 87);
     const char *tables[] = { "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
                              "call_transcripts_fts" };
@@ -493,7 +515,7 @@ static void test_previews_0088(void) {
         "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
         " VALUES(5,1,1,'00ff','a.jpg','image/jpeg',100,1);",
         NULL, NULL, NULL) == SQLITE_OK);
-    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
     CHECK(oc_schema_version(db) == 88);
     CHECK(table_exists(db, "attachment_previews"));
     CHECK(scalar(db, "SELECT COUNT(*) FROM attachments WHERE id=5 AND width IS NULL AND height IS NULL;") == 1);
@@ -567,6 +589,7 @@ int run_migrate_tests(void) {
     test_also_channel();
     test_calls_0087();
     test_previews_0088();
+    test_rendered_audio_uses_0089();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

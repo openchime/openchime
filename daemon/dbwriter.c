@@ -13347,6 +13347,25 @@ static oc_dbres *process_tts_touch(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* A message's speech was looked up under a handle (REQ-250): recorded, so the
+ * rendering goes when the message ages out. Fire and forget, as a touch is. */
+static oc_dbres *process_tts_use(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO rendered_audio_uses(message_id, handle)"
+            " SELECT id, ?2 FROM messages WHERE id = ?1;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_blob (st, 2, j->tts_handle, 32, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
 /* The export of a video message (ARCH-135). The gate is the download's: the
  * copy is the video, so whoever may read the video may have it. Then it must be
  * a video message -- an attachment with a media row of kind 1 -- whose bytes are
@@ -14026,6 +14045,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SUMMARY_SEEN)  return process_summary_seen(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
+    if (j->type == OC_JOB_TTS_USE)       return process_tts_use(w->db, j);
     if (j->type == OC_JOB_EXPORT_STORE)  return process_export_store(w->db, j);
     if (j->type == OC_JOB_EXPORT_TOUCH)  return process_export_touch(w->db, j);
     if (j->type == OC_JOB_PREVIEW_STORE) return process_preview_store(w->db, j);
@@ -14491,6 +14511,265 @@ static void prune_recordings(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now,
     }
 }
 
+/* Message retention (REQ-250). Run a statement over the set in temp.aged_ids. */
+static void aged_exec(sqlite3 *db, const char *sql) {
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
+/* Every table that names a message by `message_id` -- found from the schema, as
+ * purge_channel does, so a table added later is not missed -- loses the rows
+ * naming the messages in temp.aged_ids. Attachments are not among them: they
+ * are detached, not deleted, so the orphan sweep reclaims their bytes. */
+static void aged_delete_named(sqlite3 *db) {
+    sqlite3_stmt *t = NULL;
+    char names[64][64]; int n = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.name FROM sqlite_master m JOIN pragma_table_info(m.name) p "
+            " WHERE m.type='table' AND m.name NOT IN ('messages','attachments') "
+            "   AND m.name NOT LIKE 'messages_fts%' AND m.name NOT LIKE 'sqlite_%' "
+            "   AND p.name = 'message_id';", -1, &t, NULL) == SQLITE_OK) {
+        while (sqlite3_step(t) == SQLITE_ROW && n < 64)
+            snprintf(names[n++], sizeof names[0], "%s", (const char *)sqlite3_column_text(t, 0));
+    }
+    sqlite3_finalize(t);
+    for (int i = 0; i < n; i++) {
+        char sql[192];
+        snprintf(sql, sizeof sql, "DELETE FROM \"%.63s\" WHERE message_id IN (SELECT id FROM temp.aged_ids);", names[i]);
+        aged_exec(db, sql);
+    }
+}
+
+/* Remove by age every message older than `keep_ms`, a thread only whole: a
+ * top-level message goes with all its replies once it and its newest reply are
+ * both past the age, and not before. At most `batch` threads a pass, so a long
+ * backlog clears over several. With each message go its search entries (the
+ * delete trigger), every row naming it, every summary built on it and every
+ * read-aloud rendering it was spoken under; its attachments are detached for
+ * the orphan sweep. A forward of it elsewhere keeps its excerpt: that belongs
+ * to the forward, which ages out by its own time. */
+static void purge_aged(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now, uint64_t keep_ms, uint32_t batch) {
+    if (!keep_ms) return;
+    const uint64_t cutoff = now > keep_ms ? now - keep_ms : 0;
+    uint64_t roots[256]; int nr = 0;
+    if (batch == 0 || batch > 256) batch = 256;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.id FROM messages m WHERE m.parent_id IS NULL AND m.created_at_ms < ?1"
+            "   AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.parent_id = m.id AND x.created_at_ms >= ?1)"
+            " ORDER BY m.id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)batch);
+        while (sqlite3_step(st) == SQLITE_ROW && nr < 256) roots[nr++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!nr) return;
+
+    aged_exec(db, "CREATE TEMP TABLE IF NOT EXISTS aged_ids(id INTEGER PRIMARY KEY);");
+    aged_exec(db, "DELETE FROM temp.aged_ids;");
+    /* A thread whose renderings would not fit what is left of this pass's
+     * reclaim list waits for the next pass, rather than leaving bytes behind. */
+    for (int i = 0; i < nr; i++) {
+        int64_t renders = 0;
+        if (sqlite3_prepare_v2(db,
+                "SELECT COUNT(*) FROM rendered_audio a WHERE a.handle IN"
+                " (SELECT u.handle FROM rendered_audio_uses u JOIN messages m ON m.id = u.message_id"
+                "   WHERE m.id = ?1 OR m.parent_id = ?1);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            if (sqlite3_step(st) == SQLITE_ROW) renders = sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        if (r->n_reclaim + (size_t)renders > cap) break;
+        if (sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO temp.aged_ids(id) SELECT id FROM messages WHERE id = ?1 OR parent_id = ?1;",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+        /* Its renderings: the rows go now and their bytes with this pass. */
+        if (sqlite3_prepare_v2(db,
+                "DELETE FROM rendered_audio WHERE handle IN"
+                " (SELECT u.handle FROM rendered_audio_uses u JOIN messages m ON m.id = u.message_id"
+                "   WHERE m.id = ?1 OR m.parent_id = ?1) RETURNING blob_key;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+                const char *key = (const char *)sqlite3_column_text(st, 0);
+                char *dup = key ? strdup(key) : NULL;
+                if (!dup) continue;
+                r->reclaim[r->n_reclaim].storage_key = dup;
+                r->reclaim[r->n_reclaim].attachment_id = 0;
+                r->n_reclaim++;
+                r->maint_renders++;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* Summaries first, while the messages they were built on can still be read. */
+    if (sqlite3_prepare_v2(db, "SELECT id FROM temp.aged_ids ORDER BY id;", -1, &st, NULL) == SQLITE_OK)
+        while (sqlite3_step(st) == SQLITE_ROW) sum_purge_msg(db, (uint64_t)sqlite3_column_int64(st, 0));
+    sqlite3_finalize(st);
+
+    aged_exec(db, "DELETE FROM snippets_fts WHERE rowid IN"
+                  " (SELECT id FROM attachments WHERE message_id IN (SELECT id FROM temp.aged_ids));");
+    aged_exec(db, "UPDATE attachments SET message_id = NULL WHERE message_id IN (SELECT id FROM temp.aged_ids);");
+    aged_delete_named(db);
+    aged_exec(db, "DELETE FROM thread_follows WHERE root_id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM thread_reads WHERE root_id IN (SELECT id FROM temp.aged_ids);");
+    /* Replies before their roots: a reply names its root. */
+    aged_exec(db, "DELETE FROM messages WHERE parent_id IS NOT NULL AND id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM messages WHERE id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM temp.aged_ids;");
+}
+
+/* A change of retention is audited (REQ-250, REQ-251): it is the operator's
+ * setting, read at start, so at start the writer compares it with the value the
+ * newest `retention.change` entry recorded (none recorded: off) and, when they
+ * differ, records one administrative entry, by no user, old and new in
+ * `detail`. An unchanged value records nothing. */
+static void retention_audit(sqlite3 *db, int days) {
+    int was = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT detail FROM audit_log WHERE action = 'retention.change' ORDER BY id DESC LIMIT 1;",
+                           -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        const char *d = (const char *)sqlite3_column_text(st, 0);
+        const char *n = d ? strstr(d, "new=") : NULL;
+        if (n) was = atoi(n + 4);
+    }
+    sqlite3_finalize(st);
+    if (was == days) return;
+    char detail[64];
+    snprintf(detail, sizeof detail, "old=%d new=%d", was, days);
+    audit_log(db, OC_AUDIT_ADMIN, "retention.change", 0, NULL, 0, "workspace", 1, detail);
+}
+
+/* Count of one statement bound to one id. */
+static int64_t aged_count(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    int64_t n = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Run one statement bound to one id, queueing each blob key it RETURNs for
+ * reclaim as the daemon's own work (no attachment row behind it). */
+static void aged_reclaim_keys(sqlite3 *db, oc_dbres *r, size_t cap, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            const char *key = (const char *)sqlite3_column_text(st, 0);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            r->reclaim[r->n_reclaim].storage_key = dup;
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+static void aged_exec_id(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Remove by age every call that ended longer ago than `keep_ms` (REQ-250): its
+ * people, invitations, timeline, recordings, transcripts and its chat, whose
+ * files -- the recording among them -- their previews and exported copies, and every
+ * read-aloud rendering of its messages are reclaimed. The message a call left
+ * in the conversation it was started from is a message, and ages by its own
+ * time; until then it stays, naming no call. A call not yet ended never goes.
+ * At most `batch` calls a pass, and a call whose bytes would not fit what is
+ * left of this pass's reclaim list waits for the next. */
+static void purge_aged_calls(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now, uint64_t keep_ms, uint32_t batch) {
+    if (!keep_ms) return;
+    const uint64_t cutoff = now > keep_ms ? now - keep_ms : 0;
+    uint64_t calls[256]; int nc = 0;
+    if (batch == 0 || batch > 256) batch = 256;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id FROM calls WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1 ORDER BY id LIMIT ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)batch);
+        while (sqlite3_step(st) == SQLITE_ROW && nc < 256) calls[nc++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    for (int i = 0; i < nc; i++) {
+        const uint64_t call = calls[i];
+        /* What its chat's bytes need of the reclaim list: every file not yet
+         * reclaimed, every exported copy of one, every rendering of a message. */
+        int64_t need =
+            aged_count(db, "SELECT COUNT(*) FROM attachments a JOIN channels c ON c.id = a.channel_id"
+                           " WHERE c.call_id = ?1 AND a.reclaimed_at_ms = 0;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM exported_video e JOIN attachments a ON a.id = e.attachment_id"
+                           " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM attachment_previews p JOIN attachments a ON a.id = p.attachment_id"
+                           " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM rendered_audio WHERE handle IN (SELECT u.handle FROM rendered_audio_uses u"
+                           " JOIN messages m ON m.id = u.message_id JOIN channels c ON c.id = m.channel_id WHERE c.call_id = ?1);", call);
+        if (r->n_reclaim + (size_t)need > cap) break;
+
+        /* The chat's files, the recording among them: tombstoned and queued. */
+        if (sqlite3_prepare_v2(db, "SELECT a.id, a.storage_key FROM attachments a JOIN channels c ON c.id = a.channel_id"
+                                   " WHERE c.call_id = ?1 AND a.reclaimed_at_ms = 0;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+            while (sqlite3_step(st) == SQLITE_ROW)
+                reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0), (const char *)sqlite3_column_text(st, 1),
+                            now, OC_RECLAIM_EXPIRED);
+        }
+        sqlite3_finalize(st);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM exported_video WHERE attachment_id IN (SELECT a.id FROM attachments a"
+            " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) RETURNING blob_key;", call);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM attachment_previews WHERE attachment_id IN (SELECT a.id FROM attachments a"
+            " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) RETURNING storage_key;", call);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM rendered_audio WHERE handle IN (SELECT u.handle FROM rendered_audio_uses u"
+            " JOIN messages m ON m.id = u.message_id JOIN channels c ON c.id = m.channel_id WHERE c.call_id = ?1)"
+            " RETURNING blob_key;", call);
+
+        /* The call's own rows, then its chat and the chat's files, then the call. */
+        aged_exec_id(db, "UPDATE messages SET call_id = NULL WHERE call_id = ?1 AND channel_id NOT IN"
+                         " (SELECT id FROM channels WHERE call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM call_recordings WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_transcript_lines WHERE transcript_id IN"
+                         " (SELECT id FROM call_transcripts WHERE call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM call_transcripts WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_events WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_invitees WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_participants WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM snippets_fts WHERE rowid IN (SELECT a.id FROM attachments a"
+                         " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM attachment_media WHERE attachment_id IN (SELECT a.id FROM attachments a"
+                         " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) OR poster_id IN"
+                         " (SELECT a.id FROM attachments a JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1);", call);
+        uint64_t chats[8]; int nch = 0;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE call_id = ?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+            while (sqlite3_step(st) == SQLITE_ROW && nch < 8) chats[nch++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        for (int k = 0; k < nch; k++) {
+            /* The files go first, by message and by channel, so purge_channel
+             * meets no row naming them. */
+            aged_exec_id(db, "UPDATE attachments SET message_id = NULL WHERE channel_id = ?1;", chats[k]);
+            aged_exec_id(db, "DELETE FROM attachments WHERE channel_id = ?1;", chats[k]);
+            purge_channel(db, chats[k]);
+        }
+        aged_exec_id(db, "DELETE FROM calls WHERE id = ?1;", call);
+    }
+}
+
 static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -14520,6 +14799,16 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
      * §8): one older, from its call's end, goes -- its bytes and its row; the
      * message that carried it shows it gone, as any file reclaimed. */
     if (j->maint_rec_days) prune_recordings(db, r, cap, now, j->maint_rec_days);
+    /* Message retention (REQ-250): messages, and calls, past the age go, in one
+     * transaction, a bounded batch a pass. */
+    if (j->maint_retention_days) {
+        const uint64_t keep = (uint64_t)j->maint_retention_days * 24ull * 60 * 60 * 1000;
+        const uint32_t batch = j->maint_batch ? j->maint_batch : 64;
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        purge_aged(db, r, cap, now, keep, batch);
+        purge_aged_calls(db, r, cap, now, keep, batch);
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    }
 
     /* Tier 0 (ARCH-111): read-aloud renderings, before anything a user uploaded.
      * A rendering is the daemon's own work and can be made again from the message
@@ -15776,6 +16065,7 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
     sqlite3_exec(w->db, "UPDATE summary_requests SET state='queued', conn_id=0, req_id=0;", NULL, NULL, NULL);
     /* A call open when the daemon stopped ended then (CALLS.md §1). */
     calls_close_stopped(w->db);
+    retention_audit(w->db, oc_config_get()->retention_days);
     if (local_issuer_load(w) != 0) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;

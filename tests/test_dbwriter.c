@@ -12863,11 +12863,451 @@ static void test_call_recordings(void) {
     cleanup_db(path);
 }
 
+/* Message retention (REQ-250). A workspace whose messages are seeded straight
+ * into the database at chosen times, and the storage pass run over it with a
+ * retention in days. */
+#define RET_DAY (86400000ull)
+static uint64_t ret_now(void) { return (uint64_t)time(NULL) * 1000; }
+
+static void ret_sql(const char *path, const char *sql) {
+    sqlite3 *db = NULL;
+    CHECK(raw_open(path, &db) == SQLITE_OK);
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+    if (rc != SQLITE_OK) printf("    ret_sql: %s\n", err ? err : "?");
+    CHECK(rc == SQLITE_OK);
+    sqlite3_free(err);
+    sqlite3_close(db);
+}
+
+/* A message in the default channel, `age_ms` old, by `uid`; its id. */
+static uint64_t ret_msg(const char *path, uint64_t uid, uint64_t age_ms, uint64_t parent, const char *body) {
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT OR IGNORE INTO channels(id,kind,name,is_public,created_at_ms) VALUES(%d,'channel','general',1,0);"
+             "INSERT INTO messages(channel_id,author_id,body,created_at_ms,parent_id) VALUES(%d,%llu,'%s',%llu,%s);",
+             OC_DEFAULT_CHANNEL, OC_DEFAULT_CHANNEL, (unsigned long long)uid, body,
+             (unsigned long long)(ret_now() - age_ms), parent ? "?" : "NULL");
+    if (parent) {
+        char *q = strstr(sql, ",?);");
+        char tail[32];
+        snprintf(tail, sizeof tail, ",%llu);", (unsigned long long)parent);
+        if (q) strcpy(q, tail);
+    }
+    ret_sql(path, sql);
+    return (uint64_t)e2e_scalar(path, "SELECT MAX(id) FROM messages;", 0);
+}
+
+/* One storage pass with retention `days` (0: off) and `batch`; its result. */
+static oc_dbres *ret_pass(oc_dbwriter *w, uint32_t days, uint32_t batch) {
+    oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = batch;
+    j->maint_retention_days = days;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_STORAGE_MAINT);
+    return r;
+}
+
+static int64_t ret_count(const char *path, const char *sql, uint64_t arg) { return e2e_scalar(path, sql, arg); }
+
+static void test_retention_off(void) {
+    const char *path = tdb("ret_off.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 400 * RET_DAY, 0, "very old");
+    oc_dbres_free(ret_pass(w, 0, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", m) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_boundary(void) {
+    const char *path = tdb("ret_edge.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    /* A second either side of thirty days: the clock moves between seeding
+     * and the pass, so the margin is the clock's, not the rule's. */
+    uint64_t past  = ret_msg(path, a, 30 * RET_DAY + 1000, 0, "just past");
+    uint64_t short_ = ret_msg(path, a, 30 * RET_DAY - 60000, 0, "just short");
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", past) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", short_) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_linked_rows(void) {
+    const char *path = tdb("ret_rows.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "a poll and a list");
+    char sql[1024];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO pins(message_id,channel_id,pinned_by,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,0);"
+             "INSERT INTO saved_items(user_id,message_id,created_at_ms) VALUES(%3$llu,%1$llu,0);"
+             "INSERT INTO reactions(message_id,user_id,emoji,created_at_ms) VALUES(%1$llu,%3$llu,'+1',0);"
+             "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,0,0,3,0);"
+             "INSERT INTO polls(message_id,channel_id,created_at_ms) VALUES(%1$llu,%2$d,0);"
+             "INSERT INTO poll_options(message_id,idx,label) VALUES(%1$llu,0,'yes');"
+             "INSERT INTO todo_lists(message_id,channel_id,author_id,title,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,'list',0);"
+             "INSERT INTO todo_tasks(message_id,idx,name) VALUES(%1$llu,0,'task');",
+             (unsigned long long)m, OC_DEFAULT_CHANNEL, (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    const char *tables[] = { "pins", "saved_items", "reactions", "mentions", "polls", "poll_options",
+                             "todo_lists", "todo_tasks" };
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
+        char q[128];
+        snprintf(q, sizeof q, "SELECT COUNT(*) FROM %s WHERE message_id = ?1;", tables[i]);
+        CHECK(ret_count(path, q, m) == 0);
+    }
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", m) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_attachments(void) {
+    const char *path = tdb("ret_files.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "with a file");
+    char sql[1024];
+    unsigned long long old = (unsigned long long)(ret_now() - 40 * RET_DAY);
+    snprintf(sql, sizeof sql,
+             "INSERT INTO attachments(id,channel_id,uploader_id,message_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(901,%1$d,%2$llu,%3$llu,'ret_file','a.txt','text/plain',4,%4$llu);"
+             "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(902,%1$d,%2$llu,'ret_avatar','me.png','image/png',4,%4$llu);"
+             "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(903,%1$d,%2$llu,'ret_emoji','shipit.png','image/png',4,%4$llu);"
+             "UPDATE users SET avatar_attachment_id = 902 WHERE id = %2$llu;"
+             "INSERT INTO custom_emoji(name,attachment_id,created_by,created_at_ms) VALUES('shipit',903,%2$llu,%4$llu);",
+             OC_DEFAULT_CHANNEL, (unsigned long long)a, (unsigned long long)m, old);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    /* Detached by retention, then reclaimed by the orphan tier. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachments WHERE id = 901 AND message_id IS NULL;", 0) == 1);
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int file = 0, avatar = 0, emoji = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        file |= !strcmp(k, "ret_file"); avatar |= !strcmp(k, "ret_avatar"); emoji |= !strcmp(k, "ret_emoji");
+    }
+    oc_dbres_free(r);
+    CHECK(file || ret_count(path, "SELECT reclaimed_at_ms > 0 FROM attachments WHERE id = 901;", 0) == 1);
+    CHECK(!avatar && !emoji);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachments WHERE id IN (902,903) AND reclaimed_at_ms = 0;", 0) == 2);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_search(void) {
+    const char *path = tdb("ret_fts.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    ret_msg(path, a, 40 * RET_DAY, 0, "zebracorn quarterly");
+    ret_msg(path, a, 1 * RET_DAY, 0, "fresh words");
+    ret_sql(path, "INSERT INTO attachments(id,channel_id,uploader_id,message_id,storage_key,filename,mime,size,created_at_ms)"
+                  " SELECT 911,channel_id,author_id,id,'ret_snip','s.txt','text/plain',4,created_at_ms FROM messages"
+                  " WHERE body = 'zebracorn quarterly';"
+                  "INSERT INTO snippets_fts(rowid,title,body) VALUES(911,'snippet','okapiword');");
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'zebracorn';", 0) == 1);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'zebracorn';", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM snippets_fts WHERE snippets_fts MATCH 'okapiword';", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'fresh';", 0) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_summaries(void) {
+    const char *path = tdb("ret_sum.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "summarised");
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO summary_nodes(id,channel_id,kind,ikey,start_ms,end_ms,version,body,created_at_ms)"
+             " VALUES(77,%d,0,'k',0,1,'v',x'00',0);"
+             "INSERT INTO summary_inputs(parent_id,ord,child_kind,child_id) VALUES(77,0,0,%llu);",
+             OC_DEFAULT_CHANNEL, (unsigned long long)m);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM summary_nodes WHERE id = 77;", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_threads(void) {
+    const char *path = tdb("ret_thread.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t root = ret_msg(path, a, 60 * RET_DAY, 0, "old root");
+    uint64_t r1 = ret_msg(path, a, 50 * RET_DAY, root, "old reply");
+    uint64_t r2 = ret_msg(path, a, 10 * RET_DAY, root, "recent reply");
+    char sql[256];
+    snprintf(sql, sizeof sql, "INSERT INTO thread_follows(user_id,root_id,follow,created_at_ms) VALUES(%llu,%llu,1,0);",
+             (unsigned long long)a, (unsigned long long)root);
+    sqlite3 *db = NULL;
+    int has_follows = raw_open(path, &db) == SQLITE_OK && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    /* A reply is recent: the whole thread stays, the old reply too. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1 OR parent_id = ?1;", root) == 3);
+    /* Once that reply ages too, the thread goes whole. */
+    snprintf(sql, sizeof sql, "UPDATE messages SET created_at_ms = %llu WHERE id = %llu;",
+             (unsigned long long)(ret_now() - 40 * RET_DAY), (unsigned long long)r2);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id IN (?1);", root) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", r1) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", r2) == 0);
+    if (has_follows) CHECK(ret_count(path, "SELECT COUNT(*) FROM thread_follows WHERE root_id = ?1;", root) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_forward_kept(void) {
+    const char *path = tdb("ret_fwd.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t src = ret_msg(path, a, 40 * RET_DAY, 0, "the original");
+    uint64_t fwd = ret_msg(path, a, 2 * RET_DAY, 0, "look at this");
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO forwards(message_id,src_channel,src_message,src_author,excerpt,n_attach)"
+             " VALUES(%llu,%d,%llu,%llu,'the original',0);",
+             (unsigned long long)fwd, OC_DEFAULT_CHANNEL, (unsigned long long)src, (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", src) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM forwards WHERE message_id = ?1 AND excerpt = 'the original';", fwd) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_rendered_audio(void) {
+    const char *path = tdb("ret_tts.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t old = ret_msg(path, a, 40 * RET_DAY, 0, "spoken long ago");
+    uint64_t young = ret_msg(path, a, 1 * RET_DAY, 0, "spoken today");
+    /* The use is recorded through the writer's own job, as a lookup does. */
+    uint8_t h1[32], h2[32];
+    memset(h1, 0x11, 32); memset(h2, 0x22, 32);
+    oc_job *j = oc_job_new(OC_JOB_TTS_USE, 0);
+    j->message_id = old; memcpy(j->tts_handle, h1, 32);
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    j = oc_job_new(OC_JOB_TTS_USE, 0);
+    j->message_id = young; memcpy(j->tts_handle, h2, 32);
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio_uses;", 0) == 2);
+    ret_sql(path, "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
+                  " VALUES(zeroblob(32),'v1','ret_r0',1,1,0,0);"
+                  "UPDATE rendered_audio SET handle = x'1111111111111111111111111111111111111111111111111111111111111111'"
+                  " WHERE blob_key = 'ret_r0';"
+                  "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
+                  " VALUES(x'1111111111111111111111111111111111111111111111111111111111111111','v2','ret_r1',1,1,0,0),"
+                  "       (x'2222222222222222222222222222222222222222222222222222222222222222','v1','ret_r2',1,1,0,0);");
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int k0 = 0, k1 = 0, k2 = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        k0 |= !strcmp(k, "ret_r0"); k1 |= !strcmp(k, "ret_r1"); k2 |= !strcmp(k, "ret_r2");
+    }
+    oc_dbres_free(r);
+    CHECK(k0 && k1 && !k2);   /* every model version of the aged one, not the young one's */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio WHERE blob_key IN ('ret_r0','ret_r1');", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio WHERE blob_key = 'ret_r2';", 0) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio_uses WHERE message_id = ?1;", old) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_batch(void) {
+    const char *path = tdb("ret_batch.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    for (int i = 0; i < 5; i++) ret_msg(path, a, 40 * RET_DAY, 0, "backlog");
+    int64_t before = ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0);
+    CHECK(before == 5);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 3);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 1);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A call started, recorded once and made, in a fresh workspace; its id and
+ * chat through the out-parameters, and the recording's message. */
+static uint64_t ret_call(oc_dbwriter *w, uint64_t starter, uint64_t other, const char *key, uint64_t *chat) {
+    oc_job *j = oc_job_new(OC_JOB_CALL_START, 80);
+    j->user_id = starter;
+    j->call_subject = strdup("Old review");
+    j->call_uids = calloc(1, sizeof *j->call_uids);
+    j->call_uids[0] = other; j->n_call_uids = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CALL_STARTED && r->call_id && r->call_chat);
+    const uint64_t call = r ? r->call_id : 0;
+    *chat = r ? r->call_chat : 0;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_RECORDING_START, 81);
+    j->user_id = other; j->call_id = call; j->call_spool = strdup("/var/lib/oc/recordings");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    const uint64_t rec = r ? r->rec_id : 0;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
+    j->rec_id = rec;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec; j->call_spool = strdup(key);
+    j->exp_bytes = 1000; j->exp_duration_ms = 1000;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDING_DONE);
+    oc_dbres_free(r);
+    return call;
+}
+
+static void test_retention_calls(void) {
+    const char *path = tdb("ret_calls.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER), b = reg(w, "bob", "pw-bob", OC_ROLE_MEMBER);
+    uint64_t old_chat = 0, live_chat = 0;
+    uint64_t old_call = ret_call(w, a, b, "ret_rec_old", &old_chat);
+    uint64_t live_call = ret_call(w, a, b, "ret_rec_live", &live_chat);
+    /* The line the old call left where it was started, a recent message; a
+     * transcript; the old call ended forty days ago, the other still going. */
+    uint64_t line = ret_msg(path, a, 1 * RET_DAY, 0, "Call: Old review");
+    /* The recording has a preview, as an image would: it goes with its file. */
+    char pv[256];
+    snprintf(pv, sizeof pv,
+             "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+             " SELECT id,1,'ret_rec_old-1',1,1,1,'image/png',0,0 FROM attachments WHERE storage_key = 'ret_rec_old';");
+    ret_sql(path, pv);
+    char sql[768];
+    snprintf(sql, sizeof sql,
+             "UPDATE messages SET kind = 1, call_id = %1$llu WHERE id = %2$llu;"
+             "UPDATE calls SET ended_at_ms = %3$llu, end_reason = 'left' WHERE id = %1$llu;"
+             "INSERT INTO call_transcripts(id,call_id,created_at_ms) VALUES(31,%1$llu,0);"
+             "INSERT INTO call_transcript_lines(transcript_id,speaker,start_ms,end_ms,text) VALUES(31,%4$llu,0,1,'pelicanword');",
+             (unsigned long long)old_call, (unsigned long long)line,
+             (unsigned long long)(ret_now() - 40 * RET_DAY), (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int old_key = 0, live_key = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        old_key |= !strcmp(k, "ret_rec_old"); live_key |= !strcmp(k, "ret_rec_live");
+    }
+    oc_dbres_free(r);
+    CHECK(old_key && !live_key);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachment_previews WHERE storage_key = 'ret_rec_old-1';", 0) == 0);
+    const char *gone[] = { "SELECT COUNT(*) FROM calls WHERE id = ?1;",
+                           "SELECT COUNT(*) FROM call_participants WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_invitees WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_events WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_recordings WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_transcripts WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM channels WHERE call_id = ?1;" };
+    for (size_t i = 0; i < sizeof gone / sizeof gone[0]; i++) CHECK(ret_count(path, gone[i], old_call) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channels WHERE id = ?1;", old_chat) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE channel_id = ?1;", old_chat) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_transcript_lines WHERE transcript_id = 31;", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'pelicanword';", 0) == 0);
+    /* The line it left keeps its body, naming no call. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1 AND call_id IS NULL AND body = 'Call: Old review';", line) == 1);
+    /* The call still going is untouched, chat and recording. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM calls WHERE id = ?1;", live_call) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channels WHERE id = ?1;", live_chat) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_recordings WHERE call_id = ?1;", live_call) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_audit(void) {
+    const char *path = tdb("ret_audit.db");
+    cleanup_db(path);
+    const char *q = "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.change';";
+    /* Off, never set: nothing recorded. */
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 0);
+    /* Set to 30: one entry, by no user, old and new in its detail. */
+    setenv("OPENCHIME_RETENTION_DAYS", "30", 1);
+    CHECK(oc_config_load(NULL, 0) == 0);
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.change' AND family = 1"
+                          " AND actor_id IS NULL AND detail = 'old=0 new=30';", 0) == 1);
+    /* Started again unchanged: nothing more. */
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 1);
+    /* Turned off: a second entry. */
+    unsetenv("OPENCHIME_RETENTION_DAYS");
+    CHECK(oc_config_load(NULL, 0) == 0);
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 2);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE detail = 'old=30 new=0';", 0) == 1);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
     test_call_recordings();
+    test_retention_off();
+    test_retention_boundary();
+    test_retention_linked_rows();
+    test_retention_attachments();
+    test_retention_search();
+    test_retention_summaries();
+    test_retention_threads();
+    test_retention_forward_kept();
+    test_retention_rendered_audio();
+    test_retention_batch();
+    test_retention_calls();
+    test_retention_audit();
     test_usage();
     test_muted_people();
     test_change_password();

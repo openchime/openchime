@@ -8645,6 +8645,16 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
 #ifdef OC_TTS
     case OC_RES_TTS_META: {
         tts_lookup_answered(r->tts_seq);
+        /* Which message this rendering speaks, so it goes when the message
+         * ages out (REQ-250). A voice's preview is message 0, nobody's. */
+        if (r->message_id) {
+            oc_job *uj = oc_job_new(OC_JOB_TTS_USE, 0);
+            if (uj) {
+                uj->message_id = r->message_id;
+                memcpy(uj->tts_handle, r->tts_handle, 32);
+                oc_dbwriter_submit(dbw, uj);
+            }
+        }
         /* A warming probe has no listener: render what is missing and stop. The
          * point is that the next person to press Play waits for a database read
          * rather than for the model. Missing means not stored, not just
@@ -10219,6 +10229,7 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     j->maint_evict      = (pressure && g_spol.evict_enabled);
     j->audit_max_age_ms = g_spol.audit_max_age_ms;
     j->maint_rec_days   = (uint32_t)oc_config_get()->call_recording.days;   /* CALLS.md §8 */
+    j->maint_retention_days = (uint32_t)oc_config_get()->retention_days;   /* REQ-250 */
     oc_dbwriter_submit(dbw, j);
 }
 

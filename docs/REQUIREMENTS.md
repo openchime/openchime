@@ -2357,7 +2357,14 @@ messages (author name, ARCH-74).*
   retain forever (the default, REQ-053) or delete messages/attachments older than
   a set age — applied uniformly and irreversibly once messages age out. This has
   been opt-in for organizations with data-minimization obligations and is **not** a
-  paid-tier history *cap* (REQ-053 stands).
+  paid-tier history *cap* (REQ-053 stands). It has been the workspace's
+  configuration, one age for every channel and DM, set by an owner (ARCH-127,
+  ARCH-138). A message past it has gone with its files, search entries, pins,
+  reactions, summaries and spoken copies; a thread has gone only whole, once
+  its newest reply was past it; a forward has kept its excerpt until it aged
+  out itself; and a call has gone, with its recordings, transcripts and chat,
+  once it ended that long ago. Database backups have kept their own window. A
+  change has been audited (REQ-251).
 - **REQ-251.** The daemon has recorded an **audit log** of administrative and
   security-relevant actions, **append-only, admin-readable, and kept apart from
   the message store** (ARCH-79). The catalog has covered six families:

@@ -185,6 +185,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots the daemon trusts beside the built-in ones for its own outbound connections (push, enrollment, unfurls, S3): a service behind a private CA. No client reads it: a client trusts a private CA only through the operating system's store. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
 | `OPENCHIME_ALLOWED_NETWORKS` | *(unset)* | Addresses or CIDRs, IPv4 or IPv6, comma-separated, that may connect to the TLS port (REQ-192): any other client is closed before TLS or sign-in, judged by the address a trusted proxy's header names. Unset or empty: everyone. The health port is never restricted. |
+| `OPENCHIME_RETENTION_DAYS` | `0` | How many days messages are kept (REQ-250); 0 keeps them for ever. Past it the storage pass deletes a message with its files, search entries, pins, reactions and summaries, a thread only once its newest reply is past it, and a call with its recordings and transcripts once it ended that long ago. Database backups and replicas keep their own window. Changing it is audited. Integer 0..36500. |
 
 ### Features
 

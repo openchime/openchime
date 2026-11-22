@@ -1,7 +1,7 @@
 # OpenChime — Database Schema
 
 The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
-ARCH-27 (§1); the daemon applies migrations 0001–0087 (`daemon/migrate.c`,
+ARCH-27 (§1); the daemon applies migrations 0001–0089 (`daemon/migrate.c`,
 `OC_MIGRATIONS`), in order, and new tables/columns arrive as later numbered
 migrations, never as edits to an existing one. 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
@@ -36,7 +36,7 @@ credential resets; **0055** (§3at) passkeys; **0056** (§3au) actions;
 **0057–0059** (§3av–§3ax) summaries, their queue and notices; **0060** (§3ay)
 no schema change, a mention-index point; **0061** (§3az) multi-use invites;
 **0062** (§3ba) Argon2id credentials; **0063** (§3bb) encrypted DMs; **0064**
-(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases; **0084** (§3bw) the channel of an audit entry; **0085** (§3bx) to-do lists; **0086** (§3by) exported copies of video messages; **0087** (§3bz) calls.
+(§3bc) the identity in a database of its own; **0065** (§3bd) polls; **0066** (§3be) the workspace's own sender; **0067** (§3bf) whether a member set their own quiet hours; **0068** (§3bg) read receipts as a choice; **0069** (§3bh) an invitation's creation time; **0070** (§3bi) collapsed messages; **0071** (§3bj) the kind of principal; **0072** (§3bk) search without what spoilers hide; **0073** (§3bl) a reply also posted to the channel; **0074** (§3bm) following every thread in a conversation; **0075** (§3bn) reminders on saved items; **0076** (§3bo) active days; **0077** (§3bp) muted people; **0078** (§3bq) snippets; **0079** (§3br) blocks and DM privacy; **0080** (§3bs) profile fields; **0081** (§3bt) out of office; **0082** (§3bu) channel managers; **0083** (§3bv) custom emoji aliases; **0084** (§3bw) the channel of an audit entry; **0085** (§3bx) to-do lists; **0086** (§3by) exported copies of video messages; **0087** (§3bz) calls; **0088** (§3ca) image previews; **0089** (§3cb) which messages each read-aloud rendering speaks.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -2392,3 +2392,23 @@ before any attachment tier; and, pressure or not, as soon as its attachment's
 bytes are reclaimed or its message deleted. No tombstone: a client that finds a
 rung missing (`PREVIEW_MISSING`) shows the original instead, so there is nothing
 for a reader to be told.
+
+## 3cb. Migration 0089 — which messages a rendering speaks (REQ-250)
+
+```sql
+CREATE TABLE rendered_audio_uses (
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  handle     BLOB NOT NULL,
+  PRIMARY KEY (message_id, handle)) WITHOUT ROWID;
+CREATE INDEX rendered_audio_uses_handle ON rendered_audio_uses(handle);
+```
+
+A read-aloud rendering (`rendered_audio`, §3ag) is keyed by what was said and
+in whose voice, not by message, so the handle of an aged message worked out
+again would miss a rendering made before a rename or a change of voice. Each
+lookup of a message's speech records the pair here (`TTS_USE`, a writer job the
+lookup's answer sends). *Read* by message retention: when the storage pass
+removes a message by age, it deletes every rendering the message was spoken
+under, every model version, and queues the bytes for reclaim. A row goes with
+its message; a lost row only leaves its rendering to the cache's own
+reclamation.
