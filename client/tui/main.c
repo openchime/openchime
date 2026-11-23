@@ -1668,7 +1668,7 @@ static char     g_conn_title[200];
 
 static void menu_build_conn_request(const oc_model *m) {
     g_nmenu = 0;
-    snprintf(g_conn_title, sizeof g_conn_title, "%s wants to connect as you; it returns to %s",
+    snprintf(g_conn_title, sizeof g_conn_title, "%.80s wants to connect as you; it returns to %.60s",
              m->conn_req_client, m->conn_req_return);
     g_menu[g_nmenu++] = (menuitem){ "Approve for 30 days", ACT_CONN_LIFE30 };
     g_menu[g_nmenu++] = (menuitem){ "Approve for 90 days", ACT_CONN_LIFE90 };
