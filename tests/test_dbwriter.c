@@ -6,6 +6,7 @@
 #include "auth.h"       /* oc_sha256, to re-derive an invitation's id */
 #include "config.h"     /* OC_DEPLOY_* */
 #include "dbwriter.h"
+#include "oauth.h"      /* the authorize page's states */
 #include "relaykeys.h"
 #include "migrate.h"
 #include "notify.h"   /* the badge asks the same rule a toast does */
@@ -13481,6 +13482,334 @@ static void test_agents(void) {
     cleanup_db(path);
 }
 
+/* ---- A person's AI clients (docs/details/AUTH.md §8.13) ------------------- */
+
+#define OA_CH  "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"   /* RFC 7636 appendix B */
+#define OA_VER "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+#define OA_RES "https://ws.example/mcp"
+
+static oc_dbres *oa_job(oc_dbwriter *w, int type, uint64_t uid) {
+    oc_job *j = oc_job_new(type, 805);
+    j->user_id = uid;
+    return j ? (oc_dbwriter_submit(w, j), wait_result(w)) : NULL;
+}
+
+static oc_dbres *oa_register(oc_dbwriter *w, const char *name, const char *uris) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_REGISTER, 805);
+    j->oa_name = strdup(name); j->oa_uris = strdup(uris); j->token_from = strdup("192.0.2.9");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_begin(oc_dbwriter *w, const char *client, const char *redirect) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_BEGIN, 805);
+    j->oa_client_id = strdup(client); j->oa_redirect = strdup(redirect); j->oa_challenge = strdup(OA_CH);
+    j->oa_state = strdup("st-1"); j->oa_resource = strdup(OA_RES);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_code_job(oc_dbwriter *w, int type, uint64_t uid, const char *code, int approve, uint32_t days) {
+    oc_job *j = oc_job_new(type, 805);
+    j->user_id = uid; j->oa_code = strdup(code); j->oa_approve = (uint8_t)approve; j->oa_lifetime = days;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_poll(oc_dbwriter *w, const char *request) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_POLL, 805);
+    j->oa_request = strdup(request);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_exchange(oc_dbwriter *w, const char *code, const char *client, const char *verifier) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_EXCHANGE, 805);
+    j->oa_code = strdup(code); j->oa_client_id = strdup(client); j->oa_verifier = strdup(verifier);
+    j->oa_redirect = strdup("http://127.0.0.1:4000/cb"); j->oa_resource = strdup(OA_RES);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_refresh(oc_dbwriter *w, const char *refresh, const char *client) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_REFRESH, 805);
+    j->oa_refresh = strdup(refresh); j->oa_client_id = strdup(client);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_lookup(oc_dbwriter *w, const char *access) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_LOOKUP, 805);
+    j->token = strdup(access); j->token_len = strlen(access); j->token_from = strdup("192.0.2.10");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* The error a refusal carries: the OAuth code, or "#<reason>" for a person's. */
+static int oa_refused(oc_dbres *r, const char *oauth, uint16_t code) {
+    int ok = r && r->type == OC_RES_OAUTH_ERR && (oauth ? r->oa_error && strcmp(r->oa_error, oauth) == 0 : r->err_code == code);
+    oc_dbres_free(r);
+    return ok;
+}
+
+/* One flow up to the code the person types: its page handle and code. */
+static int oa_start(oc_dbwriter *w, const char *client, char *request, char *code) {
+    oc_dbres *r = oa_begin(w, client, "http://127.0.0.1:4000/cb");
+    int ok = r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_PENDING && r->oa_request && r->oa_code;
+    if (ok) { snprintf(request, 64, "%s", r->oa_request); snprintf(code, 16, "%s", r->oa_code); }
+    oc_dbres_free(r);
+    return ok;
+}
+
+/* Approved and collected: the authorization code the page hands back. */
+static int oa_approved(oc_dbwriter *w, uint64_t uid, const char *client, uint32_t days, char *authcode) {
+    char request[64], code[16];
+    if (!oa_start(w, client, request, code)) return 0;
+    oc_dbres *r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, uid, code, 1, days);
+    int ok = r && r->type == OC_RES_OAUTH_DECIDED;
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    ok = ok && r && r->type == OC_RES_OAUTH_REDIRECT && r->oa_code;
+    if (ok) snprintf(authcode, 64, "%s", r->oa_code);
+    oc_dbres_free(r);
+    return ok;
+}
+
+static void test_connections(void) {
+    const char *path = tdb("connections.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "cnown", "pw-own", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "cnbob", "pw-bob", OC_ROLE_MEMBER);
+    uint64_t cat = reg(w, "cncat", "pw-cat", OC_ROLE_MEMBER);
+    CHECK(own && bob && cat);
+    ret_sql(path, "INSERT INTO users(id, subject, display_name, role, kind, created_at_ms) VALUES"
+                  " (9910, 'visitor:v', 'Vis', 'member', 'visitor', 1), (9911, 'agent:a', 'Bot', 'member', 'agent', 1),"
+                  " (9912, 'local:gone', 'Gone', 'member', 'human', 1);");
+    ret_sql(path, "UPDATE users SET disabled=1 WHERE id=9912;");
+
+    /* A registered client, and an authorize request against it. */
+    oc_dbres *r = oa_register(w, "Desk AI", "http://127.0.0.1:5000/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_CLIENT && r->oa_client_id && strncmp(r->oa_client_id, "occl_", 5) == 0);   /* contract: the client prefix */
+    char client[64] = "";
+    if (r && r->oa_client_id) snprintf(client, sizeof client, "%s", r->oa_client_id);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM oauth_clients WHERE kind='registered' AND created_from='192.0.2.9' AND ?1=?1;", 0) == 1);
+    r = oa_begin(w, "occl_nobody", "http://127.0.0.1:4000/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);
+    oc_dbres_free(r);
+    r = oa_begin(w, client, "https://elsewhere.example/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);
+    oc_dbres_free(r);
+    /* A document's URL never fetched is fetched first. */
+    r = oa_begin(w, "https://client.example/c.json", "https://client.example/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_NEED_FETCH);
+    oc_dbres_free(r);
+
+    char request[64] = "", code[16] = "";
+    CHECK(oa_start(w, client, request, code));
+    CHECK(strlen(code) == 8 && strncmp(request, "ocrq_", 5) == 0);
+    /* Hashed only. */
+    char q[300];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM oauth_approvals WHERE CAST(code_hash AS TEXT) LIKE '%%%s%%' AND ?1=?1;", code);
+    CHECK(ret_count(path, q, 0) == 0);
+
+    /* Pending: the page waits. */
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_PENDING && r->oa_name &&
+          strcmp(r->oa_name, "Desk AI") == 0);   /* contract: the registered name */
+    oc_dbres_free(r);
+
+    /* Who may act on the code: a person; never a visitor, an agent or a removed account. */
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9910, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9911, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9912, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, 9910, code, 1, 30), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, "BBBB-BBBB", 0, 0), NULL, OC_ERR_UNKNOWN_CODE));
+    char lower[16];
+    for (int i = 0; code[i]; i++) lower[i] = (char)(code[i] - 'A' + 'a'), lower[i + 1] = '\0';
+    r = oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, lower, 0, 0);   /* as typed: any case */
+    CHECK(r && r->type == OC_RES_OAUTH_APPROVAL && r->oa_name && strcmp(r->oa_name, "Desk AI") == 0 && r->oa_redirect &&
+          strcmp(r->oa_redirect, "http://127.0.0.1:4000/cb") == 0);   /* contract: what the request named */
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, bob, code, 1, 7), NULL, OC_ERR_BAD_LIFETIME));
+
+    /* Approved for 30 days; the page collects a one-minute code, once. */
+    r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, bob, code, 1, 30);
+    CHECK(r && r->type == OC_RES_OAUTH_DECIDED);
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, cat, code, 1, 30), NULL, OC_ERR_UNKNOWN_CODE));   /* used */
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_REDIRECT && r->oa_code && strncmp(r->oa_code, "ocac_", 5) == 0 && r->oa_state &&
+          strcmp(r->oa_state, "st-1") == 0);   /* contract: the client's state, returned */
+    char authcode[64] = "";
+    if (r && r->oa_code) snprintf(authcode, sizeof authcode, "%s", r->oa_code);
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);   /* collected: over */
+    oc_dbres_free(r);
+
+    /* The exchange: PKCE and the client checked; the code good once. */
+    CHECK(oa_refused(oa_exchange(w, authcode, "occl_other", OA_VER), "invalid_grant", 0));
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER "x"), "invalid_grant", 0));
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));    /* spent by the wrong try */
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    ret_sql(path, "UPDATE oauth_approvals SET auth_code_until=1 WHERE auth_code_hash IS NOT NULL;");   /* a minute gone */
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS && r->oa_access && r->oa_refresh);
+    char access[64] = "", refresh[64] = "";
+    if (r && r->oa_access) { snprintf(access, sizeof access, "%s", r->oa_access); snprintf(refresh, sizeof refresh, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    CHECK(strncmp(access, "ocpa_", 5) == 0 && strncmp(refresh, "ocpr_", 5) == 0);   /* contract: the prefixes */
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));   /* once */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND lifetime_days=30"
+                          " AND expires_at_ms - created_at_ms = 30*86400000;", bob) == 1);
+
+    /* The access token acts as the person, through the client. */
+    r = oa_lookup(w, access);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL && r->oa_person && r->user_id == bob && r->oa_name &&
+          strcmp(r->oa_name, "Desk AI") == 0);   /* contract: the approved name */
+    uint64_t conn = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE id=?1 AND last_used_from='192.0.2.10';", conn) == 1);
+    CHECK(agent_err(oa_lookup(w, "ocpa_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(agent_err(oa_lookup(w, refresh)) == OC_ERR_AUTH_INVALID_TOKEN);   /* a refresh token is no access token */
+
+    /* Refresh: a new pair; the old refresh token is retired, and refused, audited. */
+    r = oa_refresh(w, refresh, client);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS && r->oa_access && r->oa_refresh && strcmp(r->oa_refresh, refresh) != 0);
+    char access2[64] = "", refresh2[64] = "";
+    if (r && r->oa_access) { snprintf(access2, sizeof access2, "%s", r->oa_access); snprintf(refresh2, sizeof refresh2, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_refresh(w, refresh, client), "invalid_grant", 0));
+    CHECK(oa_refused(oa_refresh(w, refresh2, "occl_other"), "invalid_grant", 0));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.refresh_refused' AND family=?1;", OC_AUDIT_SECURITY) == 2);
+    r = oa_lookup(w, access2);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL);
+    oc_dbres_free(r);
+
+    /* An access token an hour old, and a connection past its lifetime, are refused. */
+    ret_sql(path, "UPDATE mcp_access_tokens SET expires_at_ms=1;");
+    CHECK(agent_err(oa_lookup(w, access2)) == OC_ERR_AUTH_INVALID_TOKEN);
+    r = oa_refresh(w, refresh2, client);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS);
+    char access3[64] = "", refresh3[64] = "";
+    if (r && r->oa_access) { snprintf(access3, sizeof access3, "%s", r->oa_access); snprintf(refresh3, sizeof refresh3, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    snprintf(q, sizeof q, "UPDATE mcp_connections SET expires_at_ms=2 WHERE id=%llu;", (unsigned long long)conn);
+    ret_sql(path, q);
+    CHECK(agent_err(oa_lookup(w, access3)) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(oa_refused(oa_refresh(w, refresh3, client), "invalid_grant", 0));
+
+    /* Never: no end. A pending approval past ten minutes is gone to the app, expired to the page. */
+    CHECK(oa_approved(w, bob, client, 0, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS);
+    char access4[64] = "";
+    if (r && r->oa_access) snprintf(access4, sizeof access4, "%s", r->oa_access);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND lifetime_days=0 AND expires_at_ms=0;", bob) == 1);
+    CHECK(oa_start(w, client, request, code));
+    ret_sql(path, "UPDATE oauth_approvals SET expires_at_ms=5 WHERE status=0;");
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, code, 0, 0), NULL, OC_ERR_UNKNOWN_CODE));
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_EXPIRED);
+    oc_dbres_free(r);
+
+    /* Declined: the page returns access_denied. */
+    CHECK(oa_start(w, client, request, code));
+    r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, cat, code, 0, 0);
+    CHECK(r && r->type == OC_RES_OAUTH_DECIDED);
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_REDIRECT && !r->oa_code && r->oa_error && strcmp(r->oa_error, "access_denied") == 0);   /* contract: RFC 6749's code */
+    oc_dbres_free(r);
+
+    /* cat's own connection, for the lists. */
+    CHECK(oa_approved(w, cat, client, 90, authcode));
+    oc_dbres_free(oa_exchange(w, authcode, client, OA_VER));
+
+    /* Lists: one's own; everyone's for an owner or admin only; never a token. */
+    r = oa_job(w, OC_JOB_OAUTH_LIST, bob);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 1 && r->oa_conns[0].user_id == bob &&
+          r->oa_conns[0].lifetime_days == 0);
+    uint64_t bob_conn = r && r->n_oa_conns ? r->oa_conns[0].id : 0;
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_LIST, 805);
+    j->user_id = bob; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    CHECK(oa_refused(wait_result(w), NULL, OC_ERR_FORBIDDEN));
+    j = oc_job_new(OC_JOB_OAUTH_LIST, 805);
+    j->user_id = own; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 2);
+    uint64_t cat_conn = 0;
+    for (size_t i = 0; r && i < r->n_oa_conns; i++) if (r->oa_conns[i].user_id == cat) cat_conn = r->oa_conns[i].id;
+    oc_dbres_free(r);
+
+    /* Revoking: not another's as a member; one's own; anyone's as an owner. */
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = bob; j->oa_conn_id = cat_conn;
+    oc_dbwriter_submit(w, j);
+    CHECK(oa_refused(wait_result(w), NULL, OC_ERR_UNKNOWN_CONNECTION));
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = bob; j->oa_conn_id = bob_conn;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 0);
+    oc_dbres_free(r);
+    CHECK(agent_err(oa_lookup(w, access4)) == OC_ERR_AUTH_INVALID_TOKEN);
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = own; j->oa_conn_id = cat_conn; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 0);
+    oc_dbres_free(r);
+
+    /* A post through a connection names its client. */
+    ret_sql(path, "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(9821,'channel','cn-room',1,1);");
+    snprintf(q, sizeof q, "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9821,%llu,1);", (unsigned long long)bob);
+    ret_sql(path, q);
+    j = oc_job_new(OC_JOB_SEND, 806);
+    j->user_id = bob; j->channel_id = 9821; j->via = strdup("Desk AI");
+    memset(j->idem, 0x5A, OC_IDEM_LEN);
+    oc_job_set_body(j, "from the client", 15);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->via && strcmp(r->via, "Desk AI") == 0);   /* contract: the client's name */
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE author_id=?1 AND via='Desk AI';", bob) == 1);
+
+    /* Removing a person revokes their connections. */
+    CHECK(oa_approved(w, cat, client, 365, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    char access5[64] = "";
+    if (r && r->oa_access) snprintf(access5, sizeof access5, "%s", r->oa_access);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_REMOVE_USER, 807);
+    j->user_id = own; j->target_user_id = cat;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(agent_err(oa_lookup(w, access5)) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND revoked_at_ms=0;", cat) == 0);
+
+    /* The audit: approvals and declines in the account family, a person's own
+     * revoke there too, an owner's of another's administrative; never a token or code. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_approve' AND family=?1;", OC_AUDIT_ACCOUNT) >= 6);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_decline' AND family=?1;", OC_AUDIT_ACCOUNT) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=?1;", OC_AUDIT_ACCOUNT) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=?1;", OC_AUDIT_ADMIN) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE (COALESCE(detail,'')||COALESCE(target,'')) GLOB '*oc[pa][arc]_*' AND ?1=?1;", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -13497,6 +13826,7 @@ int run_dbwriter_tests(void) {
     test_retention_forward_kept();
     test_retention_rendered_audio();
     test_agents();
+    test_connections();
     test_retention_batch();
     test_retention_calls();
     test_retention_audit();

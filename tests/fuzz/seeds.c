@@ -449,6 +449,13 @@ int main(int argc, char **argv) {
     { static oc_list_agent_tokens m; FRAME("list_agent_tokens", oc_encode_list_agent_tokens(&w, V, &m)); }
     { static oc_agent_token_list m; FRAME("agent_token_list", oc_encode_agent_token_list(&w, V, &m)); }
     { static oc_revoke_agent_token m; FRAME("revoke_agent_token", oc_encode_revoke_agent_token(&w, V, &m)); }
+    { static oc_connection_code m; FRAME("connection_code", oc_encode_connection_code(&w, V, &m)); }
+    { static oc_connection_request m; FRAME("connection_request", oc_encode_connection_request(&w, V, &m)); }
+    { static oc_connection_decide m; FRAME("connection_decide", oc_encode_connection_decide(&w, V, &m)); }
+    { static oc_connection_decided m; FRAME("connection_decided", oc_encode_connection_decided(&w, V, &m)); }
+    { static oc_list_connections m; FRAME("list_connections", oc_encode_list_connections(&w, V, &m)); }
+    { static oc_connection_list m; FRAME("connection_list", oc_encode_connection_list(&w, V, &m)); }
+    { static oc_revoke_connection m; FRAME("revoke_connection", oc_encode_revoke_connection(&w, V, &m)); }
     { static oc_error m; FRAME("error", oc_encode_error(&w, V, &m)); }
 
     static const uint16_t one[] = { 1 }, small[] = { 3, 7, 64 }, whole[] = { 16384 }, mixed[] = { 9, 4096, 2, 300 };

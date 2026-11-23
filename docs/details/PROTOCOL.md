@@ -115,7 +115,11 @@ during the TLS handshake:
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
 which serves `POST /webhook/<token>` (§5.15), `POST /mcp` when the operator
-turns MCP on (MCP.md: one JSON-RPC request per POST, `GET` and `DELETE` `405`),
+turns MCP on (MCP.md: one JSON-RPC request per POST, `GET` and `DELETE` `405`)
+and with it the MCP authorization server's routes (AUTH.md §8.13):
+`GET /.well-known/oauth-protected-resource`,
+`GET /.well-known/oauth-authorization-server`, `GET /oauth/authorize`,
+`POST /oauth/token` and `POST /oauth/register`,
 the WebSocket upgrade `GET /ws`
 (§1.2), `POST /enroll-proof` (central's check of the address an enrolled
 workspace reported, AUTH.md §3.6), the daemon's own sign-in pages (AUTH.md
@@ -217,8 +221,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 50** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 51** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 51 put `via` in `BROADCAST` (after `call_id`) and `THREAD_REPLY` (after
+> `also_channel`), each ahead of the body: the AI client a person posted
+> through (AUTH.md §8.13, §5.16q). Version
 > 50 appended `rec_by` to `CALL_STATE`: who started the recording going on
 > (CALLS.md §8), and `faces` to each `CALL_HISTORY_PAGE` entry: who took part,
 > up to three, first joined first. Version 49 made a call an object of its own (CALLS.md §1, §5.17): `CALL_START` and
@@ -617,6 +624,7 @@ tenant-monotonic (ARCH-43).
 | `broadcast_stored` | u8 | `1` when the daemon stored a broadcast mention (`@here`, `@channel` or `@everyone`) for the message when it was sent, so a broadcast its body holds notifies (REQ-221); else `0`, whatever the body. Any other value is malformed. Since version 32 (version 31 carried `broadcast_held` here). |
 | `parent_id`    | u64  | The thread root of a reply also posted to the channel (REQ-062, §5.10), which a replay of the main scroll carries with it; `0` for a message that is not a reply. Since version 36. |
 | `call_id`      | u64  | The call a call message is about (kind `1`, §5.17); `0` for any other message, and for a missed-call line from before version 49. Since version 49. |
+| `via`          | str  | The AI client a person posted the message through (AUTH.md §8.13), which a client shows as "via <client>" beside the author; empty for any other message. Since version 51. |
 | `body`         | lstr | Message body (§7).                           |
 
 `broadcast_stored` is the daemon's answer to whether a broadcast mention
@@ -1479,6 +1487,7 @@ member of the channel:
 | `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
 | `broadcast_stored` | u8 | As on `BROADCAST` (§5.3): `1` when the reply's send stored a broadcast mention (REQ-221). Since version 32. |
 | `also_channel` | u8  | `1` when the reply is also in the channel's main scroll (REQ-062): the client shows it there too, from this one frame. Since version 36. |
+| `via`         | str  | As on `BROADCAST` (§5.3): the AI client the reply came through, else empty. Since version 51. |
 | `body`        | lstr | The reply body.                                          |
 
 `participant` is the only per-recipient field on a fan-out frame, so the daemon
@@ -3257,6 +3266,42 @@ empty or too long.
 person, and must be in the channel themselves. Anyone else is refused
 `FORBIDDEN`. An agent is never put in a DM, a group DM or a user group.
 
+### 5.16q A person's AI clients (AUTH.md §8.13)
+
+A person connects their own AI client to the MCP endpoint by approving it in
+their signed-in app: the daemon's authorize page shows the client's name and an
+eight-letter code, and the person enters the code here. The connection then
+acts as them, and each one is listed and revoked here. All are new frames;
+`via` on `BROADCAST` and `THREAD_REPLY` is the layout change of version 51.
+Every frame is refused `FORBIDDEN` to a visitor, an agent or a removed account,
+and `CONNECTIONS_OFF` 3084 while `OPENCHIME_MCP_CONNECTIONS` is off. No frame
+carries a token.
+
+- **`CONNECTION_CODE` (C → S), `0x014D`** `{ code: str }` — the code as the
+  person typed it (either case, a dash or spaces anywhere). Answered
+  `CONNECTION_REQUEST`, or `UNKNOWN_CODE` 3081 for a code that is not pending:
+  unknown, past its ten minutes, or already acted on.
+- **`CONNECTION_REQUEST` (S → C), `0x014E`** `{ code: str, client_name: str,
+  redirect_uri: str }` — what is asking: the client's name, and where it will
+  return the person, for them to check before approving.
+- **`CONNECTION_DECIDE` (C → S), `0x014F`** `{ code: str, approve: u8,
+  lifetime_days: u32 }` — approve (`1`), with the connection's lifetime: `0`
+  for never, `30`, `90` or `365` (any other is `BAD_LIFETIME` 3083), or decline
+  (`0`, lifetime ignored). Answered `CONNECTION_DECIDED`, or `UNKNOWN_CODE`.
+- **`CONNECTION_DECIDED` (S → C), `0x0150`** `{ approved: u8, client_name: str }`.
+- **`LIST_CONNECTIONS` (C → S), `0x0151`** `{ all: u8 }` — one's own (`0`), or
+  everyone's (`1`, an owner's or admin's; anyone else `FORBIDDEN`). Answered
+- **`CONNECTION_LIST` (S → C), `0x0152`** `{ all: u8, count: u16, entries: [ {
+  connection_id: u64, user_id: u64, user_name: str, client_name: str,
+  created_at_ms: u64, last_used_at_ms: u64, expires_at_ms: u64, lifetime_days:
+  u32 } ] }` — the connections in force, newest first, at most 500;
+  `last_used_at_ms` 0 for never, `expires_at_ms` 0 for no end.
+- **`REVOKE_CONNECTION` (C → S), `0x0153`** `{ connection_id: u64, all: u8 }` —
+  one's own, or with `all` anyone's as an owner or admin. Its tokens go at once:
+  the client's next request is refused. Answered `CONNECTION_LIST` in the same
+  scope, or `UNKNOWN_CONNECTION` 3082 for one that is not there or not the
+  caller's.
+
 ---
 
 ### 5.17 Calls (REQ-150-152, REQ-160, REQ-161, REQ-301-306, ARCH-73, ARCH-86/87, ARCH-113)
@@ -3968,6 +4013,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3078` | `PREVIEW_RUNG` | transfer | no    | A `PREVIEW_BEGIN` naming a rung that is neither 1 nor 2 (§5.14f). |
 | `3079` | `UNKNOWN_SCOPE` | admin | no    | A token minted with a scope outside the catalog (§5.16p). |
 | `3080` | `TOO_MANY_TOKENS` | admin | no    | A token minted for an agent that already holds 10 (§5.16p). |
+| `3081` | `UNKNOWN_CODE` | account | no    | A `CONNECTION_CODE` or `CONNECTION_DECIDE` whose code no AI client is waiting on: unknown, past its ten minutes, or already acted on (§5.16q). |
+| `3082` | `UNKNOWN_CONNECTION` | account | no    | A `REVOKE_CONNECTION` for a connection that is not in force, or not the caller's to revoke (§5.16q). |
+| `3083` | `BAD_LIFETIME` | account | no    | A `CONNECTION_DECIDE` approving with a lifetime other than 0, 30, 90 or 365 days (§5.16q). |
+| `3084` | `CONNECTIONS_OFF` | account | no    | Any §5.16q frame while `OPENCHIME_MCP_CONNECTIONS` is off. |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing

@@ -115,6 +115,10 @@ const cfg_row OC_CFG[] = {
     BOOL("OPENCHIME_MCP", CFG_OPERATOR, G_FLAG, "off", "The MCP endpoint, `/mcp` (docs/details/MCP.md): an agent holding a token reads the channels it is a member of, searches them and posts as itself. Off, `/mcp` does not exist.", mcp.enabled),
     INT("OPENCHIME_MCP_CALLS_PER_MINUTE", CFG_OPERATOR, G_FLAG, "60", 1, 6000, "How many MCP tool calls one agent token may make a minute, refilled continuously; a search counts as three. Over it a call is answered 429 with Retry-After.", mcp.per_minute),
     INT("OPENCHIME_MCP_BURST", CFG_OPERATOR, G_FLAG, "20", 1, 1000, "How many MCP tool calls one agent token may make at once before `OPENCHIME_MCP_CALLS_PER_MINUTE` paces it.", mcp.burst),
+    /* A BOOL a client is told (CFG_VISIBLE), written out: the macro has no flags. */
+    { "OPENCHIME_MCP_CONNECTIONS", CFG_BOOL, CFG_OPERATOR, G_FLAG, "on",
+      "Whether people may connect their own AI clients to the MCP endpoint (docs/details/AUTH.md §8.13): a client is approved in the person's signed-in app with a code, and acts as them. Off, `/oauth/authorize` and `/oauth/register` say so and every such connection is refused at `/mcp`; agents are not affected. Needs `OPENCHIME_MCP`.",
+      0, 0, NULL, F(mcp.connections), NULL, CFG_VISIBLE, 0 },
     U64("OPENCHIME_CALL_RECORDING_MAX_MB", CFG_OPERATOR, G_FLAG, "0", 0, 100000000, "The most space, in megabytes, the calls' recordings may take together; 0 is no cap. At the cap a recording cannot be started.", call_recording.max_mb),
     CUSTOM("OPENCHIME_SUMMARY", CFG_OPERATOR, G_FLAG, "off",
            "Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there).",

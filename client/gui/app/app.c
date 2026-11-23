@@ -1761,6 +1761,7 @@ static int have_camera(void) {
  * where tags were drawn (the dump's `agenttags` line). */
 enum { ATAG_TRANSCRIPT = 0, ATAG_MEMBERS, ATAG_MENTION, ATAG_PROFILE, ATAG_SEARCH, ATAG_SUMMARY, ATAG_N };
 static int      g_atag_n[ATAG_N];
+static int      g_via_n;   /* "via <client>" labels drawn in the last frame (AUTH.md §8.13) */
 static uint64_t g_atag_uid[ATAG_N];
 static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line);   /* fwd */
 
@@ -2059,7 +2060,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PFIELD_DELETE,
        CONF_WS_FORGET_SET,
        /* Admin > Agents: remove an agent, revoke one of its tokens. */
-       CONF_AGENT_REMOVE, CONF_AGENT_REVOKE };
+       CONF_AGENT_REMOVE, CONF_AGENT_REVOKE, CONF_CONN_REVOKE, CONF_CONN_REVOKE_ALL };
 static uint64_t g_agt_sel;   /* Admin > Agents: the agent whose tokens are open; 0: the list of agents */
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
@@ -7962,6 +7963,15 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
         float tagw = oc_model_user_is_agent(m, msg->author_id)
                    ? agent_tag(rt, ATAG_TRANSCRIPT, msg->author_id, tx + text_width(nm, g_title) + 8, hl) : 0;
+        if (msg->via[0]) {
+            /* Posted through an AI client (AUTH.md §8.13): said beside the author. */
+            char via[128];
+            snprintf(via, sizeof via, "via %s", msg->via);
+            float vx = tx + text_width(nm, g_title) + 8 + tagw;
+            draw_text(rt, via, g_meta, baseline_align(hl, g_title, g_meta, vx, hl.right), OC_COL_MUTED);
+            tagw += text_width(via, g_meta) + 8;
+            g_via_n++;
+        }
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
             struct tm tv; char when[24] = "";
@@ -16720,6 +16730,8 @@ static void confirm_run(oc_win *hwnd) {
         if (g_agt_sel == g_confirm_id) g_agt_sel = 0;
         break;
     case CONF_AGENT_REVOKE: oc_client_revoke_agent_token(g_client, g_agt_sel, g_confirm_id); break;
+    case CONF_CONN_REVOKE: oc_client_revoke_connection(g_client, g_confirm_id, 0); break;
+    case CONF_CONN_REVOKE_ALL: oc_client_revoke_connection(g_client, g_confirm_id, 1); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -19864,7 +19876,7 @@ static int shell_visible(void) {
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
 enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS,
-       ADM_AGENTS, ADM_COUNT };
+       ADM_AGENTS, ADM_CONNECTIONS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -19874,7 +19886,9 @@ static rectf g_adm_tabs[ADM_COUNT];
  * is shown here once, with Copy, until Done. Every button is one entry in
  * g_agtbtns, so a click, the keyboard's invoke and the harness press the same
  * thing. */
-enum { AGB_NEW = 1, AGB_TOKENS, AGB_REMOVE, AGB_BACK, AGB_MINT, AGB_REVOKE, AGB_COPY, AGB_DONE };
+enum { AGB_NEW = 1, AGB_TOKENS, AGB_REMOVE, AGB_BACK, AGB_MINT, AGB_REVOKE, AGB_COPY, AGB_DONE,
+       /* AI clients (AUTH.md §8.13), on the tab of their own: the same buttons. */
+       AGB_CN_APPROVE, AGB_CN_LIFE, AGB_CN_ALLOW, AGB_CN_DECLINE, AGB_CN_REVOKE, AGB_CN_REVOKE_ALL };
 static struct { rectf r; int kind; uint64_t id; char aid[OC_ACC_AID_MAX]; char name[96]; } g_agtbtns[96];
 static int      g_n_agtbtns;
 static char     g_agt_tok[96];             /* the token just minted, shown until Done */
@@ -19940,6 +19954,135 @@ static int agents_ask(oc_win *hwnd, int with_agent, char *agent_name, size_t an_
     return 1;
 }
 
+/* ---- AI clients (docs/details/AUTH.md §8.13) -----------------------------------
+ * One tab, reached by everyone from the profile menu: the person's own AI
+ * clients, each with Revoke, and Approve an AI client -- the code its page
+ * shows, then what is asking and where it returns, a lifetime and Approve or
+ * Decline. An owner or admin sees everyone's below, each with Revoke. */
+static uint32_t g_cn_life = 30;   /* the lifetime chosen, in days; 0 never */
+
+static void conns_refresh(void) {
+    const oc_model *m = model();
+    if (!g_client || !m) return;
+    oc_client_list_connections(g_client, 0);
+    if (self_role(m) >= OC_ROLE_ADMIN) oc_client_list_connections(g_client, 1);
+}
+
+static void conns_press(oc_win *hwnd, int kind, uint64_t id) {
+    const oc_model *m = model();
+    if (!m || !g_client) return;
+    switch (kind) {
+    case AGB_CN_APPROVE: {
+        oc_field f[1];
+        memset(f, 0, sizeof f);
+        f[0].kind = FF_TEXT; f[0].label = "Code";
+        f[0].hint = "The eight letters the AI client's page shows.";
+        if (form_dialog(hwnd, "Approve an AI client", f, 1) && f[0].value[0]) oc_client_connection_code(g_client, f[0].value);
+        break;
+    }
+    case AGB_CN_LIFE: g_cn_life = (uint32_t)id; break;
+    case AGB_CN_ALLOW:
+        if (m->conn_req_open) oc_client_connection_decide(g_client, m->conn_req_code, 1, g_cn_life);
+        break;
+    case AGB_CN_DECLINE:
+        if (m->conn_req_open) oc_client_connection_decide(g_client, m->conn_req_code, 0, 0);
+        break;
+    case AGB_CN_REVOKE:
+        confirm_open(hwnd, CONF_CONN_REVOKE, id, "Revoke this AI client?",
+                     "It is refused from its next request, and must be approved again to come back.", "Revoke");
+        break;
+    case AGB_CN_REVOKE_ALL:
+        confirm_open(hwnd, CONF_CONN_REVOKE_ALL, id, "Revoke this person's AI client?",
+                     "It is refused from its next request. They are not told; the audit log records it.", "Revoke");
+        break;
+    }
+}
+
+static void conn_line(const oc_conn_view *v, int with_person, char *out, size_t cap) {
+    char made[24] = "", used[40] = "never used", ends[40] = "no end";
+    rel_time(v->created_at, made, sizeof made);
+    if (v->last_used_at) { char lu[24]; rel_time(v->last_used_at, lu, sizeof lu); snprintf(used, sizeof used, "used %s", lu); }
+    if (v->expires_at) {
+        time_t t = (time_t)(v->expires_at / 1000);
+        struct tm tv;
+        if (oc_localtime_r(&t, &tv)) strftime(ends, sizeof ends, "ends %d %b %Y", &tv);
+    }
+    snprintf(out, cap, "%s%s%s  \xC2\xB7  approved %s  \xC2\xB7  %s  \xC2\xB7  %s", with_person ? "for " : "",
+             with_person ? v->user_name : "", with_person ? "" : "", made, used, ends);
+}
+
+static void draw_connections(gfx *rt, const oc_model *m, rectf body) {
+    g_n_agtbtns = 0;
+    float x = body.left + 20, right = body.right - 20, y = body.top + 14;
+    char aid[OC_ACC_AID_MAX], nm[160], line[400];
+    if (!oc_model_connections_on(m)) {
+        overlay_empty(rt, body, "This workspace does not let people connect their own AI clients.");
+        return;
+    }
+    draw_text(rt, "Your AI clients", g_title, rf(x, y, right - 200, y + 26), OC_COL_TEXT);
+    agtbtn(rt, rf(right - 190, y, right, y + 28), "Approve an AI client", 0, AGB_CN_APPROVE, 0, "settings.conn.approve",
+           "Approve an AI client");
+    y += 34;
+    draw_text(rt, "An AI client you connect acts as you, reading and posting where you can.", g_meta,
+              rf(x, y, right, y + 20), OC_COL_MUTED);
+    y += 30;
+    if (m->conn_req_open) {
+        /* What the code names: checked here before it is let in. */
+        rectf card = rf(x, y, right, y + 150);
+        fill_round(rt, card, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, card, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        snprintf(line, sizeof line, "%s wants to connect as you", m->conn_req_client);
+        draw_text(rt, line, g_ui_b, rf(x + 12, y + 10, right - 12, y + 32), OC_COL_TEXT);
+        snprintf(line, sizeof line, "It returns to %s", m->conn_req_return);
+        draw_text(rt, line, g_meta, rf(x + 12, y + 34, right - 12, y + 54), OC_COL_MUTED);
+        draw_text(rt, "For how long", g_ui, rf(x + 12, y + 62, x + 140, y + 88), OC_COL_TEXT);
+        static const struct { uint32_t days; const char *label; } LIFE[] = {
+            { 30, "30 days" }, { 90, "90 days" }, { 365, "365 days" }, { 0, "No end" } };
+        float bx = x + 140;
+        for (size_t i = 0; i < sizeof LIFE / sizeof LIFE[0]; i++) {
+            snprintf(aid, sizeof aid, "settings.conn.life.%u", LIFE[i].days);
+            snprintf(nm, sizeof nm, "Lasts %s%s", LIFE[i].label, g_cn_life == LIFE[i].days ? ", chosen" : "");
+            snprintf(line, sizeof line, "%s%s", g_cn_life == LIFE[i].days ? "\xE2\x9C\x93 " : "", LIFE[i].label);
+            agtbtn(rt, rf(bx, y + 60, bx + 100, y + 88), line, 0, AGB_CN_LIFE, LIFE[i].days, aid, nm);
+            bx += 108;
+        }
+        snprintf(nm, sizeof nm, "Approve %s", m->conn_req_client);
+        agtbtn(rt, rf(x + 12, y + 106, x + 112, y + 134), "Approve", 0, AGB_CN_ALLOW, 0, "settings.conn.allow", nm);
+        snprintf(nm, sizeof nm, "Decline %s", m->conn_req_client);
+        agtbtn(rt, rf(x + 122, y + 106, x + 222, y + 134), "Decline", 1, AGB_CN_DECLINE, 0, "settings.conn.decline", nm);
+        y += 164;
+    }
+    if (!m->n_my_conns) {
+        draw_text(rt, "None connected.", g_meta, rf(x, y, right, y + 22), OC_COL_MUTED);
+        y += 30;
+    }
+    for (size_t i = 0; i < m->n_my_conns && y < body.bottom - 40; i++) {
+        const oc_conn_view *v = &m->my_conns[i];
+        draw_text(rt, v->client_name, g_ui_b, rf(x, y, right - 90, y + 20), OC_COL_TEXT);
+        conn_line(v, 0, line, sizeof line);
+        draw_text(rt, line, g_meta, rf(x, y + 20, right - 90, y + 40), OC_COL_MUTED);
+        snprintf(aid, sizeof aid, "settings.conn.%llu.revoke", (unsigned long long)v->id);
+        snprintf(nm, sizeof nm, "Revoke %s", v->client_name);
+        agtbtn(rt, rf(right - 80, y + 6, right, y + 32), "Revoke", 1, AGB_CN_REVOKE, v->id, aid, nm);
+        y += 48;
+    }
+    if (self_role(m) < OC_ROLE_ADMIN) return;
+    y += 12;
+    draw_text(rt, "Everyone's AI clients", g_title, rf(x, y, right, y + 26), OC_COL_TEXT);
+    y += 34;
+    if (!m->n_all_conns) { draw_text(rt, "None connected.", g_meta, rf(x, y, right, y + 22), OC_COL_MUTED); return; }
+    for (size_t i = 0; i < m->n_all_conns && y < body.bottom - 40; i++) {
+        const oc_conn_view *v = &m->all_conns[i];
+        draw_text(rt, v->client_name, g_ui_b, rf(x, y, right - 90, y + 20), OC_COL_TEXT);
+        conn_line(v, 1, line, sizeof line);
+        draw_text(rt, line, g_meta, rf(x, y + 20, right - 90, y + 40), OC_COL_MUTED);
+        snprintf(aid, sizeof aid, "admin.conn.%llu.revoke", (unsigned long long)v->id);
+        snprintf(nm, sizeof nm, "Revoke %s for %s", v->client_name, v->user_name);
+        agtbtn(rt, rf(right - 80, y + 6, right, y + 32), "Revoke", 1, AGB_CN_REVOKE_ALL, v->id, aid, nm);
+        y += 48;
+    }
+}
+
 static void agents_press(oc_win *hwnd, int kind, uint64_t id) {
     const oc_model *m = model();
     if (!m || !g_client) return;
@@ -19977,6 +20120,7 @@ static void agents_press(oc_win *hwnd, int kind, uint64_t id) {
         g_agt_tok_scopes[0] = '\0';
         if (g_agt_sel) oc_client_list_agent_tokens(g_client, g_agt_sel);
         break;
+    default: conns_press(hwnd, kind, id); break;
     }
     invalidate();
 }
@@ -20083,6 +20227,7 @@ static void admin_select(int t) {
     else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
     else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
     else if (t == ADM_AGENTS)   agents_back();
+    else if (t == ADM_CONNECTIONS) conns_refresh();
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -20672,13 +20817,14 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Blocks",    OC_ICON_USER },
         { "Profile fields", OC_ICON_USER },
         { "Agents",    OC_ICON_USER },
+        { "AI clients", OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
     for (int i = 0; i < ADM_COUNT; i++) {
         /* A member reaches Admin only through the picker's Manage link, and is
          * shown the one tab it opens. */
-        if (!admin && i != ADM_EMOJI) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
+        if (!admin && i != ADM_EMOJI && i != ADM_CONNECTIONS) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
         float tw = 26 + text_width(T[i].label, g_ui) + 16;
         rectf r = rf(tx, ty + 2, tx + tw, ty + TABBAR_H - 1);
         int on = (g_adm_tab == i);
@@ -20692,6 +20838,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
 
     rectf body = rf(reg.left, ty + TABBAR_H, reg.right, reg.bottom);
     if (g_adm_tab == ADM_EMOJI) { draw_emoji_admin(rt, m, body); return; }
+    if (g_adm_tab == ADM_CONNECTIONS) { draw_connections(rt, m, body); return; }
     if (!admin) {
         overlay_empty(rt, body, "Admin only.");
         return;
@@ -25451,6 +25598,7 @@ static void paint(oc_win *hwnd) {
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
     memset(g_atag_n, 0, sizeof g_atag_n);
+    g_via_n = 0;
     g_n_timehits = 0;
     g_n_replierhits = 0;
     g_n_emojiboxes = 0;
@@ -29139,10 +29287,10 @@ static void a11y_publish_scene(const oc_model *m) {
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
         static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks",
-                                                       "profile-fields", "agents" };
+                                                       "profile-fields", "agents", "connections" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
-            if (!admin && t != ADM_EMOJI) continue;
+            if (!admin && t != ADM_EMOJI && t != ADM_CONNECTIONS) continue;
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "admin.tab.%s", TABAID[t]);
             acc_push(items, &n, OC_ACC_BUTTON, aid, TABAID[t], g_adm_tabs[t], ATOK(AT_ADMTAB, (uint64_t)t));
@@ -29159,7 +29307,7 @@ static void a11y_publish_scene(const oc_model *m) {
                 }
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
             }
-        if (g_adm_tab == ADM_AGENTS)
+        if (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS)
             for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
                 acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
                          ATOK(AT_AGENTBTN, (uint64_t)i));
@@ -33510,7 +33658,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Admin > Agents: each button, as it was drawn -- first, since the
      * transcript's hit-boxes from before Admin opened are still held. */
-    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS && !modal_open())
+    if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && !modal_open())
         for (int i = 0; i < g_n_agtbtns; i++)
             if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
     /* A spoiler is revealed, or covered again, by a click on it. */
@@ -37702,6 +37850,7 @@ static void open_profile_menu(oc_win *hwnd) {
     mi_sep();
     mi_item(65, "Profile");
     mi_item(70, "Preferences  (Ctrl+,)");
+    if (pm && oc_model_connections_on(pm)) mi_item(76, "AI clients");
     mi_sep();
     mi_item_d(3, "Sign out");
     g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
@@ -39889,6 +40038,12 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         modal_enter(hwnd, &g_notify_open);
         break;
     case 70: modal_enter(hwnd, &g_prefs_open); break;
+    case 76:   /* a person's AI clients (AUTH.md §8.13): Admin's tab, which everyone is shown */
+        close_overlays();
+        g_view = VIEW_ADMIN; layout_composer(hwnd);
+        admin_select(ADM_CONNECTIONS);
+        invalidate();
+        break;
     case 73: {   /* catch-up, in ONE frame (MARK_ALL_READ). This was a loop over
                   * CLIENT_ACK, which cost a round trip per unread conversation
                   * and made the one menu item that exists for a busy workspace
@@ -41334,6 +41489,12 @@ static void test_dump(const char *path) {
         }
         int live = 0;
         for (size_t i = 0; m && i < m->n_users; i++) live += m->users[i].agent && !m->users[i].disabled;
+        fprintf(f, "connections shown=%d open=%d client=\"%s\" decided=%d mine=%d all=%d life=%u vias=%d\n",
+                g_view == VIEW_ADMIN && g_adm_tab == ADM_CONNECTIONS, m ? m->conn_req_open : 0, m ? m->conn_req_client : "",
+                m ? m->conn_decided : 0, m ? (int)m->n_my_conns : 0, m ? (int)m->n_all_conns : 0, g_cn_life, g_via_n);
+        for (size_t i = 0; m && i < m->n_all_conns; i++)
+            fprintf(f, "  conn id=%llu uid=%llu client=\"%s\"\n", (unsigned long long)m->all_conns[i].id,
+                    (unsigned long long)m->all_conns[i].user_id, m->all_conns[i].client_name);
         fprintf(f, "agentadmin shown=%d sel=%llu token=%d prefixed=%d tokscopes=\"%s\" descs=%d atokens=%d agents=%d\n",
                 g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS, (unsigned long long)g_agt_sel, g_agt_tok[0] != 0,
                 strncmp(g_agt_tok, OC_PRINCIPAL_TOKEN_PREFIX, strlen(OC_PRINCIPAL_TOKEN_PREFIX)) == 0,
@@ -45641,7 +45802,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
             break;
         case AT_AGENTBTN:
-            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS && (int)arg < g_n_agtbtns)
+            if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && (int)arg < g_n_agtbtns)
                 agents_press(hwnd, g_agtbtns[arg].kind, g_agtbtns[arg].id);
             break;
         case AT_SUMITEM:

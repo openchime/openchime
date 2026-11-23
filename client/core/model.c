@@ -482,12 +482,19 @@ int oc_model_has_default_quiet_hours(const oc_model *m) {
     return oc_model_workspace_setting(m, "default_quiet_hours", v, sizeof v) && v[0];
 }
 
+int oc_model_connections_on(const oc_model *m) {
+    char v[8];
+    return !oc_model_workspace_setting(m, "mcp_connections", v, sizeof v) || strcmp(v, "off") != 0;
+}
+
 int oc_model_receipts_on(const oc_model *m) {
     char v[8];
     return !oc_model_workspace_setting(m, "read_receipts", v, sizeof v) || strcmp(v, "off") != 0;
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->my_conns); m->my_conns = NULL; m->n_my_conns = 0;
+    free(m->all_conns); m->all_conns = NULL; m->n_all_conns = 0;
     free(m->call_hist);
     m->call_hist = NULL; m->n_call_hist = 0;
     oc_call_page_view_free(m->call_page);
@@ -2419,6 +2426,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                                 e->msg_kind, e->broadcast_stored, &e->body)) {
             msg_set_action(&c->msgs[c->n_msgs - 1], e);
             c->msgs[c->n_msgs - 1].call_id = e->call_id;
+            /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
+             * in the scroll an older page put it. */
+            for (size_t k = c->n_msgs; k-- > 0;)
+                if (c->msgs[k].message_id == e->message_id) {
+                    snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
+                    break;
+                }
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
              * a message mattered, and a badge that emptied itself overnight
@@ -3273,6 +3287,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (m->n_thread_msgs > before) {
                 msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
                 m->thread_msgs[m->n_thread_msgs - 1].broadcast_stored = e->broadcast_stored;   /* REQ-221 */
+                snprintf(m->thread_msgs[m->n_thread_msgs - 1].via, sizeof m->thread_msgs[0].via, "%s", e->via);
             }
         }
         break;
@@ -3605,6 +3620,41 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             snprintf(t->last_from, sizeof t->last_from, "%s", e->preview ? e->preview : "");
         }
         break;
+    case OC_EV_CONNECTION_REQUEST:
+        m->conn_req_open = 1;
+        m->conn_decided = 0;
+        snprintf(m->conn_req_code, sizeof m->conn_req_code, "%s", e->preview ? e->preview : "");
+        snprintf(m->conn_req_client, sizeof m->conn_req_client, "%s", e->body ? e->body : "");
+        snprintf(m->conn_req_return, sizeof m->conn_req_return, "%s", e->topic ? e->topic : "");
+        break;
+    case OC_EV_CONNECTION_DECIDED:
+        m->conn_req_open = 0;
+        m->conn_decided = e->status ? 1 : 2;
+        snprintf(m->conn_decided_client, sizeof m->conn_decided_client, "%s", e->body ? e->body : "");
+        set_status(m, e->status ? "AI client approved" : "AI client declined");
+        break;
+    case OC_EV_CONNECTIONS_BEGIN:
+        if (e->status) { m->n_all_conns = 0; m->all_conns_known = 1; }
+        else m->n_my_conns = 0;
+        break;
+    case OC_EV_CONNECTION_ROW: {
+        oc_conn_view **arr = e->status ? &m->all_conns : &m->my_conns;
+        size_t *n = e->status ? &m->n_all_conns : &m->n_my_conns;
+        oc_conn_view *g = realloc(*arr, (*n + 1) * sizeof *g);
+        if (!g) break;
+        *arr = g;
+        oc_conn_view *v = &g[(*n)++];
+        memset(v, 0, sizeof *v);
+        v->id = e->message_id;
+        v->user_id = e->user_id;
+        v->created_at = e->created_at;
+        v->last_used_at = e->server_time;
+        v->expires_at = e->parent_id;
+        v->lifetime_days = e->count;
+        snprintf(v->user_name, sizeof v->user_name, "%s", e->topic ? e->topic : "");
+        snprintf(v->client_name, sizeof v->client_name, "%s", e->body ? e->body : "");
+        break;
+    }
     case OC_EV_ATTACHMENT_DATA:
         /* Held until a frontend takes it. Full means nobody is taking them, and
          * then the oldest goes: a frontend asks again for what it still wants. */

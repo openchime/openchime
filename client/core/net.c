@@ -596,6 +596,13 @@ static char *slice_text(oc_slice s) {
     return t;
 }
 
+/* A wire string into a fixed field, cut to fit and always terminated. */
+static void slice_into(char *out, size_t cap, oc_slice s) {
+    size_t n = s.len < cap - 1 ? s.len : cap - 1;
+    if (n) memcpy(out, s.ptr, n);
+    out[n] = '\0';
+}
+
 static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
                              const oc_attach_entry *att, uint16_t n) {
     for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
@@ -1107,6 +1114,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->msg_kind = b.kind;
                 e->call_id = b.call_id;          /* a call's message: which call (CALLS.md §1) */
                 e->broadcast_stored = b.broadcast_stored;
+                slice_into(e->via, sizeof e->via, b.via);   /* an AI client's post (AUTH.md §8.13) */
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
                                     ? b.author_name.len : sizeof e->author_name - 1;
@@ -1742,6 +1750,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
                     e->broadcast_stored = tr.broadcast_stored;
+                    slice_into(e->via, sizeof e->via, tr.via);
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
                     oc_queue_push(out, e);
                     push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
@@ -2733,6 +2742,42 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = te[i].created_by;
                 e->created_at = te[i].created_at_ms;
                 e->server_time = te[i].last_used_at_ms;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_REQUEST) {
+            oc_connection_request cr;
+            if (oc_decode_connection_request(&p, &cr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CONNECTION_REQUEST);
+            if (e) {
+                e->preview = slice_text(cr.code);
+                e->body = slice_text(cr.client_name);
+                e->topic = slice_text(cr.redirect_uri);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_DECIDED) {
+            oc_connection_decided cd;
+            if (oc_decode_connection_decided(&p, &cd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CONNECTION_DECIDED);
+            if (e) { e->status = cd.approved; e->body = slice_text(cd.client_name); oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_LIST) {
+            static oc_connection_entry ce[OC_CONNECTION_LIST_MAX];   /* the net thread's alone */
+            uint16_t count = 0; uint8_t all = 0;
+            if (oc_decode_connection_list(&p, &all, ce, OC_CONNECTION_LIST_MAX, &count) != OC_OK) return -1;
+            if (count > OC_CONNECTION_LIST_MAX) count = OC_CONNECTION_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_CONNECTIONS_BEGIN);
+            if (b) { b->status = all; oc_queue_push(to_ui, b); }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_CONNECTION_ROW);
+                if (!e) continue;
+                e->status = all;
+                e->message_id = ce[i].connection_id;
+                e->user_id = ce[i].user_id;
+                e->topic = slice_text(ce[i].user_name);
+                e->body = slice_text(ce[i].client_name);
+                e->created_at = ce[i].created_at_ms;
+                e->server_time = ce[i].last_used_at_ms;
+                e->parent_id = ce[i].expires_at_ms;
+                e->count = ce[i].lifetime_days;
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
@@ -4450,6 +4495,25 @@ static int run_connection(oc_net *n, int reconnecting,
                 } else {
                     oc_revoke_agent_token m = { c->message_id, c->channel_id };
                     er = oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CONNECTION_CODE || c->type == OC_CMD_CONNECTION_DECIDE ||
+                c->type == OC_CMD_LIST_CONNECTIONS || c->type == OC_CMD_REVOKE_CONNECTION) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_CONNECTION_CODE) {
+                    oc_connection_code m = { oc_slice_str(c->body ? c->body : "") };
+                    er = oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_CONNECTION_DECIDE) {
+                    oc_connection_decide m = { oc_slice_str(c->body ? c->body : ""), (uint8_t)(c->op ? 1 : 0), (uint32_t)c->message_id };
+                    er = oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_LIST_CONNECTIONS) {
+                    oc_list_connections m = { (uint8_t)(c->op ? 1 : 0) };
+                    er = oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_revoke_connection m = { c->message_id, (uint8_t)(c->op ? 1 : 0) };
+                    er = oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &m);
                 }
                 if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

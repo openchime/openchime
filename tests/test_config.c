@@ -372,6 +372,22 @@ static void test_visible(void) {
         if (!strcmp(key, "custom_emoji_add")) saw = !strcmp(val, "admins");
     CHECK(saw);
     refuses("OPENCHIME_CUSTOM_EMOJI_ADD", "moderators");
+    /* Whether people may connect their own AI clients: on by default, told as on or off. */
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    CHECK(oc_config_get()->mcp.connections == 1);
+    saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "mcp_connections")) saw = !strcmp(val, "on");
+    CHECK(saw);
+    accepts("OPENCHIME_MCP_CONNECTIONS", "off");
+    CHECK(oc_config_get()->mcp.connections == 0);
+    saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "mcp_connections")) saw = !strcmp(val, "off");
+    CHECK(saw);
+    refuses("OPENCHIME_MCP_CONNECTIONS", "admins");
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
 }
 
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
@@ -516,7 +532,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 50);     /* OPENCHIME_MODE, the three OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
+    CHECK(operator_rows == 51);     /* OPENCHIME_MODE, the four OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 13);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

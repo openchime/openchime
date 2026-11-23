@@ -2450,3 +2450,94 @@ which never returns the hash, and by the lookup a request authenticates with,
 which refuses a token whose row is gone. *Deleted* by revoking, and with every
 other token of the agent when the agent is removed, in the same transaction as
 its channel memberships; its messages stay under its name.
+
+## 3cd. Migration 0091 — a person's AI-client connections (AUTH.md §8.13)
+
+```sql
+CREATE TABLE oauth_clients (
+  id            INTEGER PRIMARY KEY,
+  client_id     TEXT NOT NULL UNIQUE,
+  kind          TEXT NOT NULL CHECK (kind IN ('registered','document')),
+  name          TEXT NOT NULL,
+  redirect_uris TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  created_from  TEXT NOT NULL DEFAULT '',
+  fetched_at_ms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE oauth_approvals (
+  id              INTEGER PRIMARY KEY,
+  request_hash    BLOB NOT NULL UNIQUE,
+  code_hash       BLOB NOT NULL UNIQUE,
+  client_id       TEXT NOT NULL,
+  client_name     TEXT NOT NULL,
+  redirect_uri    TEXT NOT NULL,
+  code_challenge  TEXT NOT NULL,
+  state           TEXT NOT NULL,
+  resource        TEXT NOT NULL,
+  created_at_ms   INTEGER NOT NULL,
+  expires_at_ms   INTEGER NOT NULL,
+  created_from    TEXT NOT NULL DEFAULT '',
+  status          INTEGER NOT NULL DEFAULT 0,
+  approved_by     INTEGER REFERENCES users(id),
+  lifetime_days   INTEGER NOT NULL DEFAULT 0,
+  auth_code_hash  BLOB,
+  auth_code_until INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX oauth_approvals_auth_code ON oauth_approvals(auth_code_hash)
+  WHERE auth_code_hash IS NOT NULL;
+CREATE TABLE mcp_connections (
+  id              INTEGER PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  client_id       TEXT NOT NULL,
+  client_name     TEXT NOT NULL,
+  resource        TEXT NOT NULL,
+  lifetime_days   INTEGER NOT NULL DEFAULT 0,
+  expires_at_ms   INTEGER NOT NULL DEFAULT 0,
+  created_at_ms   INTEGER NOT NULL,
+  last_used_at_ms INTEGER NOT NULL DEFAULT 0,
+  last_used_from  TEXT NOT NULL DEFAULT '',
+  refresh_hash    BLOB,
+  revoked_at_ms   INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX mcp_connections_refresh ON mcp_connections(refresh_hash)
+  WHERE refresh_hash IS NOT NULL;
+CREATE INDEX mcp_connections_user ON mcp_connections(user_id);
+CREATE TABLE mcp_access_tokens (
+  token_hash    BLOB PRIMARY KEY,
+  connection_id INTEGER NOT NULL REFERENCES mcp_connections(id),
+  expires_at_ms INTEGER NOT NULL) WITHOUT ROWID;
+CREATE INDEX mcp_access_tokens_connection ON mcp_access_tokens(connection_id);
+ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT '';
+```
+
+The daemon as the MCP endpoint's OAuth authorization server, for a person's own
+AI client (AUTH.md §8.13). Every secret is stored as its **SHA-256**, never
+itself: the authorize page's handle, the eight-letter code, the authorization
+code, the refresh token and each access token.
+
+- **`oauth_clients`** — a client that identified itself. `kind` `'registered'`:
+  by Dynamic Client Registration, its `client_id` minted here, `created_from`
+  the address that registered it. `'document'`: by a Client ID Metadata
+  Document, its `client_id` the document's `https` URL, fetched again once
+  `fetched_at_ms` is 24 hours old. `redirect_uris` is the declared URIs, one to
+  a line.
+- **`oauth_approvals`** — one authorize request, from the page that showed it to
+  the code exchange. `request_hash` is the page's own handle (it refreshes by
+  it), `code_hash` the code the person types in their app; `client_name`,
+  `redirect_uri`, `code_challenge` (PKCE `S256`), `state` and `resource` the
+  checked request; `expires_at_ms` ten minutes on. `status` 0 pending, 1
+  approved, 2 declined, 3 collected. On approval `approved_by` is the person,
+  `lifetime_days` what they chose, `auth_code_hash` the authorization code's
+  hash and `auth_code_until` 60 seconds on. A row is deleted an hour after it
+  expired.
+- **`mcp_connections`** — what an approval made: the person, the client and its
+  name as approved, the `resource` it is bound to, `lifetime_days` chosen (0, 30,
+  90 or 365; 0 never ends) and `expires_at_ms` (0 for never), the current
+  refresh token's hash (`refresh_hash`, replaced on every refresh), and its last
+  use and address, written at most once a minute. Revoking sets
+  `revoked_at_ms` and deletes its access tokens; the row stays for the list.
+- **`mcp_access_tokens`** — each access token's hash against its connection, an
+  hour each; expired rows are deleted on the next refresh of their connection.
+- **`messages.via`** — the client's name on a post made through a connection,
+  `''` on every other.
+
+*Read* by the token lookup at `/mcp`, which refuses a token past its expiry, a
+connection revoked or past its lifetime, and a person removed. *Written* only
+by the writer's OAuth jobs; removing a person revokes their connections.

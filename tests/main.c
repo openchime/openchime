@@ -61,6 +61,7 @@ int run_blob_cache_tests(void);
 int run_xferpool_tests(void);
 int run_preview_tests(void);
 int run_mcp_tests(void);
+int run_oauth_tests(void);
 int run_storage_tests(void);
 int run_config_tests(void);
 int run_slow_blob_tests(void);
@@ -322,6 +323,7 @@ static const struct suite {
     S(run_xferpool_tests,        FAST, THREADS),
     S(run_preview_tests,         FAST, THREADS),
     S(run_mcp_tests,             FAST, PLAIN),
+    S(run_oauth_tests,           FAST, PLAIN),
     S(run_config_tests,          FAST, PLAIN),
     S(run_storage_tests,         FAST, THREADS),
     S(run_slow_blob_tests,       FAST, THREADS),

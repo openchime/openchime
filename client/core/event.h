@@ -440,7 +440,19 @@ enum {
      * its last use (0 never), `preview` where from. */
     OC_EV_AGENT_TOKEN,
     OC_EV_AGENT_TOKENS_BEGIN,
-    OC_EV_AGENT_TOKEN_ROW
+    OC_EV_AGENT_TOKEN_ROW,
+    /* A person's AI clients (AUTH.md §8.13). CONNECTION_REQUEST: what a code
+     * names -- `preview` the code, `body` the client's name, `topic` where it
+     * returns. CONNECTION_DECIDED: `status` 1 approved, 0 declined, `body` the
+     * client's name. CONNECTIONS_BEGIN: a list follows, `status` 1 everyone's,
+     * replacing what was held. CONNECTION_ROW: one -- `message_id` its id,
+     * `user_id` whose, `topic` their name, `body` the client's, `created_at`,
+     * `server_time` its last use (0 never), `parent_id` its end (0 none),
+     * `count` its lifetime in days (0 never). */
+    OC_EV_CONNECTION_REQUEST,
+    OC_EV_CONNECTION_DECIDED,
+    OC_EV_CONNECTIONS_BEGIN,
+    OC_EV_CONNECTION_ROW
 };
 
 /* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
@@ -510,6 +522,7 @@ typedef struct {
     uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
+    char     via[104];     /* MESSAGE / THREAD_REPLY: the AI client it came through, "" for none */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
     char     ws_audience[132]; /* WORKSPACE_INFO: the workspace's audience id, "" when not enrolled */
     /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
@@ -839,6 +852,14 @@ enum {
     OC_CMD_REMOVE_AGENT,
     OC_CMD_LIST_AGENT_TOKENS,
     OC_CMD_REVOKE_AGENT_TOKEN,
+    /* A person's AI clients: CONNECTION_CODE body = the code; CONNECTION_DECIDE
+     * body = the code, op = approve, message_id = the lifetime in days;
+     * LIST_CONNECTIONS op = everyone's; REVOKE_CONNECTION message_id = the
+     * connection, op = from everyone's. */
+    OC_CMD_CONNECTION_CODE,
+    OC_CMD_CONNECTION_DECIDE,
+    OC_CMD_LIST_CONNECTIONS,
+    OC_CMD_REVOKE_CONNECTION,
     OC_CMD_QUIT
 };
 

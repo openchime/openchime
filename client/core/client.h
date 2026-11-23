@@ -697,6 +697,17 @@ void oc_client_remove_agent(oc_client *c, uint64_t agent_id);
 void oc_client_list_agent_tokens(oc_client *c, uint64_t agent_id);
 void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t token_id);
 
+/* A person's own AI clients (docs/details/AUTH.md §8.13). The code an
+ * authorize page shows is looked up (the model's `conn_req` then names the
+ * client and where it returns) and approved, with a lifetime of 0 (never), 30,
+ * 90 or 365 days, or declined. The connections in force are listed -- one's
+ * own, or with `everyone` all of them, an owner's or admin's -- into the
+ * model's `my_conns` or `all_conns`, and revoked from either. */
+void oc_client_connection_code(oc_client *c, const char *code);
+void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days);
+void oc_client_list_connections(oc_client *c, int everyone);
+void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int everyone);
+
 /* Transfers wait their turn in a queue rather than being refused while another
  * runs; each carries a tag that its OC_EV_XFER progress and completion events
  * repeat. A download's or fetch's tag is the attachment id. */

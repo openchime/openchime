@@ -41,6 +41,9 @@
 #include "protocol.h"
 #include "ratelimit.h"
 #include "mcp.h"
+#include "oauth.h"   /* the MCP authorization server (AUTH.md §8.13) */
+#include "https_client.h"
+#include <netdb.h>
 #include "listen.h"
 #include "proxyproto.h"
 #include "idmap.h"
@@ -227,6 +230,8 @@ typedef struct web_req {
 
 struct mcp_req;
 static void mcp_req_free(struct mcp_req *m);
+struct oa_req;
+static void oa_req_free(struct oa_req *o);
 
 typedef struct conn_s {
     int          fd;
@@ -308,6 +313,7 @@ typedef struct conn_s {
     int          http_pending;
     struct web_req *web;         /* a sign-in page's post awaiting its check (AUTH.md §8.10) */
     struct mcp_req *mcp;         /* an MCP request awaiting the writer (docs/details/MCP.md) */
+    struct oa_req *oa;           /* an OAuth request awaiting the writer (AUTH.md §8.13) */
     int          groups_sent;    /* this session's groups have followed its user list (REQ-307) */
     /* The indexes (below): where this connection sits in the live list, its
      * neighbours among its user's connections once authenticated, and the last
@@ -494,6 +500,8 @@ static __thread uint64_t      g_max_video  = 0;   /* OPENCHIME_MAX_VIDEO_SIZE, s
 static __thread oc_ratelimit *g_webhook_rl;
 static __thread oc_ratelimit *g_proof_rl;   /* /enroll-proof, per caller */
 static __thread oc_ratelimit *g_mcp_fail_rl; /* /mcp, failed sign-ins per source */
+static __thread oc_ratelimit *g_oa_reg_rl;   /* /oauth/register, registrations per source */
+static __thread oc_ratelimit *g_oa_begin_rl; /* /oauth/authorize, requests begun per source */
 /* Device codes (AUTH.md §8.11): the pending requests, and how often one source
  * may look a code up on the /device page -- a guessed code is the attack. */
 static __thread oc_devcodes  *g_devcodes;
@@ -1062,6 +1070,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     free(c->dq);
     if (c->web) { oc_e2e_wipe(c->web, sizeof *c->web); free(c->web); }
     mcp_req_free(c->mcp);
+    oa_req_free(c->oa);
     flush_out(c);   /* what was staged goes, if the socket takes it now */
     oc_ioloop_close(g_io, c->conn_id, fd);
     for (oc_io_event *e = c->fq_head, *n; e; e = n) { n = e->next; oc_io_event_free(e); }
@@ -4492,6 +4501,46 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        /* A person's AI clients (AUTH.md §8.13): the writer checks who may;
+         * while the setting is off, nothing is asked of it. */
+        if (hdr.msg_type == OC_MSG_CONNECTION_CODE || hdr.msg_type == OC_MSG_CONNECTION_DECIDE ||
+            hdr.msg_type == OC_MSG_LIST_CONNECTIONS || hdr.msg_type == OC_MSG_REVOKE_CONNECTION) {
+            oc_job *j = NULL;
+            if (hdr.msg_type == OC_MSG_CONNECTION_CODE) {
+                oc_connection_code m;
+                if (oc_decode_connection_code(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OAUTH_CODE_FIND, c->conn_id))) return -1;
+                j->oa_code = slice_dup(m.code);
+            } else if (hdr.msg_type == OC_MSG_CONNECTION_DECIDE) {
+                oc_connection_decide m;
+                if (oc_decode_connection_decide(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OAUTH_DECIDE, c->conn_id))) return -1;
+                j->oa_code = slice_dup(m.code);
+                j->oa_approve = m.approve;
+                j->oa_lifetime = m.lifetime_days;
+            } else if (hdr.msg_type == OC_MSG_LIST_CONNECTIONS) {
+                oc_list_connections m;
+                if (oc_decode_list_connections(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OAUTH_LIST, c->conn_id))) return -1;
+                j->oa_all = m.all;
+            } else {
+                oc_revoke_connection m;
+                if (oc_decode_revoke_connection(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OAUTH_REVOKE, c->conn_id))) return -1;
+                j->oa_conn_id = m.connection_id;
+                j->oa_all = m.all;
+            }
+            if (!oc_config_get()->mcp.connections) {
+                oc_job_free(j);
+                uint8_t tmp[96]; oc_wbuf ew; oc_wbuf_init(&ew, tmp, sizeof tmp);
+                oc_error e = { OC_ERR_CONNECTIONS_OFF, 0, { NULL, 0 }, oc_slice_str("AI clients are off") };
+                if (oc_encode_error(&ew, OC_PROTOCOL_VERSION, &e) != OC_OK || out_append(c, tmp, ew.len) < 0) return -1;
+                continue;
+            }
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_DELETE_WEBHOOK) {
             oc_delete_webhook dw;
             if (oc_decode_delete_webhook(&p, &dw) != OC_OK) return -1;
@@ -5914,7 +5963,7 @@ void oc_netloop_set_adopted_address(const char *name) {
  * wasm is beside the binary (webapp.h) -- on the TLS port only, where the
  * sign-in pages it chains to live; the health port stays health and the
  * harness's WebSocket, nothing a person signs in through in the clear. */
-static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 9];
+static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 18];
 static void sites_init(void) {
     size_t na = 0;
     const oc_http_route *app = oc_webapp_routes(&na);
@@ -5926,6 +5975,21 @@ static void sites_init(void) {
         static const oc_http_route MCP_ROUTE =
             { "POST", OC_MCP_PATH, 0, OC_HTTP_LOOP, OC_MCP_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL };
         g_tls_routes[nt++] = MCP_ROUTE;
+        /* ...and with it the authorization server a person's AI client signs
+         * in through (AUTH.md §8.13). Its handlers say so while
+         * OPENCHIME_MCP_CONNECTIONS is off, which may change while running. */
+        static const oc_http_route OA_ROUTES[] = {
+            /* Each document at its own path, and under it a resource's path
+             * (RFC 9728 §3.1, RFC 8414 §3.1), which some clients ask first. */
+            { "GET",  OC_OAUTH_RESOURCE_PATH, 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "GET",  OC_OAUTH_RESOURCE_PATH, 1, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "GET",  OC_OAUTH_SERVER_PATH, 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "GET",  OC_OAUTH_SERVER_PATH, 1, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "GET",  OC_OAUTH_AUTHORIZE_PATH, 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "POST", OC_OAUTH_TOKEN_PATH, 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+            { "POST", OC_OAUTH_REGISTER_PATH, 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+        };
+        for (size_t i = 0; i < sizeof OA_ROUTES / sizeof OA_ROUTES[0]; i++) g_tls_routes[nt++] = OA_ROUTES[i];
     }
     for (size_t i = 0; i < na && i < 8; i++) g_tls_routes[nt + i] = app[i];
     g_tls_site.routes = g_tls_routes; g_tls_site.n = nt + (na < 8 ? na : 8); g_tls_site.fallback = NULL;
@@ -6996,16 +7060,31 @@ static int on_address_proof(conn *c, const oc_http_req *req) {
 
 typedef struct mcp_req {
     oc_mcp_call call;
-    uint64_t    agent, token_id;
+    uint64_t    agent, token_id;  /* agent: the account acted as, an agent's or a person's */
     char        scopes[512];
     uint64_t    channel_id;
-    char        channel[160];    /* "#name", as answered and audited */
+    char        channel[160];    /* "#name" or "@alice", as answered and audited */
+    /* A person's access token (AUTH.md §8.13): acting as them, through `via`,
+     * the client's name, which their posts and the audit rows carry. */
+    int         person;
+    char       *via;
+    char        base[300];       /* "https://<host>": where the challenge points */
+    oc_mcp_chan *chans;          /* the conversations the caller reads, once known */
+    size_t      n_chans;
 } mcp_req;
 
 static void mcp_req_free(mcp_req *m) {
     if (!m) return;
     oc_mcp_call_free(&m->call);
+    for (size_t i = 0; i < m->n_chans; i++) free(m->chans[i].name);
+    free(m->chans);
+    free(m->via);
     free(m);
+}
+
+/* A conversation as the MCP surface names it: "#name", or a DM's "@alice". */
+static void mcp_label(const oc_mcp_chan *ch, char *out, size_t cap) {
+    snprintf(out, cap, "%c%s", ch->is_dm ? '@' : '#', ch->name ? ch->name : "");
 }
 
 /* One token's budget: its bucket, and its posts' window (REQ-190). */
@@ -7054,11 +7133,16 @@ static void mcp_finish(int ep, conn **conns, conn *c, int status, oc_mcp_buf *b,
     conn_close(ep, conns, c->fd);
 }
 
-static void mcp_challenge(int ep, conn **conns, conn *c, const char *id) {
+/* A 401 that says where to get a token: the protected resource's metadata
+ * (RFC 9728), for a client to find this workspace's authorization server. */
+static void mcp_challenge(int ep, conn **conns, conn *c, const char *id, const char *base) {
     oc_mcp_buf b = { 0 };
+    char hdr[400] = "WWW-Authenticate: Bearer\r\n";
+    if (base && base[0])
+        snprintf(hdr, sizeof hdr, "WWW-Authenticate: Bearer resource_metadata=\"%s" OC_OAUTH_RESOURCE_PATH "\"\r\n", base);
     oc_mcp_error(&b, id, -32001, "Unauthorized", NULL);
-    if (ep < 0) { mcp_reply(c, 401, &b, "WWW-Authenticate: Bearer\r\n"); oc_mcp_buf_free(&b); return; }
-    mcp_finish(ep, conns, c, 401, &b, "WWW-Authenticate: Bearer\r\n");
+    if (ep < 0) { mcp_reply(c, 401, &b, hdr); oc_mcp_buf_free(&b); return; }
+    mcp_finish(ep, conns, c, 401, &b, hdr);
 }
 
 /* One audit row: `family` OC_AUDIT_MCP for a tool call, OC_AUDIT_SECURITY for a
@@ -7069,12 +7153,17 @@ static void mcp_audit(oc_dbwriter *dbw, int family, const mcp_req *m, const char
     oc_job *j = oc_job_new(OC_JOB_MCP_AUDIT, 0);
     if (!j) return;
     j->user_id = m ? m->agent : 0;
-    j->token_id = m ? m->token_id : 0;
+    j->token_id = m && !m->person ? m->token_id : 0;
     j->mcp_family = family;
     j->mcp_outcome = (uint8_t)(ok ? 1 : 0);
     j->mcp_action = strdup(action);
     j->mcp_target = m && m->channel[0] ? strdup(m->channel) : NULL;
-    j->mcp_detail = detail ? strdup(detail) : NULL;
+    if (m && m->person) {
+        /* A person through a client: the person is the actor, the client named. */
+        char d[512];
+        snprintf(d, sizeof d, "client=%s%s%s", m->via ? m->via : "", detail ? " " : "", detail ? detail : "");
+        j->mcp_detail = strdup(d);
+    } else j->mcp_detail = detail ? strdup(detail) : NULL;
     oc_dbwriter_submit(dbw, j);
 }
 
@@ -7109,6 +7198,7 @@ static int on_mcp(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     mcp_req *m = calloc(1, sizeof *m);
     oc_mcp_buf b = { 0 };
     if (!m) { mcp_reply(c, 500, &b, NULL); return -1; }
+    if (oc_oauth_base(req->host, req->host_len, m->base, sizeof m->base) != 0) m->base[0] = '\0';
     int rc = oc_mcp_parse(req->body, req->body_len, &h, &m->call, &b);
     if (rc) { mcp_reply(c, rc, &b, NULL); oc_mcp_buf_free(&b); mcp_req_free(m); return -1; }
     if (m->call.method == OC_MCP_DISCOVER) {              /* asks no token: it says how to get one */
@@ -7130,14 +7220,22 @@ static int on_mcp(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     const char *a = req->authorization;
     size_t al = req->authorization_len;
     if (!a || al <= sizeof BEARER - 1 || strncasecmp(a, BEARER, sizeof BEARER - 1) != 0) {
-        mcp_challenge(-1, NULL, c, m->call.id);
+        mcp_challenge(-1, NULL, c, m->call.id, m->base);
         mcp_req_free(m);
         return -1;
     }
     a += sizeof BEARER - 1;
     al -= sizeof BEARER - 1;
     while (al && *a == ' ') { a++; al--; }
-    oc_job *j = oc_job_new(OC_JOB_TOKEN_LOOKUP, c->conn_id);
+    /* A person's access token (AUTH.md §8.13), or an agent's. While people's
+     * connections are off, every one is refused as if unknown. */
+    int person = oc_oauth_token_of(a, al) == OC_OAUTH_TOKEN_PERSON;
+    if (person && !oc_config_get()->mcp.connections) {
+        mcp_challenge(-1, NULL, c, m->call.id, m->base);
+        mcp_req_free(m);
+        return -1;
+    }
+    oc_job *j = oc_job_new(person ? OC_JOB_OAUTH_LOOKUP : OC_JOB_TOKEN_LOOKUP, c->conn_id);
     if (!j || !(j->token = malloc(al + 1))) { oc_job_free(j); mcp_reply(c, 500, &b, NULL); mcp_req_free(m); return -1; }
     memcpy(j->token, a, al);
     j->token[al] = '\0';
@@ -7149,19 +7247,21 @@ static int on_mcp(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     return 0;
 }
 
-/* The channel `want` names among the agent's (a name with or without '#', or
- * an id): its index, or -1. */
-static long mcp_find_channel(const oc_dbres *r, const char *want) {
-    const char *nm = want[0] == '#' ? want + 1 : want;
+/* The conversation `want` names among the caller's (its name as shown --
+ * "#name", "@alice" -- or without its sign, or an id): its index, or -1. */
+static long mcp_find_channel(const oc_mcp_chan *chans, size_t n, const char *want) {
     uint64_t id = 0;
     int numeric = want[0] != '\0';
     for (const char *p = want; *p; p++) {
         if (*p < '0' || *p > '9') { numeric = 0; break; }
         id = id * 10 + (uint64_t)(*p - '0');
     }
-    for (size_t i = 0; i < r->n_mcp_chans; i++) {
-        if (numeric && r->mcp_chans[i].id == id) return (long)i;
-        if (r->mcp_chans[i].name && strcmp(r->mcp_chans[i].name, nm) == 0) return (long)i;
+    char label[200];
+    for (size_t i = 0; i < n; i++) {
+        if (numeric && chans[i].id == id) return (long)i;
+        mcp_label(&chans[i], label, sizeof label);
+        if (strcmp(label, want) == 0) return (long)i;
+        if (want[0] != '#' && want[0] != '@' && chans[i].name && strcmp(chans[i].name, want) == 0) return (long)i;
     }
     return -1;
 }
@@ -7169,13 +7269,17 @@ static long mcp_find_channel(const oc_dbres *r, const char *want) {
 static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbres *r) {
     mcp_req *m = c->mcp;
     oc_mcp_buf b = { 0 };
+    /* Kept: a search names each result's conversation from it. */
+    m->chans = r->mcp_chans; m->n_chans = r->n_mcp_chans;
+    r->mcp_chans = NULL; r->n_mcp_chans = 0;
     if (m->call.method == OC_MCP_TOOLS_LIST) {
-        size_t n = r->n_mcp_chans;
+        size_t n = m->n_chans;
         char **names = n ? calloc(n, sizeof *names) : NULL;
         size_t k = 0;
         for (size_t i = 0; names && i < n; i++) {
-            size_t l = strlen(r->mcp_chans[i].name ? r->mcp_chans[i].name : "");
-            if ((names[k] = malloc(l + 2))) { names[k][0] = '#'; memcpy(names[k] + 1, r->mcp_chans[i].name, l + 1); k++; }
+            char label[200];
+            mcp_label(&m->chans[i], label, sizeof label);
+            if ((names[k] = strdup(label))) k++;
         }
         oc_mcp_tools_list(&b, m->call.id, mcp_version(), (const char *const *)names, k);
         for (size_t i = 0; i < k; i++) free(names[i]);
@@ -7187,12 +7291,12 @@ static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbr
     if (q->arg_error[0]) { mcp_tool_refuse(ep, conns, dbw, c, q->arg_error); return; }
     long ci = -1;
     if (q->channel[0]) {
-        ci = mcp_find_channel(r, q->channel);
+        ci = mcp_find_channel(m->chans, m->n_chans, q->channel);
         /* The same words whether it exists or not: an agent learns nothing of a
          * conversation it is not in. */
         if (ci < 0) { mcp_tool_refuse(ep, conns, dbw, c, "no such conversation"); return; }
-        m->channel_id = r->mcp_chans[ci].id;
-        snprintf(m->channel, sizeof m->channel, "#%s", r->mcp_chans[ci].name ? r->mcp_chans[ci].name : "");
+        m->channel_id = m->chans[ci].id;
+        mcp_label(&m->chans[ci], m->channel, sizeof m->channel);
     }
     int pub = has_scope(m->scopes, "channels:history"), priv = has_scope(m->scopes, "groups:history");
     if (q->tool == OC_MCP_POST) {
@@ -7204,6 +7308,7 @@ static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbr
         j->user_id = m->agent;
         j->channel_id = m->channel_id;
         j->parent_id = q->thread;
+        if (m->person && m->via) j->via = strdup(m->via);   /* "via <client>" beside the post */
         /* The same key from the same token is the same post (ARCH-44): its
          * idempotency token is the key hashed with the token's id. */
         uint8_t idem[OC_SHA256_LEN];
@@ -7218,7 +7323,7 @@ static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbr
         return;
     }
     if (ci >= 0) {
-        int is_pub = r->mcp_chans[ci].is_public;
+        int is_pub = m->chans[ci].is_public || m->chans[ci].is_dm;
         if (is_pub && !pub) { mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the channels:history scope"); return; }
         if (!is_pub && !priv) { mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the groups:history scope"); return; }
     } else if (!pub && !priv) {
@@ -7229,6 +7334,7 @@ static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbr
     if (!j) { mcp_tool_refuse(ep, conns, dbw, c, "the read could not be made"); return; }
     j->user_id = m->agent;
     j->channel_id = m->channel_id;
+    j->mcp_person = (uint8_t)m->person;
     j->mcp_limit = (uint16_t)q->limit;
     j->mcp_since = q->since_ms; j->mcp_has_since = (uint8_t)q->has_since;
     if (q->tool == OC_MCP_READ_HISTORY) {
@@ -7279,7 +7385,13 @@ static void mcp_messages(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbr
         x->file_names = (const char *const *)w->file_names;
         x->file_types = (const char *const *)w->file_types;
         x->file_sizes = w->file_sizes;
-        if (search) { snprintf(chn[i], sizeof chn[i], "#%s", w->channel ? w->channel : ""); x->channel = chn[i]; }
+        if (search) {
+            long ci = -1;
+            for (size_t k = 0; k < m->n_chans && ci < 0; k++) if (m->chans[k].id == w->channel_id) ci = (long)k;
+            if (ci >= 0) mcp_label(&m->chans[ci], chn[i], sizeof chn[i]);
+            else snprintf(chn[i], sizeof chn[i], "#%s", w->channel ? w->channel : "");
+            x->channel = chn[i];
+        }
     }
     oc_mcp_buf s = { 0 };
     oc_mcp_put(&s, "{");
@@ -7324,12 +7436,22 @@ static int mcp_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     case OC_RES_AGENT_ERR:
         if (g_mcp_fail_rl) oc_ratelimit_record(g_mcp_fail_rl, c->source, now_ms());
         mcp_audit(dbw, OC_AUDIT_SECURITY, NULL, "mcp.auth_failed", 0, NULL);
-        mcp_challenge(ep, conns, c, m->call.id);
+        mcp_challenge(ep, conns, c, m->call.id, m->base);
         return 1;
     case OC_RES_TOKEN_PRINCIPAL: {
         m->agent = r->user_id;
         m->token_id = r->message_id;
         snprintf(m->scopes, sizeof m->scopes, "%s", r->tok_scopes ? r->tok_scopes : "");
+        if (r->oa_person) {
+            /* A person, through a client: exactly their access, every kind of
+             * conversation they read and post in. Turned off meanwhile: refused.
+             * The budget is the connection's, apart from any agent token's. */
+            if (!oc_config_get()->mcp.connections) { mcp_challenge(ep, conns, c, m->call.id, m->base); return 1; }
+            m->person = 1;
+            m->via = r->oa_name; r->oa_name = NULL;
+            m->token_id = r->message_id | (1ull << 63);
+            snprintf(m->scopes, sizeof m->scopes, "channels:history groups:history im:history mpim:history chat:write");
+        }
         if (g_mcp_fail_rl) oc_ratelimit_reset(g_mcp_fail_rl, c->source);
         if (m->call.method == OC_MCP_TOOLS_CALL) {
             /* The budget, before anything is read: a search costs three; a post
@@ -7356,6 +7478,7 @@ static int mcp_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
         oc_job *j = oc_job_new(OC_JOB_MCP_CHANNELS, c->conn_id);
         if (!j) { oc_mcp_buf b = { 0 }; b.failed = 1; mcp_finish(ep, conns, c, 500, &b, NULL); return 1; }
         j->user_id = m->agent;
+        j->mcp_person = (uint8_t)m->person;
         oc_dbwriter_submit(dbw, j);
         return 1;
     }
@@ -7383,6 +7506,385 @@ static int mcp_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
                         : r->err_code == OC_ERR_CHANNEL_ARCHIVED ? "the conversation is archived"
                         : r->err_code == OC_ERR_UNKNOWN_CHANNEL || r->err_code == OC_ERR_NOT_A_MEMBER ? "no such conversation"
                         : "the post was refused");
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* --- The MCP authorization server (docs/details/AUTH.md §8.13) ----------------
+ * A person's own AI client connects as them: it finds this server from /mcp's
+ * challenge and the two metadata documents, identifies itself (registered here,
+ * or by a metadata document fetched off this loop), and sends the person to
+ * /oauth/authorize. That page signs nobody in and runs no script: it names the
+ * client, shows an eight-letter code and reloads itself every three seconds
+ * until the person approves or declines the code in their signed-in app; then
+ * it sends them back with a one-minute authorization code, which /oauth/token
+ * exchanges, with PKCE, for an hour's access token and a refresh token. The
+ * writer keeps every piece of state, hashed; this only reads and answers. */
+
+#define OA_FETCH_MAX 8   /* metadata documents being fetched at once */
+
+enum { OA_AUTHORIZE = 1, OA_TOKEN, OA_REGISTER };
+typedef struct oa_req {
+    int                kind;
+    char               base[300];
+    oc_oauth_authorize az;
+    int                fetched;       /* its client's document fetched once already */
+} oa_req;
+
+static void oa_req_free(oa_req *o) { free(o); }
+
+/* A test's knob: a metadata document at http://127.0.0.1, and on a private
+ * address, is fetched -- the loopback server a test serves one from. */
+static int g_oa_test_docs;
+void oc_netloop_set_oauth_test_documents(int on) { __atomic_store_n(&g_oa_test_docs, on, __ATOMIC_RELAXED); }
+
+static pthread_mutex_t g_oa_fetch_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_oa_fetch_cv = PTHREAD_COND_INITIALIZER;
+static int             g_oa_fetching;
+
+static void oa_fetches_wait(void) {
+    pthread_mutex_lock(&g_oa_fetch_mu);
+    while (g_oa_fetching > 0) pthread_cond_wait(&g_oa_fetch_cv, &g_oa_fetch_mu);
+    pthread_mutex_unlock(&g_oa_fetch_mu);
+}
+
+static const char OA_PAGE_HDRS[] =
+    "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none';"
+    " form-action 'none'\r\n"
+    "X-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n";
+static const char OA_JSON_HDRS[] = "Cache-Control: no-store\r\nPragma: no-cache\r\n";
+
+static void oa_send(conn *c, int status, const char *ctype, const oc_mcp_buf *b, const char *extra) {
+    static const char OOM[] = "{\"error\":\"server_error\"}";
+    int ok = b && b->p && !b->failed;
+    char hdr[OC_HTTP_HEAD_MAX];
+    size_t len = ok ? b->len : sizeof OOM - 1;
+    size_t n = oc_http_head_ex(hdr, sizeof hdr, ok ? status : 500, ok ? ctype : "application/json", len, extra ? extra : "");
+    if (!n) return;
+    out_append(c, (const uint8_t *)hdr, n);
+    out_append(c, (const uint8_t *)(ok ? b->p : OOM), len);
+}
+
+static void oa_json(conn *c, int status, oc_mcp_buf *b) { oa_send(c, status, "application/json", b, OA_JSON_HDRS); }
+
+static void oa_json_error(conn *c, int status, const char *error, const char *description) {
+    oc_mcp_buf b = { 0 };
+    oc_oauth_error_json(&b, error, description);
+    oa_json(c, status, &b);
+    oc_mcp_buf_free(&b);
+}
+
+static void oa_page(conn *c, int status, oc_oauth_page_kind kind, const char *name, const char *code, const char *reload,
+                    const char *message) {
+    oc_mcp_buf b = { 0 };
+    oc_oauth_page(&b, kind, name, code, reload, message);
+    oa_send(c, status, "text/html; charset=utf-8", &b, OA_PAGE_HDRS);
+    oc_mcp_buf_free(&b);
+}
+
+/* Done with an answer that came back from the writer: sent, and closed. */
+static void oa_done(int ep, conn **conns, conn *c) {
+    flush_out(c);
+    conn_close(ep, conns, c->fd);
+}
+
+static int oa_path_is(const oc_http_req *req, const char *path, int prefix) {
+    size_t n = strlen(path), pl = req->path_len;
+    const char *q = memchr(req->path, '?', req->path_len);
+    if (q) pl = (size_t)(q - req->path);
+    if (pl < n || memcmp(req->path, path, n) != 0) return 0;
+    return pl == n || (prefix && req->path[n] == '/');
+}
+
+static int is_oauth_path(const oc_http_req *req) {
+    return oa_path_is(req, OC_OAUTH_RESOURCE_PATH, 1) || oa_path_is(req, OC_OAUTH_SERVER_PATH, 1) ||
+           oa_path_is(req, OC_OAUTH_AUTHORIZE_PATH, 0) || oa_path_is(req, OC_OAUTH_TOKEN_PATH, 0) ||
+           oa_path_is(req, OC_OAUTH_REGISTER_PATH, 0);
+}
+
+/* Whether every address `url`'s host has is a public one: the daemon fetches
+ * nothing on a private network for a stranger. */
+static int oa_host_public(const char *url) {
+    char host[256], port[8];
+    if (oc_unfurl_url_target(url, host, sizeof host, port, sizeof port) != 0) return 0;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) return 0;
+    int ok = 1;
+    for (struct addrinfo *a = res; a; a = a->ai_next) if (!oc_unfurl_addr_public(a->ai_addr)) ok = 0;
+    freeaddrinfo(res);
+    return ok;
+}
+
+typedef struct { oc_dbwriter *dbw; uint64_t conn_id; char url[OC_OAUTH_URI_MAX + 1]; int test; } oa_fetch;
+
+/* A Client ID Metadata Document, fetched off the loop: 64 KiB at most, five
+ * seconds, its client_id its own URL. Whatever comes of it goes to the writer,
+ * which stores it and answers the loop. */
+static void *oa_fetch_main(void *arg) {
+    oa_fetch *f = arg;
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_DOC_STORE, f->conn_id);
+    char err[200] = "";
+    oc_oauth_client_meta meta;
+    if (!f->test && !oa_host_public(f->url)) {
+        snprintf(err, sizeof err, "The client's metadata document is not on a public address.");
+    } else {
+        oc_https_resp resp;
+        memset(&resp, 0, sizeof resp);
+        char herr[160];
+        if (oc_https_request("GET", f->url, NULL, NULL, 0, "Accept: application/json\r\n", OC_OAUTH_DOC_TIMEOUT_MS, &resp,
+                             herr, sizeof herr) != 0) {
+            snprintf(err, sizeof err, "The client's metadata document could not be fetched.");
+        } else {
+            if (resp.status != 200) snprintf(err, sizeof err, "The client's metadata document could not be fetched.");
+            else if (oc_oauth_parse_document(resp.body, resp.body_len, f->url, f->test, &meta, err, sizeof err) != 0 && !err[0])
+                snprintf(err, sizeof err, "The client's metadata document is not one this workspace reads.");
+            oc_https_resp_free(&resp);
+        }
+    }
+    if (j) {
+        j->oa_client_id = strdup(f->url);
+        if (!err[0]) {
+            char uris[OC_OAUTH_URIS_MAX * (OC_OAUTH_URI_MAX + 1) + 1];
+            oc_oauth_uris_join(&meta, uris, sizeof uris);
+            j->oa_name = strdup(meta.name);
+            j->oa_uris = strdup(uris);
+        } else j->oa_state = strdup(err);
+        oc_dbwriter_submit(f->dbw, j);
+    }
+    free(f);
+    pthread_mutex_lock(&g_oa_fetch_mu);
+    g_oa_fetching--;
+    pthread_cond_broadcast(&g_oa_fetch_cv);
+    pthread_mutex_unlock(&g_oa_fetch_mu);
+    return NULL;
+}
+
+static int oa_fetch_start(oc_dbwriter *dbw, uint64_t conn_id, const char *url) {
+    pthread_mutex_lock(&g_oa_fetch_mu);
+    int busy = g_oa_fetching >= OA_FETCH_MAX;
+    if (!busy) g_oa_fetching++;
+    pthread_mutex_unlock(&g_oa_fetch_mu);
+    if (busy) return -1;
+    oa_fetch *f = calloc(1, sizeof *f);
+    pthread_t t;
+    pthread_attr_t at;
+    int started = 0;
+    if (f) {
+        f->dbw = dbw;
+        f->conn_id = conn_id;
+        f->test = __atomic_load_n(&g_oa_test_docs, __ATOMIC_RELAXED);
+        snprintf(f->url, sizeof f->url, "%s", url);
+        if (pthread_attr_init(&at) == 0) {
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            started = pthread_create(&t, &at, oa_fetch_main, f) == 0;
+            pthread_attr_destroy(&at);
+        }
+    }
+    if (!started) {
+        free(f);
+        pthread_mutex_lock(&g_oa_fetch_mu);
+        g_oa_fetching--;
+        pthread_cond_broadcast(&g_oa_fetch_cv);
+        pthread_mutex_unlock(&g_oa_fetch_mu);
+        return -1;
+    }
+    return 0;
+}
+
+static oc_job *oa_begin_job(const oa_req *o, uint64_t conn_id, const char *source) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_BEGIN, conn_id);
+    if (!j) return NULL;
+    j->oa_client_id = strdup(o->az.client_id);
+    j->oa_redirect = strdup(o->az.redirect_uri);
+    j->oa_challenge = strdup(o->az.challenge);
+    j->oa_state = strdup(o->az.state);
+    j->oa_resource = strdup(o->az.resource);
+    j->token_from = strdup(source);
+    return j;
+}
+
+static int on_oauth(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
+    char base[300];
+    if (oc_oauth_base(req->host, req->host_len, base, sizeof base) != 0) {
+        http_reply(c, 400, "text/plain", "bad host\n", 9);
+        return -1;
+    }
+    oc_mcp_buf b = { 0 };
+    if (oa_path_is(req, OC_OAUTH_RESOURCE_PATH, 1)) {
+        oc_oauth_resource_metadata(&b, base);
+        oa_send(c, 200, "application/json", &b, "Access-Control-Allow-Origin: *\r\n");
+        oc_mcp_buf_free(&b);
+        return -1;
+    }
+    if (oa_path_is(req, OC_OAUTH_SERVER_PATH, 1)) {
+        oc_oauth_server_metadata(&b, base);
+        oa_send(c, 200, "application/json", &b, "Access-Control-Allow-Origin: *\r\n");
+        oc_mcp_buf_free(&b);
+        return -1;
+    }
+    int on = oc_config_get()->mcp.connections;
+    uint64_t now = now_ms();
+    oa_req *o = calloc(1, sizeof *o);
+    if (!o) { http_reply(c, 500, "text/plain", "out of memory\n", 14); return -1; }
+    snprintf(o->base, sizeof o->base, "%s", base);
+    oc_job *j = NULL;
+    if (oa_path_is(req, OC_OAUTH_AUTHORIZE_PATH, 0)) {
+        o->kind = OA_AUTHORIZE;
+        if (!on) { oa_page(c, 403, OC_OAUTH_PAGE_OFF, NULL, NULL, NULL, NULL); oa_req_free(o); return -1; }
+        const char *q = memchr(req->path, '?', req->path_len);
+        size_t ql = q ? req->path_len - (size_t)(q + 1 - req->path) : 0;
+        char resource[320], err[200];
+        snprintf(resource, sizeof resource, "%s/mcp", base);
+        if (oc_oauth_parse_authorize(q ? q + 1 : "", ql, resource, &o->az, err, sizeof err) != 0) {
+            oa_page(c, 400, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, err);
+            oa_req_free(o);
+            return -1;
+        }
+        if (o->az.request[0]) {
+            if ((j = oc_job_new(OC_JOB_OAUTH_POLL, c->conn_id))) j->oa_request = strdup(o->az.request);
+        } else {
+            if (g_oa_begin_rl && oc_ratelimit_blocked(g_oa_begin_rl, c->source, now)) {
+                oa_page(c, 429, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, "Too many requests from here: wait a minute and start again.");
+                oa_req_free(o);
+                return -1;
+            }
+            if (g_oa_begin_rl) oc_ratelimit_record(g_oa_begin_rl, c->source, now);
+            j = oa_begin_job(o, c->conn_id, c->source);
+        }
+    } else if (oa_path_is(req, OC_OAUTH_TOKEN_PATH, 0)) {
+        o->kind = OA_TOKEN;
+        oc_oauth_token_req t;
+        const char *e = req->is_form ? oc_oauth_parse_token(req->body, req->body_len, &t) : "invalid_request";
+        if (e) { oa_json_error(c, 400, e, NULL); oa_req_free(o); return -1; }
+        if (!on) { oa_json_error(c, 400, "invalid_grant", "this workspace does not let people connect AI clients"); oa_req_free(o); return -1; }
+        if ((j = oc_job_new(t.grant == OC_OAUTH_GRANT_CODE ? OC_JOB_OAUTH_EXCHANGE : OC_JOB_OAUTH_REFRESH, c->conn_id))) {
+            j->oa_client_id = strdup(t.client_id);
+            j->oa_resource = strdup(t.resource);
+            if (t.grant == OC_OAUTH_GRANT_CODE) {
+                j->oa_code = strdup(t.code);
+                j->oa_verifier = strdup(t.verifier);
+                j->oa_redirect = strdup(t.redirect_uri);
+            } else j->oa_refresh = strdup(t.refresh);
+        }
+    } else {
+        o->kind = OA_REGISTER;
+        if (!on) { oa_json_error(c, 403, "access_denied", "this workspace does not let people connect AI clients"); oa_req_free(o); return -1; }
+        if (g_oa_reg_rl && oc_ratelimit_blocked(g_oa_reg_rl, c->source, now)) {
+            oa_json_error(c, 429, "slow_down", "too many registrations from this address");
+            oa_req_free(o);
+            return -1;
+        }
+        if (g_oa_reg_rl) oc_ratelimit_record(g_oa_reg_rl, c->source, now);
+        oc_oauth_client_meta meta;
+        char err[200];
+        if (oc_oauth_parse_registration(req->body, req->body_len, &meta, err, sizeof err) != 0) {
+            oa_json_error(c, 400, strstr(err, "redirect") ? "invalid_redirect_uri" : "invalid_client_metadata", err);
+            oa_req_free(o);
+            return -1;
+        }
+        char uris[OC_OAUTH_URIS_MAX * (OC_OAUTH_URI_MAX + 1) + 1];
+        oc_oauth_uris_join(&meta, uris, sizeof uris);
+        if ((j = oc_job_new(OC_JOB_OAUTH_REGISTER, c->conn_id))) {
+            j->oa_name = strdup(meta.name);
+            j->oa_uris = strdup(uris);
+            j->token_from = strdup(c->source);
+        }
+    }
+    if (!j) { http_reply(c, 500, "text/plain", "out of memory\n", 14); oa_req_free(o); return -1; }
+    c->oa = o;
+    c->http_pending = 1;
+    oc_dbwriter_submit(dbw, j);
+    return 0;
+}
+
+/* The writer's answer to a request a connection carries in `oa`: 1 when it is
+ * consumed. */
+static int oa_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
+    conn *c = find_by_id(conns, r->conn_id);
+    if (!c || !c->oa) return 0;
+    oa_req *o = c->oa;
+    oc_mcp_buf b = { 0 };
+    switch (r->type) {
+    case OC_RES_OAUTH_PAGE: {
+        if (r->oa_page != OC_OAUTH_PAGE_PENDING) {
+            oa_page(c, 200, OC_OAUTH_PAGE_EXPIRED, NULL, NULL, NULL, NULL);
+            oa_done(ep, conns, c);
+            return 1;
+        }
+        const char *request = r->oa_request ? r->oa_request : o->az.request;
+        const char *code = r->oa_code ? r->oa_code : o->az.code;
+        char reload[200];
+        snprintf(reload, sizeof reload, OC_OAUTH_AUTHORIZE_PATH "?request=%s&code=%s", request, code);
+        oa_page(c, 200, OC_OAUTH_PAGE_PENDING, r->oa_name, code, reload, NULL);
+        oa_done(ep, conns, c);
+        return 1;
+    }
+    case OC_RES_OAUTH_REDIRECT: {
+        oc_oauth_redirect(&b, r->oa_redirect ? r->oa_redirect : "", r->oa_code, r->oa_error, r->oa_state ? r->oa_state : "",
+                          o->base);
+        char loc[OC_HTTP_HEAD_MAX - 160];
+        if (b.p && !b.failed && b.len + 80 < sizeof loc) {
+            snprintf(loc, sizeof loc, "Location: %s\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n", b.p);
+            char hdr[OC_HTTP_HEAD_MAX];
+            size_t n = oc_http_head_ex(hdr, sizeof hdr, 302, "text/plain", 0, loc);
+            if (n) out_append(c, (const uint8_t *)hdr, n);
+            else oa_page(c, 500, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, "The address to return to is too long.");
+        } else {
+            oa_page(c, 500, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, "The address to return to is too long.");
+        }
+        oc_mcp_buf_free(&b);
+        oa_done(ep, conns, c);
+        return 1;
+    }
+    case OC_RES_OAUTH_NEED_FETCH:
+        if (o->fetched || oa_fetch_start(dbw, c->conn_id, o->az.client_id) != 0) {
+            oa_page(c, 503, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, "The client's metadata document could not be fetched just now.");
+            oa_done(ep, conns, c);
+        }
+        return 1;
+    case OC_RES_OAUTH_CLIENT:
+        if (o->kind == OA_REGISTER) {
+            oc_oauth_client_meta meta;
+            memset(&meta, 0, sizeof meta);
+            snprintf(meta.name, sizeof meta.name, "%s", r->oa_name ? r->oa_name : "");
+            for (const char *p = r->oa_uris ? r->oa_uris : ""; *p && meta.n_uris < OC_OAUTH_URIS_MAX;) {
+                const char *e = strchr(p, '\n');
+                size_t n = e ? (size_t)(e - p) : strlen(p);
+                snprintf(meta.uris[meta.n_uris++], sizeof meta.uris[0], "%.*s", (int)n, p);
+                p = e ? e + 1 : p + n;
+            }
+            oc_oauth_registered(&b, r->oa_client_id ? r->oa_client_id : "", &meta, now_ms() / 1000);
+            oa_json(c, 201, &b);
+            oc_mcp_buf_free(&b);
+            oa_done(ep, conns, c);
+            return 1;
+        }
+        {   /* a document stored: the request goes on, once */
+            o->fetched = 1;
+            oc_job *j = oa_begin_job(o, c->conn_id, c->source);
+            if (!j) { oa_page(c, 500, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, "Out of memory."); oa_done(ep, conns, c); return 1; }
+            oc_dbwriter_submit(dbw, j);
+        }
+        return 1;
+    case OC_RES_OAUTH_TOKENS:
+        oc_oauth_token_json(&b, r->oa_access ? r->oa_access : "", r->oa_refresh ? r->oa_refresh : "",
+                            OC_OAUTH_ACCESS_TTL_MS / 1000);
+        oa_json(c, 200, &b);
+        oc_mcp_buf_free(&b);
+        oa_done(ep, conns, c);
+        return 1;
+    case OC_RES_OAUTH_ERR:
+        if (o->kind == OA_AUTHORIZE) {
+            oa_page(c, 400, OC_OAUTH_PAGE_REFUSED, NULL, NULL, NULL, r->oa_error && r->oa_error[0] ? r->oa_error : "The request was refused.");
+        } else {
+            const char *e = r->oa_error && r->oa_error[0] ? r->oa_error : "server_error";
+            oa_json_error(c, strcmp(e, "server_error") == 0 ? 500 : 400, e, NULL);
+        }
+        oa_done(ep, conns, c);
         return 1;
     default:
         return 0;
@@ -7421,6 +7923,7 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     if (req.path_len >= sizeof OC_MCP_PATH - 1 && memcmp(req.path, OC_MCP_PATH, sizeof OC_MCP_PATH - 1) == 0 &&
         (req.path_len == sizeof OC_MCP_PATH - 1 || req.path[sizeof OC_MCP_PATH - 1] == '?'))
         return on_mcp(c, &req, dbw);
+    if (oc_config_get()->mcp.enabled && is_oauth_path(&req)) return on_oauth(c, &req, dbw);
     return on_web_page(c, &req, dbw);
 }
 
@@ -7704,6 +8207,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     /* An MCP request's steps come back here; a post's answer then goes on to
      * its fan-out below, the HTTP connection already answered and closed. */
     if (r->conn_id && mcp_result(ep, conns, dbw, r)) return;
+    if (r->conn_id && oa_result(ep, conns, dbw, r)) return;
     /* Somebody joined -- by invitation, a first sign-in, an account made on the
      * pages: everyone connected learns them now, not at their next LIST_USERS.
      * Before the answer, so the newcomer's own first connection, not signed in
@@ -8024,9 +8528,10 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0, {0} };
             broadcast_set_attach(&b, r->attach, r->n_attach);
             b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
+            b.via = oc_slice_str(r->via ? r->via : "");   /* an AI client's post (AUTH.md §8.13) */
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             size_t blen = w.len;
             fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
@@ -8116,7 +8621,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_RESTORE_OK: {
         /* Back for every member: the message whole, replacing its tombstone. */
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0, {0} };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
@@ -8831,7 +9336,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    /* Also in the channel (REQ-062): this one frame
                                     * says so, to every member, so a client shows
                                     * the reply once, in both places. */
-                                   .also_channel = r->also_channel };
+                                   .also_channel = r->also_channel,
+                                   .via = oc_slice_str(r->via ? r->via : "") };
             tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
 
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -8924,7 +9430,8 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
                                    .reply_count = (uint32_t)r->n_thread,
                                    .participant = (uint8_t)(in_thread != 0),
                                    .body        = body,
-                                   .broadcast_stored = m->broadcast_stored };   /* REQ-221 */
+                                   .broadcast_stored = m->broadcast_stored,   /* REQ-221 */
+                                   .via = oc_slice_str(m->via ? m->via : "") };
             tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
@@ -9592,6 +10099,55 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_OAUTH_APPROVAL: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_connection_request m = { oc_slice_str(r->oa_code ? r->oa_code : ""), oc_slice_str(r->oa_name ? r->oa_name : ""),
+                                    oc_slice_str(r->oa_redirect ? r->oa_redirect : "") };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_connection_request(&w, OC_PROTOCOL_VERSION, &m) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_OAUTH_DECIDED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_connection_decided m = { r->oa_approve_echo, oc_slice_str(r->oa_name ? r->oa_name : "") };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_connection_decided(&w, OC_PROTOCOL_VERSION, &m) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_OAUTH_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        /* As many as fit a frame, newest first. */
+        size_t n = r->n_oa_conns > OC_CONNECTION_LIST_MAX ? OC_CONNECTION_LIST_MAX : r->n_oa_conns;
+        oc_connection_entry *ents = n ? calloc(n, sizeof *ents) : NULL;
+        if (n && !ents) break;
+        size_t bytes = 16;
+        size_t k = 0;
+        for (; k < n; k++) {
+            const oc_conn_row *x = &r->oa_conns[k];
+            size_t need = 48 + 4 + strlen(x->user_name ? x->user_name : "") + strlen(x->client_name ? x->client_name : "");
+            if (bytes + need > OC_MAX_FRAME_SIZE - 64) break;
+            bytes += need;
+            ents[k] = (oc_connection_entry){ x->id, x->user_id, oc_slice_str(x->user_name ? x->user_name : ""),
+                                             oc_slice_str(x->client_name ? x->client_name : ""), x->created_ms,
+                                             x->last_used_ms, x->expires_ms, x->lifetime_days };
+        }
+        oc_connection_list l = { r->oa_approve_echo, (uint16_t)k, ents };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_connection_list(&w, OC_PROTOCOL_VERSION, &l) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_OAUTH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c || !r->err_code) break;
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("connection refused") };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_WEBHOOK_CREATED: {
         /* Hand the minted token back to the client that asked (shown once). */
         conn *c = find_by_id(conns, r->conn_id);
@@ -9609,7 +10165,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         /* Fan the posted message out to connected members (like SEND_OK)... */
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0, {0} };
         b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
@@ -10251,7 +10807,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
             oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_CALL,
-                               body, 0, {{0}}, {0}, 0, 0, r->call_id };
+                               body, 0, {{0}}, {0}, 0, 0, r->call_id, {0} };
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             size_t blen = w.len;
             fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
@@ -10326,7 +10882,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
-                           body, 0, {{0}}, {0}, 0, 0, 0 };
+                           body, 0, {{0}}, {0}, 0, 0, 0, {0} };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
@@ -10382,7 +10938,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_MESSAGE,
-                           body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0 };
+                           body, 0, {{0}}, {0}, r->broadcast_stored, 0, 0, {0} };
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
@@ -10430,11 +10986,12 @@ static size_t backfill_next(conn *c) {
             if (i >= r->n_replay) { c->bf_phase = BF_PIN; c->bf_i = 0; continue; }
             oc_replay_msg *m = &r->replay[i];
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored, 0, 0 };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0}, m->broadcast_stored, 0, 0, {0} };
             broadcast_set_attach(&b, m->attach, m->n_attach);
             b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             b.parent_id = m->parent_id;   /* a reply also in the channel, with its thread (REQ-062) */
             b.call_id = m->call_id;       /* a call message's call (CALLS.md §1) */
+            b.via = oc_slice_str(m->via ? m->via : "");   /* the AI client it came through */
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             c->bf_phase = BF_META;
             return w.len;
@@ -11558,6 +12115,8 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
     g_proof_rl = oc_ratelimit_new(OC_PROOF_RATE_MAX, OC_PROOF_RATE_WINDOW, 256);
     g_mcp_fail_rl = oc_ratelimit_new(OC_MCP_FAIL_MAX, OC_MCP_FAIL_WINDOW, 1024);
+    g_oa_reg_rl = oc_ratelimit_new(OC_MCP_FAIL_MAX, OC_MCP_FAIL_WINDOW, 1024);
+    g_oa_begin_rl = oc_ratelimit_new(OC_MCP_FAIL_MAX, OC_MCP_FAIL_WINDOW, 1024);
     g_devcodes = oc_devcodes_new();
     g_websteps = oc_websteps_new();
     if (g_devcodes) {
@@ -11873,6 +12432,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_ratelimit_free(g_proof_rl);
     oc_ratelimit_free(g_mcp_fail_rl);
     g_mcp_fail_rl = NULL;
+    oa_fetches_wait();   /* a metadata document's fetch hands its result to the writer: done before it stops */
+    oc_ratelimit_free(g_oa_reg_rl);
+    g_oa_reg_rl = NULL;
+    oc_ratelimit_free(g_oa_begin_rl);
+    g_oa_begin_rl = NULL;
     free(g_mcp_toks);
     g_mcp_toks = NULL;
     g_mcp_ntoks = 0;

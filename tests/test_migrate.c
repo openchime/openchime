@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 90);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens */
+    CHECK(oc_schema_version(db) == 91);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -119,7 +119,8 @@ static void test_embedded_schema(void) {
                              "todo_lists", "todo_tasks",
                              "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
-                             "call_transcripts_fts", "attachment_previews", "principal_tokens" };
+                             "call_transcripts_fts", "attachment_previews", "principal_tokens",
+                             "oauth_clients", "oauth_approvals", "mcp_connections", "mcp_access_tokens" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -419,7 +420,7 @@ static void test_rendered_audio_uses_0089(void) {
     CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
     CHECK(!table_exists(db, "rendered_audio_uses"));
     CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 90);
+    CHECK(oc_schema_version(db) == OC_MIGRATIONS_COUNT);
     CHECK(table_exists(db, "rendered_audio_uses"));
     CHECK(sqlite3_exec(db,
         "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
@@ -535,6 +536,43 @@ static void test_previews_0088(void) {
     sqlite3_close(db);
 }
 
+/* A person's AI-client connections (0091), from 0090: the four tables, a
+ * message's `via` defaulting to '' for what was there, a client id and a
+ * refresh token's hash each unique, and a client's kind one of the two. */
+static void test_connections_0091(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 90, &err) == SQLITE_OK);
+    CHECK(!table_exists(db, "mcp_connections"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'local:ann',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(7,1,1,'hello',5);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 91, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 91);
+    CHECK(table_exists(db, "oauth_clients") && table_exists(db, "oauth_approvals") &&
+          table_exists(db, "mcp_connections") && table_exists(db, "mcp_access_tokens"));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM messages WHERE id=7 AND via='';") == 1);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c1','registered','Desk','http://127.0.0.1/cb',1);"
+        "INSERT INTO mcp_connections(id,user_id,client_id,client_name,resource,created_at_ms,refresh_hash)"
+        " VALUES(1,1,'c1','Desk','https://x/mcp',1,x'01');"
+        "INSERT INTO mcp_access_tokens(token_hash,connection_id,expires_at_ms) VALUES(x'02',1,9);"
+        "INSERT INTO oauth_approvals(request_hash,code_hash,client_id,client_name,redirect_uri,code_challenge,state,"
+        " resource,created_at_ms,expires_at_ms) VALUES(x'03',x'04','c1','Desk','http://127.0.0.1/cb','ch','st','https://x/mcp',1,2);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM mcp_connections WHERE id=1 AND lifetime_days=0 AND expires_at_ms=0 AND revoked_at_ms=0;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM oauth_approvals WHERE status=0 AND auth_code_hash IS NULL;") == 1);
+    CHECK(sqlite3_exec(db, "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c1','registered','B','',1);",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c2','other','B','',1);",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO mcp_connections(user_id,client_id,client_name,resource,created_at_ms,refresh_hash)"
+                           " VALUES(1,'c1','Desk','https://x/mcp',1,x'01');", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 static void test_sql_functions(void) {
     sqlite3 *db = open_mem();
     oc_migrate_functions(db);
@@ -590,6 +628,7 @@ int run_migrate_tests(void) {
     test_calls_0087();
     test_previews_0088();
     test_rendered_audio_uses_0089();
+    test_connections_0091();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

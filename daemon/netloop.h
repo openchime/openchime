@@ -129,6 +129,9 @@ void oc_netloop_set_presence_rate_ms(uint32_t ms);
 void oc_netloop_set_device_ttl_ms(uint64_t ms);
 /* ...and the interval, in seconds, a client is asked to poll at; 0 restores five. */
 void oc_netloop_set_device_interval_s(unsigned s);
+/* A test's knob (AUTH.md §8.13): an AI client's metadata document may be at
+ * http://127.0.0.1 and on a private address, where a test serves one. */
+void oc_netloop_set_oauth_test_documents(int on);
 
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. NULL (the

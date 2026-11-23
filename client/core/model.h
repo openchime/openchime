@@ -99,6 +99,7 @@ typedef struct {
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
+    char     via[104];        /* the AI client it was posted through, "" for none (AUTH.md §8.13) */
     uint64_t author_id;
     uint64_t message_id;
     uint64_t server_time;
@@ -338,6 +339,14 @@ typedef struct {
     char     scopes[512];
     char     last_from[64];
 } oc_agent_token_row;
+
+/* One AI-client connection (AUTH.md §8.13), as a list shows it: never a token. */
+typedef struct {
+    uint64_t id, user_id, created_at, last_used_at, expires_at;   /* expires 0: never */
+    uint32_t lifetime_days;
+    char     user_name[64];
+    char     client_name[104];
+} oc_conn_view;
 
 /* A workspace's own profile field, and one person's value for one. */
 typedef struct { uint64_t id; uint8_t kind; uint16_t position;
@@ -784,6 +793,20 @@ typedef struct {
     uint64_t  atokens_agent;
     oc_agent_token_row atokens[OC_AGENT_TOKEN_LIST_MAX];
     uint8_t   n_atokens;
+    /* A person's AI clients (AUTH.md §8.13): what the code they entered names
+     * (conn_req_open until they approve or decline, and the code, client and
+     * return address); the last decision (conn_decided, 1 approved, 2
+     * declined, 0 none yet) and its client; and the connections listed, one's
+     * own and, for an owner or admin, everyone's. Heap. */
+    uint8_t   conn_req_open;
+    char      conn_req_code[16];
+    char      conn_req_client[104];
+    char      conn_req_return[520];
+    uint8_t   conn_decided;
+    char      conn_decided_client[104];
+    oc_conn_view *my_conns, *all_conns;
+    size_t    n_my_conns, n_all_conns;
+    uint8_t   all_conns_known;
     /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
     uint64_t  reset_user_id;
     char      reset_token[80];
@@ -1291,6 +1314,9 @@ void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
 /* A workspace setting by key ("default_channels"), as the daemon told it,
  * into `out`; returns 1, or 0 (and "") when the daemon did not tell it. */
 int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap);
+/* Whether the workspace lets people connect their own AI clients
+ * (OPENCHIME_MCP_CONNECTIONS, read-only): on unless it says off. */
+int oc_model_connections_on(const oc_model *m);
 /* Whether this person may add a custom emoji (REQ-072): the workspace's
  * `custom_emoji_add`, everyone by default, or only owners and admins. */
 int oc_model_may_add_emoji(const oc_model *m);

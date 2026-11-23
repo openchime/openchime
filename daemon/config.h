@@ -192,7 +192,8 @@ typedef struct {
     /* The MCP endpoint (docs/details/MCP.md): OPENCHIME_MCP, off unless turned
      * on; each agent token's budget, `per_minute` calls refilled continuously
      * up to `burst`. */
-    struct { int enabled; int per_minute; int burst; } mcp;
+    /* connections: people may connect their own AI clients (AUTH.md §8.13). */
+    struct { int enabled; int per_minute; int burst; int connections; } mcp;
     int retention_days;                 /* OPENCHIME_RETENTION_DAYS: messages older are deleted (REQ-250); 0 keeps them */
     /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */

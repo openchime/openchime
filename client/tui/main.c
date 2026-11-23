@@ -458,6 +458,10 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
     } else {
         msg_nick(nick, sizeof nick, m, me, ch);
         snprintf(line, sizeof line, "%s  %s%s", stamp, nick, oc_model_user_is_agent(mdl, m->author_id) ? "  [Agent]" : "");
+        if (m->via[0]) {   /* posted through an AI client (AUTH.md §8.13) */
+            size_t l = strlen(line);
+            snprintf(line + l, sizeof line - l, "  via %s", m->via);
+        }
         if (m->edited && !m->deleted) {
             size_t l = strlen(line);
             snprintf(line + l, sizeof line - l, " (edited)");
@@ -1428,6 +1432,11 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_AGT_NEW, ACT_AGT_TOKENS, ACT_AGT_MINT, ACT_AGT_ADDHERE, ACT_AGT_REMOVE, ACT_AGT_PROFILE,
        ACT_SCOPE_DONE, ACT_SCOPE0, ACT_SCOPE_LAST = ACT_SCOPE0 + 23,
        ACT_ATOK0, ACT_ATOK_LAST = ACT_ATOK0 + 23,
+       /* AI clients (AUTH.md §8.13): approve by code; the lifetime chosen and
+        * the decision; one's own and, for an owner or admin, everyone's, each
+        * revoked by Enter */
+       ACT_CONN_APPROVE, ACT_CONN_MINE, ACT_CONN_ALL, ACT_CONN_LIFE30, ACT_CONN_LIFE90, ACT_CONN_LIFE365,
+       ACT_CONN_LIFE0, ACT_CONN_DECLINE, ACT_CONN0, ACT_CONN_LAST = ACT_CONN0 + 23,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -1649,6 +1658,48 @@ static void menu_build_atokens(const oc_model *m) {
     }
 }
 
+/* AI clients (AUTH.md §8.13): what a code names, as a menu of the lifetimes to
+ * approve with and Decline; and a list of connections, each Enter revokes. */
+static char     g_conn_labels[24][200];
+static uint64_t g_conn_ids[24];
+static int      g_conn_all;            /* the list open is everyone's */
+static int      g_conn_await;          /* 1: one's own asked for, 2: everyone's; opens when it lands */
+static char     g_conn_title[200];
+
+static void menu_build_conn_request(const oc_model *m) {
+    g_nmenu = 0;
+    snprintf(g_conn_title, sizeof g_conn_title, "%s wants to connect as you; it returns to %s",
+             m->conn_req_client, m->conn_req_return);
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 30 days", ACT_CONN_LIFE30 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 90 days", ACT_CONN_LIFE90 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 365 days", ACT_CONN_LIFE365 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve with no end", ACT_CONN_LIFE0 };
+    g_menu[g_nmenu++] = (menuitem){ "Decline", ACT_CONN_DECLINE };
+}
+
+static void menu_build_conns(const oc_model *m, int all) {
+    g_nmenu = 0;
+    g_conn_all = all;
+    const oc_conn_view *v = all ? m->all_conns : m->my_conns;
+    size_t n = all ? m->n_all_conns : m->n_my_conns;
+    for (size_t i = 0; i < n && i < 24 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); i++) {
+        char used[40] = "never used", ends[32] = "no end";
+        struct tm tv;
+        if (v[i].last_used_at) {
+            time_t t = (time_t)(v[i].last_used_at / 1000);
+            if (oc_localtime_r(&t, &tv)) strftime(used, sizeof used, "used %Y-%m-%d %H:%M", &tv);
+        }
+        if (v[i].expires_at) {
+            time_t t = (time_t)(v[i].expires_at / 1000);
+            if (oc_localtime_r(&t, &tv)) strftime(ends, sizeof ends, "ends %Y-%m-%d", &tv);
+        }
+        snprintf(g_conn_labels[i], sizeof g_conn_labels[i], "Revoke %s%s%s  (%s; %s)", v[i].client_name,
+                 all ? " for " : "", all ? v[i].user_name : "", used, ends);
+        g_conn_ids[i] = v[i].id;
+        g_menu[g_nmenu++] = (menuitem){ g_conn_labels[i], ACT_CONN0 + (int)i };
+    }
+}
+
 /* The token just minted, shown once. */
 static void draw_agent_token(const oc_model *m, int W, int H) {
     const tk_theme *th = tk_theme_active();
@@ -1775,6 +1826,9 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
     { "You",     "Blocked people",      NULL, NULL, ACT_BLOCKED },
     { "You",     "Who can start a DM with you (anyone/nobody)", NULL, NULL, ACT_DMPRIV },
+    { "You",     "Approve an AI client", NULL, NULL, ACT_CONN_APPROVE },
+    { "You",     "Your AI clients",     NULL, NULL, ACT_CONN_MINE },
+    { "Admin",   "Everyone's AI clients", NULL, NULL, ACT_CONN_ALL },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "New agent",           NULL, NULL, ACT_AGT_NEW },
     { "Admin",   "Blocks",              NULL, NULL, ACT_BLOCKS_ADMIN },
@@ -1807,6 +1861,9 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
         if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
         if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
         if (g_launcher_items[i].id == ACT_VOICES && !oc_model_tts_available(m)) continue;
+        if ((g_launcher_items[i].id == ACT_CONN_APPROVE || g_launcher_items[i].id == ACT_CONN_MINE ||
+             g_launcher_items[i].id == ACT_CONN_ALL) && !oc_model_connections_on(m)) continue;
+        if (g_launcher_items[i].id == ACT_CONN_ALL && !self_admin(m)) continue;
         g_launcher_now[n++] = g_launcher_items[i];
     }
     if (m->summary_open && cid && m->summary_channel == cid)
@@ -4054,7 +4111,8 @@ int main(int argc, char **argv) {
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
            PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO,
-           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME, PROMPT_AGENT_NAME, PROMPT_AGENT_TOKEN };
+           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME, PROMPT_AGENT_NAME, PROMPT_AGENT_TOKEN,
+           PROMPT_CONN_CODE };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
@@ -4320,6 +4378,25 @@ int main(int argc, char **argv) {
             if (am->agent_token[0])
                 oc_model_take_agent_token(am, g_tok_shown, sizeof g_tok_shown, &g_tok_agent, NULL,
                                           g_tok_scopes, sizeof g_tok_scopes);
+            /* AI clients: what a code names opens as the choice; a list asked for opens as it lands. */
+            if (am->conn_req_open && !action_open && !prompt_kind) {
+                menu_build_conn_request(am);
+                act_title = g_conn_title;
+                action_menu.sel = action_menu.top = 0;
+                action_open = 1; tk_list_reset_filter(&action_menu);
+                am->conn_req_open = 0;   /* asked once; the code is kept for the answer */
+            }
+            if (g_conn_await && !action_open && !prompt_kind &&
+                (g_conn_await == 1 || am->all_conns_known)) {
+                menu_build_conns(am, g_conn_await == 2);
+                act_title = g_conn_await == 2 ? "Everyone's AI clients: Enter revokes one" : "Your AI clients: Enter revokes one";
+                g_conn_await = 0;
+                action_menu.sel = action_menu.top = 0;
+                action_open = 1; tk_list_reset_filter(&action_menu);
+                if (!g_nmenu) {   /* nothing to revoke: said as the list's one line */
+                    g_menu[g_nmenu++] = (menuitem){ "None connected", 0 };
+                }
+            }
             if (g_agt_await && am->atokens_agent == g_agt_await && !action_open) {
                 act_uid = g_agt_await; g_agt_await = 0;
                 menu_build_atokens(am);
@@ -4630,6 +4707,7 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_CONN_CODE && *v) oc_client_connection_code(cl, v);
                 else if (k == PROMPT_AGENT_NAME && *v) {   /* then its first token's name */
                     snprintf(g_agt_name, sizeof g_agt_name, "%s", v);
                     prompt_kind = PROMPT_AGENT_TOKEN; prompt_title = "Its first token's name (where it is used, such as CI)";
@@ -4853,6 +4931,15 @@ int main(int argc, char **argv) {
                     } else await_invite = 1;
                 }
                 else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
+                else if (id == ACT_CONN_APPROVE) {
+                    prompt_kind = PROMPT_CONN_CODE; prompt_title = "Approve an AI client: the code its page shows";
+                    tk_input_init(&prompt_input, 0, "e.g. BCDF-GHJK");
+                }
+                else if (id == ACT_CONN_MINE) { oc_client_list_connections(cl, 0); g_conn_await = 1; }
+                else if (id == ACT_CONN_ALL)  {
+                    ((oc_model *)oc_client_model(cl))->all_conns_known = 0;
+                    oc_client_list_connections(cl, 1); g_conn_await = 2;
+                }
                 else if (id == ACT_AGT_NEW) {
                     g_agt_uid = 0;
                     prompt_kind = PROMPT_AGENT_NAME; prompt_title = "New agent: its name"; tk_input_init(&prompt_input, 0, "name");
@@ -5033,6 +5120,13 @@ int main(int argc, char **argv) {
                     }
                     else if (id >= ACT_ATOK0 && id <= ACT_ATOK_LAST)
                         oc_client_revoke_agent_token(cl, act_uid, g_atok_ids[id - ACT_ATOK0]);
+                    else if (id >= ACT_CONN0 && id <= ACT_CONN_LAST)
+                        oc_client_revoke_connection(cl, g_conn_ids[id - ACT_CONN0], g_conn_all);
+                    else if (id == ACT_CONN_DECLINE)
+                        oc_client_connection_decide(cl, oc_client_model(cl)->conn_req_code, 0, 0);
+                    else if (id == ACT_CONN_LIFE30 || id == ACT_CONN_LIFE90 || id == ACT_CONN_LIFE365 || id == ACT_CONN_LIFE0)
+                        oc_client_connection_decide(cl, oc_client_model(cl)->conn_req_code, 1,
+                                                    id == ACT_CONN_LIFE30 ? 30 : id == ACT_CONN_LIFE90 ? 90 : id == ACT_CONN_LIFE365 ? 365 : 0);
                     else if (id == ACT_PROFILE_OF) {
                         /* Their whole profile, which is what carries the
                          * workspace's fields; shown as it lands. */

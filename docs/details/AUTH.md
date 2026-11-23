@@ -1132,3 +1132,100 @@ and the relay's keys are what vouch for them.
 - **Saying so.** `WORKSPACE_INFO` carries the mode (PROTOCOL.md §4.3a); every
   client shows that this is a public demo, read by everyone and erased every
   night, for as long as it is open.
+
+### 8.13 The MCP endpoint's authorization server
+
+A person connects an AI client of their own to the MCP endpoint (MCP.md §3.2,
+REQ-323) through MCP's OAuth authorization flow, with **the daemon as the
+authorization server**: OAuth 2.1 with PKCE, Protected Resource Metadata (RFC
+9728), Authorization Server Metadata (RFC 8414), Dynamic Client Registration
+(RFC 7591) and Client ID Metadata Documents, and the resource indicator (RFC
+8707). It exists while MCP is on (`OPENCHIME_MCP`), and people's connections
+are refused while `OPENCHIME_MCP_CONNECTIONS` is off (on by default; clients
+are told it read-only): the authorize and registration endpoints say so, every
+connection's request at `/mcp` is `401`, and the app's approval is refused
+`CONNECTIONS_OFF`; agents are unaffected. Built: `daemon/oauth.c` (the
+documents, the checks, PKCE, the tokens, the page), the routes in
+`daemon/netloop.c`, the state in `daemon/dbwriter.c` (SCHEMA.md §3cd), the
+app's frames (PROTOCOL.md §5.16q).
+
+**Metadata.** `GET /.well-known/oauth-protected-resource` (and the same under
+`/mcp`) names the resource `https://<host>/mcp` and the daemon as its
+authorization server; `GET /.well-known/oauth-authorization-server` names the
+issuer `https://<host>`, the authorize, token and registration endpoints,
+`S256` as the only code challenge method, the grant types `authorization_code`
+and `refresh_token`, public clients only (`token_endpoint_auth_method` `none`),
+the `iss` response parameter (RFC 9207), and that client ID metadata documents
+are supported. A `401` from `/mcp` carries
+`WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource"`.
+`<host>` is the request's own Host.
+
+**Client identification**, either way:
+
+- **Registration.** `POST /oauth/register` with a JSON body: `client_name` (at
+  most 100 bytes, no control character; "An unnamed client" when absent) and
+  one to eight `redirect_uris`. `grant_types`, `response_types` and
+  `token_endpoint_auth_method`, if present, may hold only what is supported.
+  Answered `201` with a minted `client_id` (`occl_` and 32 random bytes in
+  base64url). Twenty registrations a minute per source, as failed sign-ins are
+  limited (REQ-191).
+- **A metadata document.** A `client_id` that is an `https` URL with a path is
+  fetched, off the event loop, with a 64 KiB cap and a five-second limit, from
+  a public address only; its `client_id` must be its own URL, and its name and
+  redirect URIs are read as a registration's. It is kept 24 hours, then fetched
+  again on the next request.
+
+Either way a redirect URI is `https` with a host, or `http` to a loopback
+address (`127.0.0.1`, `[::1]`, `localhost`), with no fragment, and an authorize
+request's must be one the client declared — for loopback, on any port (RFC 8252
+§7.3).
+
+**The authorize page.** `GET /oauth/authorize` with `response_type=code`, a
+known `client_id`, a declared `redirect_uri`, an `S256` `code_challenge`, a
+`state` and a `resource` naming this workspace's `/mcp`. Anything else is
+refused on the page, never redirected. Twenty requests a minute per source. The
+page **signs nobody in and runs no script** (its policy allows neither script
+nor form): it names the client and shows an **eight-letter code** from the
+device codes' alphabet (§8.11), as `XXXX-XXXX`, and asks the person to approve
+it in their OpenChime app. It reloads itself every **three seconds** (a meta
+refresh carrying its own handle and the code, which the daemon keeps hashed
+only). The request waits **ten minutes**; then the page says it expired.
+Approved, the next reload redirects to the `redirect_uri` with an authorization
+code, the `state` and `iss`; declined, with `error=access_denied`. Collected
+once: a later reload says it is over.
+
+**The approval, in the app.** A signed-in person enters the code (either case,
+a dash or spaces anywhere) and is shown the client's name and where it will
+return; they approve choosing the connection's **lifetime** — never ending, 30,
+90 or 365 days — or decline. An unknown, expired or used code is refused
+`UNKNOWN_CODE`; a visitor, an agent or a removed account is refused. Approving
+and declining are audited in the account family. In the GUI this is the AI
+clients tab, reached from the profile menu; in the terminal client, the
+launcher's "Approve an AI client".
+
+**Tokens.** The authorization code (`ocac_`) is good **once, within 60
+seconds**: `POST /oauth/token` with `grant_type=authorization_code` checks the
+PKCE verifier, the `client_id`, the `redirect_uri` and, when sent, the
+`resource`; any failed try spends it. It answers an **access token** (`ocpa_`)
+valid **one hour** and a **refresh token** (`ocpr_`) valid for the connection's
+lifetime. `grant_type=refresh_token` with the same `client_id` returns a new
+pair and **retires the old refresh token**; a refused refresh (unknown,
+retired, revoked, expired, another client, a removed person) is audited in the
+security family. Every token is 32 random bytes in base64url behind its prefix,
+sent once, stored only as its SHA-256; the prefixes tell a person's access
+token from an agent's (`ocpt_`) at `/mcp`.
+
+**At `/mcp`.** A person's access token acts as the person: `tools/list` names
+their channels as `#name`, their DMs and group DMs by the others' handles
+(`@alice`, `@alice,@bob`), never an encrypted DM; `read_history`, `search` and
+`post` reach exactly what they can. A post stores the client's name in
+`messages.via`, carried on `BROADCAST` and `THREAD_REPLY` and shown as
+"via <client>" beside the author. Every tool call is audited in the MCP family
+with the person as actor and `client=<name>` in `detail`. Each connection has a
+budget of its own (`OPENCHIME_MCP_CALLS_PER_MINUTE`, `OPENCHIME_MCP_BURST`).
+
+**Connections.** A person lists their own (the client, when it was approved and
+last used, when it ends; never a token) and revokes any; an owner or admin
+lists everyone's and revokes any — audited in the account family for one's
+own, the administrative for another's. Revoking deletes the connection's
+tokens, so its next request is `401`. Removing a person revokes theirs.

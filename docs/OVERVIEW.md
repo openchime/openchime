@@ -68,7 +68,7 @@ the map behind it.
 
 | Document | Holds | Fills in |
 |---|---|---|
-| [AUTH.md](./details/AUTH.md) | Signing in: local accounts, the relay, direct connections, sessions, second steps, the demo workspace. | ARCH-19, 55–60, 84; REQ-020–029, 181–184, 191 |
+| [AUTH.md](./details/AUTH.md) | Signing in: local accounts, the relay, direct connections, sessions, second steps, the demo workspace, and the MCP endpoint's authorization server. | ARCH-19, 55–60, 84; REQ-020–029, 181–184, 191 |
 | [SSO.md](./details/SSO.md) | Registering the daemon with an organization's own sign-in provider. | ARCH-55; REQ-027 |
 | [CALLS.md](./details/CALLS.md) | Calls: the model, Calls home, signaling, end-to-end encryption, screen sharing, cameras, recording. | ARCH-73, 86, 87, 113, 136; REQ-150–152, 160–161, 301–306 |
 | [AUDIO.md](./details/AUDIO.md) | A call's audio: the relay, the client's audio engine, transport and echo cancellation. | ARCH-18, 31, 73; REQ-151–152 |

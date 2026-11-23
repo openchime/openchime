@@ -29,6 +29,7 @@
 #include "joinrules.h"
 #include "jwt.h"
 #include "scopes.h"
+#include "oauth.h"    /* the AI clients' tokens and codes (AUTH.md §8.13) */
 #include "localissuer.h"
 #include "ratelimit.h"
 #include "roles.h"
@@ -342,6 +343,9 @@ static void job_free(oc_job *j) {
     for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
     free(j->agent_name); free(j->token_name); free(j->token_scopes); free(j->token_from);
     free(j->mcp_query); free(j->mcp_from); free(j->mcp_action); free(j->mcp_target); free(j->mcp_detail);
+    free(j->oa_client_id); free(j->oa_name); free(j->oa_uris); free(j->oa_redirect); free(j->oa_challenge);
+    free(j->oa_state); free(j->oa_resource); free(j->oa_request); free(j->oa_code); free(j->oa_verifier);
+    free(j->oa_refresh); free(j->via);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -914,6 +918,10 @@ void oc_dbres_free(oc_dbres *r) {
     }
     free(r->ptokens);
     free(r->tok_scopes);
+    free(r->oa_client_id); free(r->oa_name); free(r->oa_uris); free(r->oa_request); free(r->oa_code);
+    free(r->oa_redirect); free(r->oa_state); free(r->oa_error); free(r->oa_access); free(r->oa_refresh); free(r->via);
+    for (size_t i = 0; i < r->n_oa_conns; i++) { free(r->oa_conns[i].user_name); free(r->oa_conns[i].client_name); }
+    free(r->oa_conns);
     for (size_t i = 0; i < r->n_mcp_chans; i++) free(r->mcp_chans[i].name);
     free(r->mcp_chans);
     for (size_t i = 0; i < r->n_mcp_rows; i++) {
@@ -939,7 +947,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->member_participant);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
-    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
+    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free(r->replay[i].via); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
     free(r->replay);
     for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
     free(r->rreact);
@@ -998,9 +1006,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->react_adj_minus);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
-    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
+    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free(r->thread[i].via); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
     free(r->thread);
-    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free(r->search[i].author_name); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
+    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free(r->search[i].author_name); free(r->search[i].via); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
@@ -3777,6 +3785,15 @@ static void deactivate_user(sqlite3 *db, uint64_t uid, uint64_t actor, const cha
      * promise cannot be kept and there is nobody left to tell. */
     sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* And the AI clients connected as them (AUTH.md §8.13): revoked, their
+     * tokens gone, so not one more request is answered as them. */
+    sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id IN"
+                           " (SELECT id FROM mcp_connections WHERE user_id=?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "UPDATE mcp_connections SET revoked_at_ms=?2, refresh_hash=NULL"
+                           " WHERE user_id=?1 AND revoked_at_ms=0;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     audit_actor(db, OC_AUDIT_ADMIN, action, actor, uid, NULL, 1, NULL);
@@ -5091,6 +5108,22 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
     sqlite3_finalize(st);
 }
 
+/* The AI client a message was posted through (messages.via, AUTH.md §8.13):
+ * heap, or NULL for a message that came through none. */
+static char *message_via(sqlite3 *db, uint64_t message_id) {
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT via FROM messages WHERE id=?1 AND via<>'';", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *v = (const char *)sqlite3_column_text(st, 0);
+            if (v) out = strdup(v);
+        }
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -5125,6 +5158,8 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     /* An encrypted DM carries text only: no files, no forwards (PRIVATE-DM.md). */
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    /* An AI client never posts into an encrypted DM: it would be plain text there. */
+    if (r->ch_e2e && j->via && j->via[0]) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     /* A poll (REQ-225): its options are checked here, where it is stored. */
@@ -5140,12 +5175,13 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
 
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms) "
-        "VALUES(?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, via) "
+        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    sqlite3_bind_text(st, 5, j->via ? j->via : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -5198,6 +5234,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->message_id = mid;
     r->server_time = ts;
     r->author_name = lookup_display_name(db, j->user_id);   /* name for the live BROADCAST */
+    if (j->via && j->via[0]) r->via = strdup(j->via);
     /* Read the reference back rather than echoing what was asked for: what the
      * channel is told is what actually landed in the table, or nothing. */
     append_forward(db, r, mid, j->channel_id);
@@ -8376,6 +8413,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     if (acc == CH_ARCHIVED){ r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (r->ch_e2e && j->via && j->via[0]) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
@@ -8389,14 +8427,15 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     /* Also to the channel (REQ-062): one row, flagged, never a copy -- the main
      * scroll's queries take a flagged reply as they take a top-level message. */
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel) "
-        "VALUES(?, ?, ?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel, via) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root);
     sqlite3_bind_int(st, 6, j->also_channel ? 1 : 0);
+    sqlite3_bind_text(st, 7, j->via ? j->via : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -8455,6 +8494,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->parent_id = root;
     r->reply_count = count;
     r->also_channel = j->also_channel ? 1 : 0;
+    if (j->via && j->via[0]) r->via = strdup(j->via);
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
     if (is_todo) append_todo(db, r, mid);
@@ -8621,6 +8661,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
         int blen = sqlite3_column_bytes(st, 3);
         if (b && blen > 0) { m->body = malloc((size_t)blen); if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; } }
         m->broadcast_stored = broadcast_stored(db, m->message_id);
+        m->via = message_via(db, m->message_id);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);  /* REQ-140 */
         n++;
     }
@@ -9279,6 +9320,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
             m->saved     = m->saved_at != 0;
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+            m->via       = message_via(db, m->message_id);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
             m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
             m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
@@ -9482,6 +9524,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
         m->saved     = m->saved_at != 0;
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+        m->via       = message_via(db, m->message_id);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
         m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
         m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
@@ -11025,14 +11068,17 @@ static char *mcp_dup(sqlite3_stmt *st, int i) {
     return strdup(t ? t : "");
 }
 
-static int agent_reads(sqlite3 *db, uint64_t channel, uint64_t agent) {
+/* An agent reads its channels; a person through an AI client (`person`) also
+ * their DMs and group DMs. Never an encrypted one. */
+static int agent_reads(sqlite3 *db, uint64_t channel, uint64_t agent, int person) {
     sqlite3_stmt *st = NULL;
     int ok = 0;
     if (sqlite3_prepare_v2(db,
             "SELECT 1 FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
-            " WHERE c.id=?1 AND cm.user_id=?2 AND c.kind='channel' AND c.e2e=0;", -1, &st, NULL) == SQLITE_OK) {
+            " WHERE c.id=?1 AND cm.user_id=?2 AND (c.kind='channel' OR ?3=1) AND c.e2e=0;", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)channel);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)agent);
+        sqlite3_bind_int(st, 3, person ? 1 : 0);
         ok = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -11045,10 +11091,18 @@ static oc_dbres *process_mcp_channels(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_MCP_CHANNELS;
     sqlite3_stmt *st = NULL;
+    /* A DM or group DM is named by the others in it, by handle, in order:
+     * "alice", "alice,@bob" -- shown as "@alice", "@alice,@bob". */
     if (sqlite3_prepare_v2(db,
-            "SELECT c.id, c.name, c.is_public FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
-            " WHERE cm.user_id=?1 AND c.kind='channel' AND c.e2e=0 ORDER BY c.name, c.id;", -1, &st, NULL) == SQLITE_OK) {
+            "SELECT c.id, CASE WHEN c.kind='dm' THEN"
+            "   (SELECT group_concat(h, ',@') FROM (SELECT CASE WHEN substr(u.subject,1,6)='local:' THEN substr(u.subject,7)"
+            "      ELSE COALESCE(NULLIF(u.display_name,''), 'user'||u.id) END AS h"
+            "     FROM channel_members o JOIN users u ON u.id=o.user_id WHERE o.channel_id=c.id AND o.user_id<>?1 ORDER BY h))"
+            "   ELSE c.name END, c.is_public, c.kind='dm'"
+            " FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
+            " WHERE cm.user_id=?1 AND (c.kind='channel' OR ?2=1) AND c.e2e=0 ORDER BY c.kind='dm', 2, c.id;", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int(st, 2, j->mcp_person ? 1 : 0);
         while (sqlite3_step(st) == SQLITE_ROW) {
             oc_mcp_chan *g = realloc(r->mcp_chans, (r->n_mcp_chans + 1) * sizeof *g);
             if (!g) break;
@@ -11057,6 +11111,7 @@ static oc_dbres *process_mcp_channels(sqlite3 *db, const oc_job *j) {
             c->id = (uint64_t)sqlite3_column_int64(st, 0);
             c->name = mcp_dup(st, 1);
             c->is_public = (uint8_t)sqlite3_column_int(st, 2);
+            c->is_dm = (uint8_t)sqlite3_column_int(st, 3);
         }
     }
     sqlite3_finalize(st);
@@ -11139,7 +11194,7 @@ static oc_dbres *process_mcp_read(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_MCP_MESSAGES;
     r->channel_id = j->channel_id;
-    if (!agent_reads(db, j->channel_id, j->user_id)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (!agent_reads(db, j->channel_id, j->user_id, j->mcp_person)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (j->mcp_thread &&
         !mcp_exists(db, "SELECT 1 FROM messages WHERE id=?1 AND channel_id=?2 AND parent_id IS NULL AND ?3=?3;",
                     j->mcp_thread, j->channel_id, 0)) {
@@ -11222,7 +11277,7 @@ static oc_dbres *process_mcp_search(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->type = OC_RES_MCP_MESSAGES;
-    if (j->channel_id && !agent_reads(db, j->channel_id, j->user_id)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (j->channel_id && !agent_reads(db, j->channel_id, j->user_id, j->mcp_person)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     char fq[1200];
     if (!j->mcp_query || mcp_fts_query(j->mcp_query, fq, sizeof fq) != 0) return r;
     uint64_t from_uid = 0;
@@ -11242,7 +11297,7 @@ static oc_dbres *process_mcp_search(sqlite3 *db, const oc_job *j) {
     const char *sql =
         "SELECT * FROM (SELECT " MCP_COLS ", bm25(messages_fts) AS rank"
         "  FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid"
-        "  JOIN channels ch ON ch.id=m.channel_id AND ch.kind='channel' AND ch.e2e=0"
+        "  JOIN channels ch ON ch.id=m.channel_id AND (ch.kind='channel' OR ?13=1) AND ch.e2e=0"
         "  JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.user_id=?2"
         "  LEFT JOIN users u ON u.id=m.author_id"
         " WHERE messages_fts MATCH ?1 AND m.deleted_at_ms IS NULL AND m.body IS NOT NULL"
@@ -11264,6 +11319,7 @@ static oc_dbres *process_mcp_search(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_double(st, 10, j->mcp_rank);
     sqlite3_bind_int64(st, 11, (sqlite3_int64)j->mcp_after);
     sqlite3_bind_int64(st, 12, (sqlite3_int64)lim + 1);
+    sqlite3_bind_int  (st, 13, j->mcp_person ? 1 : 0);
     size_t got = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (got++ == lim) { r->mcp_more_newer = 1; break; }   /* another page follows */
@@ -11604,6 +11660,573 @@ static oc_dbres *process_token_lookup(sqlite3 *db, const oc_job *j) {
         }
         sqlite3_finalize(st);
     }
+    return r;
+}
+
+/* --- A person's AI clients (docs/details/AUTH.md §8.13; SCHEMA.md 0091) -------
+ * The daemon as the MCP endpoint's authorization server. A client identifies
+ * itself (registered, or by its metadata document); an authorize request waits
+ * as an approval with an eight-letter code until the person enters that code
+ * in their signed-in app and approves or declines; the page collects the
+ * outcome and hands the client a one-minute authorization code; the token
+ * endpoint exchanges it, with PKCE, for an hour's access token and a refresh
+ * token for the connection's lifetime. Every secret is kept as its SHA-256. */
+
+static oc_dbres *oa_res(const oc_job *j, int type) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = type;
+    return r;
+}
+
+/* A refusal: `oauth` the OAuth error code (the token endpoint's) or the page's
+ * sentence; `code` the reason a person's app is told. */
+static oc_dbres *oa_refuse(const oc_job *j, const char *oauth, uint16_t code) {
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_ERR);
+    if (!r) return NULL;
+    r->oa_error = strdup(oauth ? oauth : "");
+    r->err_code = code;
+    return r;
+}
+
+static void oa_bind_hash(sqlite3_stmt *st, int i, const char *secret) {
+    uint8_t h[32];
+    if (!secret || oc_oauth_hash(secret, strlen(secret), h) != 0) memset(h, 0, sizeof h);
+    sqlite3_bind_blob(st, i, h, sizeof h, SQLITE_TRANSIENT);
+}
+
+static char *oa_col(sqlite3_stmt *st, int i) {
+    const char *t = (const char *)sqlite3_column_text(st, i);
+    return strdup(t ? t : "");
+}
+
+/* Whether `uid` may connect an AI client as themself: a person (not a
+ * visitor, an agent or the workspace), not removed. */
+static int oa_person(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE id=?1 AND kind='human' AND disabled=0 AND is_system=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        ok = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static oc_dbres *process_oauth_register(sqlite3 *db, const oc_job *j) {
+    char id[OC_OAUTH_TOKEN_MAX];
+    if (!j->oa_name || !j->oa_uris || oc_oauth_mint(OC_OAUTH_CLIENT_PREFIX, id, sizeof id) != 0)
+        return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO oauth_clients(client_id, kind, name, redirect_uris, created_at_ms, created_from)"
+            " VALUES(?1, 'registered', ?2, ?3, ?4, ?5);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, j->oa_name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, j->oa_uris, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text(st, 5, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_CLIENT);
+    if (r) { r->oa_client_id = strdup(id); r->oa_name = strdup(j->oa_name); r->oa_uris = strdup(j->oa_uris); }
+    return r;
+}
+
+static oc_dbres *process_oauth_doc_store(sqlite3 *db, const oc_job *j) {
+    /* A fetch that failed comes here too, its sentence in oa_state, so the
+     * request waiting on it is answered in order. */
+    if (!j->oa_client_id || !j->oa_name || !j->oa_uris)
+        return oa_refuse(j, j->oa_state ? j->oa_state : "The client's metadata document could not be read.", OC_ERR_INTERNAL);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO oauth_clients(client_id, kind, name, redirect_uris, created_at_ms, fetched_at_ms)"
+            " VALUES(?1, 'document', ?2, ?3, ?4, ?4)"
+            " ON CONFLICT(client_id) DO UPDATE SET name=excluded.name, redirect_uris=excluded.redirect_uris,"
+            "   fetched_at_ms=excluded.fetched_at_ms WHERE kind='document';", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, j->oa_client_id, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, j->oa_name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, j->oa_uris, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_CLIENT);
+    if (r) { r->oa_client_id = strdup(j->oa_client_id); r->oa_name = strdup(j->oa_name); r->oa_uris = strdup(j->oa_uris); }
+    return r;
+}
+
+/* An authorize request, checked by the loop, against its client: a document
+ * not yet fetched or a day old is fetched first; a redirect URI the client
+ * did not declare is refused. Then a pending approval with a new handle and
+ * code, ten minutes long. */
+static oc_dbres *process_oauth_begin(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_client_id || !j->oa_redirect || !j->oa_challenge || !j->oa_state || !j->oa_resource)
+        return oa_refuse(j, "The request is incomplete.", OC_ERR_INTERNAL);
+    uint64_t now = dbw_now_ms();
+    /* Approvals an hour past their end are of no more use to anyone. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM oauth_approvals WHERE expires_at_ms < ?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(now > 3600000u ? now - 3600000u : 0));
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    char *name = NULL, *uris = NULL, *kind = NULL;
+    uint64_t fetched = 0;
+    if (sqlite3_prepare_v2(db, "SELECT name, redirect_uris, kind, fetched_at_ms FROM oauth_clients WHERE client_id=?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, j->oa_client_id, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            name = oa_col(st, 0); uris = oa_col(st, 1); kind = oa_col(st, 2);
+            fetched = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    int is_doc = oc_oauth_client_id_is_url(j->oa_client_id, 1);
+    if (is_doc && (!name || (kind && strcmp(kind, "document") == 0 && now >= fetched + OC_OAUTH_DOC_TTL_MS))) {
+        free(name); free(uris); free(kind);
+        return oa_res(j, OC_RES_OAUTH_NEED_FETCH);
+    }
+    free(kind);
+    if (!name || !uris) {
+        free(name); free(uris);
+        return oa_refuse(j, "This workspace does not know the client that sent you here.", OC_ERR_INTERNAL);
+    }
+    if (!oc_oauth_uris_has(uris, j->oa_redirect)) {
+        free(name); free(uris);
+        return oa_refuse(j, "The client asked to return somewhere it did not declare.", OC_ERR_INTERNAL);
+    }
+    free(uris);
+    char request[OC_OAUTH_TOKEN_MAX], code[OC_OAUTH_CODE_LEN + 1];
+    int ok = 0;
+    for (int tries = 0; tries < 4 && !ok; tries++) {
+        if (oc_oauth_mint(OC_OAUTH_REQUEST_PREFIX, request, sizeof request) != 0 || oc_oauth_approval_code(code) != 0) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO oauth_approvals(request_hash, code_hash, client_id, client_name, redirect_uri, code_challenge,"
+                " state, resource, created_at_ms, expires_at_ms, created_from)"
+                " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);", -1, &st, NULL) == SQLITE_OK) {
+            oa_bind_hash(st, 1, request);
+            oa_bind_hash(st, 2, code);
+            sqlite3_bind_text(st, 3, j->oa_client_id, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 5, j->oa_redirect, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 6, j->oa_challenge, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 7, j->oa_state, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 8, j->oa_resource, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 9, (sqlite3_int64)now);
+            sqlite3_bind_int64(st, 10, (sqlite3_int64)(now + OC_OAUTH_PENDING_TTL_MS));
+            sqlite3_bind_text(st, 11, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;   /* a code taken already: another try */
+        }
+        sqlite3_finalize(st);
+    }
+    if (!ok) { free(name); return oa_refuse(j, "The workspace could not take the request just now.", OC_ERR_INTERNAL); }
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_PAGE);
+    if (!r) { free(name); return NULL; }
+    r->oa_page = OC_OAUTH_PAGE_PENDING;
+    r->oa_name = name;
+    r->oa_request = strdup(request);
+    r->oa_code = strdup(code);
+    return r;
+}
+
+/* The page reloading itself, by its handle: still pending (the client's name;
+ * the code, kept hashed only, is the page's to carry in its reload), expired,
+ * or acted on -- collected once, as a redirect with an authorization code or
+ * access_denied. */
+static oc_dbres *process_oauth_poll(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    oc_dbres *r = NULL;
+    if (!j->oa_request) return oa_refuse(j, "This request is not one this workspace made.", OC_ERR_INTERNAL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, status, expires_at_ms, client_name, redirect_uri, state FROM oauth_approvals WHERE request_hash=?1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return oa_refuse(j, "The workspace could not look the request up.", OC_ERR_INTERNAL);
+    }
+    oa_bind_hash(st, 1, j->oa_request);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return oa_refuse(j, "This request is not one this workspace made, or it is over.", OC_ERR_INTERNAL);
+    }
+    uint64_t id = (uint64_t)sqlite3_column_int64(st, 0);
+    int status = sqlite3_column_int(st, 1);
+    uint64_t expires = (uint64_t)sqlite3_column_int64(st, 2);
+    char *name = oa_col(st, 3), *redirect = oa_col(st, 4), *state = oa_col(st, 5);
+    sqlite3_finalize(st);
+    if (status == 0 && now < expires) {
+        r = oa_res(j, OC_RES_OAUTH_PAGE);
+        if (r) { r->oa_page = OC_OAUTH_PAGE_PENDING; r->oa_name = name; name = NULL; }
+    } else if (status == 1 || status == 2) {
+        /* Collected once: the next reload finds it over. */
+        char code[OC_OAUTH_TOKEN_MAX] = "";
+        int ok = status == 2 || oc_oauth_mint(OC_OAUTH_CODE_PREFIX, code, sizeof code) == 0;
+        st = NULL;
+        if (ok && sqlite3_prepare_v2(db,
+                "UPDATE oauth_approvals SET status=3, auth_code_hash=?2, auth_code_until=?3 WHERE id=?1 AND status IN (1,2);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            if (status == 1) oa_bind_hash(st, 2, code);
+            else sqlite3_bind_null(st, 2);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)(status == 1 ? now + OC_OAUTH_CODE_TTL_MS : 0));
+            ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        } else ok = 0;
+        sqlite3_finalize(st);
+        if (!ok) r = oa_refuse(j, "The workspace could not finish the request.", OC_ERR_INTERNAL);
+        else if ((r = oa_res(j, OC_RES_OAUTH_REDIRECT))) {
+            r->oa_redirect = redirect; redirect = NULL;
+            r->oa_state = state; state = NULL;
+            if (status == 1) r->oa_code = strdup(code);
+            else r->oa_error = strdup("access_denied");
+        }
+    } else if (status == 0) {
+        r = oa_res(j, OC_RES_OAUTH_PAGE);
+        if (r) r->oa_page = OC_OAUTH_PAGE_EXPIRED;
+    } else {
+        r = oa_refuse(j, "This request is over: start again from the AI client.", OC_ERR_INTERNAL);
+    }
+    free(name); free(redirect); free(state);
+    return r;
+}
+
+/* The approval a person's code names, pending and in time: its id, the
+ * client's name and where it returns. 0, or -1. */
+static int oa_pending(sqlite3 *db, const char *typed, uint64_t *id, char **name, char **redirect) {
+    char code[OC_OAUTH_CODE_LEN + 1];
+    if (!typed || oc_oauth_code_normalize(typed, code) != 0) return -1;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, client_name, redirect_uri FROM oauth_approvals WHERE code_hash=?1 AND status=0 AND expires_at_ms > ?2;",
+            -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, code);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            *id = (uint64_t)sqlite3_column_int64(st, 0);
+            if (name) *name = oa_col(st, 1);
+            if (redirect) *redirect = oa_col(st, 2);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found ? 0 : -1;
+}
+
+static oc_dbres *process_oauth_code_find(sqlite3 *db, const oc_job *j) {
+    if (!oa_person(db, j->user_id)) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    uint64_t id = 0;
+    char *name = NULL, *redirect = NULL;
+    if (oa_pending(db, j->oa_code, &id, &name, &redirect) != 0) return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_APPROVAL);
+    if (!r) { free(name); free(redirect); return NULL; }
+    r->oa_name = name;
+    r->oa_redirect = redirect;
+    r->oa_code = strdup(j->oa_code);
+    return r;
+}
+
+static oc_dbres *process_oauth_decide(sqlite3 *db, const oc_job *j) {
+    if (!oa_person(db, j->user_id)) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    if (j->oa_approve && !oc_oauth_lifetime_ok(j->oa_lifetime)) return oa_refuse(j, NULL, OC_ERR_BAD_LIFETIME);
+    uint64_t id = 0;
+    char *name = NULL;
+    if (oa_pending(db, j->oa_code, &id, &name, NULL) != 0) return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "UPDATE oauth_approvals SET status=?2, approved_by=?3, lifetime_days=?4 WHERE id=?1 AND status=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_bind_int(st, 2, j->oa_approve ? 1 : 2);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)(j->oa_approve ? j->oa_lifetime : 0));
+        ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    if (!ok) { free(name); return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE); }
+    char detail[64];
+    if (j->oa_lifetime) snprintf(detail, sizeof detail, "lifetime=%u days", j->oa_lifetime);
+    else snprintf(detail, sizeof detail, "lifetime=never");
+    audit_actor(db, OC_AUDIT_ACCOUNT, j->oa_approve ? "mcp.connection_approve" : "mcp.connection_decline",
+                j->user_id, 0, name, 1, j->oa_approve ? detail : NULL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_DECIDED);
+    if (r) { r->oa_name = name; name = NULL; r->oa_approve_echo = j->oa_approve; }
+    free(name);
+    return r;
+}
+
+/* A new access token for connection `conn`, its refresh token rotated: both
+ * into `r` (shown once), only their hashes kept. 0, or -1. */
+static int oa_issue(sqlite3 *db, uint64_t conn, oc_dbres *r) {
+    char access[OC_OAUTH_TOKEN_MAX], refresh[OC_OAUTH_TOKEN_MAX];
+    if (oc_oauth_mint(OC_OAUTH_ACCESS_PREFIX, access, sizeof access) != 0 ||
+        oc_oauth_mint(OC_OAUTH_REFRESH_PREFIX, refresh, sizeof refresh) != 0)
+        return -1;
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id=?1 AND expires_at_ms <= ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT INTO mcp_access_tokens(token_hash, connection_id, expires_at_ms) VALUES(?1, ?2, ?3);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, access);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)conn);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)(now + OC_OAUTH_ACCESS_TTL_MS));
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (ok && sqlite3_prepare_v2(db, "UPDATE mcp_connections SET refresh_hash=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+        oa_bind_hash(st, 2, refresh);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    } else ok = 0;
+    sqlite3_finalize(st);
+    if (!ok) return -1;
+    r->oa_access = strdup(access);
+    r->oa_refresh = strdup(refresh);
+    return r->oa_access && r->oa_refresh ? 0 : -1;
+}
+
+static oc_dbres *process_oauth_exchange(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_code || !j->oa_verifier || !j->oa_redirect || !j->oa_client_id) return oa_refuse(j, "invalid_request", 0);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    uint64_t id = 0, user = 0, until = 0;
+    uint32_t days = 0;
+    char *client = NULL, *name = NULL, *redirect = NULL, *challenge = NULL, *resource = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, approved_by, lifetime_days, auth_code_until, client_id, client_name, redirect_uri, code_challenge, resource"
+            " FROM oauth_approvals WHERE auth_code_hash=?1 AND status=3;", -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, j->oa_code);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            id = (uint64_t)sqlite3_column_int64(st, 0);
+            user = (uint64_t)sqlite3_column_int64(st, 1);
+            days = (uint32_t)sqlite3_column_int64(st, 2);
+            until = (uint64_t)sqlite3_column_int64(st, 3);
+            client = oa_col(st, 4); name = oa_col(st, 5); redirect = oa_col(st, 6);
+            challenge = oa_col(st, 7); resource = oa_col(st, 8);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!id) return oa_refuse(j, "invalid_grant", 0);
+    /* Single use: whatever happens next, this code is spent. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE oauth_approvals SET auth_code_hash=NULL WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = NULL;
+    if (now > until || strcmp(client, j->oa_client_id) != 0 || strcmp(redirect, j->oa_redirect) != 0 ||
+        (j->oa_resource && j->oa_resource[0] && strcmp(j->oa_resource, resource) != 0) ||
+        !oc_oauth_pkce_ok(j->oa_verifier, challenge) || !oa_person(db, user)) {
+        r = oa_refuse(j, "invalid_grant", 0);
+    } else {
+        sqlite3_exec(db, "SAVEPOINT oauth_exchange;", NULL, NULL, NULL);
+        st = NULL;
+        uint64_t conn = 0;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO mcp_connections(user_id, client_id, client_name, resource, lifetime_days, expires_at_ms, created_at_ms)"
+                " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)user);
+            sqlite3_bind_text(st, 2, client, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, resource, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)days);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)(days ? now + (uint64_t)days * 86400000u : 0));
+            sqlite3_bind_int64(st, 7, (sqlite3_int64)now);
+            if (sqlite3_step(st) == SQLITE_DONE) conn = (uint64_t)sqlite3_last_insert_rowid(db);
+        }
+        sqlite3_finalize(st);
+        r = oa_res(j, OC_RES_OAUTH_TOKENS);
+        if (r && (!conn || oa_issue(db, conn, r) != 0)) {
+            sqlite3_exec(db, "ROLLBACK TO oauth_exchange;", NULL, NULL, NULL);
+            oc_dbres_free(r);
+            r = oa_refuse(j, "server_error", 0);
+        }
+        sqlite3_exec(db, "RELEASE oauth_exchange;", NULL, NULL, NULL);
+    }
+    free(client); free(name); free(redirect); free(challenge); free(resource);
+    return r;
+}
+
+static oc_dbres *process_oauth_refresh(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_refresh || !j->oa_client_id) return oa_refuse(j, "invalid_request", 0);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    uint64_t conn = 0, user = 0, expires = 0, revoked = 0;
+    char *client = NULL, *resource = NULL, *name = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, user_id, expires_at_ms, revoked_at_ms, client_id, resource, client_name FROM mcp_connections"
+            " WHERE refresh_hash=?1;", -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, j->oa_refresh);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            conn = (uint64_t)sqlite3_column_int64(st, 0);
+            user = (uint64_t)sqlite3_column_int64(st, 1);
+            expires = (uint64_t)sqlite3_column_int64(st, 2);
+            revoked = (uint64_t)sqlite3_column_int64(st, 3);
+            client = oa_col(st, 4); resource = oa_col(st, 5); name = oa_col(st, 6);
+        }
+    }
+    sqlite3_finalize(st);
+    const char *why = !conn ? "unknown" : revoked ? "revoked" : (expires && now >= expires) ? "expired"
+                    : strcmp(client, j->oa_client_id) != 0 ? "another client"
+                    : (j->oa_resource && j->oa_resource[0] && strcmp(j->oa_resource, resource) != 0) ? "another resource"
+                    : !oa_person(db, user) ? "removed" : NULL;
+    oc_dbres *r = NULL;
+    if (why) {
+        /* Refused: audited, the person as actor when the token was theirs. */
+        char detail[96];
+        snprintf(detail, sizeof detail, "refresh refused: %s", why);
+        if (user) audit_actor(db, OC_AUDIT_SECURITY, "mcp.refresh_refused", user, 0, name, 0, detail);
+        else audit_log(db, OC_AUDIT_SECURITY, "mcp.refresh_refused", 0, NULL, 0, NULL, 0, detail);
+        r = oa_refuse(j, "invalid_grant", 0);
+    } else {
+        r = oa_res(j, OC_RES_OAUTH_TOKENS);
+        if (r && oa_issue(db, conn, r) != 0) { oc_dbres_free(r); r = oa_refuse(j, "server_error", 0); }
+    }
+    free(client); free(resource); free(name);
+    return r;
+}
+
+/* The lookup a person's access token authenticates with at /mcp: the token in
+ * time, its connection neither revoked nor past its lifetime, its person a
+ * person still. Never cached. The connection's last use is written at most
+ * once a minute. */
+static oc_dbres *process_oauth_lookup(sqlite3 *db, const oc_job *j) {
+    if (!j->token || oc_oauth_token_of(j->token, j->token_len) != OC_OAUTH_TOKEN_PERSON) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms(), conn = 0, last = 0;
+    oc_dbres *r = NULL;
+    uint8_t h[32];
+    if (oc_oauth_hash(j->token, j->token_len, h) != 0) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.user_id, c.client_name, c.last_used_at_ms FROM mcp_access_tokens t"
+            " JOIN mcp_connections c ON c.id=t.connection_id JOIN users u ON u.id=c.user_id"
+            " WHERE t.token_hash=?1 AND t.expires_at_ms > ?2 AND c.revoked_at_ms=0"
+            "   AND (c.expires_at_ms=0 OR c.expires_at_ms > ?2) AND u.kind='human' AND u.disabled=0;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, h, sizeof h, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        if (sqlite3_step(st) == SQLITE_ROW && (r = oa_res(j, OC_RES_TOKEN_PRINCIPAL))) {
+            conn = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = conn;
+            r->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->oa_name = oa_col(st, 2);
+            r->oa_person = 1;
+            last = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!r) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    if (now >= last + TOKEN_USE_EVERY_MS) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE mcp_connections SET last_used_at_ms=?2, last_used_from=?3 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_bind_text (st, 3, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
+/* The connections still in force: the caller's own, or with `all` (an owner
+ * or admin) everyone's. */
+static void oa_list_into(sqlite3 *db, oc_dbres *r, uint64_t uid, int all) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.user_id, COALESCE(u.display_name, u.subject), c.client_name, c.created_at_ms, c.last_used_at_ms,"
+            " c.expires_at_ms, c.lifetime_days FROM mcp_connections c JOIN users u ON u.id=c.user_id"
+            " WHERE c.revoked_at_ms=0 AND (c.expires_at_ms=0 OR c.expires_at_ms > ?2) AND (?3=1 OR c.user_id=?1)"
+            " ORDER BY c.created_at_ms DESC, c.id DESC LIMIT 500;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_int(st, 3, all ? 1 : 0);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_conn_row *g = realloc(r->oa_conns, (r->n_oa_conns + 1) * sizeof *g);
+            if (!g) break;
+            r->oa_conns = g;
+            oc_conn_row *c = &r->oa_conns[r->n_oa_conns++];
+            c->id = (uint64_t)sqlite3_column_int64(st, 0);
+            c->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            c->user_name = oa_col(st, 2);
+            c->client_name = oa_col(st, 3);
+            c->created_ms = (uint64_t)sqlite3_column_int64(st, 4);
+            c->last_used_ms = (uint64_t)sqlite3_column_int64(st, 5);
+            c->expires_ms = (uint64_t)sqlite3_column_int64(st, 6);
+            c->lifetime_days = (uint32_t)sqlite3_column_int64(st, 7);
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_oauth_list(sqlite3 *db, const oc_job *j) {
+    if (j->oa_all && get_role(db, j->user_id) < OC_ROLE_ADMIN) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_LIST);
+    if (!r) return NULL;
+    r->oa_approve_echo = j->oa_all;
+    oa_list_into(db, r, j->user_id, j->oa_all);
+    return r;
+}
+
+/* Revoking: one's own, or anyone's as an owner or admin. Audited in the
+ * account family for one's own, the administrative for another's. */
+static oc_dbres *process_oauth_revoke(sqlite3 *db, const oc_job *j) {
+    int admin = get_role(db, j->user_id) >= OC_ROLE_ADMIN;
+    if (j->oa_all && !admin) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    sqlite3_stmt *st = NULL;
+    uint64_t owner = 0;
+    char *name = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT user_id, client_name FROM mcp_connections WHERE id=?1 AND revoked_at_ms=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        if (sqlite3_step(st) == SQLITE_ROW) { owner = (uint64_t)sqlite3_column_int64(st, 0); name = oa_col(st, 1); }
+    }
+    sqlite3_finalize(st);
+    if (!owner || (owner != j->user_id && !admin)) { free(name); return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CONNECTION); }
+    sqlite3_exec(db, "SAVEPOINT oauth_revoke;", NULL, NULL, NULL);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE mcp_connections SET revoked_at_ms=?2, refresh_hash=NULL WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "RELEASE oauth_revoke;", NULL, NULL, NULL);
+    char detail[48];
+    snprintf(detail, sizeof detail, "connection=%llu", (unsigned long long)j->oa_conn_id);
+    audit_actor(db, owner == j->user_id ? OC_AUDIT_ACCOUNT : OC_AUDIT_ADMIN, "mcp.connection_revoke", j->user_id,
+                owner, name, 1, detail);
+    free(name);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_LIST);
+    if (!r) return NULL;
+    r->oa_approve_echo = j->oa_all;
+    oa_list_into(db, r, j->user_id, j->oa_all);
     return r;
 }
 
@@ -14707,6 +15330,17 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_TOKEN_REVOKE)   return process_token_revoke(w->db, j);
     if (j->type == OC_JOB_TOKEN_LOOKUP)   return process_token_lookup(w->db, j);
     if (j->type == OC_JOB_MCP_AUDIT)      return process_mcp_audit(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REGISTER)  return process_oauth_register(w->db, j);
+    if (j->type == OC_JOB_OAUTH_DOC_STORE) return process_oauth_doc_store(w->db, j);
+    if (j->type == OC_JOB_OAUTH_BEGIN)     return process_oauth_begin(w->db, j);
+    if (j->type == OC_JOB_OAUTH_POLL)      return process_oauth_poll(w->db, j);
+    if (j->type == OC_JOB_OAUTH_CODE_FIND) return process_oauth_code_find(w->db, j);
+    if (j->type == OC_JOB_OAUTH_DECIDE)    return process_oauth_decide(w->db, j);
+    if (j->type == OC_JOB_OAUTH_EXCHANGE)  return process_oauth_exchange(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REFRESH)   return process_oauth_refresh(w->db, j);
+    if (j->type == OC_JOB_OAUTH_LOOKUP)    return process_oauth_lookup(w->db, j);
+    if (j->type == OC_JOB_OAUTH_LIST)      return process_oauth_list(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REVOKE)    return process_oauth_revoke(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);

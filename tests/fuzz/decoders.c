@@ -153,6 +153,16 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
       oc_rbuf_init(&p, buf, len);
       rc = oc_decode_agent_token_list(&p, &aid, te, 4, &nc);
       if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_agent_token_list"); }
+    oc_connection_code ccd; D(oc_decode_connection_code(&p, &ccd));
+    oc_connection_request crq; D(oc_decode_connection_request(&p, &crq));
+    oc_connection_decide cnd; D(oc_decode_connection_decide(&p, &cnd));
+    oc_connection_decided cnx; D(oc_decode_connection_decided(&p, &cnx));
+    oc_list_connections lcn; D(oc_decode_list_connections(&p, &lcn));
+    oc_revoke_connection rcn; D(oc_decode_revoke_connection(&p, &rcn));
+    { oc_connection_entry ce[4]; uint16_t nc = 0; uint8_t all = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_connection_list(&p, &all, ce, 4, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_connection_list"); }
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
     oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
     D(oc_decode_list_groups(&p));

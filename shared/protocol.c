@@ -450,6 +450,7 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_u64(w, m->parent_id);               /* a reply also in the channel (REQ-062), else 0 */
     oc_w_u64(w, m->call_id);                 /* a call message's call (CALLS.md §1), else 0 */
+    oc_w_str(w, m->via);                     /* the AI client it came through (AUTH.md §8.13), else empty */
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -984,6 +985,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
     oc_w_u8(w, m->participant ? 1u : 0u);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_u8(w, m->also_channel ? 1u : 0u);
+    oc_w_str(w, m->via);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -1677,6 +1679,14 @@ const char *oc_error_text(uint16_t code) {
         return "a token can only be given the kinds of access listed";
     case OC_ERR_TOO_MANY_TOKENS:
         return "this agent already has as many tokens as it can hold: revoke one first";
+    case OC_ERR_UNKNOWN_CODE:
+        return "no AI client is waiting on that code: check it, or start again from the client";
+    case OC_ERR_UNKNOWN_CONNECTION:
+        return "that connection is gone";
+    case OC_ERR_BAD_LIFETIME:
+        return "a connection lasts for ever, or 30, 90 or 365 days";
+    case OC_ERR_CONNECTIONS_OFF:
+        return "this workspace does not let people connect AI clients";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -3106,6 +3116,66 @@ oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_re
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_connection_code(oc_wbuf *w, uint16_t version, const oc_connection_code *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_CODE);
+    oc_w_str(w, m->code);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_request(oc_wbuf *w, uint16_t version, const oc_connection_request *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_REQUEST);
+    oc_w_str(w, m->code);
+    oc_w_str(w, m->client_name);
+    oc_w_str(w, m->redirect_uri);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_decide(oc_wbuf *w, uint16_t version, const oc_connection_decide *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_DECIDE);
+    oc_w_str(w, m->code);
+    oc_w_u8(w, m->approve ? 1u : 0u);
+    oc_w_u32(w, m->lifetime_days);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_decided(oc_wbuf *w, uint16_t version, const oc_connection_decided *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_DECIDED);
+    oc_w_u8(w, m->approved ? 1u : 0u);
+    oc_w_str(w, m->client_name);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_connections(oc_wbuf *w, uint16_t version, const oc_list_connections *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CONNECTIONS);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_connection_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_LIST);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_connection_entry *e = &m->entries[i];
+        oc_w_u64(w, e->connection_id);
+        oc_w_u64(w, e->user_id);
+        oc_w_str(w, e->user_name);
+        oc_w_str(w, e->client_name);
+        oc_w_u64(w, e->created_at_ms);
+        oc_w_u64(w, e->last_used_at_ms);
+        oc_w_u64(w, e->expires_at_ms);
+        oc_w_u32(w, e->lifetime_days);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_CONNECTION);
+    oc_w_u64(w, m->connection_id);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_BEGIN);
     oc_w_u64(w, m->attachment_id);
@@ -3534,6 +3604,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->parent_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
+    m->via = oc_r_str(p);
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -4007,6 +4078,7 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->also_channel = oc_r_u8(p);
     if (m->also_channel > 1) return OC_E_MALFORMED;
+    m->via = oc_r_str(p);
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {
@@ -4532,6 +4604,67 @@ oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_to
 oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m) {
     m->agent_id = oc_r_u64(p);
     m->token_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_code(oc_rbuf *p, oc_connection_code *m) {
+    m->code = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_request(oc_rbuf *p, oc_connection_request *m) {
+    m->code = oc_r_str(p);
+    m->client_name = oc_r_str(p);
+    m->redirect_uri = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_decide(oc_rbuf *p, oc_connection_decide *m) {
+    m->code = oc_r_str(p);
+    m->approve = oc_r_u8(p);
+    if (m->approve > 1) return OC_E_MALFORMED;
+    m->lifetime_days = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_decided(oc_rbuf *p, oc_connection_decided *m) {
+    m->approved = oc_r_u8(p);
+    if (m->approved > 1) return OC_E_MALFORMED;
+    m->client_name = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_connections(oc_rbuf *p, oc_list_connections *m) {
+    m->all = oc_r_u8(p);
+    if (m->all > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entry *entries, uint16_t cap,
+                                    uint16_t *out_count) {
+    *all = oc_r_u8(p);
+    if (*all > 1) return OC_E_MALFORMED;
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_connection_entry e;
+        e.connection_id = oc_r_u64(p);
+        e.user_id = oc_r_u64(p);
+        e.user_name = oc_r_str(p);
+        e.client_name = oc_r_str(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.last_used_at_ms = oc_r_u64(p);
+        e.expires_at_ms = oc_r_u64(p);
+        e.lifetime_days = oc_r_u32(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m) {
+    m->connection_id = oc_r_u64(p);
+    m->all = oc_r_u8(p);
+    if (m->all > 1) return OC_E_MALFORMED;
     return r_done(p);
 }
 

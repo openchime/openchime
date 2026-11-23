@@ -1887,6 +1887,41 @@ void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t toke
     if (token_id) agent_cmd(c, OC_CMD_REVOKE_AGENT_TOKEN, agent_id, token_id);
 }
 
+void oc_client_connection_code(oc_client *c, const char *code) {
+    if (!c || !code || !code[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CONNECTION_CODE);
+    if (!cmd) return;
+    cmd->body = strdup(code);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days) {
+    if (!c || !code || !code[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CONNECTION_DECIDE);
+    if (!cmd) return;
+    cmd->body = strdup(code);
+    cmd->op = (uint8_t)(approve ? 1 : 0);
+    cmd->message_id = lifetime_days;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_connections(oc_client *c, int everyone) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_CONNECTIONS);
+    if (!cmd) return;
+    cmd->op = (uint8_t)(everyone ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int everyone) {
+    if (!c || !connection_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_CONNECTION);
+    if (!cmd) return;
+    cmd->message_id = connection_id;
+    cmd->op = (uint8_t)(everyone ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
     if (!c || !attachment_id) return;
     if (rung != OC_PREVIEW_RUNG_INLINE_WIRE && rung != OC_PREVIEW_RUNG_EXPANDED_WIRE) {

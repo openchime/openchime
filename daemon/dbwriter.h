@@ -422,7 +422,37 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * mcp_pub and private ones when mcp_priv; both answered
         * OC_RES_MCP_MESSAGES, or that with err_code. MCP_AUDIT (write, fire and
         * forget): one row in family mcp_family. */
-       OC_JOB_MCP_CHANNELS = 265, OC_JOB_MCP_READ = 266, OC_JOB_MCP_SEARCH = 267, OC_JOB_MCP_AUDIT = 268 };
+       OC_JOB_MCP_CHANNELS = 265, OC_JOB_MCP_READ = 266, OC_JOB_MCP_SEARCH = 267, OC_JOB_MCP_AUDIT = 268,
+       /* A person's AI clients (docs/details/AUTH.md §8.13; SCHEMA.md 0091),
+        * every one a write. OAUTH_REGISTER: oa_name, oa_uris (one to a line),
+        * token_from the registering address; answered OC_RES_OAUTH_CLIENT with
+        * the minted oa_client_id. OAUTH_DOC_STORE: a fetched metadata document,
+        * oa_client_id its URL, oa_name, oa_uris; answered OC_RES_OAUTH_CLIENT.
+        * OAUTH_BEGIN: the checked authorize request (oa_client_id,
+        * oa_redirect, oa_challenge, oa_state, oa_resource), token_from;
+        * answered OC_RES_OAUTH_PAGE (pending: oa_name, oa_code, oa_request),
+        * OC_RES_OAUTH_NEED_FETCH (a document's URL unknown or older than a
+        * day), or OC_RES_OAUTH_ERR (oa_error: the page's sentence).
+        * OAUTH_POLL: oa_request, the page's handle; answered OC_RES_OAUTH_PAGE
+        * (pending, or oa_page OC_OAUTH_PAGE_EXPIRED) or OC_RES_OAUTH_REDIRECT
+        * (oa_redirect, oa_state, and oa_code the authorization code or
+        * oa_error "access_denied"). OAUTH_CODE_FIND: oa_code as the person
+        * typed it, user_id the person; answered OC_RES_OAUTH_APPROVAL (oa_name,
+        * oa_redirect). OAUTH_DECIDE: the same and oa_approve, oa_lifetime;
+        * answered OC_RES_OAUTH_DECIDED. OAUTH_EXCHANGE: oa_code, oa_verifier,
+        * oa_redirect, oa_client_id, oa_resource; OAUTH_REFRESH: oa_refresh,
+        * oa_client_id, oa_resource; both answered OC_RES_OAUTH_TOKENS
+        * (oa_access, oa_refresh) or OC_RES_OAUTH_ERR (oa_error, the OAuth
+        * code). OAUTH_LOOKUP: token, token_from; answered
+        * OC_RES_TOKEN_PRINCIPAL with oa_person set, or OC_RES_AGENT_ERR.
+        * OAUTH_LIST: user_id, oa_all for everyone's (an owner's or admin's);
+        * OAUTH_REVOKE: the same and oa_conn_id; both answered
+        * OC_RES_OAUTH_LIST. Refusals to a person are OC_RES_OAUTH_ERR with
+        * err_code. */
+       OC_JOB_OAUTH_REGISTER = 269, OC_JOB_OAUTH_DOC_STORE = 270, OC_JOB_OAUTH_BEGIN = 271,
+       OC_JOB_OAUTH_POLL = 272, OC_JOB_OAUTH_CODE_FIND = 273, OC_JOB_OAUTH_DECIDE = 274,
+       OC_JOB_OAUTH_EXCHANGE = 275, OC_JOB_OAUTH_REFRESH = 276, OC_JOB_OAUTH_LOOKUP = 277,
+       OC_JOB_OAUTH_LIST = 278, OC_JOB_OAUTH_REVOKE = 279 };
 
 /* At most this many tokens an agent holds (docs/details/MCP.md §3.1). */
 #define OC_AGENT_MAX_TOKENS 10
@@ -626,11 +656,22 @@ typedef struct oc_job {
     uint8_t        mcp_has_before, mcp_has_after, mcp_has_since, mcp_has_until;
     uint16_t       mcp_limit;
     uint8_t        mcp_pub, mcp_priv, mcp_has_cursor;
+    /* As a person through an AI client (AUTH.md §8.13), not an agent: DMs and
+     * group DMs are theirs to read too, never an encrypted one. */
+    uint8_t        mcp_person;
     double         mcp_rank;
     char          *mcp_query, *mcp_from;
     int            mcp_family;
     uint8_t        mcp_outcome;
     char          *mcp_action, *mcp_target, *mcp_detail;
+
+    /* A person's AI clients (OC_JOB_OAUTH_*). Strings heap. `via` on a SEND
+     * or SEND_REPLY: the client a post came through, stored on the message. */
+    char          *oa_client_id, *oa_name, *oa_uris, *oa_redirect, *oa_challenge, *oa_state, *oa_resource;
+    char          *oa_request, *oa_code, *oa_verifier, *oa_refresh, *via;
+    uint32_t       oa_lifetime;
+    uint8_t        oa_approve, oa_all;
+    uint64_t       oa_conn_id;
 
     /* Image previews (ARCH-137): PREVIEW_STORE's and PREVIEW_LOOKUP's
      * fields, with attachment_id. pv_keys and pv_mime are heap. */
@@ -1086,10 +1127,24 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The MCP surface: an agent's conversations (mcp_chans), and a page of
         * messages (mcp_rows, in id order, with mcp_more_older / mcp_more_newer,
         * and mcp_newest_kept when it was read backwards). */
-       OC_RES_MCP_CHANNELS = 154, OC_RES_MCP_MESSAGES = 155 };
+       OC_RES_MCP_CHANNELS = 154, OC_RES_MCP_MESSAGES = 155,
+       /* A person's AI clients (OC_JOB_OAUTH_*): what each job above answers. */
+       OC_RES_OAUTH_CLIENT = 156, OC_RES_OAUTH_PAGE = 157, OC_RES_OAUTH_REDIRECT = 158,
+       OC_RES_OAUTH_NEED_FETCH = 159, OC_RES_OAUTH_TOKENS = 160, OC_RES_OAUTH_ERR = 161,
+       OC_RES_OAUTH_APPROVAL = 162, OC_RES_OAUTH_DECIDED = 163, OC_RES_OAUTH_LIST = 164 };
+
+/* One AI-client connection as a list shows it: never a token. */
+typedef struct {
+    uint64_t id, user_id;
+    char    *user_name, *client_name;   /* heap */
+    uint64_t created_ms, last_used_ms, expires_ms;   /* expires 0: never */
+    uint32_t lifetime_days;
+} oc_conn_row;
 
 /* A conversation an agent may read, as the MCP surface names it. */
-typedef struct { uint64_t id; char *name; uint8_t is_public; } oc_mcp_chan;
+/* `is_dm`: a DM or group DM, its name the others' handles ("alice" or
+ * "alice,@bob"), shown with '@' where a channel's is shown with '#'. */
+typedef struct { uint64_t id; char *name; uint8_t is_public, is_dm; } oc_mcp_chan;
 /* A message as the MCP surface returns it; every string heap. */
 typedef struct {
     uint64_t id, channel_id, at_ms;
@@ -1377,6 +1432,8 @@ typedef struct {
     /* Folded away by the REQUESTING user, likewise private to them: the net
      * thread replays it as a COLLAPSED_UPDATED down this connection. */
     uint8_t  collapsed;
+    /* The AI client it was posted through (messages.via), heap, NULL for none. */
+    char    *via;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
     uint64_t call_id;      /* a call message's call (CALLS.md §1), 0 for none */
     uint64_t call_line;    /* SEARCH: a transcript line's id (its hit), 0 for a message */
@@ -1786,6 +1843,15 @@ typedef struct oc_dbres {
     oc_mcp_row             *mcp_rows;
     size_t                  n_mcp_rows;
     uint8_t                 mcp_more_older, mcp_more_newer, mcp_newest_kept;
+    /* OC_RES_OAUTH_* (heap strings), and `via` on SEND_OK / REPLY_OK. On
+     * OC_RES_TOKEN_PRINCIPAL, oa_person says the token is a person's access
+     * token: message_id its connection, oa_name its client. */
+    char                   *oa_client_id, *oa_name, *oa_uris, *oa_request, *oa_code, *oa_redirect, *oa_state;
+    char                   *oa_error, *oa_access, *oa_refresh, *via;
+    uint8_t                 oa_page, oa_person;
+    uint8_t                 oa_approve_echo;   /* DECIDED: approved; LIST: everyone's */
+    oc_conn_row            *oa_conns;
+    size_t                  n_oa_conns;
     /* OC_RES_PREVIEW_META and OC_RES_PREVIEW_STORED (ARCH-137). */
     char                   *pv_key, *pv_mime;
     uint64_t                pv_size;

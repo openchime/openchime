@@ -1971,6 +1971,84 @@ static const char MIGRATION_0090[] =
     "CREATE UNIQUE INDEX principal_tokens_hash ON principal_tokens(token_hash);"
     "CREATE INDEX principal_tokens_user ON principal_tokens(user_id);";
 
+static const char MIGRATION_0091[] =
+    /* A person's own AI clients (docs/details/AUTH.md §8.13, MCP.md §3.2): the
+     * daemon as the MCP endpoint's OAuth authorization server.
+     *
+     * `oauth_clients` holds a client that identified itself: registered
+     * (Dynamic Client Registration, `kind` 'registered', its `client_id` minted
+     * here) or a Client ID Metadata Document (`kind` 'document', its `client_id`
+     * the document's https URL, kept 24 hours from `fetched_at_ms`).
+     * `redirect_uris` is the declared URIs, one to a line.
+     *
+     * `oauth_approvals` holds one authorize request until it is collected: the
+     * page's own handle and the eight-letter code the person types, each as its
+     * SHA-256; the request's checked parameters; and, once the person acted in
+     * their app, who did, the lifetime chosen and the authorization code's
+     * SHA-256, single use. `status` 0 pending, 1 approved, 2 declined, 3 used.
+     *
+     * `mcp_connections` holds what an approval made: the person, the client and
+     * its name as approved, the lifetime chosen (`lifetime_days` 0: never ends)
+     * and its end, the current refresh token's SHA-256, and when it was last
+     * used and from where. Revoking sets `revoked_at_ms`; the row stays for the
+     * list and the audit. `mcp_access_tokens` holds each hour-long access
+     * token's SHA-256 against its connection.
+     *
+     * `messages.via` names the client a post came through, '' for any other. */
+    "CREATE TABLE oauth_clients ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  client_id     TEXT NOT NULL UNIQUE,"
+    "  kind          TEXT NOT NULL CHECK (kind IN ('registered','document')),"
+    "  name          TEXT NOT NULL,"
+    "  redirect_uris TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  created_from  TEXT NOT NULL DEFAULT '',"
+    "  fetched_at_ms INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE oauth_approvals ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  request_hash    BLOB NOT NULL UNIQUE,"
+    "  code_hash       BLOB NOT NULL UNIQUE,"
+    "  client_id       TEXT NOT NULL,"
+    "  client_name     TEXT NOT NULL,"
+    "  redirect_uri    TEXT NOT NULL,"
+    "  code_challenge  TEXT NOT NULL,"
+    "  state           TEXT NOT NULL,"
+    "  resource        TEXT NOT NULL,"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  expires_at_ms   INTEGER NOT NULL,"
+    "  created_from    TEXT NOT NULL DEFAULT '',"
+    "  status          INTEGER NOT NULL DEFAULT 0,"
+    "  approved_by     INTEGER REFERENCES users(id),"
+    "  lifetime_days   INTEGER NOT NULL DEFAULT 0,"
+    "  auth_code_hash  BLOB,"
+    "  auth_code_until INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE UNIQUE INDEX oauth_approvals_auth_code ON oauth_approvals(auth_code_hash) WHERE auth_code_hash IS NOT NULL;"
+    "CREATE TABLE mcp_connections ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  user_id         INTEGER NOT NULL REFERENCES users(id),"
+    "  client_id       TEXT NOT NULL,"
+    "  client_name     TEXT NOT NULL,"
+    "  resource        TEXT NOT NULL,"
+    "  lifetime_days   INTEGER NOT NULL DEFAULT 0,"
+    "  expires_at_ms   INTEGER NOT NULL DEFAULT 0,"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  last_used_at_ms INTEGER NOT NULL DEFAULT 0,"
+    "  last_used_from  TEXT NOT NULL DEFAULT '',"
+    "  refresh_hash    BLOB,"
+    "  revoked_at_ms   INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE UNIQUE INDEX mcp_connections_refresh ON mcp_connections(refresh_hash) WHERE refresh_hash IS NOT NULL;"
+    "CREATE INDEX mcp_connections_user ON mcp_connections(user_id);"
+    "CREATE TABLE mcp_access_tokens ("
+    "  token_hash    BLOB PRIMARY KEY,"
+    "  connection_id INTEGER NOT NULL REFERENCES mcp_connections(id),"
+    "  expires_at_ms INTEGER NOT NULL"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX mcp_access_tokens_connection ON mcp_access_tokens(connection_id);"
+    "ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT '';";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -2062,6 +2140,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 88, MIGRATION_0088 },
     { 89, MIGRATION_0089 },
     { 90, MIGRATION_0090 },
+    { 91, MIGRATION_0091 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

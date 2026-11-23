@@ -364,7 +364,7 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0}, 0, 0, 0, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -375,7 +375,7 @@ static void test_messaging_frames(void) {
     {
         /* A call's message names its call (CALLS.md §1). */
         oc_broadcast in = { 1002, 7, 42, 1751200500000ull, OC_MSG_KIND_CALL,
-                            oc_slice_str("alice started a call: standup"), 0, {{0}}, {0}, 0, 0, 55 };
+                            oc_slice_str("alice started a call: standup"), 0, {{0}}, {0}, 0, 0, 55, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -432,7 +432,7 @@ static void test_broadcast_stored_frames(void) {
     for (uint8_t stored = 0; stored <= 1; stored++) {
         {
             oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("@channel standup"),
-                                0, {{0}}, {0}, stored, 0, 0 };
+                                0, {{0}}, {0}, stored, 0, 0, {0} };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -441,7 +441,7 @@ static void test_broadcast_stored_frames(void) {
         }
         {   /* The tail behind it: a name, so a zero attachment count first. */
             oc_broadcast in = { 1002, 7, 42, 1751200500000ull, 0, oc_slice_str("@here"),
-                                0, {{0}}, oc_slice_str("CI"), stored, 0, 0 };
+                                0, {{0}}, oc_slice_str("CI"), stored, 0, 0, {0} };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -449,14 +449,14 @@ static void test_broadcast_stored_frames(void) {
             CHECK(slice_eq_str(out.author_name, "CI"));
         }
         {
-            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored, 0, 0 };
+            oc_broadcast in = { 1003, 7, 42, 1000, 0, oc_slice_str("@everyone back"), 0, {{0}}, {0}, stored, 0, 0, {0} };
             ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
             CHECK(out.broadcast_stored == stored && slice_eq_str(out.body, "@everyone back"));
         }
         {   /* Not tied to the body: an edit may have taken the broadcast out. */
-            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored, 0, 0 };
+            oc_broadcast in = { 1005, 7, 42, 1000, 0, oc_slice_str("standup moved"), 0, {{0}}, {0}, stored, 0, 0, {0} };
             ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
             oc_broadcast out;
             CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -479,7 +479,7 @@ static void test_broadcast_stored_frames(void) {
     /* A byte that is not a flag. BROADCAST's sits after four u64s and `kind`;
      * THREAD_REPLY's after five u64s, `reply_count` and `participant`. */
     {
-        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1, 0, 0 };
+        oc_broadcast in = { 1, 7, 42, 1, 0, oc_slice_str("@here"), 0, {{0}}, {0}, 1, 0, 0, {0} };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
         CHECK(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
         CHECK(frame[OC_HEADER_SIZE + 33] == 1);
@@ -1589,7 +1589,7 @@ static void test_admin_frames(void) {
               slice_eq_str(out.text, "echo hi\n"));
     }
     {   /* ...and carried on a message with them, beside an ordinary file. */
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str(""), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str(""), 0, {{0}}, {0}, 0, 0, 0, {0} };
         in.n_attach = 2;
         in.attach[0].id = 81; in.attach[0].filename = oc_slice_str("deploy.sh.txt");
         in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 8;
@@ -2412,7 +2412,7 @@ static void test_group_frames(void) {
         CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
     }
     {
-        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0}, 0, 0, 0, {0} };
         ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
@@ -2620,7 +2620,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0}, 0, 0, 0, {0} };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -2635,7 +2635,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0}, 0, 0, 0, {0} };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -2645,7 +2645,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0, 0, 0 };
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0}, 0, 0, 0, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -3090,6 +3090,84 @@ static void test_agent_frames(void) {
         CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK && n == 2);
         CHECK(out[0].flags == OC_USER_AGENT && out[1].flags == OC_USER_SYSTEM);
         CHECK((OC_USER_AGENT & OC_USER_SYSTEM) == 0);
+    }
+}
+
+/* A person's AI clients (AUTH.md §8.13): every frame through and back, and
+ * `via` on BROADCAST and THREAD_REPLY at version 51. */
+static void test_connection_frames(void) {
+    static uint8_t frame[4096];
+    CHECK(OC_PROTOCOL_VERSION == 51);
+    {
+        oc_connection_code in = { oc_slice_str("bcdf-ghjk") };
+        ROUNDTRIP(oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_CODE, h, p);
+        oc_connection_code out;
+        CHECK(oc_decode_connection_code(&p, &out) == OC_OK && slice_eq_str(out.code, "bcdf-ghjk"));
+    }
+    {
+        oc_connection_request in = { oc_slice_str("BCDFGHJK"), oc_slice_str("Desk AI"), oc_slice_str("http://127.0.0.1:5000/cb") };
+        ROUNDTRIP(oc_encode_connection_request(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_REQUEST, h, p);
+        oc_connection_request out;
+        CHECK(oc_decode_connection_request(&p, &out) == OC_OK && slice_eq_str(out.client_name, "Desk AI") &&
+              slice_eq_str(out.redirect_uri, "http://127.0.0.1:5000/cb") && slice_eq_str(out.code, "BCDFGHJK"));
+    }
+    {
+        oc_connection_decide in = { oc_slice_str("BCDFGHJK"), 1, 90 };
+        ROUNDTRIP(oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_DECIDE, h, p);
+        oc_connection_decide out;
+        CHECK(oc_decode_connection_decide(&p, &out) == OC_OK && out.approve == 1 && out.lifetime_days == 90);
+    }
+    {
+        oc_connection_decided in = { 0, oc_slice_str("Desk AI") };
+        ROUNDTRIP(oc_encode_connection_decided(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_DECIDED, h, p);
+        oc_connection_decided out;
+        CHECK(oc_decode_connection_decided(&p, &out) == OC_OK && out.approved == 0 && slice_eq_str(out.client_name, "Desk AI"));
+    }
+    {
+        oc_list_connections in = { 1 };
+        ROUNDTRIP(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_CONNECTIONS, h, p);
+        oc_list_connections out;
+        CHECK(oc_decode_list_connections(&p, &out) == OC_OK && out.all == 1);
+    }
+    {
+        oc_connection_entry ents[2] = {
+            { 11, 5, oc_slice_str("Ann"), oc_slice_str("Desk AI"), 100, 200, 0, 0 },
+            { 12, 6, oc_slice_str("Bo"), oc_slice_str("Notes"), 300, 0, 400, 30 },
+        };
+        oc_connection_list in = { 1, 2, ents };
+        ROUNDTRIP(oc_encode_connection_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_LIST, h, p);
+        oc_connection_entry out[1];
+        uint16_t n = 0;
+        uint8_t all = 0;
+        CHECK(oc_decode_connection_list(&p, &all, out, 1, &n) == OC_OK && all == 1 && n == 2);   /* past the cap: read, dropped */
+        CHECK(out[0].connection_id == 11 && out[0].user_id == 5 && out[0].last_used_at_ms == 200 && out[0].expires_at_ms == 0);
+    }
+    {
+        oc_revoke_connection in = { 12, 1 };
+        ROUNDTRIP(oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REVOKE_CONNECTION, h, p);
+        oc_revoke_connection out;
+        CHECK(oc_decode_revoke_connection(&p, &out) == OC_OK && out.connection_id == 12 && out.all == 1);
+    }
+    {
+        oc_connection_decide in = { oc_slice_str("X"), 1, 30 };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        frame[OC_HEADER_SIZE + 3] = 2;   /* `approve` is a flag */
+        oc_header h; oc_rbuf p; oc_connection_decide out;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK && oc_decode_connection_decide(&p, &out) == OC_E_MALFORMED);
+    }
+    {
+        oc_broadcast in = { 9, 7, 42, 1000, 0, oc_slice_str("drafted for you"), 0, {{0}}, {0}, 0, 0, 0, oc_slice_str("Desk AI") };
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK && slice_eq_str(out.via, "Desk AI") && slice_eq_str(out.body, "drafted for you"));
+    }
+    {
+        oc_thread_reply in = { .message_id = 10, .channel_id = 7, .parent_id = 9, .author_id = 42, .server_time = 1,
+                               .reply_count = 1, .body = oc_slice_str("ok"), .via = oc_slice_str("Desk AI") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK && slice_eq_str(out.via, "Desk AI") && slice_eq_str(out.body, "ok"));
     }
 }
 
@@ -3642,6 +3720,7 @@ int run_protocol_tests(void) {
     test_tts_frames();
     test_scope_catalog();
     test_agent_frames();
+    test_connection_frames();
     test_preview_frames();
     test_call_frames();
     test_block_frames();

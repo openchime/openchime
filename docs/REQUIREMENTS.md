@@ -1750,11 +1750,16 @@ where one exists.
   exactly their access** — the channels and DMs they can read and post in, no
   more — for as long as the connection stands. The client has signed in through
   **MCP's OAuth authorization flow with the daemon as the authorization
-  server**, the person approving it on the daemon's own pages after signing in
-  there as they normally do; a person has been able to see and end their
-  connections, and an ended connection, or a removed person's, has been refused
-  on the next request. Encrypted DMs (REQ-314) have stayed unreadable through
-  it, since the daemon cannot read them.
+  server**, the person approving it **in their signed-in OpenChime app** by the
+  code the daemon's authorize page showed, after seeing the client's name and
+  where it returns, and **choosing how long it lasts**: never ending, or 30, 90
+  or 365 days. A person has been able to see and revoke their own connections,
+  and an **owner or admin to see and revoke everyone's**; a revoked connection,
+  one past its lifetime, or a removed person's has been refused on the next
+  request. An operator has been able to turn people's connections off
+  (`OPENCHIME_MCP_CONNECTIONS`, shown to clients read-only), refusing every one
+  until it is on again, agents unaffected. Encrypted DMs (REQ-314) have stayed
+  unreadable through it, since the daemon cannot read them.
 - **REQ-324.** A **write through the MCP surface has been visibly attributed**: an
   agent's post has been authored by the agent and shown as an agent's, and a
   post through a person's connection has been authored by the person and shown

@@ -20,6 +20,7 @@
 #include "netloop.h"
 #include "config.h"
 #include "dbwriter.h"
+#include "auth.h"       /* oc_sha256: an approval code stored as the daemon stores it */
 #include "sum_worker.h"   /* the daemon summarizes with a stub model here */
 #include "protocol.h"
 #include "tls.h"
@@ -6722,7 +6723,7 @@ static void test_browser_signin(void) {
  * it unpaired; an ACTION for something not held stands on its own. */
 static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0, 0 };
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0}, 0, 0, 0, {0} };
     if (with_file) {
         b.n_attach = 1;
         b.attach[0].id = 9;
@@ -7865,6 +7866,49 @@ int run_client_core_tests(void) {
             const oc_model *am = oc_client_model(a);
             CHECK(am->n_atokens == 1 && strcmp(am->atokens[0].name, "first") == 0 && am->atokens[0].id == tid);
             oc_client_remove_agent(a, agent);
+        }
+
+        /* A person's AI clients (AUTH.md §8.13), through the real daemon: an
+         * authorize request waiting on a code, as the page leaves it; dana
+         * enters it as typed and sees the client and its return; she approves
+         * for 90 days. Then her list holds a connection made for her, the
+         * owner's view everyone's, and revoking empties hers. */
+        {
+            uint8_t h[32];
+            CHECK(oc_sha256("BCDFGHJK", 8, h) == 0);
+            char hex[65], q[900];
+            for (int k = 0; k < 32; k++) snprintf(hex + 2 * k, 3, "%02X", h[k]);
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open_v2(tpath("itest_core.db"), &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            snprintf(q, sizeof q,
+                     "INSERT INTO oauth_approvals(request_hash,code_hash,client_id,client_name,redirect_uri,code_challenge,"
+                     "state,resource,created_at_ms,expires_at_ms) VALUES(x'01',x'%s','occl_t','Desk AI','http://127.0.0.1:9/cb',"
+                     "'c','s','https://x/mcp',1,%lld);", hex, (long long)time(NULL) * 1000 + 600000);
+            CHECK(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+            oc_client_connection_code(a, "bcdf-ghjk");
+            CHECK(WAIT_FOR(a, m->conn_req_open));
+            const oc_model *am = oc_client_model(a);
+            CHECK(strcmp(am->conn_req_client, "Desk AI") == 0 && strcmp(am->conn_req_return, "http://127.0.0.1:9/cb") == 0);   /* contract: the request's own */
+            oc_client_connection_decide(a, am->conn_req_code, 1, 90);
+            CHECK(WAIT_FOR(a, m->conn_decided == 1));
+            CHECK(!am->conn_req_open && strcmp(am->conn_decided_client, "Desk AI") == 0);   /* contract: the request's own */
+            /* Used: entered again, it is refused. */
+            oc_client_connection_code(a, "BCDF-GHJK");
+            CHECK(WAIT_FOR(a, m->last_error_code == OC_ERR_UNKNOWN_CODE));
+            snprintf(q, sizeof q,
+                     "INSERT INTO mcp_connections(user_id,client_id,client_name,resource,lifetime_days,expires_at_ms,created_at_ms)"
+                     " VALUES(%llu,'occl_t','Desk AI','https://x/mcp',90,0,5);", (unsigned long long)am->user_id);
+            CHECK(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(db);
+            oc_client_list_connections(a, 0);
+            CHECK(WAIT_FOR(a, m->n_my_conns == 1));
+            CHECK(am->my_conns[0].user_id == am->user_id && am->my_conns[0].lifetime_days == 90 &&
+                  strcmp(am->my_conns[0].client_name, "Desk AI") == 0);   /* contract: the stored name */
+            oc_client_list_connections(a, 1);
+            CHECK(WAIT_FOR(a, m->all_conns_known && m->n_all_conns == 1));
+            oc_client_revoke_connection(a, am->my_conns[0].id, 0);
+            CHECK(WAIT_FOR(a, m->n_my_conns == 0));
         }
 
         /* Image previews (ARCH-137): dana posts a large JPEG and a small PNG;

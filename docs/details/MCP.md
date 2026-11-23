@@ -7,8 +7,8 @@ the audit (§8–§11); the decision and what was rejected are ARCH-120.
 
 Built: the endpoint for agents (`daemon/mcp.c` reads and writes the JSON,
 `daemon/netloop.c` serves `/mcp`, `daemon/dbwriter.c` reads, posts and audits).
-A person's own AI client (§3.2) is not built yet: until it is, every token the
-endpoint accepts is an agent's.
+A person's own AI client (§3.2) too: `daemon/oauth.c` and the authorization
+server's routes in `daemon/netloop.c`, designed in AUTH.md §8.13.
 
 Nothing here is a setting's name, a table or a frame. Those are written into
 CONFIG.md, SCHEMA.md and PROTOCOL.md with the code that has them.
@@ -139,21 +139,17 @@ and DMs they can read and post in, no more. Nothing it does is possible that
 the person could not do in a client.
 
 It signs in with **MCP's OAuth authorization flow, with the daemon as the
-authorization server**. In outline: the `401` challenge names the daemon's
-protected-resource metadata; the client finds the daemon's authorization
-server metadata from it, identifies itself, and opens the person's browser at
-the daemon's authorize page with PKCE; the person signs in there as they
-always do (ARCH-59, AUTH.md §8.10, or through the workspace's identity source)
-and approves the client by name; the client redeems the code for tokens bound
-to this workspace's `/mcp`. The daemon stores the tokens hashed, as it does
-sessions, and a person sees their connections and ends any of them; removing a
-person ends theirs. An ended connection's next request is `401`.
-
-The authorization server — its metadata, client identification, the approval
-page, token lifetimes and refresh, and the connection list — is its own change
-and its own document. This one fixes only what it must: the daemon is the
-authorization server, the principal is the person, and their access is the
-whole of the client's.
+authorization server**, designed in **AUTH.md §8.13**. In outline: the `401`
+challenge names the daemon's protected-resource metadata; the client finds the
+daemon's authorization server metadata from it, identifies itself, and opens
+the person's browser at the daemon's authorize page with PKCE; that page signs
+nobody in: it names the client and shows a code, which the person enters in
+their signed-in OpenChime app, approving the client by name with a lifetime;
+the client redeems the code for tokens bound to this workspace's `/mcp`. The
+daemon stores the tokens hashed, as it does sessions, and a person sees their
+connections and ends any of them, as an owner or admin may anyone's; removing
+a person ends theirs. An ended connection's next request is `401`. Its posts
+carry the client's name (`via`), shown beside the person's.
 
 Encrypted DMs (REQ-314) are not readable through a connection: the daemon
 cannot read them, and they are left out of everything §4 returns.

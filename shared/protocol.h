@@ -263,7 +263,7 @@
  * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
  * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
  * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
-#define OC_PROTOCOL_VERSION 50u
+#define OC_PROTOCOL_VERSION 51u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -724,6 +724,17 @@ typedef enum {
     OC_MSG_LIST_AGENT_TOKENS    = 0x014A, /* C->S, an agent's tokens */
     OC_MSG_AGENT_TOKEN_LIST     = 0x014B, /* S->C, the list: never a token */
     OC_MSG_REVOKE_AGENT_TOKEN   = 0x014C, /* C->S, revoke one token */
+    /* A person's own AI clients (docs/details/AUTH.md §8.13): the code an
+     * authorize page shows, looked up and approved or declined in the app, and
+     * the connections it made, listed and revoked -- one's own, or everyone's
+     * for an owner or admin. Never a token. */
+    OC_MSG_CONNECTION_CODE      = 0x014D, /* C->S, the code a person typed: what is asking */
+    OC_MSG_CONNECTION_REQUEST   = 0x014E, /* S->C, the client and where it returns */
+    OC_MSG_CONNECTION_DECIDE    = 0x014F, /* C->S, approve (with a lifetime) or decline */
+    OC_MSG_CONNECTION_DECIDED   = 0x0150, /* S->C, done */
+    OC_MSG_LIST_CONNECTIONS     = 0x0151, /* C->S, one's own, or everyone's */
+    OC_MSG_CONNECTION_LIST      = 0x0152, /* S->C, the list */
+    OC_MSG_REVOKE_CONNECTION    = 0x0153, /* C->S, revoke one; answered with the list */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -851,6 +862,10 @@ typedef enum {
     OC_ERR_PREVIEW_RUNG        = 3078, /* PREVIEW_BEGIN named a rung that does not exist (ARCH-137) */
     OC_ERR_UNKNOWN_SCOPE       = 3079, /* a token minted with a scope outside the catalog (docs/plans/APPS.md §4) */
     OC_ERR_TOO_MANY_TOKENS     = 3080, /* the agent already holds the most tokens it may (docs/details/MCP.md §3.1) */
+    OC_ERR_UNKNOWN_CODE        = 3081, /* no AI client is waiting on that approval code: unknown, expired or already used (AUTH.md §8.13) */
+    OC_ERR_UNKNOWN_CONNECTION  = 3082, /* no such AI-client connection, or not the caller's to revoke (AUTH.md §8.13) */
+    OC_ERR_BAD_LIFETIME        = 3083, /* a connection's lifetime other than never, 30, 90 or 365 days (AUTH.md §8.13) */
+    OC_ERR_CONNECTIONS_OFF     = 3084, /* the workspace does not let people connect AI clients (OPENCHIME_MCP_CONNECTIONS) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -1236,14 +1251,17 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
  * (REQ-062), 0 for a message that is not a reply; on the wire it follows
  * `broadcast_stored`, in the fixed part. `call_id` is the call a call message
  * is about (kind OC_MSG_KIND_CALL, CALLS.md §1), 0 for any other message and
- * for a missed-call line from before calls were kept; it follows `parent_id`. */
+ * for a missed-call line from before calls were kept; it follows `parent_id`.
+ * `via` names the AI client a person posted through (AUTH.md §8.13), empty for
+ * any other message; it follows `call_id`, ahead of the body (version 51). */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name;   /* override name (webhooks); empty = use author_id */
                  uint8_t broadcast_stored;
                  uint64_t parent_id;
-                 uint64_t call_id; } oc_broadcast;
+                 uint64_t call_id;
+                 oc_slice via; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1443,7 +1461,11 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t paren
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  uint8_t broadcast_stored;
-                 uint8_t also_channel; } oc_thread_reply;
+                 uint8_t also_channel;
+                 /* The AI client the reply was posted through (AUTH.md §8.13),
+                  * empty for none: after `also_channel`, ahead of the body
+                  * (version 51). */
+                 oc_slice via; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
@@ -2148,6 +2170,20 @@ typedef struct { uint64_t token_id; oc_slice name; oc_slice scopes; uint64_t cre
 typedef struct { uint64_t agent_id; uint16_t count; const oc_agent_token_entry *entries; } oc_agent_token_list;
 typedef struct { uint64_t agent_id; uint64_t token_id; } oc_revoke_agent_token;
 
+/* A person's AI clients (AUTH.md §8.13). `code` is the eight letters as typed
+ * (either case, a dash anywhere); `lifetime_days` 0 (never), 30, 90 or 365;
+ * `all` 1 asks for, or revokes from, everyone's (an owner or admin). */
+#define OC_CONNECTION_LIST_MAX 500
+typedef struct { oc_slice code; } oc_connection_code;
+typedef struct { oc_slice code; oc_slice client_name; oc_slice redirect_uri; } oc_connection_request;
+typedef struct { oc_slice code; uint8_t approve; uint32_t lifetime_days; } oc_connection_decide;
+typedef struct { uint8_t approved; oc_slice client_name; } oc_connection_decided;
+typedef struct { uint8_t all; } oc_list_connections;
+typedef struct { uint64_t connection_id; uint64_t user_id; oc_slice user_name; oc_slice client_name;
+                 uint64_t created_at_ms; uint64_t last_used_at_ms; uint64_t expires_at_ms; uint32_t lifetime_days; } oc_connection_entry;
+typedef struct { uint8_t all; uint16_t count; const oc_connection_entry *entries; } oc_connection_list;
+typedef struct { uint64_t connection_id; uint8_t all; } oc_revoke_connection;
+
 /* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
  * little-endian PCM, at most max_segment_ms long. */
 #define OC_STT_RATE        16000u
@@ -2629,6 +2665,13 @@ oc_result oc_encode_mint_agent_token(oc_wbuf *w, uint16_t version, const oc_mint
 oc_result oc_encode_list_agent_tokens(oc_wbuf *w, uint16_t version, const oc_list_agent_tokens *m);
 oc_result oc_encode_agent_token_list(oc_wbuf *w, uint16_t version, const oc_agent_token_list *m);
 oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_revoke_agent_token *m);
+oc_result oc_encode_connection_code(oc_wbuf *w, uint16_t version, const oc_connection_code *m);
+oc_result oc_encode_connection_request(oc_wbuf *w, uint16_t version, const oc_connection_request *m);
+oc_result oc_encode_connection_decide(oc_wbuf *w, uint16_t version, const oc_connection_decide *m);
+oc_result oc_encode_connection_decided(oc_wbuf *w, uint16_t version, const oc_connection_decided *m);
+oc_result oc_encode_list_connections(oc_wbuf *w, uint16_t version, const oc_list_connections *m);
+oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_connection_list *m);
+oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m);
 oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
 oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
 oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
@@ -2888,6 +2931,15 @@ oc_result oc_decode_list_agent_tokens(oc_rbuf *p, oc_list_agent_tokens *m);
 oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_token_entry *entries, uint16_t cap,
                                      uint16_t *out_count);
 oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m);
+oc_result oc_decode_connection_code(oc_rbuf *p, oc_connection_code *m);
+oc_result oc_decode_connection_request(oc_rbuf *p, oc_connection_request *m);
+oc_result oc_decode_connection_decide(oc_rbuf *p, oc_connection_decide *m);
+oc_result oc_decode_connection_decided(oc_rbuf *p, oc_connection_decided *m);
+oc_result oc_decode_list_connections(oc_rbuf *p, oc_list_connections *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entry *entries, uint16_t cap,
+                                    uint16_t *out_count);
+oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
 oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
 oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
 oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);

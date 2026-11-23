@@ -5907,6 +5907,375 @@ static void test_mcp_wire(void) {
     db_unlink("itest_mcp.db");
 }
 
+/* A person's AI client over the wire (AUTH.md §8.13): the metadata documents
+ * and /mcp's challenge; a registration and a metadata document served from a
+ * loopback server; the authorize page, the approval in the app by its code,
+ * the redirect, the code exchanged once; /mcp as the person -- their DM read,
+ * an encrypted DM not listed, a post carrying "via" to another member; refresh
+ * rotating; an expired token, a connection past its lifetime, a revoked one and
+ * a removed person refused; the lists, one's own and an owner's; and the
+ * setting off and on again. */
+#define OA_CH  "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"   /* RFC 7636 appendix B */
+#define OA_VER "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+#define OA_CB  "http%3A%2F%2F127.0.0.1%3A4000%2Fcb"
+#define OA_RES "https%3A%2F%2Fx%2Fmcp"
+
+/* One HTTP request to the daemon (Host: x): its status, the answer in `out`. */
+static int oa_http(int port, const uint8_t *pin, const char *verb, const char *path, const char *ctype, const char *body,
+                   char *out, size_t cap) {
+    client h;
+    if (http_client_open(&h, port, pin) != 0) return -1;
+    char req[4096], ct[96] = "";
+    if (ctype) snprintf(ct, sizeof ct, "Content-Type: %s\r\n", ctype);
+    int rn = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: x\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                      verb, path, ct, body ? strlen(body) : 0, body ? body : "");
+    int st = -1;
+    out[0] = '\0';
+    if (rn > 0 && (size_t)rn < sizeof req && write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0) {
+        http_read_response(&h, out, cap);
+        if (strncmp(out, "HTTP/1.1 ", 9) == 0) st = atoi(out + 9);
+    }
+    client_close(&h);
+    return st;
+}
+
+/* The value after `key` in `s`, up to any of `stop`. */
+static void oa_take(const char *s, const char *key, const char *stop, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *p = s ? strstr(s, key) : NULL;
+    if (!p) return;
+    p += strlen(key);
+    size_t n = strcspn(p, stop);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+static void oa_pct(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~') out[o++] = (char)*p;
+        else o += (size_t)snprintf(out + o, cap - o, "%%%02X", *p);
+    }
+    out[o] = '\0';
+}
+
+/* The authorize page for `client_id`: 200 with its handle and code, or the status. */
+static int oa_authorize(int port, const uint8_t *pin, const char *client_id, char *request, char *code, char *page, size_t cap) {
+    char id[600], path[1200];
+    oa_pct(client_id, id, sizeof id);
+    snprintf(path, sizeof path, "/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s"
+             "&code_challenge=" OA_CH "&code_challenge_method=S256&state=st%%2042&resource=%s", id, OA_CB, OA_RES);
+    int st = oa_http(port, pin, "GET", path, NULL, NULL, page, cap);
+    oa_take(page, "request=", "&\"", request, 64);
+    oa_take(page, ";code=", "&\"", code, 16);
+    return st;
+}
+
+/* The person signed in on `pc` approves `code` for `days`. 0, or the ERROR's code. */
+static int oa_approve(client *pc, const char *code, int approve, uint32_t days) {
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_connection_code cc = { oc_slice_str(code) };
+    if (oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &cc) != OC_OK || send_frame(pc, buf, w.len) != 0) return -1;
+    for (int i = 0; i < 64; i++) {
+        if (read_frame_raw(pc, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_ERROR) { oc_error e; return oc_decode_error(&p, &e) == OC_OK ? e.code : -1; }
+        if (hdr.msg_type == OC_MSG_CONNECTION_REQUEST) break;
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_connection_decide cd = { oc_slice_str(code), (uint8_t)approve, days };
+    if (oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &cd) != OC_OK || send_frame(pc, buf, w.len) != 0) return -1;
+    return read_type(pc, OC_MSG_CONNECTION_DECIDED, &hdr, &p);
+}
+
+/* Exchange an authorization code: the status, the tokens into `access`/`refresh`. */
+static int oa_token(int port, const uint8_t *pin, const char *form, char *access, char *refresh) {
+    char resp[4096];
+    int st = oa_http(port, pin, "POST", "/oauth/token", "application/x-www-form-urlencoded", form, resp, sizeof resp);
+    if (access) oa_take(resp, "\"access_token\":\"", "\"", access, 64);
+    if (refresh) oa_take(resp, "\"refresh_token\":\"", "\"", refresh, 64);
+    return st;
+}
+
+/* A whole connection, for the person on `pc`: 0 with its tokens. */
+static int oa_connect(int port, const uint8_t *pin, client *pc, const char *client_id, uint32_t days, char *access, char *refresh) {
+    char request[64], code[16], page[8192], path[300], resp[4096], loc[600], authcode[64], form[1200], id[600];
+    if (oa_authorize(port, pin, client_id, request, code, page, sizeof page) != 200 || !code[0]) return -1;
+    if (oa_approve(pc, code, 1, days) != 0) return -1;
+    snprintf(path, sizeof path, "/oauth/authorize?request=%s&code=%s", request, code);
+    if (oa_http(port, pin, "GET", path, NULL, NULL, resp, sizeof resp) != 302) return -1;
+    oa_take(resp, "Location: ", "\r", loc, sizeof loc);
+    oa_take(loc, "code=", "&", authcode, sizeof authcode);
+    oa_pct(client_id, id, sizeof id);
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, id, OA_RES);
+    return oa_token(port, pin, form, access, refresh) == 200 && access[0] && refresh[0] ? 0 : -1;
+}
+
+/* A loopback server for one client metadata document. */
+typedef struct { int lfd, port, stop; char doc[600]; } oa_docsrv;
+
+static void *oa_doc_thread(void *arg) {
+    oa_docsrv *d = arg;
+    while (!__atomic_load_n(&d->stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd pf = { d->lfd, POLLIN, 0 };
+        if (poll(&pf, 1, 100) <= 0) continue;
+        int fd = accept(d->lfd, NULL, NULL);
+        if (fd < 0) continue;
+        char req[2048];
+        ssize_t r = read(fd, req, sizeof req - 1);
+        (void)r;
+        idp_reply(fd, 200, "application/json", d->doc);
+        close(fd);
+    }
+    return NULL;
+}
+
+static void test_oauth_wire(void) {
+    setenv("OPENCHIME_MCP", "on", 1);
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    char cfgerr[256];
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    oc_netloop_set_oauth_test_documents(1);
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_oauth.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_oauth.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);
+    CHECK(dbw != NULL);
+    if (!dbw) { unsetenv("OPENCHIME_MCP"); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "bob", "pw-bob", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "carol", "pw-carol", OC_ROLE_MEMBER, 2048) != 0);
+    struct loop_arg arg;
+    pthread_t th;
+    int port = start_loop(&arg, &th, &srv, dbw, 0);
+    CHECK(port != 0);
+    static char resp[65536];
+    char access[64] = "", refresh[64] = "";
+
+    /* The documents, and the challenge that points to them. */
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-protected-resource", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"resource\":\"https://x/mcp\"") && strstr(resp, "\"authorization_servers\":[\"https://x\"]"));   /* contract: RFC 9728 */
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-protected-resource/mcp", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-authorization-server", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"issuer\":\"https://x\"") && strstr(resp, "\"code_challenge_methods_supported\":[\"S256\"]") &&
+          strstr(resp, "\"token_endpoint\":\"https://x/oauth/token\"") &&
+          strstr(resp, "\"client_id_metadata_document_supported\":true"));   /* contract: RFC 8414 and the MCP revision */
+    CHECK(mcp_call(port, pin, "POST", NULL, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(strstr(resp, "WWW-Authenticate: Bearer resource_metadata=\"https://x/.well-known/oauth-protected-resource\"") != NULL);   /* contract: RFC 9728 §5.1 */
+
+    /* A registration. */
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"client_name\":\"Desk AI\",\"redirect_uris\":[\"http://evil.example/cb\"]}", resp, sizeof resp) == 400);
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"client_name\":\"Desk AI\",\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"],\"token_endpoint_auth_method\":\"none\"}",
+                  resp, sizeof resp) == 201);
+    char client_id[64] = "";
+    oa_take(resp, "\"client_id\":\"", "\"", client_id, sizeof client_id);
+    CHECK(strncmp(client_id, "occl_", 5) == 0);
+
+    /* The page refuses what is wrong in place, never redirecting. */
+    CHECK(oa_http(port, pin, "GET", "/oauth/authorize?response_type=code&client_id=occl_x&redirect_uri=" OA_CB
+                  "&code_challenge=" OA_CH "&code_challenge_method=S256&state=s&resource=https%3A%2F%2Felsewhere%2Fmcp",
+                  NULL, NULL, resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "Location:") == NULL && strstr(resp, "<script") == NULL);
+    CHECK(oa_http(port, pin, "GET", "/oauth/authorize?response_type=code&client_id=occl_nobody&redirect_uri=" OA_CB
+                  "&code_challenge=" OA_CH "&code_challenge_method=S256&state=s&resource=" OA_RES,
+                  NULL, NULL, resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "Location:") == NULL);
+
+    /* bob, alice and carol signed in; alice and bob share a DM; bob and carol an encrypted one. */
+    client a, b, cc;
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&cc, port, pin) == 0 && do_handshake(&cc) == 0 && do_auth(&cc, "carol", "pw-carol", &uc) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = dm; memset(s.idem, 0x61, OC_IDEM_SIZE); s.body = oc_slice_str("hi bob, from alice");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(tpath("itest_oauth.db"), &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char q[400];
+    snprintf(q, sizeof q, "INSERT INTO channels(id,kind,is_public,created_at_ms,dm_key,e2e) VALUES(9301,'dm',0,1,'e2e-test',1);"
+             "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9301,%llu,1),(9301,%llu,1);",
+             (unsigned long long)ub, (unsigned long long)uc);
+    CHECK(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+
+    /* The flow: the page names the client and a code; bob approves it in the
+     * app; the page sends him back with a code and the state; it is exchanged once. */
+    char request[64], code[16], page[8192];
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 200);
+    CHECK(strstr(page, "Desk AI") && strlen(code) == 8 && strncmp(request, "ocrq_", 5) == 0);
+    CHECK(strstr(page, "http-equiv=\"refresh\" content=\"3;") && !strstr(page, "<script") && !strstr(page, "<form"));   /* contract: HTML's refresh, no script, no form */
+    snprintf(q, sizeof q, "/oauth/authorize?request=%s&code=%s", request, code);
+    CHECK(oa_http(port, pin, "GET", q, NULL, NULL, resp, sizeof resp) == 200);   /* still waiting */
+    CHECK(strstr(resp, "Desk AI") != NULL);
+    CHECK(oa_approve(&b, "BBBB-BBBB", 1, 30) == OC_ERR_UNKNOWN_CODE);
+    CHECK(oa_approve(&b, code, 1, 30) == 0);
+    CHECK(oa_http(port, pin, "GET", q, NULL, NULL, resp, sizeof resp) == 302);
+    char loc[600], authcode[64];
+    oa_take(resp, "Location: ", "\r", loc, sizeof loc);
+    oa_take(loc, "code=", "&", authcode, sizeof authcode);
+    CHECK(strncmp(loc, "http://127.0.0.1:4000/cb?code=ocac_", 35) == 0 && strstr(loc, "&state=st%2042") &&
+          strstr(loc, "&iss=https%3A%2F%2Fx"));   /* contract: RFC 6749 §4.1.2, RFC 9207 */
+    char form[1200];
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "x&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, client_id, OA_RES);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);                          /* the wrong verifier spends it */
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, client_id, OA_RES);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);
+    CHECK(oa_connect(port, pin, &b, client_id, 30, access, refresh) == 0);
+    CHECK(strncmp(access, "ocpa_", 5) == 0 && strncmp(refresh, "ocpr_", 5) == 0);   /* contract: the prefixes */
+
+    /* As bob: his channels and his DM by the other's handle, never the encrypted DM. */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"#general\"") && strstr(resp, "\"@alice\"") && !strstr(resp, "\"@carol\""));
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@alice\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "hi bob, from alice") != NULL);   /* contract: the message alice sent */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@carol\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "no such conversation") != NULL);   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "post",
+                   "\"name\":\"post\",\"arguments\":{\"channel\":\"@alice\",\"text\":\"drafted for bob\"}", resp, sizeof resp) == 200);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.author_id == ub && bc.via.len == 7 && memcmp(bc.via.ptr, "Desk AI", 7) == 0);   /* contract: the approved name */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@alice\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "drafted for bob") != NULL);
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND detail LIKE 'client=Desk AI%'") >= 4, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND actor_id=%llu AND detail LIKE '%%ocp%%';", (unsigned long long)ub);
+    CHECK(mcp_scalar(db, q) == 0);
+
+    /* Refresh: a new pair; the old refresh token, once used, is refused. */
+    char access2[64] = "", refresh2[64] = "";
+    snprintf(form, sizeof form, "grant_type=refresh_token&refresh_token=%s&client_id=%s", refresh, client_id);
+    CHECK(oa_token(port, pin, form, access2, refresh2) == 200 && access2[0] && strcmp(refresh2, refresh) != 0);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);
+    /* An access token past its hour. */
+    CHECK(sqlite3_exec(db, "UPDATE mcp_access_tokens SET expires_at_ms=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    snprintf(form, sizeof form, "grant_type=refresh_token&refresh_token=%s&client_id=%s", refresh2, client_id);
+    CHECK(oa_token(port, pin, form, access2, refresh2) == 200);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 200);
+
+    /* bob's list, and his revoke: the client's next request is refused. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_connections lc = { 0 };
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    oc_connection_entry ents[8]; uint16_t n = 0; uint8_t all = 0;
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 1 && ents[0].user_id == ub &&
+          ents[0].lifetime_days == 30 && ents[0].last_used_at_ms > 0);
+    uint64_t bob_conn = n ? ents[0].connection_id : 0;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_connection rv = { bob_conn, 0 };
+    CHECK(oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &rv) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 0);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 401);
+
+    /* A connection past its lifetime. */
+    CHECK(oa_connect(port, pin, &b, client_id, 90, access, refresh) == 0);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(sqlite3_exec(db, "UPDATE mcp_connections SET expires_at_ms=2 WHERE lifetime_days=90;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 401);
+
+    /* The owner's view: everyone's; and carol, removed, is refused. A member asking for everyone's is not. */
+    char caccess[64] = "", crefresh[64] = "";
+    CHECK(oa_connect(port, pin, &cc, client_id, 0, caccess, crefresh) == 0);
+    CHECK(mcp_call(port, pin, "POST", caccess, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(oa_connect(port, pin, &b, client_id, 365, access, refresh) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    lc.all = 1;
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && all == 1 && n == 2);
+    uint64_t bob365 = 0;
+    for (uint16_t i = 0; i < n; i++) if (ents[i].user_id == ub) bob365 = ents[i].connection_id;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_connection rv2 = { bob365, 1 };
+    CHECK(oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &rv2) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 1);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_user ru = { uc };
+    CHECK(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(WAIT_UNTIL(mcp_call(port, pin, "POST", caccess, "tools/list", NULL, "", resp, sizeof resp) == 401, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=1;") == 1);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=2;") == 1);
+
+    /* A client known by its metadata document, served from a loopback server. */
+    oa_docsrv ds;
+    memset(&ds, 0, sizeof ds);
+    ds.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(ds.lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(ds.lfd, 8) == 0 &&
+          getsockname(ds.lfd, (struct sockaddr *)&sa, &sl) == 0);
+    ds.port = ntohs(sa.sin_port);
+    char docid[96];
+    snprintf(docid, sizeof docid, "http://127.0.0.1:%d/client.json", ds.port);
+    snprintf(ds.doc, sizeof ds.doc, "{\"client_id\":\"%s\",\"client_name\":\"Notes Helper\",\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"]}", docid);
+    pthread_t dth;
+    CHECK(pthread_create(&dth, NULL, oa_doc_thread, &ds) == 0);
+    CHECK(oa_authorize(port, pin, docid, request, code, page, sizeof page) == 200);
+    CHECK(strstr(page, "Notes Helper") != NULL && strlen(code) == 8);   /* contract: the document's own name */
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM oauth_clients WHERE kind='document' AND client_id='%s';", docid);
+    CHECK(mcp_scalar(db, q) == 1);
+    __atomic_store_n(&ds.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(dth, NULL);
+    close(ds.lfd);
+
+    /* Off: the pages say so, the app is refused, and every connection is refused; on again, they work. */
+    char baccess[64] = "", brefresh[64] = "";
+    CHECK(oa_connect(port, pin, &b, client_id, 30, baccess, brefresh) == 0);
+    setenv("OPENCHIME_MCP_CONNECTIONS", "off", 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 403);
+    CHECK(strstr(page, "AI clients are off") != NULL);   /* contract: the page's own heading */
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"]}", resp, sizeof resp) == 403);
+    CHECK(mcp_call(port, pin, "POST", baccess, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(oa_approve(&b, "BCDF-GHJK", 1, 30) == OC_ERR_CONNECTIONS_OFF);
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(mcp_call(port, pin, "POST", baccess, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 200);
+
+    sqlite3_close(db);
+    client_close(&a);
+    client_close(&b);
+    client_close(&cc);
+    stop_loop(&arg, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_netloop_set_oauth_test_documents(0);
+    unsetenv("OPENCHIME_MCP");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    db_unlink("itest_oauth.db");
+}
+
 static void test_webhook_vertical(int port, const uint8_t *pin) {
     client a;
     CHECK(client_open(&a, port, pin) == 0);
@@ -10317,6 +10686,7 @@ int run_netloop_tests(void) {
         test_agent_vertical(arg.port, pin);
         test_mcp_off(arg.port, pin);
         test_mcp_wire();
+        test_oauth_wire();
         test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and
