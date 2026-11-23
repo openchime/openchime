@@ -7843,6 +7843,30 @@ int run_client_core_tests(void) {
             }
         }
 
+        /* Agents (docs/details/MCP.md §3.1): dana, an owner, makes one. Its
+         * token reaches her once, held until taken and then gone; both
+         * rosters know it is an agent; its token list holds the one token,
+         * named, with its scopes and without the token. */
+        {
+            oc_client_create_agent(a, "Robo", "first", "chat:write im:history");
+            CHECK(WAIT_FOR(a, m->agent_token[0] != '\0'));
+            char tok[96], scopes[128];
+            uint64_t agent = 0, tid = 0;
+            CHECK(oc_model_take_agent_token((oc_model *)oc_client_model(a), tok, sizeof tok, &agent, &tid,
+                                            scopes, sizeof scopes) == 1);
+            CHECK(agent && tid && strncmp(tok, OC_PRINCIPAL_TOKEN_PREFIX, strlen(OC_PRINCIPAL_TOKEN_PREFIX)) == 0);
+            CHECK(strcmp(scopes, "chat:write im:history") == 0);   /* contract: the catalog's order */
+            CHECK(oc_model_take_agent_token((oc_model *)oc_client_model(a), tok, sizeof tok, NULL, NULL, NULL, 0) == 0);
+            CHECK(WAIT_FOR(a, oc_model_user_is_agent(m, agent)));
+            CHECK(WAIT_FOR(b, oc_model_user_is_agent(m, agent)));
+            CHECK(!oc_model_user_is_agent(oc_client_model(b), oc_client_model(a)->user_id));
+            oc_client_list_agent_tokens(a, agent);
+            CHECK(WAIT_FOR(a, m->atokens_agent == agent && m->n_atokens == 1));
+            const oc_model *am = oc_client_model(a);
+            CHECK(am->n_atokens == 1 && strcmp(am->atokens[0].name, "first") == 0 && am->atokens[0].id == tid);
+            oc_client_remove_agent(a, agent);
+        }
+
         /* Image previews (ARCH-137): dana posts a large JPEG and a small PNG;
          * erik asks for each at the rung he would draw it at. The JPEG comes
          * back at the inline rung's size and at the expanded rung's; the PNG,

@@ -3,6 +3,7 @@
  * §2.1), and a single CHECK macro counts failures. Built and run by `make test`; non-zero exit means failure. */
 
 #include "protocol.h"
+#include "scopes.h"
 #include "check.h"
 
 #include <string.h>
@@ -2997,6 +2998,101 @@ static void test_preview_frames(void) {
     }
 }
 
+/* The scope catalog (docs/plans/APPS.md §4): every scope has a name and words
+ * for the owner choosing it; a list is taken in the catalog's order, each once,
+ * and refused for a name outside it or a separator that is not one space. */
+static void test_scope_catalog(void) {
+    CHECK(oc_scope_count() == 14);
+    for (size_t i = 0; i < oc_scope_count(); i++) {
+        const oc_scope *sc = oc_scope_at(i);
+        CHECK(sc && sc->name && sc->name[0] && sc->desc && sc->desc[0]);
+        CHECK(sc && oc_scope_find(sc->name, strlen(sc->name)) == sc);
+        CHECK(sc && !strchr(sc->name, ' '));
+    }
+    CHECK(oc_scope_at(oc_scope_count()) == NULL);
+    CHECK(oc_scope_find("chat:writ", 9) == NULL);
+    char out[512];
+    CHECK(oc_scopes_normalize("im:history chat:write chat:write", 32, out, sizeof out) == 0 &&
+          strcmp(out, "chat:write im:history") == 0);   /* contract: the stored and wire form of a token's scopes */
+    CHECK(oc_scopes_normalize("", 0, out, sizeof out) == 0 && out[0] == '\0');
+    CHECK(oc_scopes_normalize("chat:write admin", 16, out, sizeof out) == -1);
+    CHECK(oc_scopes_normalize("chat:write  im:history", 22, out, sizeof out) == -1);
+    CHECK(oc_scopes_normalize(" chat:write", 11, out, sizeof out) == -1);
+    CHECK(oc_scopes_normalize("chat:write ", 11, out, sizeof out) == -1);
+    CHECK(oc_scopes_normalize("chat:write", 10, out, 5) == -1);
+}
+
+/* Agents and their tokens: every frame through and back, and the roster's
+ * agent bit beside the workspace sender's. */
+static void test_agent_frames(void) {
+    static uint8_t frame[4096];
+    {
+        oc_create_agent in = { oc_slice_str("Helper"), oc_slice_str("CI"), oc_slice_str("chat:write im:history") };
+        ROUNDTRIP(oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_AGENT, h, p);
+        oc_create_agent out;
+        CHECK(oc_decode_create_agent(&p, &out) == OC_OK && out.name.len == 6 && out.token_name.len == 2 &&
+              out.scopes.len == 21 && memcmp(out.scopes.ptr, "chat:write im:history", 21) == 0);
+    }
+    {
+        oc_agent_token in = { 7, 9, oc_slice_str("ocpt_abc"), oc_slice_str("chat:write") };
+        ROUNDTRIP(oc_encode_agent_token(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AGENT_TOKEN, h, p);
+        oc_agent_token out;
+        CHECK(oc_decode_agent_token(&p, &out) == OC_OK && out.agent_id == 7 && out.token_id == 9 &&
+              out.token.len == 8 && out.scopes.len == 10);
+    }
+    {
+        oc_remove_agent in = { 7 };
+        ROUNDTRIP(oc_encode_remove_agent(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_AGENT, h, p);
+        oc_remove_agent out;
+        CHECK(oc_decode_remove_agent(&p, &out) == OC_OK && out.agent_id == 7);
+    }
+    {
+        oc_mint_agent_token in = { 7, oc_slice_str("laptop"), oc_slice_str("im:history") };
+        ROUNDTRIP(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MINT_AGENT_TOKEN, h, p);
+        oc_mint_agent_token out;
+        CHECK(oc_decode_mint_agent_token(&p, &out) == OC_OK && out.agent_id == 7 && out.name.len == 6 && out.scopes.len == 10);
+    }
+    {
+        oc_list_agent_tokens in = { 7 };
+        ROUNDTRIP(oc_encode_list_agent_tokens(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_AGENT_TOKENS, h, p);
+        oc_list_agent_tokens out;
+        CHECK(oc_decode_list_agent_tokens(&p, &out) == OC_OK && out.agent_id == 7);
+    }
+    {
+        oc_agent_token_entry ents[2] = {
+            { 1, oc_slice_str("first"), oc_slice_str("chat:write"), 3, 100, 0, oc_slice_str("") },
+            { 2, oc_slice_str("laptop"), oc_slice_str(""), 3, 200, 300, oc_slice_str("192.0.2.7") },
+        };
+        oc_agent_token_list in = { 7, 2, ents };
+        ROUNDTRIP(oc_encode_agent_token_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AGENT_TOKEN_LIST, h, p);
+        oc_agent_token_entry out[1];
+        uint16_t n = 0;
+        uint64_t aid = 0;
+        CHECK(oc_decode_agent_token_list(&p, &aid, out, 1, &n) == OC_OK && aid == 7 && n == 2);   /* past the cap: read, dropped */
+        CHECK(out[0].token_id == 1 && out[0].created_by == 3 && out[0].created_at_ms == 100 && out[0].name.len == 5);
+    }
+    {
+        oc_revoke_agent_token in = { 7, 2 };
+        ROUNDTRIP(oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REVOKE_AGENT_TOKEN, h, p);
+        oc_revoke_agent_token out;
+        CHECK(oc_decode_revoke_agent_token(&p, &out) == OC_OK && out.agent_id == 7 && out.token_id == 2);
+    }
+    {
+        /* The agent bit rides the roster's flags byte: same layout, same version. */
+        oc_user_list_entry e[2];
+        memset(e, 0, sizeof e);
+        e[0].user_id = 5; e[0].flags = OC_USER_AGENT;
+        e[1].user_id = 6; e[1].flags = OC_USER_SYSTEM;
+        oc_user_list in = { 2, e };
+        ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
+        oc_user_list_entry out[2];
+        uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK && n == 2);
+        CHECK(out[0].flags == OC_USER_AGENT && out[1].flags == OC_USER_SYSTEM);
+        CHECK((OC_USER_AGENT & OC_USER_SYSTEM) == 0);
+    }
+}
+
 static void test_tts_frames(void) {
     uint8_t frame[4096];
     {
@@ -3544,6 +3640,8 @@ int run_protocol_tests(void) {
     test_user_mute_frames();
     test_profile_frames();
     test_tts_frames();
+    test_scope_catalog();
+    test_agent_frames();
     test_preview_frames();
     test_call_frames();
     test_block_frames();

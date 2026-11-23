@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 89);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses */
+    CHECK(oc_schema_version(db) == 90);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -119,7 +119,7 @@ static void test_embedded_schema(void) {
                              "todo_lists", "todo_tasks",
                              "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
-                             "call_transcripts_fts", "attachment_previews" };
+                             "call_transcripts_fts", "attachment_previews", "principal_tokens" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -419,7 +419,7 @@ static void test_rendered_audio_uses_0089(void) {
     CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
     CHECK(!table_exists(db, "rendered_audio_uses"));
     CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 89);
+    CHECK(oc_schema_version(db) == 90);
     CHECK(table_exists(db, "rendered_audio_uses"));
     CHECK(sqlite3_exec(db,
         "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"

@@ -714,6 +714,16 @@ typedef enum {
     OC_MSG_PREVIEW_INFO         = 0x0143, /* S->C, its size, dimensions and type */
     OC_MSG_PREVIEW_CHUNK        = 0x0144, /* S->C, a slice of the preview */
     OC_MSG_PREVIEW_END          = 0x0145, /* S->C, the whole preview is sent */
+    /* Agents and their tokens (docs/details/MCP.md §3.1, docs/plans/MCP.md §3):
+     * an owner's or admin's. A token is answered once, to the connection that
+     * minted it, and never listed. New frames, so no version bump. */
+    OC_MSG_CREATE_AGENT         = 0x0146, /* C->S, an agent, and its first token */
+    OC_MSG_AGENT_TOKEN          = 0x0147, /* S->C, a token minted: shown once */
+    OC_MSG_REMOVE_AGENT         = 0x0148, /* C->S, an agent, its tokens and its memberships */
+    OC_MSG_MINT_AGENT_TOKEN     = 0x0149, /* C->S, another token for an agent */
+    OC_MSG_LIST_AGENT_TOKENS    = 0x014A, /* C->S, an agent's tokens */
+    OC_MSG_AGENT_TOKEN_LIST     = 0x014B, /* S->C, the list: never a token */
+    OC_MSG_REVOKE_AGENT_TOKEN   = 0x014C, /* C->S, revoke one token */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -839,6 +849,8 @@ typedef enum {
     OC_ERR_RECORDING_UNAVAILABLE = 3076, /* no recording here: not built in, turned off, a demo, or the recordings' space is used up (CALLS.md §8) */
     OC_ERR_PREVIEW_MISSING     = 3077, /* the attachment has no preview at that rung: never made, or reclaimed; download the original (ARCH-137) */
     OC_ERR_PREVIEW_RUNG        = 3078, /* PREVIEW_BEGIN named a rung that does not exist (ARCH-137) */
+    OC_ERR_UNKNOWN_SCOPE       = 3079, /* a token minted with a scope outside the catalog (docs/plans/APPS.md §4) */
+    OC_ERR_TOO_MANY_TOKENS     = 3080, /* the agent already holds the most tokens it may (docs/details/MCP.md §3.1) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -2122,6 +2134,20 @@ typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t width; uint32_t 
 typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t seq; oc_slice data; } oc_preview_chunk;
 typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_end;
 
+/* Agents and their tokens. `scopes` is scope names from the catalog
+ * (shared/scopes.h) separated by single spaces; `token` is
+ * OC_PRINCIPAL_TOKEN_PREFIX and 32 bytes in base64url. */
+#define OC_AGENT_TOKEN_LIST_MAX 16
+typedef struct { oc_slice name; oc_slice token_name; oc_slice scopes; } oc_create_agent;
+typedef struct { uint64_t agent_id; uint64_t token_id; oc_slice token; oc_slice scopes; } oc_agent_token;
+typedef struct { uint64_t agent_id; } oc_remove_agent;
+typedef struct { uint64_t agent_id; oc_slice name; oc_slice scopes; } oc_mint_agent_token;
+typedef struct { uint64_t agent_id; } oc_list_agent_tokens;
+typedef struct { uint64_t token_id; oc_slice name; oc_slice scopes; uint64_t created_by; uint64_t created_at_ms;
+                 uint64_t last_used_at_ms; oc_slice last_used_from; } oc_agent_token_entry;
+typedef struct { uint64_t agent_id; uint16_t count; const oc_agent_token_entry *entries; } oc_agent_token_list;
+typedef struct { uint64_t agent_id; uint64_t token_id; } oc_revoke_agent_token;
+
 /* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
  * little-endian PCM, at most max_segment_ms long. */
 #define OC_STT_RATE        16000u
@@ -2159,6 +2185,14 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                   * start <= now < end; the reader decides. */
                  uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_user_list_entry;
 #define OC_USER_SYSTEM 0x01u
+/* An agent (docs/details/MCP.md §3.1, §7): not a person, but an account a
+ * token acts as; every surface that names it says so. A bit beside
+ * OC_USER_SYSTEM in the same byte, so the entry's layout is unchanged. */
+#define OC_USER_AGENT  0x02u
+/* An agent's token as it is shown once and presented: this prefix, then its
+ * 32 random bytes in base64url, so a secret scanner can recognise a leaked
+ * one (docs/plans/MCP.md §3.1). */
+#define OC_PRINCIPAL_TOKEN_PREFIX "ocpt_"
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first
@@ -2588,6 +2622,13 @@ oc_result oc_encode_preview_begin(oc_wbuf *w, uint16_t version, const oc_preview
 oc_result oc_encode_preview_info(oc_wbuf *w, uint16_t version, const oc_preview_info *m);
 oc_result oc_encode_preview_chunk(oc_wbuf *w, uint16_t version, const oc_preview_chunk *m);
 oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_end *m);
+oc_result oc_encode_create_agent(oc_wbuf *w, uint16_t version, const oc_create_agent *m);
+oc_result oc_encode_agent_token(oc_wbuf *w, uint16_t version, const oc_agent_token *m);
+oc_result oc_encode_remove_agent(oc_wbuf *w, uint16_t version, const oc_remove_agent *m);
+oc_result oc_encode_mint_agent_token(oc_wbuf *w, uint16_t version, const oc_mint_agent_token *m);
+oc_result oc_encode_list_agent_tokens(oc_wbuf *w, uint16_t version, const oc_list_agent_tokens *m);
+oc_result oc_encode_agent_token_list(oc_wbuf *w, uint16_t version, const oc_agent_token_list *m);
+oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_revoke_agent_token *m);
 oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
 oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
 oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
@@ -2838,6 +2879,15 @@ oc_result oc_decode_preview_begin(oc_rbuf *p, oc_preview_begin *m);
 oc_result oc_decode_preview_info(oc_rbuf *p, oc_preview_info *m);
 oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m);
 oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m);
+oc_result oc_decode_create_agent(oc_rbuf *p, oc_create_agent *m);
+oc_result oc_decode_agent_token(oc_rbuf *p, oc_agent_token *m);
+oc_result oc_decode_remove_agent(oc_rbuf *p, oc_remove_agent *m);
+oc_result oc_decode_mint_agent_token(oc_rbuf *p, oc_mint_agent_token *m);
+oc_result oc_decode_list_agent_tokens(oc_rbuf *p, oc_list_agent_tokens *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_token_entry *entries, uint16_t cap,
+                                     uint16_t *out_count);
+oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m);
 oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
 oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
 oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);

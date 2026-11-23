@@ -208,6 +208,25 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
     return m->reconnect_at_ms - now_ms;
 }
 
+int oc_model_user_is_agent(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; m && i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].agent != 0;
+    return 0;
+}
+
+int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
+                              char *scopes, size_t scopes_cap) {
+    if (!m || !m->agent_token[0]) return 0;
+    if (out && cap) snprintf(out, cap, "%s", m->agent_token);
+    if (scopes && scopes_cap) snprintf(scopes, scopes_cap, "%s", m->agent_token_scopes);
+    if (agent_id) *agent_id = m->agent_token_agent;
+    if (token_id) *token_id = m->agent_token_id;
+    for (volatile char *z = m->agent_token; z < m->agent_token + sizeof m->agent_token; z++) *z = 0;
+    m->agent_token_scopes[0] = '\0';
+    m->agent_token_agent = m->agent_token_id = 0;
+    return 1;
+}
+
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
     return oc_model_take_image(m, attachment_id, len, NULL);
 }
@@ -3519,6 +3538,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_USER:
         if (e->user_system) { m->ws_sender = e->user_id; break; }
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) m->users[i].agent = e->user_agent;
         /* The roster carries the profile fields now (REQ-289), so every surface
          * that shows a person can show them — the profile card included, which
          * used to say they "are not built" because only PROFILE_INFO had them and
@@ -3561,6 +3582,28 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_AGENT_TOKEN:
+        snprintf(m->agent_token, sizeof m->agent_token, "%s", e->body ? e->body : "");
+        snprintf(m->agent_token_scopes, sizeof m->agent_token_scopes, "%s", e->topic ? e->topic : "");
+        m->agent_token_agent = e->user_id;
+        m->agent_token_id = e->message_id;
+        break;
+    case OC_EV_AGENT_TOKENS_BEGIN:
+        m->atokens_agent = e->user_id;
+        m->n_atokens = 0;
+        break;
+    case OC_EV_AGENT_TOKEN_ROW:
+        if (e->user_id == m->atokens_agent && m->n_atokens < OC_AGENT_TOKEN_LIST_MAX) {
+            oc_agent_token_row *t = &m->atokens[m->n_atokens++];
+            t->id = e->message_id;
+            t->created_by = e->author_id;
+            t->created_at = e->created_at;
+            t->last_used_at = e->server_time;
+            snprintf(t->name, sizeof t->name, "%s", e->body ? e->body : "");
+            snprintf(t->scopes, sizeof t->scopes, "%s", e->topic ? e->topic : "");
+            snprintf(t->last_from, sizeof t->last_from, "%s", e->preview ? e->preview : "");
+        }
         break;
     case OC_EV_ATTACHMENT_DATA:
         /* Held until a frontend takes it. Full means nobody is taking them, and

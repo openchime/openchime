@@ -686,6 +686,17 @@ void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
  * oc_model_take_image. */
 void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung);
 
+/* Agents and their tokens (docs/details/MCP.md §3.1, §6): an owner's or an
+ * admin's. `scopes` is catalog names (shared/scopes.h) separated by single
+ * spaces. A minted token arrives once, held in the model until
+ * oc_model_take_agent_token; a token list replaces the model's `atokens`. An
+ * agent is put in a channel with oc_client_channel_invite, as a person is. */
+void oc_client_create_agent(oc_client *c, const char *name, const char *token_name, const char *scopes);
+void oc_client_mint_agent_token(oc_client *c, uint64_t agent_id, const char *name, const char *scopes);
+void oc_client_remove_agent(oc_client *c, uint64_t agent_id);
+void oc_client_list_agent_tokens(oc_client *c, uint64_t agent_id);
+void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t token_id);
+
 /* Transfers wait their turn in a queue rather than being refused while another
  * runs; each carries a tag that its OC_EV_XFER progress and completion events
  * repeat. A download's or fetch's tag is the attachment id. */

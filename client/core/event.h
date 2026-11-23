@@ -430,7 +430,17 @@ enum {
     OC_EV_PDM,
     /* PROFILE_FIELDS: the workspace's own profile fields, `pfs[0..n_pfs)`
      * with `text` the label, in position order. */
-    OC_EV_PROFILE_FIELDS
+    OC_EV_PROFILE_FIELDS,
+    /* Agents and their tokens (docs/details/MCP.md §3.1). AGENT_TOKEN: a token
+     * minted, the only time it is sent -- `user_id` the agent, `message_id` the
+     * token's id, `body` the token, `topic` its scopes. AGENT_TOKENS_BEGIN:
+     * `user_id`'s list follows, replacing what was held. AGENT_TOKEN_ROW: one
+     * token of it, never the token -- `message_id` its id, `body` its name,
+     * `topic` its scopes, `author_id` who minted it, `created_at`, `server_time`
+     * its last use (0 never), `preview` where from. */
+    OC_EV_AGENT_TOKEN,
+    OC_EV_AGENT_TOKENS_BEGIN,
+    OC_EV_AGENT_TOKEN_ROW
 };
 
 /* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
@@ -569,6 +579,7 @@ typedef struct {
     uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
     size_t    n_ids;
     uint8_t  user_system; /* USER: the workspace's own sender (OC_USER_SYSTEM), not a person */
+    uint8_t  user_agent;  /* USER: an agent (OC_USER_AGENT), not a person */
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
     uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
     size_t    der_len;
@@ -818,6 +829,16 @@ enum {
      * daemon has no preview, the original's bytes do, with the same op. Queued
      * as OC_CMD_FETCH is. */
     OC_CMD_FETCH_PREVIEW,
+    /* Agents and their tokens: CREATE_AGENT body = the name, body2 = its first
+     * token's name, body3 = the scopes; MINT_AGENT_TOKEN message_id = the
+     * agent, body = the token's name, body3 = the scopes; REMOVE_AGENT and
+     * LIST_AGENT_TOKENS message_id = the agent; REVOKE_AGENT_TOKEN message_id =
+     * the agent, channel_id = the token's id. */
+    OC_CMD_CREATE_AGENT,
+    OC_CMD_MINT_AGENT_TOKEN,
+    OC_CMD_REMOVE_AGENT,
+    OC_CMD_LIST_AGENT_TOKENS,
+    OC_CMD_REVOKE_AGENT_TOKEN,
     OC_CMD_QUIT
 };
 

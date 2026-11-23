@@ -28,6 +28,7 @@
 #include "authpool.h"
 #include "joinrules.h"
 #include "jwt.h"
+#include "scopes.h"
 #include "localissuer.h"
 #include "ratelimit.h"
 #include "roles.h"
@@ -339,6 +340,7 @@ static void job_free(oc_job *j) {
     free(j->exp_version);
     free(j->exp_blob_key);
     for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
+    free(j->agent_name); free(j->token_name); free(j->token_scopes); free(j->token_from);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -906,6 +908,11 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->tts_text); free(r->tts_blob_key);
     free(r->exp_blob_key); free(r->exp_src_key);
     free(r->pv_key); free(r->pv_mime); free(r->pv_drop[0]); free(r->pv_drop[1]);
+    for (size_t i = 0; i < r->n_ptokens; i++) {
+        free(r->ptokens[i].name); free(r->ptokens[i].scopes); free(r->ptokens[i].last_used_from);
+    }
+    free(r->ptokens);
+    free(r->tok_scopes);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
@@ -1660,6 +1667,9 @@ static int user_disabled(sqlite3 *db, uint64_t uid) {
 /* Is this user a web visitor (SCHEMA.md §3bj)? A visitor reaches nothing but
  * its own conversation: it is no DM's participant, no channel's invitee and no
  * group's member, and every refusal reads as an unknown user's does. */
+static int user_not_person(sqlite3 *db, uint64_t uid);   /* an agent's, a bot's or a visitor's row */
+static int user_kind_is(sqlite3 *db, uint64_t uid, const char *kind);
+static int actor_manages(sqlite3 *db, uint64_t uid);
 static int user_is_visitor(sqlite3 *db, uint64_t uid) {
     sqlite3_stmt *st = NULL;
     int visitor = 0;
@@ -3062,7 +3072,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system, "
-        "       ooo_start_ms, ooo_end_ms, ooo_message "
+        "       ooo_start_ms, ooo_end_ms, ooo_message, kind='agent' "
         "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
@@ -3091,7 +3101,8 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         arr[n].full_name    = strdup((const char *)sqlite3_column_text(st, 11));
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
-        arr[n].flags        = sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0;
+        arr[n].flags        = (uint8_t)((sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0) |
+                                        (sqlite3_column_int(st, 18) ? OC_USER_AGENT : 0));
         arr[n].ooo_start    = (uint64_t)sqlite3_column_int64(st, 15);
         arr[n].ooo_end      = (uint64_t)sqlite3_column_int64(st, 16);
         arr[n].ooo_message  = strdup((const char *)sqlite3_column_text(st, 17));
@@ -4329,7 +4340,7 @@ static oc_dbres *process_group_members(sqlite3 *db, const oc_job *j, int add) {
         if (add) {
             /* A removed member, or a visitor, who would gain channels through
              * the group (SCHEMA.md §3bj), is not added. */
-            if (user_disabled(db, uid) || user_is_visitor(db, uid)) continue;
+            if (user_disabled(db, uid) || user_not_person(db, uid)) continue;
             uint8_t role;
             if (!user_role(db, uid, &role)) continue;          /* no such person: nothing to add */
             sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_group_members(group_id,user_id,added_at_ms) "
@@ -6220,10 +6231,21 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
          * §3bj): no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* An agent (docs/details/MCP.md §6) is put in a channel by an owner or an
+     * admin alone, who must be in it -- adding one shows the channel's history
+     * to whoever holds its token -- and is never put anywhere by itself. A
+     * bot, until apps install it, is put nowhere. */
+    int agent = user_kind_is(db, j->target_user_id, "agent");
+    if ((agent && !actor_manages(db, j->user_id)) || user_kind_is(db, j->target_user_id, "bot") ||
+        !user_kind_is(db, j->user_id, "human")) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     int was_in = is_member(db, j->channel_id, j->target_user_id);
     add_membership(db, j->channel_id, j->target_user_id);
-    /* Told, always: someone put them somewhere. */
-    if (!was_in && j->target_user_id != j->user_id) {
+    if (agent && !was_in)
+        audit_actor_in(db, OC_AUDIT_ADMIN, "agent.channel.add", j->user_id, j->channel_id, j->target_user_id, NULL, 1, NULL);
+    /* Told, always: someone put them somewhere. An agent has no notices. */
+    if (!was_in && !agent && j->target_user_id != j->user_id) {
         char *who = audit_name_of(db, j->user_id), *ch = NULL;
         sqlite3_stmt *nq = NULL;
         sqlite3_prepare_v2(db, "SELECT name FROM channels WHERE id=?1;", -1, &nq, NULL);
@@ -6258,6 +6280,20 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
      * Added directly as well, the remove clears the direct half. */
     if (member_only_via_group(db, j->channel_id, j->target_user_id)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_MEMBER_VIA_GROUP; return r;
+    }
+    /* An agent is taken out by an owner or an admin alone (docs/details/MCP.md
+     * §6), and that is an administrative act, audited as one. */
+    if (user_kind_is(db, j->target_user_id, "agent")) {
+        if (!actor_manages(db, j->user_id)) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+        if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
+            audit_actor_in(db, OC_AUDIT_ADMIN, "agent.channel.remove", j->user_id, j->channel_id,
+                           j->target_user_id, NULL, 1, NULL);
+            note_change(db, r, j->channel_id, j->target_user_id, 0);
+        }
+        r->type = OC_RES_CHANNEL_INFO;
+        load_channel_info(db, j->channel_id, j->user_id, r);
+        fill_briefs(db, r);
+        return r;
     }
     if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
         /* REQ-251's moderation family names this explicitly: removing a member
@@ -6448,7 +6484,7 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     }
     /* A visitor is nobody's DM, and opens none (SCHEMA.md §3bj): answered as an
      * unknown target is, so nothing says a visitor is there. */
-    if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
+    if (user_not_person(db, self) || user_not_person(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     /* Blocked by them: no conversation, new or old, is opened, and the answer
@@ -6535,7 +6571,7 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     uint64_t self = j->user_id, other = j->target_user_id;
     uint8_t trole = OC_ROLE_MEMBER;
     if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
-        user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
+        user_not_person(db, self) || user_not_person(db, other)) return r;
     /* Always a new conversation: refused, as plainly as any other, to someone
      * the peer blocks or when the peer takes no new ones. */
     if (is_blocked(db, other, self) || dm_closed(db, other)) return r;
@@ -6941,7 +6977,7 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         uint8_t role = OC_ROLE_MEMBER;
         /* An unknown or disabled user, or a visitor, is refused without saying
          * which — the same no-disclosure rule OPEN_DM follows. */
-        if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
+        if (!user_role(db, u, &role) || user_disabled(db, u) || user_not_person(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         /* Anyone named who blocks the caller: refused, as a 1:1 is. */
@@ -10968,6 +11004,313 @@ static oc_dbres *process_preview_touch(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- Agents and their tokens (docs/details/MCP.md §3.1, §6, §7) ---------------
+ * An agent is a `users` row of kind 'agent' with a name and nothing of a
+ * person's: no password, no identity-provider subject, no session, no device.
+ * It acts only through a token: 32 random bytes, shown once as
+ * OC_PRINCIPAL_TOKEN_PREFIX and the bytes in base64url, stored as their
+ * SHA-256 in `principal_tokens` (migration 0090), which holds the tokens of
+ * kind 'agent' and, later, 'bot' rows alone. Everything here is an owner's or
+ * an admin's, and audited in the administrative family, never with a token. */
+
+static int user_kind_is(sqlite3 *db, uint64_t uid, const char *kind) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind=?2 FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
+        yes = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) != 0;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Not a person: a visitor, an agent or a bot. None of them is in a DM, a
+ * group DM or a user group. */
+static int user_not_person(sqlite3 *db, uint64_t uid) { return !user_kind_is(db, uid, "human"); }
+
+static int actor_manages(sqlite3 *db, uint64_t uid) {
+    uint8_t role = OC_ROLE_MEMBER;
+    return user_role(db, uid, &role) && !user_disabled(db, uid) && user_kind_is(db, uid, "human") &&
+           (role == OC_ROLE_OWNER || role == OC_ROLE_ADMIN);
+}
+
+/* A live agent: of kind 'agent' and not removed. */
+static int agent_live(sqlite3 *db, uint64_t uid) {
+    return uid && user_kind_is(db, uid, "agent") && !user_disabled(db, uid);
+}
+
+static oc_dbres *agent_refuse(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_AGENT_ERR;
+    r->err_code = code;
+    return r;
+}
+
+/* Mint a token for `agent` into `r` (OC_RES_AGENT_TOKEN): the checks a mint
+ * makes -- the scopes in the catalog, at most OC_AGENT_MAX_TOKENS -- and the
+ * row. 0, or the error code. The store takes rows of kind 'agent' and 'bot'
+ * alone. */
+static uint16_t mint_token(sqlite3 *db, uint64_t agent, uint64_t actor, const char *name, const char *scopes,
+                           oc_dbres *r) {
+    if (!user_kind_is(db, agent, "agent") && !user_kind_is(db, agent, "bot")) return OC_ERR_FORBIDDEN;
+    char canon[512];
+    if (oc_scopes_normalize(scopes ? scopes : "", scopes ? strlen(scopes) : 0, canon, sizeof canon) != 0)
+        return OC_ERR_UNKNOWN_SCOPE;
+    if (!name || !name[0] || strlen(name) > OC_MAX_CHANNEL_NAME) return OC_ERR_INVALID_CHANNEL;
+    sqlite3_stmt *st = NULL;
+    int64_t held = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)agent);
+        if (sqlite3_step(st) == SQLITE_ROW) held = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (held >= OC_AGENT_MAX_TOKENS) return OC_ERR_TOO_MANY_TOKENS;
+    uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) return OC_ERR_INTERNAL;
+    st = NULL;
+    int rc = SQLITE_ERROR;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO principal_tokens(token_hash, user_id, name, scopes, created_by, created_at_ms)"
+            " VALUES(?1, ?2, ?3, ?4, ?5, ?6);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob (st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)agent);
+        sqlite3_bind_text (st, 3, name, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 4, canon, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)actor);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return OC_ERR_INTERNAL;
+    r->type = OC_RES_AGENT_TOKEN;
+    r->user_id = agent;
+    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);   /* before the audit row's insert */
+    r->tok_scopes = strdup(canon);
+    memcpy(r->session_token, token, sizeof token);               /* the token, shown once */
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.token.mint", actor, agent, name, 1, NULL);
+    return 0;
+}
+
+static oc_dbres *process_agent_create(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!j->agent_name || !j->agent_name[0] || strlen(j->agent_name) > OC_MAX_CHANNEL_NAME)
+        return agent_refuse(j, OC_ERR_INVALID_CHANNEL);
+    char canon[512];
+    if (oc_scopes_normalize(j->token_scopes ? j->token_scopes : "", j->token_scopes ? strlen(j->token_scopes) : 0,
+                            canon, sizeof canon) != 0)
+        return agent_refuse(j, OC_ERR_UNKNOWN_SCOPE);
+    uint8_t rnd[16];
+    if (oc_rand_bytes(rnd, sizeof rnd) != 0) return agent_refuse(j, OC_ERR_INTERNAL);
+    char subject[6 + 2 * sizeof rnd + 1];
+    memcpy(subject, "agent:", 6);
+    for (size_t i = 0; i < sizeof rnd; i++) snprintf(subject + 6 + 2 * i, 3, "%02x", rnd[i]);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_exec(db, "SAVEPOINT agent_create;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    int rc = SQLITE_ERROR;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO users(subject, display_name, role, kind, created_at_ms) VALUES(?1, ?2, 'member', 'agent', ?3);",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, subject, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (st, 2, j->agent_name, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    uint64_t agent = rc == SQLITE_DONE ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    uint16_t err = agent ? 0 : OC_ERR_INTERNAL;
+    if (!err) {
+        audit_actor(db, OC_AUDIT_ADMIN, "agent.create", j->user_id, agent, j->agent_name, 1, NULL);
+        err = mint_token(db, agent, j->user_id, j->token_name && j->token_name[0] ? j->token_name : "first",
+                         canon, r);
+    }
+    if (err) {
+        sqlite3_exec(db, "ROLLBACK TO agent_create; RELEASE agent_create;", NULL, NULL, NULL);
+        r->type = OC_RES_AGENT_ERR;
+        r->err_code = err;
+        return r;
+    }
+    sqlite3_exec(db, "RELEASE agent_create;", NULL, NULL, NULL);
+    user_rows(db, agent, r);             /* the new row, for every roster */
+    return r;
+}
+
+static oc_dbres *process_token_mint(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    /* The store's own rule decides the kind (mint_token): an agent's row or a
+     * bot's, and no other. A removed one holds none. */
+    if (!j->target_user_id || user_disabled(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint16_t err = mint_token(db, j->target_user_id, j->user_id, j->token_name, j->token_scopes, r);
+    if (err) { r->type = OC_RES_AGENT_ERR; r->err_code = err; }
+    return r;
+}
+
+/* An agent's tokens into `r` as OC_RES_TOKEN_LIST: never a token or its hash. */
+static void token_rows(sqlite3 *db, uint64_t agent, oc_dbres *r) {
+    r->type = OC_RES_TOKEN_LIST;
+    r->user_id = agent;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, name, scopes, created_by, created_at_ms, last_used_at_ms, last_used_from"
+            " FROM principal_tokens WHERE user_id=?1 ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)agent);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        oc_token_row *g = realloc(r->ptokens, (r->n_ptokens + 1) * sizeof *g);
+        if (!g) break;
+        r->ptokens = g;
+        oc_token_row *t = &r->ptokens[r->n_ptokens++];
+        t->id = (uint64_t)sqlite3_column_int64(st, 0);
+        t->name = strdup((const char *)sqlite3_column_text(st, 1));
+        t->scopes = strdup((const char *)sqlite3_column_text(st, 2));
+        t->created_by = (uint64_t)sqlite3_column_int64(st, 3);
+        t->created_at_ms = (uint64_t)sqlite3_column_int64(st, 4);
+        t->last_used_at_ms = (uint64_t)sqlite3_column_int64(st, 5);
+        t->last_used_from = strdup((const char *)sqlite3_column_text(st, 6));
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_token_list(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    token_rows(db, j->target_user_id, r);
+    return r;
+}
+
+static oc_dbres *process_token_revoke(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    char *name = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT name FROM principal_tokens WHERE id=?1 AND user_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) name = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    if (!name) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM principal_tokens WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.token.revoke", j->user_id, j->target_user_id, name, 1, NULL);
+    free(name);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    token_rows(db, j->target_user_id, r);
+    return r;
+}
+
+/* Removing an agent: its tokens and its channel memberships in one
+ * transaction, its row marked removed; its messages stay under its name. The
+ * channels it left are told as for a member leaving. */
+static oc_dbres *process_agent_remove(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_exec(db, "SAVEPOINT agent_remove;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM principal_tokens WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    uint64_t chans[512];
+    size_t nch = 0;
+    if (sqlite3_prepare_v2(db, "SELECT channel_id FROM channel_members WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        while (nch < sizeof chans / sizeof chans[0] && sqlite3_step(st) == SQLITE_ROW)
+            chans[nch++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    for (size_t i = 0; i < nch; i++) note_change(db, r, chans[i], j->target_user_id, 0);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.remove", j->user_id, j->target_user_id, NULL, 1, NULL);
+    sqlite3_exec(db, "RELEASE agent_remove;", NULL, NULL, NULL);
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->target_user_id;
+    r->role = OC_ROLE_MEMBER;
+    r->disabled = 1;
+    return r;
+}
+
+/* The lookup a request authenticates with: the presented token's agent and
+ * scopes, in one indexed probe, never cached, so a revoked token or one whose
+ * agent is gone is refused at once. Its last use is written at most once a
+ * minute, on this writer's clock. */
+#define TOKEN_USE_EVERY_MS 60000u
+static oc_dbres *process_token_lookup(sqlite3 *db, const oc_job *j) {
+    size_t plen = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    uint8_t raw[OC_SESSION_TOKEN_LEN + 4], hash[OC_SHA256_LEN];
+    if (!j->token || j->token_len <= plen || memcmp(j->token, OC_PRINCIPAL_TOKEN_PREFIX, plen) != 0 ||
+        oc_base64url_decode(j->token + plen, j->token_len - plen, raw, sizeof raw) != OC_SESSION_TOKEN_LEN ||
+        oc_sha256(raw, OC_SESSION_TOKEN_LEN, hash) != 0)
+        return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    sqlite3_stmt *st = NULL;
+    oc_dbres *r = NULL;
+    uint64_t last = 0, id = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT t.id, t.user_id, t.scopes, t.last_used_at_ms FROM principal_tokens t JOIN users u ON u.id=t.user_id"
+            " WHERE t.token_hash=?1 AND u.disabled=0 AND u.kind IN ('agent','bot');", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW && (r = calloc(1, sizeof *r))) {
+            r->conn_id = j->conn_id;
+            r->type = OC_RES_TOKEN_PRINCIPAL;
+            id = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = id;
+            r->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->tok_scopes = strdup((const char *)sqlite3_column_text(st, 2));
+            last = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!r) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    uint64_t now = dbw_now_ms();
+    if (now >= last + TOKEN_USE_EVERY_MS) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE principal_tokens SET last_used_at_ms=?2, last_used_from=?3 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_bind_text (st, 3, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
 /* Incoming webhooks (REQ-170, ARCH-32). CREATE_WEBHOOK mints a per-channel token
  * for a client that can post to the channel; the raw 32-byte token is returned
  * once (only its SHA-256 is stored, like a session). Write. */
@@ -14057,6 +14400,12 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
     if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
     if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
+    if (j->type == OC_JOB_AGENT_CREATE)   return process_agent_create(w->db, j);
+    if (j->type == OC_JOB_AGENT_REMOVE)   return process_agent_remove(w->db, j);
+    if (j->type == OC_JOB_TOKEN_MINT)     return process_token_mint(w->db, j);
+    if (j->type == OC_JOB_TOKEN_LIST)     return process_token_list(w->db, j);
+    if (j->type == OC_JOB_TOKEN_REVOKE)   return process_token_revoke(w->db, j);
+    if (j->type == OC_JOB_TOKEN_LOOKUP)   return process_token_lookup(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);

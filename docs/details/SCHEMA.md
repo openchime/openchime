@@ -2412,3 +2412,41 @@ removes a message by age, it deletes every rendering the message was spoken
 under, every model version, and queues the bytes for reclaim. A row goes with
 its message; a lost row only leaves its rendering to the cache's own
 reclamation.
+
+## 3cc. Migration 0090 — tokens for agents and bots (MCP.md §3.1)
+
+```sql
+CREATE TABLE principal_tokens (
+  id              INTEGER PRIMARY KEY,
+  token_hash      BLOB NOT NULL,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  name            TEXT NOT NULL,
+  scopes          TEXT NOT NULL DEFAULT '',
+  created_by      INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms   INTEGER NOT NULL,
+  last_used_at_ms INTEGER NOT NULL DEFAULT 0,
+  last_used_from  TEXT NOT NULL DEFAULT '');
+CREATE UNIQUE INDEX principal_tokens_hash ON principal_tokens(token_hash);
+CREATE INDEX principal_tokens_user ON principal_tokens(user_id);
+```
+
+The bearer tokens of the principals that are not people: an **agent**'s now
+(`users.kind = 'agent'`, migration 0071), an app's **bot** later, in the one
+table. The writer refuses a row for any other kind.
+
+- `token_hash` — the **SHA-256 of the token**, never the token: 32 random bytes,
+  shown once as a fixed prefix and the bytes in base64url, as a webhook token
+  is (§3h). The unique index makes a request's lookup one probe.
+- `user_id` — the agent (or bot) it belongs to.
+- `name` — what the minter called it ("CI runner").
+- `scopes` — the scope names chosen at minting, space-separated, each from the
+  catalog (`shared/scopes.c`, docs/plans/APPS.md §4).
+- `created_by`, `created_at_ms` — who minted it, and when.
+- `last_used_at_ms`, `last_used_from` — its last use and the address it came
+  from, written at most once a minute per token; 0 and empty until it is used.
+
+*Written* by minting (an agent holds at most 10). *Read* by the token list,
+which never returns the hash, and by the lookup a request authenticates with,
+which refuses a token whose row is gone. *Deleted* by revoking, and with every
+other token of the agent when the agent is removed, in the same transaction as
+its channel memberships; its messages stay under its name.

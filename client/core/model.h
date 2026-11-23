@@ -326,7 +326,18 @@ typedef struct {
      * (oc_model_ooo_active), so it goes at its end with nothing sent. */
     uint64_t ooo_start, ooo_end;
     char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
+    /* An agent (USER_LIST's OC_USER_AGENT): not a person; every surface that
+     * names it tags it, and none shows its presence, status or local time. */
+    uint8_t  agent;
 } oc_member;
+
+/* One token of an agent, as member administration lists it: never the token. */
+typedef struct {
+    uint64_t id, created_by, created_at, last_used_at;
+    char     name[64];
+    char     scopes[512];
+    char     last_from[64];
+} oc_agent_token_row;
 
 /* A workspace's own profile field, and one person's value for one. */
 typedef struct { uint64_t id; uint8_t kind; uint16_t position;
@@ -764,6 +775,15 @@ typedef struct {
     oc_webhook_view *webhooks;
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
+    /* Agents (docs/details/MCP.md §3.1): the token just minted, held until a
+     * frontend takes it (oc_model_take_agent_token), and the agent whose token
+     * list is held. */
+    char      agent_token[96];
+    char      agent_token_scopes[512];
+    uint64_t  agent_token_agent, agent_token_id;
+    uint64_t  atokens_agent;
+    oc_agent_token_row atokens[OC_AGENT_TOKEN_LIST_MAX];
+    uint8_t   n_atokens;
     /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
     uint64_t  reset_user_id;
     char      reset_token[80];
@@ -1247,6 +1267,13 @@ uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *
 /* The same, with the preview rung the bytes were asked for at (ARCH-137;
  * oc_client_fetch_image): 0 for a fetch of the original. */
 uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, uint8_t *rung);
+
+/* Whether `user_id` is an agent (USER_LIST's OC_USER_AGENT). */
+int oc_model_user_is_agent(const oc_model *m, uint64_t user_id);
+/* The token just minted, copied to `out` (with its agent, id and scopes when
+ * asked) and forgotten: it is shown once. 1 when there was one, else 0. */
+int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
+                              char *scopes, size_t scopes_cap);
 
 /* What a message says in a one-line summary — a sidebar row, a toast, the
  * activity feed: its text, or for a message that is only a file, what the file

@@ -52,6 +52,7 @@
 #include "model.h"
 #include "notify.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
+#include "scopes.h"     /* the scope catalog an agent's token is minted from */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
 #include "lexer.h"      /* the snippet tokenizer (REQ-226) */
@@ -1753,6 +1754,16 @@ static int have_camera(void) {
     if (g_have_camera < 0) { oc_capture_device d[1]; g_have_camera = oc_capture_list(d, 1) > 0; }
     return g_have_camera;
 }
+/* ---- agents (docs/details/MCP.md §7) ------------------------------------------
+ * An agent is not a person: wherever its name is drawn, an "Agent" tag goes
+ * beside it, and no presence, status or local time is shown for it. Each
+ * surface that draws one counts it for the frame, so the harness can read
+ * where tags were drawn (the dump's `agenttags` line). */
+enum { ATAG_TRANSCRIPT = 0, ATAG_MEMBERS, ATAG_MENTION, ATAG_PROFILE, ATAG_SEARCH, ATAG_SUMMARY, ATAG_N };
+static int      g_atag_n[ATAG_N];
+static uint64_t g_atag_uid[ATAG_N];
+static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line);   /* fwd */
+
 static int is_video_msg(const oc_attachment *a) {
     return a && !a->reclaimed && a->media_kind == OC_MEDIA_VIDEO_MESSAGE;
 }
@@ -1951,6 +1962,7 @@ static int      g_selecting;    /* left button held, dragging a selection */
 /* `rm` is the row's Remove while one is shown (the hovered row's), and
  * `via` whether it is dimmed because a group keeps them in. */
 static struct { rectf r; uint64_t uid; rectf rm; int via; } g_memrows[256];
+static rectf g_mem_agents_label;   /* the members pane's AGENTS label, as last drawn; empty when none */
 static int g_n_memrows;
 /* Groups in the pane (REQ-309): their rows, each row's Remove, and the Add
  * group / Remove group buttons under the header. A member row's Remove shows
@@ -2045,7 +2057,10 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_MESSAGE_MOVE,
        CONF_SNIPPET_PASTE,
        CONF_PFIELD_DELETE,
-       CONF_WS_FORGET_SET };
+       CONF_WS_FORGET_SET,
+       /* Admin > Agents: remove an agent, revoke one of its tokens. */
+       CONF_AGENT_REMOVE, CONF_AGENT_REVOKE };
+static uint64_t g_agt_sel;   /* Admin > Agents: the agent whose tokens are open; 0: the list of agents */
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 static int      g_bc_confirmed;     /* CONF_BROADCAST: the send it confirmed is under way */
@@ -7945,12 +7960,14 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
          * the full width of the transcript to answer "when". */
         rectf hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
         draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
+        float tagw = oc_model_user_is_agent(m, msg->author_id)
+                   ? agent_tag(rt, ATAG_TRANSCRIPT, msg->author_id, tx + text_width(nm, g_title) + 8, hl) : 0;
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
             struct tm tv; char when[24] = "";
             if (oc_localtime_r(&t, &tv))
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
-            float wx = tx + text_width(nm, g_title) + 8;
+            float wx = tx + text_width(nm, g_title) + 8 + tagw;
             if (wx < hl.right - 60)
                 draw_text(rt, when, g_meta,
                           baseline_align(hl, g_title, g_meta, wx, hl.right),
@@ -9196,9 +9213,19 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
          * record of when something happened, and "3h" is not a record. */
         char when[24] = "";
         rel_time(r->server_time, when, sizeof when);
-        snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
-                 (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
-        draw_text(rt, head, g_meta, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
+        const char *aun = (au && au[0]) ? au : "user";
+        rectf hrow = rf(body.left + 20, y, body.right - 16, y + 20);
+        float hx = body.left + 20;
+        if (oc_model_user_is_agent(m, r->author_id)) {
+            /* The name, its Agent tag, then the rest of the line after it. */
+            draw_text(rt, aun, g_meta, hrow, OC_COL_MUTED);
+            hx += text_width(aun, g_meta) + 6;
+            hx += agent_tag(rt, ATAG_SEARCH, r->author_id, hx, hrow);
+            snprintf(head, sizeof head, "·  %s  ·  %s", (ch && ch->name) ? ch->name : "channel", when);
+        } else {
+            snprintf(head, sizeof head, "%s  ·  %s  ·  %s", aun, (ch && ch->name) ? ch->name : "channel", when);
+        }
+        draw_text(rt, head, g_meta, rf(hx, y, body.right - 16, y + 20), OC_COL_MUTED);
         char said[512];   /* an action reads "<name> <text>" (REQ-058) */
         oc_model_line(m, r->author_id, NULL, r->action, r->snippet ? r->snippet : "", said, sizeof said);
         draw_text_hl(rt, said, g_ui,
@@ -12074,6 +12101,15 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     g_display->align = ST_ALIGN_LEFT;
     y += 30;
 
+    int is_agent = oc_model_user_is_agent(m, g_profile_uid);
+    if (is_agent) {
+        /* An agent: the tag where a person's presence and role would be, and
+         * nothing it does not have -- no presence, no status, no local time, no
+         * conversation of its own (docs/details/MCP.md §7). */
+        float tw = text_width("Agent", g_meta) + UIS(16);
+        agent_tag(rt, ATAG_PROFILE, g_profile_uid, cx - tw / 2, rf(reg.left + 12, y, reg.right - 12, y + 20));
+        y += 34;
+    } else {
     uint8_t pres = oc_model_presence_of(m, g_profile_uid);
     const char *pl = pres == OC_PRESENCE_ONLINE ? "Active"
                    : pres == OC_PRESENCE_AWAY   ? "Away" : "Offline";
@@ -12089,8 +12125,13 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     draw_text(rt, sub, g_meta, rf(reg.left + 12, y, reg.right - 12, y + 20), OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
     y += 34;
+    }
 
-    if (g_profile_uid != m->user_id) {
+    if (is_agent) {
+        g_prof_dm_btn = rf(0, 0, 0, 0);
+        g_prof_mute_btn = rf(0, 0, 0, 0);
+        g_prof_block_btn = rf(0, 0, 0, 0);
+    } else if (g_profile_uid != m->user_id) {
         g_prof_dm_btn = rf(reg.left + 24, y, reg.right - 24, y + 32);
         fill_round(rt, g_prof_dm_btn, OC_R_CONTROL, OC_COL_ACCENT);
         g_ui->align = ST_ALIGN_CENTER;
@@ -14151,7 +14192,17 @@ static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
         return;
     }
     if (in_rect(g_sum_people_r, g_mouse_x, g_mouse_y)) {
-        oc_summary_posters_text(v, tip, sizeof tip);
+        /* Who posted, each agent named as one (docs/details/MCP.md §7). */
+        tip[0] = '\0';
+        size_t tw = 0, np = v->n_posters;
+        for (size_t i = 0; i < np && tw < sizeof tip; i++) {
+            const char *sep = i == 0 ? "" : np == 2 ? " and " : i + 1 == np ? ", and " : ", ";
+            int ag = oc_model_user_is_agent(m, v->posters[i].id);
+            if (ag) { g_atag_n[ATAG_SUMMARY]++; g_atag_uid[ATAG_SUMMARY] = v->posters[i].id; }
+            int k = snprintf(tip + tw, sizeof tip - tw, "%s%s%s", sep, v->posters[i].name, ag ? " (Agent)" : "");
+            if (k < 0) break;
+            tw += (size_t)k;
+        }
         if (tip[0]) draw_tip_below(rt, g_sum_people_r, tip, 0, W);
         return;
     }
@@ -14306,6 +14357,7 @@ static void mem_hits_clear(void) {
     g_n_memgrprows = 0;
     g_memrm.rm = g_grp_plus = g_mem_addppl = rf(0, 0, 0, 0);
     g_mem_pick_add = g_mem_pick_cancel = rf(0, 0, 0, 0);
+    g_mem_agents_label = rf(0, 0, 0, 0);
     g_memrm.uid = 0;
 }
 
@@ -14327,6 +14379,22 @@ static void mem_head_button(gfx *rt, rectf b, int icon) {
     float ic = UIS(14), cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
     draw_lucide(rt, icon, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
                 hot ? OC_COL_TEXT : OC_COL_MUTED);
+}
+
+/* The tag, at `x` on `line`, vertically centred: its width and the gap after
+ * it, or 0 when it would not fit before line's right edge. */
+static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line) {
+    static const char T[] = "Agent";
+    float tw = text_width(T, g_meta) + UIS(10), h = UIS(16), cy = (line.top + line.bottom) / 2;
+    if (x + tw > line.right) return 0;
+    rectf r = rf(x, cy - h / 2, x + tw, cy + h / 2);
+    fill_round(rt, r, OC_R_PILL, OC_COL_HOVER);
+    stroke_round(rt, r, OC_R_PILL, OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, T, g_meta, r, OC_COL_MUTED);
+    g_meta->align = ST_ALIGN_LEFT;
+    if (surface >= 0 && surface < ATAG_N) { g_atag_n[surface]++; g_atag_uid[surface] = uid; }
+    return tw + UIS(6);
 }
 
 static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
@@ -14441,9 +14509,15 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     /* The rule between groups and people: a gap above and below a 1px line,
      * and no space at all when there are no groups. */
     float div_gap = UIS(8), div_h = n_cg > 0 ? 2 * div_gap + 1 : 0;
+    /* A channel's agents are a group of their own, below its people, under a
+     * label (docs/details/MCP.md §7): who can read the channel through a token
+     * is plain at a glance. */
+    size_t n_agents = 0;
+    for (size_t i = 0; i < m->n_chanmem; i++) if (oc_model_user_is_agent(m, m->chanmem[i].user_id)) n_agents++;
+    float agents_h = n_agents ? ROW_H : 0;
     y = top;
     float view = H - top;
-    float content = (float)(m->n_chanmem + n_cg) * ROW_H + div_h;
+    float content = (float)(m->n_chanmem + n_cg) * ROW_H + div_h + agents_h;
     g_mem_max = content > view ? content - view : 0;
     if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
     if (g_mem_scroll < 0) g_mem_scroll = 0;
@@ -14480,8 +14554,18 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         if (ly >= top && ly < H) fill(rt, rf(x0 + 16, ly, W - 14, ly + 1), OC_COL_BORDER);
         y += div_h;
     }
+    g_mem_agents_label = rf(0, 0, 0, 0);
+    for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < m->n_chanmem; i++) {
         const oc_chan_member *cm = &m->chanmem[i];
+        int cm_agent = oc_model_user_is_agent(m, cm->user_id);
+        if (cm_agent != pass) continue;
+        if (pass == 1 && g_mem_agents_label.right <= g_mem_agents_label.left) {
+            /* The agents' label, once, above the first of them. */
+            g_mem_agents_label = rf(x0 + 16, y, W - 14, y + ROW_H);
+            if (y + ROW_H > top && y < H) draw_text(rt, "AGENTS", g_meta, rf(x0 + 16, y + 6, W - 14, y + ROW_H), OC_COL_FAINT);
+            y += ROW_H;
+        }
         if (y > H) break;
         if (y + ROW_H <= top) { y += ROW_H; continue; }   /* scrolled above the header */
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
@@ -14492,12 +14576,14 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             fill_round(rt, rf(x0 + 4, y + 1, W - 4, y + ROW_H - 1), OC_R_CONTROL, OC_COL_HOVER);
         /* The primitive rather than the composite: this row has no avatar, so
          * the dot is chrome in its own right and has no tile to be sized by. */
-        draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
-                              oc_model_presence_of(m, cm->user_id),
-                              lit ? OC_COL_HOVER : OC_COL_SIDEBAR,
-                              oc_model_dnd_of(m, cm->user_id), 2.0f);
+        if (!cm_agent)
+            draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
+                                  oc_model_presence_of(m, cm->user_id),
+                                  lit ? OC_COL_HOVER : OC_COL_SIDEBAR,
+                                  oc_model_dnd_of(m, cm->user_id), 2.0f);
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
+        if (cm_agent) agent_tag(rt, ATAG_MEMBERS, cm->user_id, x0 + 34 + text_width(disp, g_ui) + 6, rf(x0 + 34, y, W - 76, y + ROW_H));
         /* Role glyph INLINE, immediately after the name — not in a column of its
          * own. Almost nobody is an owner or an admin, so a reserved column spends
          * horizontal space on every row to serve the rare one, in a pane only
@@ -14522,7 +14608,7 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             /* Out of office (REQ-122) comes first: it says who will not answer. */
             char oo[96] = "";
             if (mu && oc_model_ooo_active(m, mu->user_id, wall_ms())) oc_model_ooo_label(mu, oo, sizeof oo);
-            if (mu && (mu->status_emoji[0] || mu->status_text[0] || oo[0])) {
+            if (mu && !cm_agent && (mu->status_emoji[0] || mu->status_text[0] || oo[0])) {
                 float sx = x0 + 34 + text_width(disp, g_ui) + 8;
                 if (cm->role >= OC_ROLE_ADMIN) sx += 18;
                 char st[220];
@@ -14876,6 +14962,11 @@ static void draw_autocomplete(gfx *rt, float x0, float w, float h) {
         if (i == g_ac_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, g_ac[i].disp, g_ui, rf(px + 12, y + 3, px + pw - 12, y + rowh),
                   i == g_ac_sel ? 0xFFFFFF : OC_COL_TEXT);
+        if (g_ac_kind == OC_AC_MENTION && g_ac[i].repl[0] == '@' && model()) {
+            uint64_t au = oc_model_user_id(model(), g_ac[i].repl + 1);
+            if (au && oc_model_user_is_agent(model(), au))
+                agent_tag(rt, ATAG_MENTION, au, px + 12 + text_width(g_ac[i].disp, g_ui) + 8, rf(px, y, px + pw - 12, y + rowh));
+        }
         y += rowh;
     }
     g_meta->align = ST_ALIGN_RIGHT;
@@ -16624,6 +16715,11 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_PFIELD_DELETE:
         oc_client_set_profile_field(g_client, g_confirm_id, OC_PROFILE_FIELD_DELETE, 0, 0, "");
         break;
+    case CONF_AGENT_REMOVE:
+        oc_client_remove_agent(g_client, g_confirm_id);
+        if (g_agt_sel == g_confirm_id) g_agt_sel = 0;
+        break;
+    case CONF_AGENT_REVOKE: oc_client_revoke_agent_token(g_client, g_agt_sel, g_confirm_id); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -19767,9 +19863,210 @@ static int shell_visible(void) {
  * before it keep their places. */
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS,
+       ADM_AGENTS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
+
+/* ---- Admin > Agents (docs/details/MCP.md §3.1, §6) -----------------------------
+ * The workspace's agents, each with its tokens; New agent and New token ask for
+ * a name and the scopes, each scope shown with what it allows; a token minted
+ * is shown here once, with Copy, until Done. Every button is one entry in
+ * g_agtbtns, so a click, the keyboard's invoke and the harness press the same
+ * thing. */
+enum { AGB_NEW = 1, AGB_TOKENS, AGB_REMOVE, AGB_BACK, AGB_MINT, AGB_REVOKE, AGB_COPY, AGB_DONE };
+static struct { rectf r; int kind; uint64_t id; char aid[OC_ACC_AID_MAX]; char name[96]; } g_agtbtns[96];
+static int      g_n_agtbtns;
+static char     g_agt_tok[96];             /* the token just minted, shown until Done */
+static char     g_agt_tok_scopes[512];
+static uint64_t g_agt_tok_agent;
+
+static void agents_back(void) { g_agt_sel = 0; }
+
+/* A token minted: taken from the model, which forgets it, to be shown once. */
+static void agents_take_token(void) {
+    oc_model *m = (oc_model *)model();
+    if (m && m->agent_token[0])
+        oc_model_take_agent_token(m, g_agt_tok, sizeof g_agt_tok, &g_agt_tok_agent, NULL,
+                                  g_agt_tok_scopes, sizeof g_agt_tok_scopes);
+}
+
+static void agtbtn(gfx *rt, rectf r, const char *label, int danger, int kind, uint64_t id,
+                   const char *aid, const char *name) {
+    mem_button(rt, r, label, danger, 0);
+    if (g_n_agtbtns >= (int)(sizeof g_agtbtns / sizeof g_agtbtns[0])) return;
+    g_agtbtns[g_n_agtbtns].r = r;
+    g_agtbtns[g_n_agtbtns].kind = kind;
+    g_agtbtns[g_n_agtbtns].id = id;
+    snprintf(g_agtbtns[g_n_agtbtns].aid, sizeof g_agtbtns[0].aid, "%s", aid);
+    snprintf(g_agtbtns[g_n_agtbtns].name, sizeof g_agtbtns[0].name, "%s", name);
+    g_n_agtbtns++;
+}
+
+/* Ask for a token's name and scopes (and, for a new agent, its name); 1 when
+ * answered, with `scopes` the chosen names separated by single spaces. */
+static int agents_ask(oc_win *hwnd, int with_agent, char *agent_name, size_t an_cap,
+                      char *token_name, size_t tn_cap, char *scopes, size_t sc_cap) {
+    oc_field f[2 + 16];
+    int n = 0;
+    memset(f, 0, sizeof f);
+    if (with_agent) {
+        f[n].kind = FF_TEXT; f[n].label = "Agent's name";
+        f[n].hint = "How its posts and mentions read.";
+        n++;
+    }
+    f[n].kind = FF_TEXT; f[n].label = "Token's name";
+    f[n].hint = "Say where it is used, such as CI or a laptop.";
+    snprintf(f[n].value, sizeof f[n].value, "%s", with_agent ? "first" : "");
+    n++;
+    int first_scope = n;
+    for (size_t i = 0; i < oc_scope_count() && n < (int)(sizeof f / sizeof f[0]); i++) {
+        const oc_scope *sc = oc_scope_at(i);
+        f[n].kind = FF_CHECK; f[n].label = sc->name; f[n].hint = sc->desc;
+        snprintf(f[n].value, sizeof f[n].value, "0");
+        n++;
+    }
+    if (!form_dialog(hwnd, with_agent ? "New agent" : "New token", f, n)) return 0;
+    if (with_agent) snprintf(agent_name, an_cap, "%s", f[0].value);
+    snprintf(token_name, tn_cap, "%s", f[first_scope - 1].value);
+    size_t at = 0;
+    scopes[0] = '\0';
+    for (int i = first_scope; i < n; i++)
+        if (!strcmp(f[i].value, "1")) {
+            int k = snprintf(scopes + at, sc_cap - at, "%s%s", at ? " " : "", f[i].label);
+            if (k < 0 || (size_t)k >= sc_cap - at) break;
+            at += (size_t)k;
+        }
+    return 1;
+}
+
+static void agents_press(oc_win *hwnd, int kind, uint64_t id) {
+    const oc_model *m = model();
+    if (!m || !g_client) return;
+    char an[128] = "", tn[64] = "", sc[512] = "", body[256];
+    switch (kind) {
+    case AGB_NEW:
+        if (agents_ask(hwnd, 1, an, sizeof an, tn, sizeof tn, sc, sizeof sc) && an[0])
+            oc_client_create_agent(g_client, an, tn[0] ? tn : "first", sc);
+        break;
+    case AGB_TOKENS:
+        g_agt_sel = id;
+        oc_client_list_agent_tokens(g_client, id);
+        break;
+    case AGB_REMOVE: {
+        const char *nm = oc_model_user_name((oc_model *)m, id);
+        snprintf(body, sizeof body, "Its tokens stop working at once and it leaves every channel it is in. "
+                 "What it posted stays, under its name.");
+        char title[160];
+        snprintf(title, sizeof title, "Remove %s?", nm && nm[0] ? nm : "this agent");
+        confirm_open(hwnd, CONF_AGENT_REMOVE, id, title, body, "Remove");
+        break;
+    }
+    case AGB_BACK: agents_back(); break;
+    case AGB_MINT:
+        if (g_agt_sel && agents_ask(hwnd, 0, NULL, 0, tn, sizeof tn, sc, sizeof sc) && tn[0])
+            oc_client_mint_agent_token(g_client, g_agt_sel, tn, sc);
+        break;
+    case AGB_REVOKE:
+        confirm_open(hwnd, CONF_AGENT_REVOKE, id, "Revoke this token?",
+                     "Anything using it is refused from its next request.", "Revoke");
+        break;
+    case AGB_COPY: oc_plat_clipboard_set_text(g_agt_tok); break;
+    case AGB_DONE:
+        for (volatile char *z = g_agt_tok; z < g_agt_tok + sizeof g_agt_tok; z++) *z = 0;
+        g_agt_tok_scopes[0] = '\0';
+        if (g_agt_sel) oc_client_list_agent_tokens(g_client, g_agt_sel);
+        break;
+    }
+    invalidate();
+}
+
+static void draw_agents_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_agtbtns = 0;
+    float x = body.left + 20, right = body.right - 20, y = body.top + 14;
+    char aid[OC_ACC_AID_MAX], nm[96], line[640];
+    if (g_agt_tok[0]) {
+        /* The token, once: copied now or never seen again. */
+        const char *an = oc_model_user_name((oc_model *)m, g_agt_tok_agent);
+        snprintf(line, sizeof line, "A new token for %s", an && an[0] ? an : "the agent");
+        draw_text(rt, line, g_title, rf(x, y, right, y + 24), OC_COL_TEXT);
+        y += 28;
+        draw_text(rt, "Copy it now: it is not shown again.", g_meta, rf(x, y, right, y + 20), OC_COL_MUTED);
+        y += 26;
+        rectf tb = rf(x, y, right, y + 34);
+        fill_round(rt, tb, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, tb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        draw_text(rt, g_agt_tok, g_ui, rf(tb.left + 10, tb.top + 8, tb.right - 10, tb.bottom), OC_COL_TEXT);
+        y += 44;
+        draw_text(rt, "What it may do", g_ui_b, rf(x, y, right, y + 22), OC_COL_TEXT);
+        y += 26;
+        const char *p = g_agt_tok_scopes;
+        if (!*p) { draw_text(rt, "Nothing yet: no access was chosen.", g_meta, rf(x, y, right, y + 20), OC_COL_MUTED); y += 22; }
+        while (*p) {
+            const char *e = strchr(p, ' ');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            const oc_scope *sc = oc_scope_find(p, len);
+            snprintf(line, sizeof line, "%.*s", (int)len, p);
+            draw_text(rt, line, g_ui, rf(x, y, right, y + 20), OC_COL_TEXT);
+            if (sc) draw_text(rt, sc->desc, g_meta, rf(x + 170, y + 2, right, y + 20), OC_COL_MUTED);
+            y += 22;
+            p = e ? e + 1 : p + len;
+        }
+        y += 10;
+        agtbtn(rt, rf(x, y, x + 90, y + 28), "Copy", 0, AGB_COPY, 0, "admin.agents.token.copy", "Copy the token");
+        agtbtn(rt, rf(x + 100, y, x + 190, y + 28), "Done", 0, AGB_DONE, 0, "admin.agents.token.done", "Done");
+        return;
+    }
+    if (g_agt_sel) {
+        const char *an = oc_model_user_name((oc_model *)m, g_agt_sel);
+        agtbtn(rt, rf(x, y, x + 70, y + 26), "Back", 0, AGB_BACK, 0, "admin.agents.back", "Back to agents");
+        snprintf(line, sizeof line, "%s's tokens", an && an[0] ? an : "Agent");
+        draw_text(rt, line, g_title, rf(x + 84, y, right - 110, y + 26), OC_COL_TEXT);
+        agtbtn(rt, rf(right - 100, y, right, y + 26), "New token", 0, AGB_MINT, g_agt_sel, "admin.agents.mint",
+               "New token");
+        y += 40;
+        if (m->atokens_agent != g_agt_sel) { overlay_empty(rt, rf(body.left, y, body.right, body.bottom), "Loading tokens."); return; }
+        if (!m->n_atokens) { overlay_empty(rt, rf(body.left, y, body.right, body.bottom), "This agent has no tokens."); return; }
+        for (uint8_t i = 0; i < m->n_atokens && y < body.bottom - 40; i++) {
+            const oc_agent_token_row *t = &m->atokens[i];
+            char when[24] = "", used[64] = "never used";
+            rel_time(t->created_at, when, sizeof when);
+            if (t->last_used_at) {
+                char lu[24]; rel_time(t->last_used_at, lu, sizeof lu);
+                snprintf(used, sizeof used, "last used %s%s%s", lu, t->last_from[0] ? " from " : "", t->last_from);
+            }
+            draw_text(rt, t->name, g_ui_b, rf(x, y, right - 90, y + 20), OC_COL_TEXT);
+            snprintf(line, sizeof line, "%s  \xC2\xB7  made %s  \xC2\xB7  %s", t->scopes[0] ? t->scopes : "no access", when, used);
+            draw_text(rt, line, g_meta, rf(x, y + 20, right - 90, y + 40), OC_COL_MUTED);
+            snprintf(aid, sizeof aid, "admin.token.%llu.revoke", (unsigned long long)t->id);
+            snprintf(nm, sizeof nm, "Revoke %s", t->name);
+            agtbtn(rt, rf(right - 80, y + 6, right, y + 32), "Revoke", 1, AGB_REVOKE, t->id, aid, nm);
+            y += 48;
+        }
+        return;
+    }
+    agtbtn(rt, rf(x, y, x + 110, y + 28), "New agent", 0, AGB_NEW, 0, "admin.agents.new", "New agent");
+    y += 42;
+    int any = 0;
+    for (size_t i = 0; i < m->n_users && y < body.bottom - 34; i++) {
+        const oc_member *u = &m->users[i];
+        if (!u->agent || u->disabled) continue;
+        any = 1;
+        draw_text(rt, u->name, g_ui, rf(x, y, right - 200, y + 30), OC_COL_TEXT);
+        agent_tag(rt, -1, u->user_id, x + text_width(u->name, g_ui) + 8, rf(x, y, right - 200, y + 30));
+        snprintf(aid, sizeof aid, "admin.agent.%llu.tokens", (unsigned long long)u->user_id);
+        snprintf(nm, sizeof nm, "%s's tokens", u->name);
+        agtbtn(rt, rf(right - 190, y + 2, right - 100, y + 28), "Tokens", 0, AGB_TOKENS, u->user_id, aid, nm);
+        snprintf(aid, sizeof aid, "admin.agent.%llu.remove", (unsigned long long)u->user_id);
+        snprintf(nm, sizeof nm, "Remove %s", u->name);
+        agtbtn(rt, rf(right - 90, y + 2, right, y + 28), "Remove", 1, AGB_REMOVE, u->user_id, aid, nm);
+        y += 36;
+    }
+    if (!any)
+        overlay_empty(rt, rf(body.left, y, body.right, body.bottom),
+                      "No agents yet. An agent acts through a token, in the channels it is added to.");
+}
+
 
 static void admin_select(int t) {
     g_adm_tab = t;
@@ -19785,6 +20082,7 @@ static void admin_select(int t) {
     else if (t == ADM_AUDIT)   { g_audit_focus = -1; oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); }
     else if (t == ADM_USAGE)    oc_client_usage(g_client, g_usage_days);
     else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
+    else if (t == ADM_AGENTS)   agents_back();
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -20373,6 +20671,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Usage",     OC_ICON_USER },
         { "Blocks",    OC_ICON_USER },
         { "Profile fields", OC_ICON_USER },
+        { "Agents",    OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -20404,6 +20703,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
     else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
     else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
+    else if (g_adm_tab == ADM_AGENTS)  draw_agents_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -21732,6 +22032,11 @@ static void tgt_rebuild(void) {
             int in = 0;
             for (size_t k = 0; m && m->chanmem_channel == g_mem_mode_cid && k < m->n_chanmem; k++)
                 if (m->chanmem[k].user_id == all[i].id) { in = 1; break; }
+            /* An agent is put in a channel by an owner or an admin alone
+             * (docs/details/MCP.md §6), so only they are offered one. */
+            int agent = !all[i].is_channel && oc_model_user_is_agent(m, all[i].id);
+            if (agent && self_role(m) < OC_ROLE_ADMIN) continue;
+            if (agent) snprintf(all[i].sub, sizeof all[i].sub, "Agent");
             if (!all[i].is_channel && !in) g_tgt[g_n_tgt++] = all[i];
         }
     } else if (g_tgt_host == TGT_HOST_GROUP) {
@@ -21757,10 +22062,17 @@ static void tgt_rebuild(void) {
             g_n_tgt++;
         }
         for (int i = 0; i < n && g_n_tgt < TGT_MAX; i++)
-            if (!all[i].is_channel && !(gv && oc_model_in_group(gv, all[i].id)))
+            if (!all[i].is_channel && !(gv && oc_model_in_group(gv, all[i].id)) &&
+                !oc_model_user_is_agent(m, all[i].id))           /* never in a group */
                 g_tgt[g_n_tgt++] = all[i];
     } else {
-        g_n_tgt = m ? (int)oc_complete_targets(m, g_tgt_q.buf, g_tgt, TGT_MAX) : 0;
+        /* New message: a person or a channel, never an agent, which is in no
+         * DM or group DM. */
+        oc_target all[TGT_MAX * 2];
+        int n = m ? (int)oc_complete_targets(m, g_tgt_q.buf, all, TGT_MAX * 2) : 0;
+        g_n_tgt = 0;
+        for (int i = 0; i < n && g_n_tgt < TGT_MAX; i++)
+            if (all[i].is_channel || !oc_model_user_is_agent(m, all[i].id)) g_tgt[g_n_tgt++] = all[i];
     }
     /* Anything already chosen drops out of the list: offering it again is an
      * invitation to a duplicate the control would then have to refuse. */
@@ -25138,6 +25450,7 @@ static void paint(oc_win *hwnd) {
      * is empty unless this frame put something in it. */
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
+    memset(g_atag_n, 0, sizeof g_atag_n);
     g_n_timehits = 0;
     g_n_replierhits = 0;
     g_n_emojiboxes = 0;
@@ -28541,6 +28854,7 @@ enum {
     AT_ADMTAB,        /* payload: Admin tab index */
     AT_TOAST,         /* payload: toast id * 2, + 1 for its close */
     AT_ALERTACK,      /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
+    AT_AGENTBTN,      /* payload: Admin > Agents button index (g_agtbtns) — press it */
     AT_SUMITEM,       /* payload: a citation's number (go to its message), or 100000 + a topic (show/hide its details) */
     AT_SUMCAL,        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
     AT_TABLEED,       /* payload: a table editor control (TEA_*) */
@@ -28825,7 +29139,7 @@ static void a11y_publish_scene(const oc_model *m) {
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
         static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks",
-                                                       "profile-fields" };
+                                                       "profile-fields", "agents" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI) continue;
@@ -28845,6 +29159,10 @@ static void a11y_publish_scene(const oc_model *m) {
                 }
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
             }
+        if (g_adm_tab == ADM_AGENTS)
+            for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
+                acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
+                         ATOK(AT_AGENTBTN, (uint64_t)i));
         if (g_adm_tab == ADM_EMOJI) {
             if (g_efind && g_efind->visible && n < OC_ACC_MAX)
                 acc_push(items, &n, OC_ACC_BUTTON, "admin.emoji.search", "Search custom emoji",
@@ -33190,6 +33508,11 @@ static void msg_open_cut(uint64_t mid, int kind) {
 
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
+    /* Admin > Agents: each button, as it was drawn -- first, since the
+     * transcript's hit-boxes from before Admin opened are still held. */
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS && !modal_open())
+        for (int i = 0; i < g_n_agtbtns; i++)
+            if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
     /* A spoiler is revealed, or covered again, by a click on it. */
     if (!modal_open())
         for (int i = 0; i < g_n_splhits; i++)
@@ -40987,13 +41310,42 @@ static void test_dump(const char *path) {
     fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
             m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f via=%d\n",
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f via=%d agent=%d\n",
                 (unsigned long long)g_memrows[i].uid,
                 g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
                 m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
                     ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
                 g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
-                g_memrows[i].via);
+                g_memrows[i].via, m ? oc_model_user_is_agent(m, g_memrows[i].uid) : 0);
+    /* Agents (docs/details/MCP.md §7): the members pane's label over its
+     * agents, and the tags each surface drew in the last frame. */
+    fprintf(f, "memagents label=%.0f,%.0f,%.0f,%.0f\n", g_mem_agents_label.left, g_mem_agents_label.top,
+            g_mem_agents_label.right, g_mem_agents_label.bottom);
+    fprintf(f, "agenttags transcript=%d members=%d mention=%d profile=%d search=%d summary=%d\n",
+            g_atag_n[ATAG_TRANSCRIPT], g_atag_n[ATAG_MEMBERS], g_atag_n[ATAG_MENTION], g_atag_n[ATAG_PROFILE],
+            g_atag_n[ATAG_SEARCH], g_atag_n[ATAG_SUMMARY]);
+    {   /* Admin > Agents: what it shows, never the token itself. */
+        int descs = 0;
+        for (const char *p = g_agt_tok_scopes; *p; ) {
+            const char *e = strchr(p, ' ');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            if (oc_scope_find(p, len)) descs++;
+            p = e ? e + 1 : p + len;
+        }
+        int live = 0;
+        for (size_t i = 0; m && i < m->n_users; i++) live += m->users[i].agent && !m->users[i].disabled;
+        fprintf(f, "agentadmin shown=%d sel=%llu token=%d prefixed=%d tokscopes=\"%s\" descs=%d atokens=%d agents=%d\n",
+                g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS, (unsigned long long)g_agt_sel, g_agt_tok[0] != 0,
+                strncmp(g_agt_tok, OC_PRINCIPAL_TOKEN_PREFIX, strlen(OC_PRINCIPAL_TOKEN_PREFIX)) == 0,
+                g_agt_tok_scopes, descs, m && m->atokens_agent == g_agt_sel ? (int)m->n_atokens : -1, live);
+        for (int i = 0; i < g_n_agtbtns; i++)
+            fprintf(f, "  agentbtn %s r=%.0f,%.0f,%.0f,%.0f\n", g_agtbtns[i].aid, g_agtbtns[i].r.left,
+                    g_agtbtns[i].r.top, g_agtbtns[i].r.right, g_agtbtns[i].r.bottom);
+        for (size_t i = 0; m && i < m->n_users; i++)
+            if (m->users[i].agent)
+                fprintf(f, "  agent uid=%llu name=\"%s\" removed=%d\n", (unsigned long long)m->users[i].user_id,
+                        m->users[i].name, m->users[i].disabled);
+    }
     {   /* The audit pane: its filters, the row the keyboard is on, and each row
          * drawn with what it names and where it is (DIPs, as `rclick` takes). */
         const oc_model *am = model();
@@ -44166,7 +44518,9 @@ static int on_tick(oc_win *hwnd) {
                 if (!total && any_unread) total = -1;   /* a dot: unread, none of it about you */
                 if (total != g_badge_shown) taskbar_badge_apply(hwnd, total);
             }
-            /* An inline image arrived: decode and cache it. */
+            /* A token minted: shown once, in Admin > Agents. */
+            if (m->agent_token[0]) { agents_take_token(); invalidate(); }
+                        /* An inline image arrived: decode and cache it. */
             {
                 uint64_t fid = 0; size_t flen = 0;
                 uint8_t frung = 0;
@@ -45285,6 +45639,10 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_ALERTACK:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
+            break;
+        case AT_AGENTBTN:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS && (int)arg < g_n_agtbtns)
+                agents_press(hwnd, g_agtbtns[arg].kind, g_agtbtns[arg].id);
             break;
         case AT_SUMITEM:
             if (g_show_members && g_rp_mode == RP_SUMMARY)

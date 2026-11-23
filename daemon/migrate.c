@@ -1947,6 +1947,30 @@ static const char MIGRATION_0089[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX rendered_audio_uses_handle ON rendered_audio_uses(handle);";
 
+static const char MIGRATION_0090[] =
+    /* The token store for the principals that are not people (docs/details/
+     * MCP.md §3.1, docs/plans/MCP.md §3): an agent's tokens now, an app's bot
+     * later, in the one table -- `users.kind` (0071) says which. A token is
+     * stored as the webhook tokens are (0010): its SHA-256 alone, under a unique
+     * index, so a request's lookup is one probe and the raw token is in no row.
+     * `scopes` is the space-separated names from the scope catalog
+     * (shared/scopes.c) chosen when it was minted; `last_used_at_ms` and
+     * `last_used_from` are written at most once a minute. Removing the
+     * principal deletes its tokens; revoking one deletes its row. */
+    "CREATE TABLE principal_tokens ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  token_hash      BLOB NOT NULL,"
+    "  user_id         INTEGER NOT NULL REFERENCES users(id),"
+    "  name            TEXT NOT NULL,"
+    "  scopes          TEXT NOT NULL DEFAULT '',"
+    "  created_by      INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  last_used_at_ms INTEGER NOT NULL DEFAULT 0,"
+    "  last_used_from  TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE UNIQUE INDEX principal_tokens_hash ON principal_tokens(token_hash);"
+    "CREATE INDEX principal_tokens_user ON principal_tokens(user_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -2037,6 +2061,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 87, MIGRATION_0087 },
     { 88, MIGRATION_0088 },
     { 89, MIGRATION_0089 },
+    { 90, MIGRATION_0090 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -1852,6 +1852,41 @@ void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_create_agent(oc_client *c, const char *name, const char *token_name, const char *scopes) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_AGENT);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(token_name ? token_name : "");
+    cmd->body3 = strdup(scopes ? scopes : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_mint_agent_token(oc_client *c, uint64_t agent_id, const char *name, const char *scopes) {
+    if (!c || !agent_id || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MINT_AGENT_TOKEN);
+    if (!cmd) return;
+    cmd->message_id = agent_id;
+    cmd->body = strdup(name);
+    cmd->body3 = strdup(scopes ? scopes : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void agent_cmd(oc_client *c, int type, uint64_t agent_id, uint64_t token_id) {
+    if (!c || !agent_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = agent_id;
+    cmd->channel_id = token_id;   /* reused as the token's id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_remove_agent(oc_client *c, uint64_t agent_id) { agent_cmd(c, OC_CMD_REMOVE_AGENT, agent_id, 0); }
+void oc_client_list_agent_tokens(oc_client *c, uint64_t agent_id) { agent_cmd(c, OC_CMD_LIST_AGENT_TOKENS, agent_id, 0); }
+void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t token_id) {
+    if (token_id) agent_cmd(c, OC_CMD_REVOKE_AGENT_TOKEN, agent_id, token_id);
+}
+
 void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
     if (!c || !attachment_id) return;
     if (rung != OC_PREVIEW_RUNG_INLINE_WIRE && rung != OC_PREVIEW_RUNG_EXPANDED_WIRE) {

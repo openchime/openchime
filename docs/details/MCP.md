@@ -110,7 +110,8 @@ scopes chosen for it when it was minted. An owner or admin creates the agent and
 mints its tokens from the client; a token is 32
 random bytes, shown once, stored as its SHA-256 and found by one indexed probe,
 exactly as session and webhook tokens are (ARCH-58/71). An agent may hold
-several, so one can be replaced without a gap. Revoking a token deletes its
+up to 10, so one can be replaced without a gap; an eleventh is refused.
+Revoking a token deletes its
 row, and the next request with it is `401`; removing the agent deletes its
 tokens and its memberships. Minting needs no identity source and no
 OpenChime-operated service, so agents work on a workspace with nothing else

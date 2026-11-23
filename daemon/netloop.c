@@ -4443,6 +4443,48 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        /* Agents and their tokens (docs/details/MCP.md §3.1): an owner's or an
+         * admin's, which the writer checks; the token goes back to this
+         * connection alone. */
+        if (hdr.msg_type == OC_MSG_CREATE_AGENT || hdr.msg_type == OC_MSG_MINT_AGENT_TOKEN ||
+            hdr.msg_type == OC_MSG_REMOVE_AGENT || hdr.msg_type == OC_MSG_LIST_AGENT_TOKENS ||
+            hdr.msg_type == OC_MSG_REVOKE_AGENT_TOKEN) {
+            oc_job *j = NULL;
+            if (hdr.msg_type == OC_MSG_CREATE_AGENT) {
+                oc_create_agent m;
+                if (oc_decode_create_agent(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_AGENT_CREATE, c->conn_id))) return -1;
+                j->agent_name = slice_dup(m.name);
+                j->token_name = slice_dup(m.token_name);
+                j->token_scopes = slice_dup(m.scopes);
+            } else if (hdr.msg_type == OC_MSG_MINT_AGENT_TOKEN) {
+                oc_mint_agent_token m;
+                if (oc_decode_mint_agent_token(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TOKEN_MINT, c->conn_id))) return -1;
+                j->target_user_id = m.agent_id;
+                j->token_name = slice_dup(m.name);
+                j->token_scopes = slice_dup(m.scopes);
+            } else if (hdr.msg_type == OC_MSG_REMOVE_AGENT) {
+                oc_remove_agent m;
+                if (oc_decode_remove_agent(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_AGENT_REMOVE, c->conn_id))) return -1;
+                j->target_user_id = m.agent_id;
+            } else if (hdr.msg_type == OC_MSG_LIST_AGENT_TOKENS) {
+                oc_list_agent_tokens m;
+                if (oc_decode_list_agent_tokens(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TOKEN_LIST, c->conn_id))) return -1;
+                j->target_user_id = m.agent_id;
+            } else {
+                oc_revoke_agent_token m;
+                if (oc_decode_revoke_agent_token(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_TOKEN_REVOKE, c->conn_id))) return -1;
+                j->target_user_id = m.agent_id;
+                j->token_id = m.token_id;
+            }
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_DELETE_WEBHOOK) {
             oc_delete_webhook dw;
             if (oc_decode_delete_webhook(&p, &dw) != OC_OK) return -1;
@@ -9064,6 +9106,51 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         int fd = c->fd;
         send_transfer_error(c, r->attachment_id, r->err_code);   /* resets the xfer */
         if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        break;
+    }
+    case OC_RES_AGENT_TOKEN: {
+        /* A token minted: to the connection that minted it, once. A new
+         * agent's roster row goes to everyone. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (c) {
+            char tok[sizeof OC_PRINCIPAL_TOKEN_PREFIX + 4 * OC_SESSION_TOKEN_LEN / 3 + 4];
+            size_t pl = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+            memcpy(tok, OC_PRINCIPAL_TOKEN_PREFIX, pl);
+            size_t tl = pl + oc_base64url_encode(r->session_token, OC_SESSION_TOKEN_LEN, tok + pl);
+            oc_agent_token at = { r->user_id, r->message_id, { (const uint8_t *)tok, tl },
+                                  oc_slice_str(r->tok_scopes ? r->tok_scopes : "") };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_agent_token(&w, OC_PROTOCOL_VERSION, &at) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+            for (volatile char *z = tok; z < tok + sizeof tok; z++) *z = 0;   /* not left in this frame's stack */
+        }
+        if (r->n_ulist) {
+            size_t len = encode_user_list(r);
+            if (len) send_to_all_authed(ep, conns, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_TOKEN_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        size_t n = r->n_ptokens > OC_AGENT_TOKEN_LIST_MAX ? OC_AGENT_TOKEN_LIST_MAX : r->n_ptokens;
+        oc_agent_token_entry ents[OC_AGENT_TOKEN_LIST_MAX];
+        for (size_t i = 0; i < n; i++) {
+            const oc_token_row *t = &r->ptokens[i];
+            ents[i] = (oc_agent_token_entry){ t->id, oc_slice_str(t->name ? t->name : ""),
+                                              oc_slice_str(t->scopes ? t->scopes : ""), t->created_by, t->created_at_ms,
+                                              t->last_used_at_ms, oc_slice_str(t->last_used_from ? t->last_used_from : "") };
+        }
+        oc_agent_token_list l = { r->user_id, (uint16_t)n, ents };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_agent_token_list(&w, OC_PROTOCOL_VERSION, &l) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_AGENT_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("agent operation refused") };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_WEBHOOK_CREATED: {

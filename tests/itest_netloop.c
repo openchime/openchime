@@ -5540,6 +5540,107 @@ static void test_address_proof_route(int port, const uint8_t *pin) {
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
  * the sender gets 200. An unknown token gets 404. */
+/* Agents over the wire (docs/details/MCP.md §3.1, §6): an owner makes one and
+ * gets its token once; every roster learns it, marked; a member cannot make
+ * one or put one in a channel; an owner puts it in a channel and the members'
+ * list shows it there; tokens are minted, listed without themselves and
+ * revoked; removing the agent takes it out of the channel. */
+static int members_include(client *c, uint64_t channel, uint64_t user) {
+    uint8_t buf[64]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_members lm = { channel };
+    if (oc_encode_list_members(&w, OC_PROTOCOL_VERSION, &lm) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    int found = 0;
+    for (;;) {
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_MEMBERS) return found;
+        if (hdr.msg_type != OC_MSG_MEMBER_ENTRY) continue;
+        oc_member_entry me;
+        if (oc_decode_member_entry(&p, &me) == OC_OK && me.user_id == user) found = 1;
+    }
+}
+
+static void test_agent_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    oc_header hdr; oc_rbuf p; uint8_t buf[512]; oc_wbuf w;
+
+    /* A member is refused. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_agent ca = { oc_slice_str("Robo"), oc_slice_str("first"), oc_slice_str("chat:write") };
+    CHECK(oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN && !er.fatal);
+
+    /* The owner makes it: the token to her alone, the roster row to both. */
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at; CHECK(oc_decode_agent_token(&p, &at) == OC_OK);
+    uint64_t agent = at.agent_id;
+    size_t pl = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    CHECK(agent && at.token.len == pl + 43 && memcmp(at.token.ptr, OC_PRINCIPAL_TOKEN_PREFIX, pl) == 0);
+    for (int k = 0; k < 2; k++) {
+        client *c = k ? &b : &a;
+        CHECK(read_type(c, OC_MSG_USER_LIST, &hdr, &p) == 0);
+        oc_user_list_entry ue[4]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, ue, 4, &n) == OC_OK && n == 1 && ue[0].user_id == agent &&
+              (ue[0].flags & OC_USER_AGENT));
+    }
+
+    /* Another token; the list shows two, without either token. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt = { agent, oc_slice_str("laptop"), oc_slice_str("im:history") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at2; CHECK(oc_decode_agent_token(&p, &at2) == OC_OK && at2.agent_id == agent);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_agent_tokens lt = { agent };
+    CHECK(oc_encode_list_agent_tokens(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN_LIST, &hdr, &p) == 0);
+    {
+        oc_agent_token_entry te[4]; uint16_t n = 0; uint64_t aid = 0;
+        CHECK(oc_decode_agent_token_list(&p, &aid, te, 4, &n) == OC_OK && aid == agent && n == 2);
+        CHECK(te[0].created_by == ua && te[1].token_id == at2.token_id);
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_agent_token rt = { agent, at2.token_id };
+    CHECK(oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &rt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN_LIST, &hdr, &p) == 0);
+    {
+        oc_agent_token_entry te[4]; uint16_t n = 0; uint64_t aid = 0;
+        CHECK(oc_decode_agent_token_list(&p, &aid, te, 4, &n) == OC_OK && n == 1);
+    }
+
+    /* Into the general channel: a member may not put it there; the owner may,
+     * and the members' list then has it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op inv = { OC_DEFAULT_CHANNEL, agent };
+    CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(members_include(&b, OC_DEFAULT_CHANNEL, agent) == 1);
+
+    /* Removed: everyone hears it, and it is no longer in the channel. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_agent ra = { agent };
+    CHECK(oc_encode_remove_agent(&w, OC_PROTOCOL_VERSION, &ra) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    for (int k = 0; k < 2; k++) {
+        client *c = k ? &b : &a;
+        CHECK(read_type(c, OC_MSG_USER_UPDATED, &hdr, &p) == 0);
+        oc_user_updated uu; CHECK(oc_decode_user_updated(&p, &uu) == OC_OK && uu.user_id == agent && uu.disabled);
+    }
+    CHECK(members_include(&b, OC_DEFAULT_CHANNEL, agent) == 0);
+    client_close(&a);
+    client_close(&b);
+}
+
 static void test_webhook_vertical(int port, const uint8_t *pin) {
     client a;
     CHECK(client_open(&a, port, pin) == 0);
@@ -9947,6 +10048,7 @@ int run_netloop_tests(void) {
         test_upload_restarted(arg.port, pin, dbw);
         test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
+        test_agent_vertical(arg.port, pin);
         test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and

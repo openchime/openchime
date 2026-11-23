@@ -398,7 +398,35 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* TTS_USE (write): message_id's speech was looked up under tts_handle,
         * so a removal by age (REQ-250) finds the rendering and deletes it;
         * answered OC_RES_OK. */
-       OC_JOB_TTS_USE = 258 };
+       OC_JOB_TTS_USE = 258,
+       /* Agents and their tokens (docs/details/MCP.md §3.1, §6; SCHEMA.md
+        * `principal_tokens`). All but TOKEN_LOOKUP are an owner's or admin's,
+        * user_id the actor. AGENT_CREATE: agent_name, and its first token's
+        * token_name and token_scopes; answered OC_RES_AGENT_TOKEN with the
+        * agent's roster row. AGENT_REMOVE: target_user_id; answered
+        * OC_RES_USER_UPDATED (disabled) with the memberships it ended.
+        * TOKEN_MINT: target_user_id, token_name, token_scopes; answered
+        * OC_RES_AGENT_TOKEN. TOKEN_LIST: target_user_id; answered
+        * OC_RES_TOKEN_LIST. TOKEN_REVOKE: target_user_id, token_id; answered
+        * OC_RES_TOKEN_LIST. Each refused as OC_RES_AGENT_ERR. TOKEN_LOOKUP:
+        * token/token_len the presented token, token_from its address; answered
+        * OC_RES_TOKEN_PRINCIPAL, or OC_RES_AGENT_ERR when it is no token. */
+       OC_JOB_AGENT_CREATE = 259, OC_JOB_AGENT_REMOVE = 260, OC_JOB_TOKEN_MINT = 261,
+       OC_JOB_TOKEN_LIST = 262, OC_JOB_TOKEN_REVOKE = 263, OC_JOB_TOKEN_LOOKUP = 264 };
+
+/* At most this many tokens an agent holds (docs/details/MCP.md §3.1). */
+#define OC_AGENT_MAX_TOKENS 10
+
+/* One token of an agent, as its list shows it: never the token. */
+typedef struct {
+    uint64_t id;
+    char    *name;          /* heap */
+    char    *scopes;        /* heap: names separated by single spaces */
+    uint64_t created_by;
+    uint64_t created_at_ms;
+    uint64_t last_used_at_ms;
+    char    *last_used_from;/* heap */
+} oc_token_row;
 
 /* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
  * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
@@ -576,6 +604,12 @@ typedef struct oc_job {
     char          *exp_blob_key;
     uint64_t       exp_bytes;
     uint32_t       exp_duration_ms;
+
+    /* Agents and tokens: AGENT_CREATE's name, a token's name and scopes
+     * (names separated by single spaces), TOKEN_REVOKE's token, and
+     * TOKEN_LOOKUP's address. All heap. */
+    char          *agent_name, *token_name, *token_scopes, *token_from;
+    uint64_t       token_id;
 
     /* Image previews (ARCH-137): PREVIEW_STORE's and PREVIEW_LOOKUP's
      * fields, with attachment_id. pv_keys and pv_mime are heap. */
@@ -1020,7 +1054,14 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_REC_PEOPLE = 146,
        /* Image previews (ARCH-137): a rung to serve (pv_key, pv_size, pv_w,
         * pv_h, pv_mime, pv_rung), or why not (err_code); and a store done. */
-       OC_RES_PREVIEW_META = 147, OC_RES_PREVIEW_ERR = 148, OC_RES_PREVIEW_STORED = 149 };
+       OC_RES_PREVIEW_META = 147, OC_RES_PREVIEW_ERR = 148, OC_RES_PREVIEW_STORED = 149,
+       /* Agents and tokens: a token minted (user_id the agent, message_id the
+        * token's id, session_token its bytes, shown once; ulist the agent's
+        * roster row when it was just created); an agent's token list
+        * (user_id, ptokens); a refusal (err_code); and a token found
+        * (user_id its agent, message_id its id, tok_scopes). */
+       OC_RES_AGENT_TOKEN = 150, OC_RES_TOKEN_LIST = 151, OC_RES_AGENT_ERR = 152,
+       OC_RES_TOKEN_PRINCIPAL = 153 };
 
 /* A line of a call's transcript as the daemon's transcript function takes it:
  * the speaker (0 unknown), from and to in ms from the call's start, the text. */
@@ -1690,6 +1731,10 @@ typedef struct oc_dbres {
     uint64_t                exp_bytes, exp_src_size;
     uint32_t                exp_duration_ms;
     uint8_t                 exp_cached;
+    /* OC_RES_TOKEN_LIST and OC_RES_TOKEN_PRINCIPAL. */
+    oc_token_row           *ptokens;
+    size_t                  n_ptokens;
+    char                   *tok_scopes;
     /* OC_RES_PREVIEW_META and OC_RES_PREVIEW_STORED (ARCH-137). */
     char                   *pv_key, *pv_mime;
     uint64_t                pv_size;

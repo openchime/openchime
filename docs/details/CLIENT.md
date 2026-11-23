@@ -206,6 +206,19 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   `oc_client_summary_cancel` cancels one being made. Activity lists notices as
   kind 4.
 
+- **Agents** (REQ-321, REQ-322, docs/details/MCP.md §3.1). Each roster entry
+  carries whether it is an agent (`USER_LIST`'s `OC_USER_AGENT`, held as
+  `oc_member.agent`, asked with `oc_model_user_is_agent`). An owner or admin
+  makes one with `oc_client_create_agent` (a name, its first token's name and
+  scopes), mints more with `oc_client_mint_agent_token`, lists an agent's tokens
+  with `oc_client_list_agent_tokens` (held as `atokens`, replaced by each list,
+  never holding a token), revokes one with `oc_client_revoke_agent_token`, and
+  removes the agent with `oc_client_remove_agent`. A minted token arrives once
+  and is held until a frontend takes it with `oc_model_take_agent_token`, which
+  clears it: no other copy is kept. Scopes are the catalog's names
+  (`shared/scopes.h`), each with the words a frontend shows beside it. An agent
+  is put in a channel with `oc_client_channel_invite`, as a person is.
+
 - **Images at the size they are drawn** (REQ-142, REQ-390, ARCH-137).
   `oc_client_fetch_image(c, attachment, rung)` fetches an image attachment into
   memory at a preview rung -- `OC_PREVIEW_RUNG_INLINE_WIRE` for the timeline,
@@ -1488,6 +1501,34 @@ the one SDL application:
 
 The terminal client draws no images (ARCH-75): an image is its attachment line,
 and it attaches by path.
+
+### Agents: administration and the tag
+
+**Administration** is an owner's or an admin's (REQ-321, docs/details/MCP.md §3.1):
+
+- **The graphical client:** Admin, **Agents**. New agent asks for a name, its
+  first token's name and its scopes, each a checkbox with its description
+  (`shared/scopes.h`). A token is shown once, with its scopes and their
+  descriptions, a Copy button and Done, which wipes it from memory. Each agent
+  has Tokens (name, scopes, when made, when last used and from where, never the
+  token; New token and Revoke) and Remove. Remove and Revoke ask first.
+- **The terminal client:** New agent is in the Ctrl+K launcher under Admin; it
+  asks for the name, the first token's name and the scopes, one line each,
+  `[x] scope  description`. Enter on an agent in the members panel opens its
+  menu: Profile, Tokens (Enter revokes one), New token, Add to the channel in
+  focus, and Remove agent. A token is shown once, alone on its line, for the
+  terminal's own copy; any key closes it and wipes it.
+
+**Adding one to a channel** is the channel's member list's Add someone in the
+graphical client, which offers agents to owners and admins alone; New message
+and group DMs never offer one.
+
+**The tag.** Everywhere a name appears an agent's carries **Agent**: the
+transcript, the member list, mention suggestions, a profile, search results
+and a summary's list of who posted (`[Agent]` and "(Agent)" in the terminal
+client). A channel's member list shows its agents in a group of their own,
+below the people. An agent shows no presence, status or local time, and its
+profile offers no Message, Mute or Block.
 
 ### Links
 

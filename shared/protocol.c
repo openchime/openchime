@@ -1673,6 +1673,10 @@ const char *oc_error_text(uint16_t code) {
         return "this image has no preview: the whole image is shown instead";
     case OC_ERR_PREVIEW_RUNG:
         return "that preview size doesn't exist";
+    case OC_ERR_UNKNOWN_SCOPE:
+        return "a token can only be given the kinds of access listed";
+    case OC_ERR_TOO_MANY_TOKENS:
+        return "this agent already has as many tokens as it can hold: revoke one first";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -3038,6 +3042,67 @@ oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_e
     size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_END);
     oc_w_u64(w, m->attachment_id);
     oc_w_u8(w, m->rung);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_create_agent(oc_wbuf *w, uint16_t version, const oc_create_agent *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_AGENT);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->token_name);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_agent_token(oc_wbuf *w, uint16_t version, const oc_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u64(w, m->token_id);
+    oc_w_str(w, m->token);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_remove_agent(oc_wbuf *w, uint16_t version, const oc_remove_agent *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REMOVE_AGENT);
+    oc_w_u64(w, m->agent_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_mint_agent_token(oc_wbuf *w, uint16_t version, const oc_mint_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MINT_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_agent_tokens(oc_wbuf *w, uint16_t version, const oc_list_agent_tokens *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_AGENT_TOKENS);
+    oc_w_u64(w, m->agent_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_agent_token_list(oc_wbuf *w, uint16_t version, const oc_agent_token_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AGENT_TOKEN_LIST);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_agent_token_entry *e = &m->entries[i];
+        oc_w_u64(w, e->token_id);
+        oc_w_str(w, e->name);
+        oc_w_str(w, e->scopes);
+        oc_w_u64(w, e->created_by);
+        oc_w_u64(w, e->created_at_ms);
+        oc_w_u64(w, e->last_used_at_ms);
+        oc_w_str(w, e->last_used_from);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_revoke_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u64(w, m->token_id);
     return oc_frame_end(w, off);
 }
 
@@ -4410,6 +4475,63 @@ oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m) {
 oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m) {
     m->attachment_id = oc_r_u64(p);
     m->rung = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_create_agent(oc_rbuf *p, oc_create_agent *m) {
+    m->name = oc_r_str(p);
+    m->token_name = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_agent_token(oc_rbuf *p, oc_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->token_id = oc_r_u64(p);
+    m->token = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_remove_agent(oc_rbuf *p, oc_remove_agent *m) {
+    m->agent_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_mint_agent_token(oc_rbuf *p, oc_mint_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->name = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_agent_tokens(oc_rbuf *p, oc_list_agent_tokens *m) {
+    m->agent_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_token_entry *entries, uint16_t cap,
+                                     uint16_t *out_count) {
+    *agent_id = oc_r_u64(p);
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_agent_token_entry e;
+        e.token_id = oc_r_u64(p);
+        e.name = oc_r_str(p);
+        e.scopes = oc_r_str(p);
+        e.created_by = oc_r_u64(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.last_used_at_ms = oc_r_u64(p);
+        e.last_used_from = oc_r_str(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->token_id = oc_r_u64(p);
     return r_done(p);
 }
 

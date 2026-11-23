@@ -156,7 +156,7 @@ counterparts to read, and `chat:write` to post. It stores only:
 - the agent it belongs to, its scopes, its name, who minted it and when;
 - when and from which address it was last used.
 
-An agent may hold several tokens (proposed: at most 10), so a token is replaced
+An agent may hold several tokens (decided: at most 10), so a token is replaced
 by minting the new one, moving the agent to it, then revoking the old. Minting
 is recorded in the administrative audit family, with the agent and the token's
 name, never the token.

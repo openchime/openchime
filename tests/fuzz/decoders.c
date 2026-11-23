@@ -143,6 +143,16 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_preview_info pvi; D(oc_decode_preview_info(&p, &pvi));
     oc_preview_chunk pvc; D(oc_decode_preview_chunk(&p, &pvc));
     oc_preview_end pve; D(oc_decode_preview_end(&p, &pve));
+    oc_create_agent cag; D(oc_decode_create_agent(&p, &cag));
+    oc_agent_token agt; D(oc_decode_agent_token(&p, &agt));
+    oc_remove_agent rag; D(oc_decode_remove_agent(&p, &rag));
+    oc_mint_agent_token mat; D(oc_decode_mint_agent_token(&p, &mat));
+    oc_list_agent_tokens lat; D(oc_decode_list_agent_tokens(&p, &lat));
+    oc_revoke_agent_token rat; D(oc_decode_revoke_agent_token(&p, &rat));
+    { oc_agent_token_entry te[4]; uint16_t nc = 0; uint64_t aid = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_agent_token_list(&p, &aid, te, 4, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_agent_token_list"); }
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
     oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
     D(oc_decode_list_groups(&p));

@@ -1368,6 +1368,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->pf_voice[n2] = '\0';
                 }
                 e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
+                e->user_agent = (ue[i].flags & OC_USER_AGENT) != 0;
                 e->ooo_start = ue[i].ooo_start;
                 e->ooo_end = ue[i].ooo_end;
                 snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
@@ -2702,6 +2703,37 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 ve->topic = slice_dup(ti.voices[i].label);
                 ve->preview = slice_dup(ti.voices[i].lang);
                 oc_queue_push(to_ui, ve);
+            }
+        } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN) {
+            /* A token, shown once: held for the frontend, which takes it. */
+            oc_agent_token at;
+            if (oc_decode_agent_token(&p, &at) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_AGENT_TOKEN);
+            if (e) {
+                e->user_id = at.agent_id;
+                e->message_id = at.token_id;
+                e->body = slice_text(at.token);
+                e->topic = slice_text(at.scopes);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN_LIST) {
+            oc_agent_token_entry te[OC_AGENT_TOKEN_LIST_MAX]; uint16_t count = 0; uint64_t aid = 0;
+            if (oc_decode_agent_token_list(&p, &aid, te, OC_AGENT_TOKEN_LIST_MAX, &count) != OC_OK) return -1;
+            if (count > OC_AGENT_TOKEN_LIST_MAX) count = OC_AGENT_TOKEN_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_AGENT_TOKENS_BEGIN);
+            if (b) { b->user_id = aid; oc_queue_push(to_ui, b); }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_AGENT_TOKEN_ROW);
+                if (!e) continue;
+                e->user_id = aid;
+                e->message_id = te[i].token_id;
+                e->body = slice_text(te[i].name);
+                e->topic = slice_text(te[i].scopes);
+                e->preview = slice_text(te[i].last_used_from);
+                e->author_id = te[i].created_by;
+                e->created_at = te[i].created_at_ms;
+                e->server_time = te[i].last_used_at_ms;
+                oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
@@ -4391,6 +4423,35 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_create_webhook cw = { c->channel_id, oc_slice_str(c->body) };
                 if (oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &cw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_AGENT && c->body) {
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_agent m = { oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
+                                      oc_slice_str(c->body3 ? c->body3 : "") };
+                if (oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MINT_AGENT_TOKEN && c->body) {
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_mint_agent_token m = { c->message_id, oc_slice_str(c->body), oc_slice_str(c->body3 ? c->body3 : "") };
+                if (oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REMOVE_AGENT || c->type == OC_CMD_LIST_AGENT_TOKENS ||
+                c->type == OC_CMD_REVOKE_AGENT_TOKEN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_REMOVE_AGENT) {
+                    oc_remove_agent m = { c->message_id };
+                    er = oc_encode_remove_agent(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_LIST_AGENT_TOKENS) {
+                    oc_list_agent_tokens m = { c->message_id };
+                    er = oc_encode_list_agent_tokens(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_revoke_agent_token m = { c->message_id, c->channel_id };
+                    er = oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_WEBHOOKS) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);

@@ -13224,6 +13224,205 @@ static void test_retention_audit(void) {
     cleanup_db(path);
 }
 
+/* ---- Agents and their tokens (docs/details/MCP.md §3.1, §6, §7) ----------- */
+
+static oc_dbres *agent_job(oc_dbwriter *w, int type, uint64_t actor, uint64_t agent, const char *name,
+                           const char *scopes, uint64_t token_id) {
+    oc_job *j = oc_job_new(type, 801);
+    j->user_id = actor;
+    j->target_user_id = agent;
+    j->token_id = token_id;
+    if (type == OC_JOB_AGENT_CREATE) j->agent_name = name ? strdup(name) : NULL;
+    else j->token_name = name ? strdup(name) : NULL;
+    j->token_scopes = scopes ? strdup(scopes) : NULL;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int agent_err(oc_dbres *r) {
+    int e = !r ? -1 : r->type == OC_RES_AGENT_ERR ? (int)r->err_code : 0;
+    oc_dbres_free(r);
+    return e;
+}
+
+/* The token as it is shown and presented: the prefix and its bytes in base64url. */
+static void token_text(const uint8_t raw[OC_SESSION_TOKEN_LEN], char *out) {
+    size_t p = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    memcpy(out, OC_PRINCIPAL_TOKEN_PREFIX, p);
+    out[p + oc_base64url_encode(raw, OC_SESSION_TOKEN_LEN, out + p)] = '\0';
+}
+
+static oc_dbres *token_lookup(oc_dbwriter *w, const char *text) {
+    oc_job *j = oc_job_new(OC_JOB_TOKEN_LOOKUP, 0);
+    j->token = strdup(text);
+    j->token_len = strlen(text);
+    j->token_from = strdup("192.0.2.7");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_agents(void) {
+    const char *path = tdb("agents.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "agown", "pw-own", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "agbob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(own && bob);
+    /* The workspace is at its cap: an agent takes no seat. */
+    oc_dbwriter_set_max_users(w, 2);
+    int64_t humans = ret_count(path, "SELECT COUNT(*) FROM users WHERE kind='human' AND is_system=0 AND ?1=?1;", 0);
+
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_CREATE, bob, 0, "Helper", "chat:write", 0)) == OC_ERR_FORBIDDEN);
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_CREATE, own, 0, "Helper", "chat:write admin", 0)) == OC_ERR_UNKNOWN_SCOPE);
+    oc_dbres *r = agent_job(w, OC_JOB_AGENT_CREATE, own, 0, "Helper", "channels:history chat:write", 0);
+    CHECK(r && r->type == OC_RES_AGENT_TOKEN && r->user_id && r->message_id);
+    uint64_t agent = r ? r->user_id : 0;
+    uint8_t first[OC_SESSION_TOKEN_LEN] = { 0 };
+    if (r) memcpy(first, r->session_token, sizeof first);
+    CHECK(r && r->tok_scopes && strcmp(r->tok_scopes, "chat:write channels:history") == 0);   /* contract: the catalog's order */
+    CHECK(r && r->n_ulist == 1 && r->ulist[0].user_id == agent && (r->ulist[0].flags & OC_USER_AGENT));
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM users WHERE id=?1 AND kind='agent' AND subject LIKE 'agent:%'"
+                          " AND display_name='Helper';", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM users WHERE kind='human' AND is_system=0 AND ?1=?1;", 0) == humans);
+    CHECK(ret_count(path, "SELECT (SELECT COUNT(*) FROM local_credentials WHERE user_id=?1)"
+                          " + (SELECT COUNT(*) FROM sessions WHERE user_id=?1);", agent) == 0);
+    /* Stored as its hash alone. */
+    uint8_t hash[OC_SHA256_LEN];
+    CHECK(oc_sha256(first, sizeof first, hash) == 0);
+    char hex[2 * OC_SHA256_LEN + 1], q[256];
+    for (unsigned i = 0; i < OC_SHA256_LEN; i++) snprintf(hex + 2 * i, 3, "%02X", hash[i]);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1 AND hex(token_hash)='%s';", hex);
+    CHECK(ret_count(path, q, agent) == 1);
+    char text[96];
+    token_text(first, text);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM audit_log WHERE COALESCE(target,'')||COALESCE(detail,'') LIKE '%%%s%%' AND ?1=?1;",
+             text + strlen(OC_PRINCIPAL_TOKEN_PREFIX));
+    CHECK(ret_count(path, q, 0) == 0);
+
+    /* Minting: owners and admins only, scopes from the catalog, ten at most. */
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, bob, agent, "laptop", "chat:write", 0)) == OC_ERR_FORBIDDEN);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "laptop", "chat:delete", 0)) == OC_ERR_UNKNOWN_SCOPE);
+    for (unsigned i = 1; i < OC_AGENT_MAX_TOKENS; i++)
+        CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "more", "im:history", 0)) == 0);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "eleventh", "im:history", 0)) == OC_ERR_TOO_MANY_TOKENS);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, bob, "person", "im:history", 0)) == OC_ERR_FORBIDDEN);
+    ret_sql(path, "INSERT INTO users(id, subject, display_name, role, kind, created_at_ms)"
+                  " VALUES(9900, 'bot:test', 'Botty', 'member', 'bot', 1);");
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, 9900, "install", "chat:write", 0)) == 0);
+
+    /* The list: everything but the token. */
+    r = agent_job(w, OC_JOB_TOKEN_LIST, own, agent, NULL, NULL, 0);
+    CHECK(r && r->type == OC_RES_TOKEN_LIST && r->n_ptokens == OC_AGENT_MAX_TOKENS);
+    uint64_t first_id = r && r->n_ptokens ? r->ptokens[0].id : 0;
+    CHECK(r && r->n_ptokens && r->ptokens[0].created_by == own && strcmp(r->ptokens[0].name, "first") == 0);
+    oc_dbres_free(r);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_LIST, bob, agent, NULL, NULL, 0)) == OC_ERR_FORBIDDEN);
+
+    /* The lookup: one probe, the agent and its scopes; last use at most once a minute. */
+    r = token_lookup(w, text);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL && r->user_id == agent && r->message_id == first_id);
+    CHECK(r && r->tok_scopes && strcmp(r->tok_scopes, "chat:write channels:history") == 0);   /* contract: the stored scopes */
+    oc_dbres_free(r);
+    int64_t used = ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id);
+    CHECK(used > 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM principal_tokens WHERE id=?1 AND last_used_from='192.0.2.7';", first_id) == 1);
+    snprintf(q, sizeof q, "UPDATE principal_tokens SET last_used_at_ms=%lld WHERE id=%llu;", (long long)used - 30000,
+             (unsigned long long)first_id);
+    ret_sql(path, q);
+    oc_dbres_free(token_lookup(w, text));                                  /* 30 s after: not written */
+    CHECK(ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id) == used - 30000);
+    snprintf(q, sizeof q, "UPDATE principal_tokens SET last_used_at_ms=%lld WHERE id=%llu;", (long long)used - 61000,
+             (unsigned long long)first_id);
+    ret_sql(path, q);
+    oc_dbres_free(token_lookup(w, text));                                  /* a minute on: written */
+    CHECK(ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id) >= used);
+    CHECK(agent_err(token_lookup(w, "ocpt_not-a-token")) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* Revoking: the row goes, and the very next lookup refuses it. */
+    r = agent_job(w, OC_JOB_TOKEN_REVOKE, own, agent, NULL, NULL, first_id);
+    CHECK(r && r->type == OC_RES_TOKEN_LIST && r->n_ptokens == OC_AGENT_MAX_TOKENS - 1);
+    oc_dbres_free(r);
+    CHECK(agent_err(token_lookup(w, text)) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* Channels: an owner or admin who is in the channel; never a DM or a group. */
+    ret_sql(path, "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(9801,'channel','ag-ops',1,1),"
+                  " (9802,'channel','ag-secret',0,1);");
+    snprintf(q, sizeof q, "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9801,%llu,1),(9801,%llu,1),"
+             "(9802,%llu,1);", (unsigned long long)own, (unsigned long long)bob, (unsigned long long)bob);
+    ret_sql(path, q);
+    oc_job *j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = bob; j->channel_id = 9801; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = own; j->channel_id = 9802; j->target_user_id = agent;     /* private, and not theirs */
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = own; j->channel_id = 9801; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channel_members WHERE channel_id=9801 AND user_id=?1;", agent) == 1);
+    j = oc_job_new(OC_JOB_OPEN_DM, 803);
+    j->user_id = own; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type != OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 804);
+    j->user_id = own;
+    j->group_uids[0] = bob; j->group_uids[1] = agent; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type != OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    uint64_t gid = grp_create(w, own, "agentsgrp");
+    CHECK(gid != 0);
+    oc_dbres_free(grp_members(w, own, gid, 1, &agent, 1));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM user_group_members WHERE user_id=?1;", agent) == 0);
+
+    /* Removing it: its tokens and memberships go, its messages stay. */
+    snprintf(q, sizeof q, "INSERT INTO messages(channel_id,author_id,body,created_at_ms) VALUES(9801,%llu,'agent says hi',5);",
+             (unsigned long long)agent);
+    ret_sql(path, q);
+    char second[96];
+    {
+        r = agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "spare", "chat:write", 0);   /* below the limit again */
+        CHECK(r && r->type == OC_RES_AGENT_TOKEN);
+        if (r) token_text(r->session_token, second); else second[0] = '\0';
+        oc_dbres_free(r);
+    }
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_REMOVE, bob, agent, NULL, NULL, 0)) == OC_ERR_FORBIDDEN);
+    r = agent_job(w, OC_JOB_AGENT_REMOVE, own, agent, NULL, NULL, 0);
+    CHECK(r && r->type == OC_RES_USER_UPDATED && r->user_id == agent && r->disabled);
+    CHECK(r && r->n_mchg == 1 && r->mchg[0].channel_id == 9801 && !r->mchg[0].joined);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1;", agent) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channel_members WHERE user_id=?1;", agent) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE author_id=?1;", agent) == 1);
+    CHECK(agent_err(token_lookup(w, second)) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* One administrative row each, naming the agent, never a token. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.create' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.token.mint' AND target_id=?1;", agent) ==
+          OC_AGENT_MAX_TOKENS + 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.token.revoke' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.channel.add' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.remove' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'agent.%' AND family<>?1;", OC_AUDIT_ADMIN) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
@@ -13238,6 +13437,7 @@ int run_dbwriter_tests(void) {
     test_retention_threads();
     test_retention_forward_kept();
     test_retention_rendered_audio();
+    test_agents();
     test_retention_batch();
     test_retention_calls();
     test_retention_audit();

@@ -1018,6 +1018,13 @@ list of people (the roster, the directory, a member picker, mention
 completion), and offers no DM, profile or role action on it. Nothing signs in
 as it, and a message sent into its DM is refused with `WORKSPACE_SENDER`.
 
+`flags` bit `0x02` (`OC_USER_AGENT`) marks **an agent** (§5.16p): an account
+that acts only through a token. A client shows an **Agent** tag beside its name
+wherever a name appears, lists it below the people in a channel's member list,
+and shows no presence, status or local time for it. A new bit in the same byte,
+so the entry's layout and the version are unchanged; a client that does not
+know it shows the agent as a person.
+
 A **phone number is deliberately absent**: it is contact detail rather than
 something drawn beside a name, and every member's number in every roster
 fan-out is a size and privacy cost with nothing asking for it. `PROFILE_INFO`
@@ -3202,6 +3209,54 @@ conversation; after `MESSAGE_RESTORED` for a restored list; replayed by backfill
 list, so every one carries the list's current state. Adding these frames needed
 no protocol-version bump.
 
+### 5.16p Agents and their tokens (REQ-321, REQ-322)
+
+An **agent** is an account that is not a person (docs/details/MCP.md §3.1): a
+`users` row of kind `agent`, with a name and nothing a person signs in with,
+which acts only through a **token**. Every frame here is an owner's or an
+admin's; from anyone else it is refused `FORBIDDEN`. All are new frames, so no
+version bump.
+
+A token is 32 random bytes, sent as `ocpt_` and the bytes in base64url. It is
+**sent once**, in `AGENT_TOKEN` to the connection that minted it, and stored only
+as its SHA-256: no frame lists it again. `scopes` is names from the scope
+catalog (`shared/scopes.c`, docs/plans/APPS.md §4) separated by single spaces;
+the daemon keeps them in the catalog's order. An agent holds at most 10 tokens.
+
+- **`CREATE_AGENT` (C → S), `0x0146`** `{ name: str, token_name: str, scopes:
+  str }` — an agent, and its first token. Answered `AGENT_TOKEN`, and the agent's
+  `USER_LIST` entry, flagged `OC_USER_AGENT`, to every connection. It takes no
+  seat in the registered-user cap.
+- **`AGENT_TOKEN` (S → C), `0x0147`** `{ agent_id: u64, token_id: u64, token:
+  str, scopes: str }` — a token minted, the only time it is sent.
+- **`REMOVE_AGENT` (C → S), `0x0148`** `{ agent_id: u64 }` — its tokens and its
+  channel memberships go in one transaction, and its row is marked removed;
+  its messages stay under its name. Answered `USER_UPDATED` (removed) to every
+  connection, and each channel it was in is told as for a member leaving.
+- **`MINT_AGENT_TOKEN` (C → S), `0x0149`** `{ agent_id: u64, name: str, scopes:
+  str }` — another token. Answered `AGENT_TOKEN`.
+- **`LIST_AGENT_TOKENS` (C → S), `0x014A`** `{ agent_id: u64 }`, answered
+- **`AGENT_TOKEN_LIST` (S → C), `0x014B`** `{ agent_id: u64, count: u16,
+  entries: [ { token_id: u64, name: str, scopes: str, created_by: u64,
+  created_at_ms: u64, last_used_at_ms: u64, last_used_from: str } ] }` — each
+  token's name, who minted it, when, its scopes, and when and from where it was
+  last used (0 and empty for never; written at most once a minute).
+- **`REVOKE_AGENT_TOKEN` (C → S), `0x014C`** `{ agent_id: u64, token_id: u64 }` —
+  the token's row is deleted, and the next request with it is refused.
+  Answered `AGENT_TOKEN_LIST`.
+
+Refusals are `ERROR` frames: `FORBIDDEN` (not an owner or admin, or no such
+agent), **`UNKNOWN_SCOPE` 3079** (a scope outside the catalog), **`TOO_MANY_TOKENS`
+3080** (the agent already holds 10), and `INVALID_CHANNEL` for a name that is
+empty or too long.
+
+**Channels.** An owner or admin adds an agent to a channel with
+`INVITE_TO_CHANNEL` and removes it with the channel's member removal, as for a
+person, and must be in the channel themselves. Anyone else is refused
+`FORBIDDEN`. An agent is never put in a DM, a group DM or a user group.
+
+---
+
 ### 5.17 Calls (REQ-150-152, REQ-160, REQ-161, REQ-301-306, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
@@ -3909,6 +3964,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3076` | `RECORDING_UNAVAILABLE` | call     | no    | A `CALL_RECORD` start where recording is not offered: not built in, turned off by an admin, a public demo, or the recordings' space used up (§5.17). |
 | `3077` | `PREVIEW_MISSING` | transfer | no    | A `PREVIEW_BEGIN` for a rung the attachment has no preview at: never made, or reclaimed. The client downloads the original instead (§5.14f). |
 | `3078` | `PREVIEW_RUNG` | transfer | no    | A `PREVIEW_BEGIN` naming a rung that is neither 1 nor 2 (§5.14f). |
+| `3079` | `UNKNOWN_SCOPE` | admin | no    | A token minted with a scope outside the catalog (§5.16p). |
+| `3080` | `TOO_MANY_TOKENS` | admin | no    | A token minted for an agent that already holds 10 (§5.16p). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -4222,6 +4279,13 @@ this table cannot silently gain a shared value.
 | `0x0143` | `PREVIEW_INFO` | S → C | the preview's dimensions, type and size (§5.14f) |
 | `0x0144` | `PREVIEW_CHUNK` | S → C | a slice of the preview (§5.14f) |
 | `0x0145` | `PREVIEW_END` | S → C | the whole preview is sent (§5.14f) |
+| `0x0146` | `CREATE_AGENT` | C → S | an agent, and its first token (§5.16p) |
+| `0x0147` | `AGENT_TOKEN` | S → C | a token minted, shown once (§5.16p) |
+| `0x0148` | `REMOVE_AGENT` | C → S | an agent, its tokens and memberships (§5.16p) |
+| `0x0149` | `MINT_AGENT_TOKEN` | C → S | another token for an agent (§5.16p) |
+| `0x014A` | `LIST_AGENT_TOKENS` | C → S | an agent's tokens (§5.16p) |
+| `0x014B` | `AGENT_TOKEN_LIST` | S → C | the list, never a token (§5.16p) |
+| `0x014C` | `REVOKE_AGENT_TOKEN` | C → S | revoke one token (§5.16p) |
 
 ## 10. Connection state machine
 

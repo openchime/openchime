@@ -442,6 +442,13 @@ int main(int argc, char **argv) {
     { static oc_history_request m; FRAME("history_request", oc_encode_history_request(&w, V, &m)); }
     { static oc_history_around m; FRAME("history_around", oc_encode_history_around(&w, V, &m)); }
     { static oc_backfill_done m; FRAME("backfill_done", oc_encode_backfill_done(&w, V, &m)); }
+    { static oc_create_agent m; FRAME("create_agent", oc_encode_create_agent(&w, V, &m)); }
+    { static oc_agent_token m; FRAME("agent_token", oc_encode_agent_token(&w, V, &m)); }
+    { static oc_remove_agent m; FRAME("remove_agent", oc_encode_remove_agent(&w, V, &m)); }
+    { static oc_mint_agent_token m; FRAME("mint_agent_token", oc_encode_mint_agent_token(&w, V, &m)); }
+    { static oc_list_agent_tokens m; FRAME("list_agent_tokens", oc_encode_list_agent_tokens(&w, V, &m)); }
+    { static oc_agent_token_list m; FRAME("agent_token_list", oc_encode_agent_token_list(&w, V, &m)); }
+    { static oc_revoke_agent_token m; FRAME("revoke_agent_token", oc_encode_revoke_agent_token(&w, V, &m)); }
     { static oc_error m; FRAME("error", oc_encode_error(&w, V, &m)); }
 
     static const uint16_t one[] = { 1 }, small[] = { 3, 7, 64 }, whole[] = { 16384 }, mixed[] = { 9, 4096, 2, 300 };
