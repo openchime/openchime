@@ -82,7 +82,10 @@ if [ ! -f "${DEST}/lib/libavcenc.a" ]; then
       for f in "${arm_selectors[@]}"; do files+=("encoder/arm/$f.c"); done
       for f in "${arm_asm[@]}"; do files+=("encoder/armv8/$f.s"); done
       inc+=(-I"${SRC}/common/arm" -I"${SRC}/common/armv8" -I"${SRC}/encoder/arm" -I"${SRC}/encoder/armv8")
-      march=(-march=armv8-a)
+      # As upstream's CMake defines it for aarch64: without ARMV8 the common
+      # headers take the 32-bit ARM inline assembly (usat), which no aarch64
+      # assembler accepts, and the selector the armv7 routines.
+      march=(-march=armv8-a -DARMV8 -DDEFAULT_ARCH=D_ARCH_ARMV8_GENERIC)
       ;;
     *) echo "build_libavc: no build for ${ARCH}" >&2; exit 2 ;;
   esac
