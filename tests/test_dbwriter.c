@@ -13320,6 +13320,372 @@ static oc_dbres *token_lookup(oc_dbwriter *w, const char *text) {
     return wait_result(w);
 }
 
+/* ---- Outgoing webhooks (docs/details/WEBHOOKS.md) -------------------------- */
+
+static oc_dbres *owh_create(oc_dbwriter *w, uint64_t actor, const char *url, const char *events,
+                            const uint64_t *chans, uint16_t n, const uint8_t *secret) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_CREATE, 802);
+    j->user_id = actor;
+    j->owh_url = strdup(url);
+    j->owh_events = strdup(events);
+    j->owh_n_channels = n;
+    for (uint16_t i = 0; i < n; i++) j->owh_channels[i] = chans[i];
+    if (secret) { j->owh_verified = 1; memcpy(j->owh_secret, secret, OC_OUTWH_SECRET_LEN); }
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *owh_job(oc_dbwriter *w, int type, uint64_t actor, uint64_t id, uint8_t enabled) {
+    oc_job *j = oc_job_new(type, 803);
+    j->user_id = actor;
+    j->owh_id = id;
+    j->owh_enabled = enabled;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int owh_err(oc_dbres *r) {
+    int e = !r ? -1 : r->type == OC_RES_OUTWH_ERR ? (int)r->err_code : 0;
+    oc_dbres_free(r);
+    return e;
+}
+
+static oc_dbres *owh_take(oc_dbwriter *w) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_TAKE, 0);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *owh_done(oc_dbwriter *w, uint64_t delivery, int ok, const char *reason) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_DONE, 0);
+    j->owh_delivery = delivery;
+    j->owh_ok = (uint8_t)ok;
+    j->owh_reason = reason ? strdup(reason) : NULL;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* The deliveries queued for webhook `hook` whose envelope holds `needle`. */
+static int64_t owh_count(const char *path, uint64_t hook, const char *needle) {
+    char sql[512];
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1 AND instr(payload, '%s') > 0;",
+             needle);
+    return ret_count(path, sql, hook);
+}
+
+/* The sealed secret stored for `hook`. Its length, or -1. */
+static int owh_sealed(const char *path, uint64_t hook, uint8_t *out, size_t cap) {
+    sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int n = -1;
+    if (raw_open(path, &db) == SQLITE_OK &&
+        sqlite3_prepare_v2(db, "SELECT secret_sealed FROM outgoing_webhooks WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)hook);
+        if (sqlite3_step(st) == SQLITE_ROW && (size_t)sqlite3_column_bytes(st, 0) <= cap) {
+            n = sqlite3_column_bytes(st, 0);
+            memcpy(out, sqlite3_column_blob(st, 0), (size_t)n);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+static void test_outgoing_webhooks(void) {
+    const char *path = tdb("outwh.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint8_t key[OC_FACTOR_KEY_LEN];
+    memset(key, 0x42, sizeof key);
+    oc_dbwriter_set_factor_key(w, key);
+    uint64_t own = reg(w, "whown", "pw-own", OC_ROLE_OWNER);
+    uint64_t adm = reg(w, "whadm", "pw-adm", OC_ROLE_ADMIN);
+    uint64_t bob = reg(w, "whbob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(own && adm && bob);
+    oc_dbres *r = create_channel(w, own, "hooks-pub", 1);
+    uint64_t pub = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, own, "hooks-priv", 0);
+    uint64_t priv = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = open_dm(w, own, bob);
+    uint64_t dm = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(pub && priv && dm);
+    const char *all = "user_change reaction_added message member_joined_channel member_left_channel "
+                      "channel_rename channel_archive channel_unarchive reaction_removed message";
+    uint64_t two[2] = { pub, priv };
+
+    /* Owners and admins alone; https only; the events listed; named channels. */
+    CHECK(owh_err(owh_create(w, bob, "https://hooks.example/in", "message", two, 2, NULL)) == OC_ERR_FORBIDDEN);
+    CHECK(owh_err(owh_create(w, own, "http://hooks.example/in", "message", two, 2, NULL)) == OC_ERR_WEBHOOK_URL);
+    CHECK(owh_err(owh_create(w, own, "https:// spaced", "message", two, 2, NULL)) == OC_ERR_WEBHOOK_URL);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message app_mention", two, 2, NULL)) == OC_ERR_WEBHOOK_EVENT);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "", two, 2, NULL)) == OC_ERR_WEBHOOK_EVENT);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message", &dm, 1, NULL)) == OC_ERR_FORBIDDEN);
+    uint64_t none = 987654;
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message", &none, 1, NULL)) == OC_ERR_UNKNOWN_CHANNEL);
+
+    /* Checked before it is saved: a secret for the check, and no row yet. */
+    r = owh_create(w, own, "https://hooks.example/in", all, two, 2, NULL);
+    CHECK(r && r->type == OC_RES_OUTWH_CHECK);
+    const char *canon = "message reaction_added reaction_removed member_joined_channel member_left_channel "
+                        "channel_rename channel_archive channel_unarchive user_change";
+    CHECK(r && r->owh_events && strcmp(r->owh_events, canon) == 0);   /* contract: the catalog's order */
+    CHECK(r && r->owh_n_channels == 2);
+    uint8_t secret[OC_OUTWH_SECRET_LEN] = { 0 }, zero[OC_OUTWH_SECRET_LEN] = { 0 };
+    if (r) memcpy(secret, r->owh_secret, sizeof secret);
+    oc_dbres_free(r);
+    CHECK(memcmp(secret, zero, sizeof secret) != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhooks WHERE ?1=?1;", 0) == 0);
+
+    /* Saved once its endpoint answered: the secret back once, kept sealed. */
+    r = owh_create(w, own, "https://hooks.example/in", all, two, 2, secret);
+    CHECK(r && r->type == OC_RES_OUTWH_SECRET && r->message_id);
+    uint64_t hook = r ? r->message_id : 0;
+    CHECK(r && memcmp(r->owh_secret, secret, sizeof secret) == 0);
+    oc_dbres_free(r);
+    uint8_t sealed[128], opened[OC_TOTP_SECRET_LEN];
+    int sl = owh_sealed(path, hook, sealed, sizeof sealed);
+    CHECK(sl == (int)OC_TOTP_SEALED_LEN);
+    CHECK(sl > 0 && memmem(sealed, (size_t)sl, secret, sizeof secret) == NULL);
+    CHECK(sl > 0 && oc_factor_open(key, hook, sealed, (size_t)sl, opened) == 0 && memcmp(opened, secret, sizeof secret) == 0);
+    CHECK(sl > 0 && oc_factor_open(key, hook + 1, sealed, (size_t)sl, opened) != 0);   /* bound to its row */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.create' AND target_id=?1;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE webhook_id=?1;", hook) == 2);
+
+    /* One naming no channel: user_change alone reaches it. */
+    r = owh_create(w, adm, "https://other.example/in", "message user_change", NULL, 0, secret);
+    CHECK(r && r->type == OC_RES_OUTWH_SECRET);
+    uint64_t bare = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    r = owh_job(w, OC_JOB_OUTWH_LIST, adm, 0, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 2);
+    CHECK(r && r->n_owh_rows == 2 && r->owh_rows[0].id == hook && r->owh_rows[0].enabled &&
+          r->owh_rows[0].n_channels == 2 && r->owh_rows[0].created_by == own &&
+          strcmp(r->owh_rows[0].url, "https://hooks.example/in") == 0 && r->owh_rows[1].n_channels == 0);
+    oc_dbres_free(r);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_LIST, bob, 0, 0)) == OC_ERR_FORBIDDEN);
+
+    /* Each event, queued in its envelope. */
+    char body[128], want[96];
+    snprintf(body, sizeof body, "hi <@U%llu> @here", (unsigned long long)bob);
+    uint64_t mid = send_id(w, own, pub, body);
+    CHECK(mid != 0);
+    CHECK(owh_count(path, hook, "\"type\":\"event_callback\"") == 1);
+    snprintf(want, sizeof want, "\"api_app_id\":\"W%llu\"", (unsigned long long)hook);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, hook, "\"authorizations\":[]") == 1);
+    CHECK(owh_count(path, hook, "\"team_id\":\"T") == 1);
+    CHECK(owh_count(path, hook, "\"event_time\":") == 1);
+    snprintf(want, sizeof want, "\"channel\":\"C%llu\",\"channel_type\":\"channel\",\"user\":\"U%llu\"",
+             (unsigned long long)pub, (unsigned long long)own);
+    CHECK(owh_count(path, hook, want) == 1);
+    snprintf(want, sizeof want, "\"text\":\"hi <@U%llu> <!here>\",\"ts\":\"%llu\"", (unsigned long long)bob,
+             (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, bare, "\"type\":\"message\"") == 0);          /* names no channel */
+    /* A mention by name becomes the id form too. */
+    char *bobname = NULL;
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+        if (raw_open(path, &db) == SQLITE_OK &&
+            sqlite3_prepare_v2(db, "SELECT display_name FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)bob);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                bobname = strdup((const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, own, pub, bob));
+    snprintf(want, sizeof want, "\"type\":\"member_joined_channel\",\"user\":\"U%llu\",\"channel\":\"C%llu\","
+             "\"channel_type\":\"C\"", (unsigned long long)bob, (unsigned long long)pub);
+    CHECK(owh_count(path, hook, want) == 1);
+    if (bobname) {
+        snprintf(body, sizeof body, "thanks @%s", bobname);
+        CHECK(send_id(w, own, pub, body) != 0);
+        snprintf(want, sizeof want, "\"text\":\"thanks <@U%llu>\"", (unsigned long long)bob);
+        CHECK(owh_count(path, hook, want) == 1);
+    }
+    free(bobname);
+    /* A private channel's, as a group. */
+    CHECK(send_id(w, own, priv, "quiet") != 0);
+    CHECK(owh_count(path, hook, "\"channel_type\":\"group\"") == 1);
+    /* Never a DM's. */
+    int64_t before = ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE ?1=?1;", 0);
+    CHECK(send_id(w, own, dm, "just us") != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE ?1=?1;", 0) == before);
+    /* An action, a reply, an edit, a delete. */
+    CHECK(send_id(w, own, pub, "/me waves") != 0);
+    CHECK(owh_count(path, hook, "\"subtype\":\"me_message\"") == 1);
+    CHECK(owh_count(path, hook, "\"text\":\"waves\"") == 1);
+    oc_job *rj = oc_job_new(OC_JOB_SEND_REPLY, 804);
+    rj->user_id = bob; rj->channel_id = pub; rj->parent_id = mid;
+    memset(rj->idem, 0x7e, OC_IDEM_LEN);
+    oc_job_set_body(rj, "a reply", 7);
+    oc_dbwriter_submit(w, rj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    oc_dbres_free(r);
+    snprintf(want, sizeof want, "\"thread_ts\":\"%llu\"", (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    r = do_edit(w, own, pub, mid, "hi again");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    CHECK(owh_count(path, hook, "\"subtype\":\"message_changed\"") == 1);
+    CHECK(owh_count(path, hook, "\"text\":\"hi again\"") == 1);
+    /* Reactions: added and removed, and nothing for one already there. */
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_ADD));
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_ADD));
+    snprintf(want, sizeof want, "\"type\":\"reaction_added\",\"user\":\"U%llu\",\"reaction\":\"thumbsup\"",
+             (unsigned long long)bob);
+    CHECK(owh_count(path, hook, want) == 1);
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_REMOVE));
+    CHECK(owh_count(path, hook, "\"type\":\"reaction_removed\"") == 1);
+    oc_job *dj = oc_job_new(OC_JOB_DELETE, 805);
+    dj->user_id = own; dj->channel_id = pub; dj->message_id = mid;
+    oc_dbwriter_submit(w, dj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    snprintf(want, sizeof want, "\"subtype\":\"message_deleted\",\"hidden\":true,\"channel\":\"C%llu\"",
+             (unsigned long long)pub);
+    CHECK(owh_count(path, hook, want) == 1);
+    snprintf(want, sizeof want, "\"deleted_ts\":\"%llu\"", (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    /* Leaving, and the channel's own changes. */
+    oc_dbres_free(chan_ref(w, OC_JOB_LEAVE_CHANNEL, bob, pub));
+    CHECK(owh_count(path, hook, "\"type\":\"member_left_channel\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_RENAME, "hooks-renamed"));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_rename\",\"channel\":{") == 1);
+    CHECK(owh_count(path, hook, "\"name\":\"hooks-renamed\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_ARCHIVE, NULL));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_archive\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_UNARCHIVE, NULL));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_unarchive\"") == 1);
+    /* A profile: to both, whatever their channels. */
+    oc_job *pj = oc_job_new(OC_JOB_SET_PROFILE, 806);
+    pj->user_id = bob;
+    pj->pf_full_name = strdup("Bob \"Builder\"");
+    pj->pf_title = strdup("Crew");
+    oc_dbwriter_submit(w, pj);
+    oc_dbres_free(wait_result(w));
+    snprintf(want, sizeof want, "\"type\":\"user_change\",\"user\":{\"id\":\"U%llu\"", (unsigned long long)bob);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, bare, want) == 1);
+    CHECK(owh_count(path, bare, "\"real_name\":\"Bob \\\"Builder\\\"\"") == 1);   /* escaped as JSON */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", bare) == 1);
+    /* Every delivery its own event id. */
+    CHECK(ret_count(path, "SELECT COUNT(*) - COUNT(DISTINCT event_id) FROM webhook_deliveries WHERE ?1=?1;", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE event_id NOT LIKE 'Ev%' AND ?1=?1;", 0) == 0);
+
+    /* Disabled by hand: no events queued; enabled, they are again. */
+    r = owh_job(w, OC_JOB_OUTWH_SET, adm, hook, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 2 && !r->owh_rows[0].enabled);
+    oc_dbres_free(r);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_SET, bob, hook, 1)) == OC_ERR_FORBIDDEN);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.disable' AND target_id=?1;", hook) == 1);
+    int64_t queued = ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook);
+    CHECK(send_id(w, own, pub, "while off") != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook) == queued);
+    oc_dbres_free(owh_job(w, OC_JOB_OUTWH_SET, own, hook, 1));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.enable' AND target_id=?1;", hook) == 1);
+
+    /* The queue: what is due is taken once, and held. */
+    {
+        sqlite3 *db = NULL;
+        if (raw_open(path, &db) == SQLITE_OK) sqlite3_exec(db, "DELETE FROM webhook_deliveries;", NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    CHECK(send_id(w, own, pub, "deliver me") != 0);
+    r = owh_take(w);
+    CHECK(r && r->type == OC_RES_OUTWH_DUE && r->n_owh_due == 1);
+    uint64_t dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    CHECK(r && r->n_owh_due == 1 && r->owh_due[0].webhook_id == hook && r->owh_due[0].attempts == 0 &&
+          r->owh_due[0].sealed_len == OC_TOTP_SEALED_LEN && strcmp(r->owh_due[0].url, "https://hooks.example/in") == 0 &&
+          strstr(r->owh_due[0].payload, "deliver me") && strncmp(r->owh_due[0].event_id, "Ev", 2) == 0);
+    oc_dbres_free(r);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 0);                     /* held while it is being sent */
+    oc_dbres_free(r);
+    char *evid = NULL;
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+        if (raw_open(path, &db) == SQLITE_OK &&
+            sqlite3_prepare_v2(db, "SELECT event_id FROM webhook_deliveries WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)dv);
+            if (sqlite3_step(st) == SQLITE_ROW) evid = strdup((const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    /* A failure: tried again after 1 s, then 2 s, ..., the same event id. */
+    oc_dbres_free(owh_done(w, dv, 0, "http_error"));
+    CHECK(ret_count(path, "SELECT attempts FROM webhook_deliveries WHERE id=?1;", dv) == 1);
+    CHECK(ret_count(path, "SELECT d.next_at_ms - w.failing_since_ms FROM webhook_deliveries d"
+                          " JOIN outgoing_webhooks w ON w.id=d.webhook_id WHERE d.id=?1;", dv) == 1000);
+    CHECK(ret_count(path, "SELECT last_reason='http_error' FROM webhook_deliveries WHERE id=?1;", dv) == 1);
+    for (uint32_t a = 1; a < OC_OUTWH_ATTEMPTS; a++) {
+        oc_dbwriter_advance_clock_ms((uint64_t)a * 120000u);
+        r = owh_take(w);
+        CHECK(r && r->n_owh_due == 1 && r->owh_due[0].id == dv && r->owh_due[0].attempts == a &&
+              evid && strcmp(r->owh_due[0].event_id, evid) == 0);
+        oc_dbres_free(r);
+        oc_dbres_free(owh_done(w, dv, 0, a == 1 ? "http_timeout" : "connection_failed"));
+    }
+    free(evid);
+    /* The eighth failure ends it. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE id=?1;", dv) == 0);
+    CHECK(ret_count(path, "SELECT enabled FROM outgoing_webhooks WHERE id=?1;", hook) == 1);
+
+    /* Failing for a day: turned off, owners and admins told, audited. */
+    CHECK(send_id(w, own, pub, "still failing") != 0);
+    oc_dbwriter_advance_clock_ms(OC_OUTWH_DISABLE_MS);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 1);
+    dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    oc_dbres_free(r);
+    r = owh_done(w, dv, 0, "http_error");
+    CHECK(r && r->type == OC_RES_OUTWH_DONE && r->owh_disabled == 1);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT enabled FROM outgoing_webhooks WHERE id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT disabled_reason <> '' FROM outgoing_webhooks WHERE id=?1;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.disable' AND target_id=?1"
+                          " AND actor_id IS NULL;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(DISTINCT cm.user_id) FROM messages m JOIN channel_members cm ON cm.channel_id=m.channel_id"
+                          " JOIN users u ON u.id=cm.user_id WHERE u.is_system=0 AND instr(m.body, 'outgoing webhook to"
+                          " https://hooks.example/in was turned off') > 0 AND ?1=?1;", 0) == 2);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages m JOIN channel_members cm ON cm.channel_id=m.channel_id"
+                          " WHERE cm.user_id=?1 AND instr(m.body, 'was turned off') > 0;", bob) == 0);
+
+    /* Turned on again and answered: done, and failing no more. */
+    oc_dbres_free(owh_job(w, OC_JOB_OUTWH_SET, own, hook, 1));
+    oc_dbwriter_advance_clock_ms(OC_OUTWH_DISABLE_MS + 600000u);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 1);
+    dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    oc_dbres_free(r);
+    oc_dbres_free(owh_done(w, dv, 1, NULL));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE id=?1;", dv) == 0);
+    CHECK(ret_count(path, "SELECT failing_since_ms FROM outgoing_webhooks WHERE id=?1;", hook) == 0);
+
+    /* Deleted: its channels and deliveries with it. */
+    CHECK(send_id(w, own, pub, "one more") != 0);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_DELETE, bob, hook, 0)) == OC_ERR_FORBIDDEN);
+    r = owh_job(w, OC_JOB_OUTWH_DELETE, own, hook, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 1 && r->owh_rows[0].id == bare);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE webhook_id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.delete' AND target_id=?1;", hook) == 1);
+
+    oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
+    cleanup_db(path);
+}
+
 static void test_agents(void) {
     const char *path = tdb("agents.db");
     cleanup_db(path);
@@ -13827,6 +14193,7 @@ int run_dbwriter_tests(void) {
     test_retention_rendered_audio();
     test_agents();
     test_connections();
+    test_outgoing_webhooks();
     test_retention_batch();
     test_retention_calls();
     test_retention_audit();

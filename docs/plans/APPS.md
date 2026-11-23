@@ -208,6 +208,11 @@ apps and the plain outgoing webhooks an owner or admin sets up (REQ-173). An
 outgoing webhook is the simpler form of the same delivery: an endpoint and a
 list of events, with no install, no bot and no commands.
 
+Outgoing webhooks are built: [details/WEBHOOKS.md](../details/WEBHOOKS.md) is
+what they do now, their events, envelope, signing and delivery, and where they
+differ from what this section proposes for apps (`api_app_id` is `W` and the
+webhook's id, and `authorizations` is empty).
+
 ### 5.1 The catalog and the envelope
 
 Event names and payloads follow the widely used chat-platform convention, so

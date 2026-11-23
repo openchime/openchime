@@ -3171,6 +3171,72 @@ static void test_connection_frames(void) {
     }
 }
 
+/* Outgoing webhooks: every frame through and back; a create naming more
+ * channels than a webhook takes is refused. */
+static void test_outgoing_webhook_frames(void) {
+    static uint8_t frame[4096];
+    {
+        oc_create_outgoing_webhook in;
+        memset(&in, 0, sizeof in);
+        in.url = oc_slice_str("https://ci.example/hook");
+        in.events = oc_slice_str("message reaction_added");
+        in.n_channels = 2; in.channels[0] = 7; in.channels[1] = 9;
+        ROUNDTRIP(oc_encode_create_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_OUTGOING_WEBHOOK, h, p);
+        oc_create_outgoing_webhook out;
+        CHECK(oc_decode_create_outgoing_webhook(&p, &out) == OC_OK && out.url.len == 23 && out.events.len == 22 &&
+              out.n_channels == 2 && out.channels[0] == 7 && out.channels[1] == 9);
+    }
+    {
+        oc_outgoing_webhook_secret in = { 4, oc_slice_str("s3cr3t") };
+        ROUNDTRIP(oc_encode_outgoing_webhook_secret(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_OUTGOING_WEBHOOK_SECRET, h, p);
+        oc_outgoing_webhook_secret out;
+        CHECK(oc_decode_outgoing_webhook_secret(&p, &out) == OC_OK && out.webhook_id == 4 && out.secret.len == 6);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_outgoing_webhooks(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_OUTGOING_WEBHOOKS, h, p);
+        CHECK(p.len == 0);
+    }
+    {
+        static oc_outgoing_webhook_entry e[2];
+        memset(e, 0, sizeof e);
+        e[0].webhook_id = 4; e[0].url = oc_slice_str("https://a.example"); e[0].events = oc_slice_str("message");
+        e[0].enabled = 1; e[0].disabled_reason = oc_slice_str(""); e[0].created_by = 3; e[0].created_at_ms = 100;
+        e[0].n_channels = 1; e[0].channels[0] = 7;
+        e[1].webhook_id = 5; e[1].url = oc_slice_str("https://b.example"); e[1].events = oc_slice_str("user_change");
+        e[1].disabled_reason = oc_slice_str("failing for 24 hours");
+        oc_outgoing_webhook_list in = { 2, e };
+        ROUNDTRIP(oc_encode_outgoing_webhook_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_OUTGOING_WEBHOOK_LIST, h, p);
+        static oc_outgoing_webhook_entry out[1];
+        uint16_t n = 0;
+        CHECK(oc_decode_outgoing_webhook_list(&p, out, 1, &n) == OC_OK && n == 2);   /* past the cap: read, dropped */
+        CHECK(out[0].webhook_id == 4 && out[0].enabled == 1 && out[0].n_channels == 1 && out[0].channels[0] == 7 &&
+              out[0].created_by == 3 && out[0].created_at_ms == 100);
+    }
+    {
+        oc_set_outgoing_webhook in = { 4, 0 };
+        ROUNDTRIP(oc_encode_set_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_OUTGOING_WEBHOOK, h, p);
+        oc_set_outgoing_webhook out;
+        CHECK(oc_decode_set_outgoing_webhook(&p, &out) == OC_OK && out.webhook_id == 4 && out.enabled == 0);
+    }
+    {
+        oc_delete_outgoing_webhook in = { 4 };
+        ROUNDTRIP(oc_encode_delete_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE_OUTGOING_WEBHOOK, h, p);
+        oc_delete_outgoing_webhook out;
+        CHECK(oc_decode_delete_outgoing_webhook(&p, &out) == OC_OK && out.webhook_id == 4);
+    }
+    {
+        /* 33 channels in a create's payload: more than a webhook takes. */
+        uint8_t raw[1024]; oc_wbuf w2; oc_wbuf_init(&w2, raw, sizeof raw);
+        oc_w_str(&w2, oc_slice_str("https://x"));
+        oc_w_str(&w2, oc_slice_str("message"));
+        oc_w_u16(&w2, OC_OUTWH_MAX_CHANNELS + 1);
+        for (int k = 0; k <= OC_OUTWH_MAX_CHANNELS; k++) oc_w_u64(&w2, (uint64_t)k + 1);
+        oc_rbuf p2; oc_rbuf_init(&p2, raw, w2.len);
+        oc_create_outgoing_webhook out;
+        CHECK(oc_decode_create_outgoing_webhook(&p2, &out) == OC_E_MALFORMED);
+    }
+}
+
 static void test_tts_frames(void) {
     uint8_t frame[4096];
     {
@@ -3721,6 +3787,7 @@ int run_protocol_tests(void) {
     test_scope_catalog();
     test_agent_frames();
     test_connection_frames();
+    test_outgoing_webhook_frames();
     test_preview_frames();
     test_call_frames();
     test_block_frames();

@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <mbedtls/sha256.h>
 #include <sys/eventfd.h>
 #include <time.h>
@@ -342,6 +343,7 @@ static void job_free(oc_job *j) {
     free(j->exp_blob_key);
     for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
     free(j->agent_name); free(j->token_name); free(j->token_scopes); free(j->token_from);
+    free(j->owh_url); free(j->owh_events); free(j->owh_reason);
     free(j->mcp_query); free(j->mcp_from); free(j->mcp_action); free(j->mcp_target); free(j->mcp_detail);
     free(j->oa_client_id); free(j->oa_name); free(j->oa_uris); free(j->oa_redirect); free(j->oa_challenge);
     free(j->oa_state); free(j->oa_resource); free(j->oa_request); free(j->oa_code); free(j->oa_verifier);
@@ -922,6 +924,15 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->oa_redirect); free(r->oa_state); free(r->oa_error); free(r->oa_access); free(r->oa_refresh); free(r->via);
     for (size_t i = 0; i < r->n_oa_conns; i++) { free(r->oa_conns[i].user_name); free(r->oa_conns[i].client_name); }
     free(r->oa_conns);
+    free(r->owh_url); free(r->owh_events);
+    for (size_t i = 0; i < r->n_owh_rows; i++) {
+        free(r->owh_rows[i].url); free(r->owh_rows[i].events); free(r->owh_rows[i].disabled_reason);
+    }
+    free(r->owh_rows);
+    for (size_t i = 0; i < r->n_owh_due; i++) {
+        free(r->owh_due[i].url); free(r->owh_due[i].event_id); free(r->owh_due[i].payload);
+    }
+    free(r->owh_due);
     for (size_t i = 0; i < r->n_mcp_chans; i++) free(r->mcp_chans[i].name);
     free(r->mcp_chans);
     for (size_t i = 0; i < r->n_mcp_rows; i++) {
@@ -1086,6 +1097,9 @@ static size_t local_subject(char *buf, size_t cap, const char *username, size_t 
 }
 
 static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, int direct);
+static void owh_member(sqlite3 *db, uint64_t channel_id, uint64_t uid, int joined);
+static int owh_txn_begin(sqlite3 *db);
+static void owh_txn_end(sqlite3 *db, int own);
 static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out);
 
 /* The public, unarchived channels OPENCHIME_DEFAULT_CHANNELS names, by name:
@@ -4017,8 +4031,11 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
         sqlite3_bind_int(st, 4, want_direct);
+        int own = owh_txn_begin(db);
         sqlite3_step(st);
         sqlite3_finalize(st);
+        owh_member(db, channel_id, user_id, 1);   /* in the same transaction */
+        owh_txn_end(db, own);
         return 1;
     }
     if (want && cur_direct != want_direct) {
@@ -4032,6 +4049,7 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         return 0;
     }
     if (!want && exists) {
+        int own = owh_txn_begin(db);
         sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
@@ -4044,6 +4062,8 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_step(st);
         sqlite3_finalize(st);
+        owh_member(db, channel_id, user_id, 0);
+        owh_txn_end(db, own);
         return -1;
     }
     return 0;
@@ -4064,6 +4084,771 @@ static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out)
     sqlite3_finalize(st);
     *n_out = n;
     return arr;
+}
+
+/* ---- Outgoing webhooks (docs/details/WEBHOOKS.md) -------------------------
+ * An owner or admin points the workspace at an https address and names the
+ * events it is sent and the channels they come from. Each event a webhook
+ * receives is queued here, as a row of webhook_deliveries, in the transaction
+ * that wrote the event; the delivery worker (daemon/webhooks_out.c) takes the
+ * rows due, signs and sends them, and says how each went. */
+
+/* The events a webhook can be sent, in the order a list shows them. */
+static const char *const OWH_EVENTS[] = {
+    "message", "reaction_added", "reaction_removed", "member_joined_channel",
+    "member_left_channel", "channel_rename", "channel_archive", "channel_unarchive",
+    "user_change",
+};
+#define OWH_N_EVENTS (sizeof OWH_EVENTS / sizeof OWH_EVENTS[0])
+
+/* A growing string; `bad` once an allocation failed, and then it stays empty. */
+typedef struct { char *p; size_t n, cap; int bad; } owh_sb;
+
+static void sb_add(owh_sb *b, const char *s, size_t n) {
+    if (b->bad) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->n + n + 1) cap *= 2;
+        char *g = realloc(b->p, cap);
+        if (!g) { b->bad = 1; return; }
+        b->p = g; b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+static void sb_str(owh_sb *b, const char *s) { sb_add(b, s, strlen(s)); }
+static void sb_fmt(owh_sb *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void sb_fmt(owh_sb *b, const char *fmt, ...) {
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof tmp) { b->bad = 1; return; }
+    sb_add(b, tmp, (size_t)n);
+}
+/* `s` as a JSON string, quoted. */
+static void sb_json(owh_sb *b, const char *s, size_t n) {
+    sb_add(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { char e[2] = { '\\', (char)c }; sb_add(b, e, 2); }
+        else if (c == '\n') sb_add(b, "\\n", 2);
+        else if (c == '\r') sb_add(b, "\\r", 2);
+        else if (c == '\t') sb_add(b, "\\t", 2);
+        else if (c < 0x20) sb_fmt(b, "\\u%04x", c);
+        else sb_add(b, (const char *)&c, 1);
+    }
+    sb_add(b, "\"", 1);
+}
+static void sb_jstr(owh_sb *b, const char *s) { sb_json(b, s ? s : "", s ? strlen(s) : 0); }
+
+/* Whether `url` is an address a webhook may have: https, a host, no space or
+ * control character. Any host: the address is the owner's or admin's choice. */
+static int owh_url_ok(const char *url) {
+    if (!url) return 0;
+    size_t n = strlen(url);
+    if (n <= 8 || n > 2048 || strncasecmp(url, "https://", 8) != 0) return 0;
+    if (url[8] == '/' || url[8] == '?' || url[8] == '#') return 0;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)url[i] <= 0x20 || url[i] == 0x7f) return 0;
+    return 1;
+}
+
+/* The event names in `in` (separated by spaces) into `out`, each once and in
+ * the catalog's order. 0, or -1 for an empty list or a name not allowed. */
+static int owh_events_canon(const char *in, char *out, size_t cap) {
+    int want[OWH_N_EVENTS] = { 0 };
+    int any = 0;
+    const char *p = in ? in : "";
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != ' ') e++;
+        size_t k = 0;
+        for (; k < OWH_N_EVENTS; k++)
+            if (strlen(OWH_EVENTS[k]) == (size_t)(e - p) && memcmp(OWH_EVENTS[k], p, (size_t)(e - p)) == 0) break;
+        if (k == OWH_N_EVENTS) return -1;
+        want[k] = 1; any = 1;
+        p = e;
+    }
+    if (!any) return -1;
+    size_t n = 0;
+    out[0] = '\0';
+    for (size_t k = 0; k < OWH_N_EVENTS; k++) {
+        if (!want[k]) continue;
+        int w = snprintf(out + n, cap - n, "%s%s", n ? " " : "", OWH_EVENTS[k]);
+        if (w < 0 || (size_t)w >= cap - n) return -1;
+        n += (size_t)w;
+    }
+    return 0;
+}
+
+/* The workspace's id in an envelope: `T` and its audience id's short form
+ * (the `ws_` dropped), or `T0` when it is not enrolled. */
+static void owh_team(sqlite3 *db, char *out, size_t cap) {
+    snprintf(out, cap, "T0");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT audience FROM ident.enrollment WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+        const char *a = (const char *)sqlite3_column_text(st, 0);
+        if (strncmp(a, "ws_", 3) == 0) a += 3;
+        if (*a) snprintf(out, cap, "T%s", a);
+    }
+    sqlite3_finalize(st);
+}
+
+/* A channel a webhook may watch: a named one, public or private, never a DM or
+ * group DM. 1, 0 for one of those, -1 for no channel at all. */
+static int owh_channel_named(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int ok = -1;
+    if (sqlite3_prepare_v2(db, "SELECT kind='channel' AND e2e=0 FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) ok = sqlite3_column_int(st, 0) ? 1 : 0;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* The enabled webhooks that receive `type` from channel `channel_id` (0: an
+ * event of no channel, user_change), into a heap array. */
+static uint64_t *owh_targets(sqlite3 *db, uint64_t channel_id, const char *type, size_t *n_out) {
+    *n_out = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id FROM outgoing_webhooks w WHERE enabled=1"
+            " AND (' ' || events || ' ') LIKE ('% ' || ?2 || ' %')"
+            " AND (?1 = 0 OR EXISTS(SELECT 1 FROM outgoing_webhook_channels c"
+            "                       WHERE c.webhook_id=w.id AND c.channel_id=?1))"
+            " ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return NULL;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
+    uint64_t *ids = NULL;
+    size_t n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t *g = realloc(ids, (n + 1) * sizeof *g);
+        if (!g) break;
+        ids = g;
+        ids[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    *n_out = n;
+    return ids;
+}
+
+/* Who is to receive an event of `type` in `channel_id`: the webhooks, or NULL
+ * when none -- then the event is not even built. A DM's and a group DM's
+ * events go nowhere. */
+static uint64_t *owh_wanted(sqlite3 *db, uint64_t channel_id, const char *type, size_t *n) {
+    *n = 0;
+    if (channel_id && owh_channel_named(db, channel_id) != 1) return NULL;
+    return owh_targets(db, channel_id, type, n);
+}
+
+/* Queue `event` (a JSON object) for each of `ids`, in its envelope. The
+ * caller holds the transaction that wrote the event. */
+static void owh_queue(sqlite3 *db, const uint64_t *ids, size_t n, const char *event) {
+    if (!n || !event) return;
+    char team[80];
+    owh_team(db, team, sizeof team);
+    uint64_t now = dbw_now_ms();
+    for (size_t i = 0; i < n; i++) {
+        uint8_t rnd[10];
+        if (oc_rand_bytes(rnd, sizeof rnd) != 0) continue;
+        char evid[3 + 2 * sizeof rnd];
+        memcpy(evid, "Ev", 2);
+        for (size_t k = 0; k < sizeof rnd; k++) snprintf(evid + 2 + 2 * k, 3, "%02x", rnd[k]);
+        owh_sb b = { 0 };
+        sb_str(&b, "{\"type\":\"event_callback\",\"team_id\":");
+        sb_jstr(&b, team);
+        sb_fmt(&b, ",\"api_app_id\":\"W%llu\",\"event_id\":\"%s\",\"event_time\":%llu,"
+                   "\"authorizations\":[],\"event\":",
+               (unsigned long long)ids[i], evid, (unsigned long long)(now / 1000u));
+        sb_str(&b, event);
+        sb_str(&b, "}");
+        sqlite3_stmt *st = NULL;
+        if (!b.bad && sqlite3_prepare_v2(db,
+                "INSERT INTO webhook_deliveries(webhook_id,event_id,payload,next_at_ms) VALUES(?1,?2,?3,?4);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)ids[i]);
+            sqlite3_bind_text(st, 2, evid, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, b.p, (int)b.n, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+        free(b.p);
+    }
+}
+
+/* A channel's type as the convention gives it in a message event. */
+static const char *owh_channel_type(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int pub = 1;
+    if (sqlite3_prepare_v2(db, "SELECT is_public FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) pub = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return pub ? "channel" : "group";
+}
+
+/* A body's text as an app reads it: every mention of a person as `<@U42>`,
+ * whichever form its author typed, and @here, @channel and @everyone as the
+ * convention writes them. A name that names no member is left as written. */
+static void owh_text(sqlite3 *db, owh_sb *b, uint64_t channel_id, const char *body, size_t len) {
+    oc_mention m[OC_MENTION_MAX];
+    size_t found = oc_mention_scan(body, len, m, OC_MENTION_MAX);
+    if (found > OC_MENTION_MAX) found = OC_MENTION_MAX;
+    owh_sb t = { 0 };
+    size_t at = 0;
+    for (size_t i = 0; i < found; i++) {
+        if (m[i].start < at || m[i].start + m[i].len > len) continue;
+        char rep[48] = "";
+        if (m[i].kind == OC_MENTION_HERE) snprintf(rep, sizeof rep, "<!here>");
+        else if (m[i].kind == OC_MENTION_CHANNEL) snprintf(rep, sizeof rep, "<!channel>");
+        else if (m[i].kind == OC_MENTION_EVERYONE) snprintf(rep, sizeof rep, "<!everyone>");
+        else if (m[i].kind == OC_MENTION_USER) {
+            uint64_t uid = m[i].user_id;
+            if (!uid) {
+                sqlite3_stmt *q = NULL;
+                if (sqlite3_prepare_v2(db,
+                        "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
+                        "WHERE cm.channel_id = ?1 AND u.is_system = 0 AND lower(u.display_name) = lower(?2) "
+                        "ORDER BY u.id LIMIT 1;", -1, &q, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
+                    sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
+                    if (sqlite3_step(q) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(q, 0);
+                }
+                sqlite3_finalize(q);
+            }
+            if (uid) snprintf(rep, sizeof rep, "<@U%llu>", (unsigned long long)uid);
+        }
+        if (!rep[0]) continue;
+        sb_add(&t, body + at, m[i].start - at);
+        sb_str(&t, rep);
+        at = m[i].start + m[i].len;
+    }
+    sb_add(&t, body + at, len - at);
+    if (t.bad) { sb_json(b, body, len); free(t.p); return; }
+    sb_json(b, t.p ? t.p : "", t.n);
+    free(t.p);
+}
+
+enum { OWH_MSG_NEW, OWH_MSG_CHANGED, OWH_MSG_DELETED };
+
+/* Message `mid` posted, changed or deleted: a `message` event, with the
+ * subtype the convention gives it. */
+static void owh_message(sqlite3 *db, uint64_t mid, int what) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.channel_id, m.author_id, COALESCE(m.body,''), COALESCE(m.parent_id,0), m.kind,"
+            "       u.kind <> 'human', EXISTS(SELECT 1 FROM actions a WHERE a.message_id=m.id),"
+            "       COALESCE(m.deleted_by, 0)"
+            "  FROM messages m JOIN users u ON u.id = m.author_id WHERE m.id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 4) != (int)OC_MSG_KIND_MESSAGE) {
+        sqlite3_finalize(st);
+        return;
+    }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0), author = (uint64_t)sqlite3_column_int64(st, 1);
+    char *body = strdup((const char *)sqlite3_column_text(st, 2));
+    size_t blen = body ? strlen(body) : 0;
+    uint64_t parent = (uint64_t)sqlite3_column_int64(st, 3);
+    int bot = sqlite3_column_int(st, 5), action = sqlite3_column_int(st, 6);
+    uint64_t by = (uint64_t)sqlite3_column_int64(st, 7);
+    sqlite3_finalize(st);
+    size_t n = 0;
+    uint64_t *ids = body ? owh_wanted(db, cid, "message", &n) : NULL;
+    if (!n) { free(ids); free(body); return; }
+    const char *text = body;
+    size_t tlen = blen;
+    if (action && tlen >= 3 && strncmp(text, "/me", 3) == 0) {    /* the action's words, "/me" gone */
+        text += 3; tlen -= 3;
+        while (tlen && *text == ' ') { text++; tlen--; }
+    }
+    const char *ctype = owh_channel_type(db, cid);
+    unsigned long long c = (unsigned long long)cid, u = (unsigned long long)author, ts = (unsigned long long)mid;
+    owh_sb b = { 0 };
+    if (what == OWH_MSG_DELETED) {
+        sb_fmt(&b, "{\"type\":\"message\",\"subtype\":\"message_deleted\",\"hidden\":true,"
+                   "\"channel\":\"C%llu\",\"channel_type\":\"%s\",\"deleted_ts\":\"%llu\","
+                   "\"ts\":\"%llu\",\"event_ts\":\"%llu\"", c, ctype, ts, ts, ts);
+        if (by) sb_fmt(&b, ",\"user\":\"U%llu\"", (unsigned long long)by);
+        sb_str(&b, "}");
+    } else {
+        owh_sb m = { 0 };
+        sb_str(&m, "{\"type\":\"message\"");
+        if (what == OWH_MSG_NEW && bot) sb_str(&m, ",\"subtype\":\"bot_message\"");
+        else if (what == OWH_MSG_NEW && action) sb_str(&m, ",\"subtype\":\"me_message\"");
+        if (what == OWH_MSG_NEW) sb_fmt(&m, ",\"channel\":\"C%llu\",\"channel_type\":\"%s\"", c, ctype);
+        sb_fmt(&m, ",\"user\":\"U%llu\",\"text\":", u);
+        owh_text(db, &m, cid, text, tlen);
+        sb_fmt(&m, ",\"ts\":\"%llu\"", ts);
+        if (parent) sb_fmt(&m, ",\"thread_ts\":\"%llu\"", (unsigned long long)parent);
+        if (what == OWH_MSG_NEW) sb_fmt(&m, ",\"event_ts\":\"%llu\"}", ts);
+        else sb_fmt(&m, ",\"edited\":{\"user\":\"U%llu\",\"ts\":\"%llu\"}}", u, ts);
+        if (what == OWH_MSG_NEW) sb_add(&b, m.p ? m.p : "", m.n);
+        else {
+            sb_fmt(&b, "{\"type\":\"message\",\"subtype\":\"message_changed\",\"hidden\":true,"
+                       "\"channel\":\"C%llu\",\"channel_type\":\"%s\",\"message\":", c, ctype);
+            sb_add(&b, m.p ? m.p : "", m.n);
+            sb_fmt(&b, ",\"ts\":\"%llu\",\"event_ts\":\"%llu\"}", ts, ts);
+        }
+        if (m.bad) b.bad = 1;
+        free(m.p);
+    }
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+    free(body);
+}
+
+/* A reaction added to or taken from message `mid` by `uid`. */
+static void owh_reaction(sqlite3 *db, uint64_t channel_id, uint64_t mid, uint64_t uid, const char *emoji, int added) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, added ? "reaction_added" : "reaction_removed", &n);
+    if (!n) { free(ids); return; }
+    uint64_t author = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT author_id FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        if (sqlite3_step(st) == SQLITE_ROW) author = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"%s\",\"user\":\"U%llu\",\"reaction\":", added ? "reaction_added" : "reaction_removed",
+           (unsigned long long)uid);
+    sb_jstr(&b, emoji);
+    sb_fmt(&b, ",\"item_user\":\"U%llu\",\"item\":{\"type\":\"message\",\"channel\":\"C%llu\",\"ts\":\"%llu\"},"
+               "\"event_ts\":\"%llu\"}", (unsigned long long)author, (unsigned long long)channel_id,
+           (unsigned long long)mid, (unsigned long long)mid);
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `uid` joined or left `channel_id`. */
+static void owh_member(sqlite3 *db, uint64_t channel_id, uint64_t uid, int joined) {
+    const char *type = joined ? "member_joined_channel" : "member_left_channel";
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, type, &n);
+    if (!n) { free(ids); return; }
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"%s\",\"user\":\"U%llu\",\"channel\":\"C%llu\",\"channel_type\":\"%s\"}", type,
+           (unsigned long long)uid, (unsigned long long)channel_id,
+           strcmp(owh_channel_type(db, channel_id), "channel") == 0 ? "C" : "G");
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `channel_id` renamed (`what` channel_rename), archived or unarchived, by `uid`. */
+static void owh_channel(sqlite3 *db, uint64_t channel_id, uint64_t uid, const char *what) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, what, &n);
+    if (!n) { free(ids); return; }
+    owh_sb b = { 0 };
+    if (strcmp(what, "channel_rename") == 0) {
+        sqlite3_stmt *st = NULL;
+        char *name = NULL;
+        uint64_t created = 0;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(name,''), created_at_ms FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                name = strdup((const char *)sqlite3_column_text(st, 0));
+                created = (uint64_t)sqlite3_column_int64(st, 1);
+            }
+        }
+        sqlite3_finalize(st);
+        sb_fmt(&b, "{\"type\":\"channel_rename\",\"channel\":{\"id\":\"C%llu\",\"name\":", (unsigned long long)channel_id);
+        sb_jstr(&b, name);
+        sb_fmt(&b, ",\"created\":%llu}}", (unsigned long long)(created / 1000u));
+        free(name);
+    } else {
+        sb_fmt(&b, "{\"type\":\"%s\",\"channel\":\"C%llu\",\"user\":\"U%llu\"}", what,
+               (unsigned long long)channel_id, (unsigned long long)uid);
+    }
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `uid`'s profile changed: user_change, to every webhook that takes it,
+ * whatever its channels. */
+static void owh_user_change(sqlite3 *db, uint64_t uid) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, 0, "user_change", &n);
+    if (!n) { free(ids); return; }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(display_name,''), COALESCE(full_name,''), COALESCE(title,''),"
+            "       COALESCE(pronouns,''), COALESCE(timezone,''), kind <> 'human'"
+            "  FROM users WHERE id=?1 AND is_system=0;", -1, &st, NULL) != SQLITE_OK ||
+        (sqlite3_bind_int64(st, 1, (sqlite3_int64)uid), sqlite3_step(st)) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        free(ids);
+        return;
+    }
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"user_change\",\"user\":{\"id\":\"U%llu\",\"name\":", (unsigned long long)uid);
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 0));
+    sb_str(&b, ",\"real_name\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 1));
+    sb_str(&b, ",\"tz\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 4));
+    sb_fmt(&b, ",\"is_bot\":%s,\"profile\":{\"display_name\":", sqlite3_column_int(st, 5) ? "true" : "false");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 0));
+    sb_str(&b, ",\"real_name\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 1));
+    sb_str(&b, ",\"title\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 2));
+    sb_str(&b, ",\"pronouns\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 3));
+    sb_str(&b, "}},\"event_ts\":");
+    sb_fmt(&b, "\"%llu\"}", (unsigned long long)dbw_now_ms());
+    sqlite3_finalize(st);
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* Begin a transaction unless the caller holds one; 1 when this began it. */
+static int owh_txn_begin(sqlite3 *db) {
+    int own = sqlite3_get_autocommit(db);
+    if (own) sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    return own;
+}
+static void owh_txn_end(sqlite3 *db, int own) {
+    if (own) sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+}
+
+static oc_dbres *owh_refuse(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_ERR;
+    r->err_code = code;
+    return r;
+}
+
+/* The webhooks into `r` as OC_RES_OUTWH_LIST, oldest first: never a secret. */
+static void owh_rows(sqlite3 *db, oc_dbres *r) {
+    r->type = OC_RES_OUTWH_LIST;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, url, events, enabled, disabled_reason, created_by, created_at_ms"
+            " FROM outgoing_webhooks ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_owh_rows < OC_OUTWH_LIST_MAX) {
+        oc_outwh_row *g = realloc(r->owh_rows, (r->n_owh_rows + 1) * sizeof *g);
+        if (!g) break;
+        r->owh_rows = g;
+        oc_outwh_row *o = &r->owh_rows[r->n_owh_rows++];
+        memset(o, 0, sizeof *o);
+        o->id = (uint64_t)sqlite3_column_int64(st, 0);
+        o->url = strdup((const char *)sqlite3_column_text(st, 1));
+        o->events = strdup((const char *)sqlite3_column_text(st, 2));
+        o->enabled = (uint8_t)sqlite3_column_int(st, 3);
+        o->disabled_reason = strdup((const char *)sqlite3_column_text(st, 4));
+        o->created_by = (uint64_t)sqlite3_column_int64(st, 5);
+        o->created_at_ms = (uint64_t)sqlite3_column_int64(st, 6);
+        sqlite3_stmt *c = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM outgoing_webhook_channels WHERE webhook_id=?1"
+                                   " ORDER BY channel_id;", -1, &c, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(c, 1, (sqlite3_int64)o->id);
+            while (sqlite3_step(c) == SQLITE_ROW && o->n_channels < OC_OUTWH_MAX_CHANNELS)
+                o->channels[o->n_channels++] = (uint64_t)sqlite3_column_int64(c, 0);
+        }
+        sqlite3_finalize(c);
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_owh_create(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    if (!owh_url_ok(j->owh_url)) return owh_refuse(j, OC_ERR_WEBHOOK_URL);
+    char events[256];
+    if (owh_events_canon(j->owh_events, events, sizeof events) != 0) return owh_refuse(j, OC_ERR_WEBHOOK_EVENT);
+    if (j->owh_n_channels > OC_OUTWH_MAX_CHANNELS) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    for (uint16_t i = 0; i < j->owh_n_channels; i++) {
+        int named = owh_channel_named(db, j->owh_channels[i]);
+        if (named < 0) return owh_refuse(j, OC_ERR_UNKNOWN_CHANNEL);
+        if (!named) return owh_refuse(j, OC_ERR_FORBIDDEN);   /* a DM or group DM */
+    }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->owh_url = strdup(j->owh_url);
+    r->owh_events = strdup(events);
+    r->owh_n_channels = j->owh_n_channels;
+    memcpy(r->owh_channels, j->owh_channels, j->owh_n_channels * sizeof j->owh_channels[0]);
+    if (!j->owh_verified) {
+        /* Not saved yet: the endpoint is checked first, signed with this. */
+        if (oc_rand_bytes(r->owh_secret, sizeof r->owh_secret) != 0) { r->type = OC_RES_OUTWH_ERR; r->err_code = OC_ERR_INTERNAL; }
+        else r->type = OC_RES_OUTWH_CHECK;
+        return r;
+    }
+    if (!w->have_factor_key) { r->type = OC_RES_OUTWH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_exec(db, "SAVEPOINT owh_create;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    uint64_t id = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO outgoing_webhooks(url, events, secret_sealed, created_by, created_at_ms)"
+            " VALUES(?1, ?2, x'', ?3, ?4);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, j->owh_url, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 2, events, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+        if (sqlite3_step(st) == SQLITE_DONE) id = (uint64_t)sqlite3_last_insert_rowid(db);
+    }
+    sqlite3_finalize(st);
+    /* Sealed bound to its webhook: moved to another row, it does not open. */
+    uint8_t sealed[OC_TOTP_SEALED_LEN];
+    int ok = id && oc_factor_seal(w->factor_key, id, j->owh_secret, sealed) == 0;
+    if (ok) {
+        st = NULL;
+        ok = sqlite3_prepare_v2(db, "UPDATE outgoing_webhooks SET secret_sealed=?1 WHERE id=?2;", -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_blob (st, 1, sealed, (int)sizeof sealed, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+    }
+    for (uint16_t i = 0; ok && i < j->owh_n_channels; i++) {
+        st = NULL;
+        ok = sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO outgoing_webhook_channels(webhook_id, channel_id) VALUES(?1, ?2);",
+                                -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->owh_channels[i]);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!ok) {
+        sqlite3_exec(db, "ROLLBACK TO owh_create; RELEASE owh_create;", NULL, NULL, NULL);
+        r->type = OC_RES_OUTWH_ERR;
+        r->err_code = OC_ERR_INTERNAL;
+        return r;
+    }
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.outgoing.create", j->user_id, id, j->owh_url, 1, events);
+    sqlite3_exec(db, "RELEASE owh_create;", NULL, NULL, NULL);
+    r->type = OC_RES_OUTWH_SECRET;
+    r->message_id = id;
+    memcpy(r->owh_secret, j->owh_secret, sizeof r->owh_secret);
+    return r;
+}
+
+static oc_dbres *process_owh_list(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+/* Webhook `id`'s address, or NULL when there is no such webhook. Heap. */
+static char *owh_url_of(sqlite3 *db, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    char *url = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT url FROM outgoing_webhooks WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) url = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    return url;
+}
+
+/* Run `sql` with ?1 bound to `id`. */
+static void owh_exec_id(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_owh_set(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    char *url = owh_url_of(db, j->owh_id);
+    if (!url) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    /* Turned on, it starts afresh: no failing day carried over. */
+    owh_exec_id(db, j->owh_enabled
+        ? "UPDATE outgoing_webhooks SET enabled=1, disabled_reason='', failing_since_ms=0 WHERE id=?1;"
+        : "UPDATE outgoing_webhooks SET enabled=0, disabled_reason='' WHERE id=?1;", j->owh_id);
+    audit_actor(db, OC_AUDIT_ADMIN, j->owh_enabled ? "webhook.outgoing.enable" : "webhook.outgoing.disable",
+                j->user_id, j->owh_id, url, 1, NULL);
+    free(url);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+static oc_dbres *process_owh_delete(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    char *url = owh_url_of(db, j->owh_id);
+    if (!url) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    int own = owh_txn_begin(db);
+    owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE webhook_id=?1;", j->owh_id);
+    owh_exec_id(db, "DELETE FROM outgoing_webhook_channels WHERE webhook_id=?1;", j->owh_id);
+    owh_exec_id(db, "DELETE FROM outgoing_webhooks WHERE id=?1;", j->owh_id);
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.outgoing.delete", j->user_id, j->owh_id, url, 1, NULL);
+    owh_txn_end(db, own);
+    free(url);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+/* The deliveries due, for the worker, each held a while so the next take does
+ * not hand it out again; one never answered is taken again once its hold
+ * ends, after a restart too. */
+static oc_dbres *process_owh_take(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_DUE;
+    uint64_t now = dbw_now_ms();
+    unsigned limit = j->owh_limit && j->owh_limit < OC_OUTWH_TAKE_MAX ? j->owh_limit : OC_OUTWH_TAKE_MAX;
+    int own = owh_txn_begin(db);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT d.id, d.webhook_id, d.attempts, w.url, d.event_id, d.payload, w.secret_sealed, d.last_reason"
+            "  FROM webhook_deliveries d JOIN outgoing_webhooks w ON w.id = d.webhook_id"
+            " WHERE w.enabled = 1 AND d.next_at_ms <= ?1 ORDER BY d.next_at_ms, d.id LIMIT ?2;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        sqlite3_bind_int  (st, 2, (int)limit);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_outwh_due *g = realloc(r->owh_due, (r->n_owh_due + 1) * sizeof *g);
+            if (!g) break;
+            r->owh_due = g;
+            oc_outwh_due *d = &r->owh_due[r->n_owh_due++];
+            memset(d, 0, sizeof *d);
+            d->id = (uint64_t)sqlite3_column_int64(st, 0);
+            d->webhook_id = (uint64_t)sqlite3_column_int64(st, 1);
+            d->attempts = (uint32_t)sqlite3_column_int(st, 2);
+            d->url = strdup((const char *)sqlite3_column_text(st, 3));
+            d->event_id = strdup((const char *)sqlite3_column_text(st, 4));
+            d->payload = strdup((const char *)sqlite3_column_text(st, 5));
+            int sl = sqlite3_column_bytes(st, 6);
+            if (sl > 0 && (size_t)sl <= sizeof d->sealed) {
+                memcpy(d->sealed, sqlite3_column_blob(st, 6), (size_t)sl);
+                d->sealed_len = (size_t)sl;
+            }
+            snprintf(d->last_reason, sizeof d->last_reason, "%s", (const char *)sqlite3_column_text(st, 7));
+        }
+    }
+    sqlite3_finalize(st);
+    for (size_t i = 0; i < r->n_owh_due; i++) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE webhook_deliveries SET next_at_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)r->owh_due[i].id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(now + OC_OUTWH_LEASE_MS));
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    owh_txn_end(db, own);
+    return r;
+}
+
+/* A delivery's outcome. Success ends it and the webhook's failing; a failure
+ * is tried again after 1 s, doubling, up to OC_OUTWH_ATTEMPTS in all. A
+ * webhook failing for a day is turned off, every owner and admin is told, and
+ * the change is audited. */
+static oc_dbres *process_owh_done(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_DONE;
+    uint64_t now = dbw_now_ms();
+    uint64_t hook = 0, failing = 0;
+    uint32_t attempts = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT d.webhook_id, d.attempts, w.failing_since_ms FROM webhook_deliveries d"
+            "  JOIN outgoing_webhooks w ON w.id = d.webhook_id WHERE d.id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->owh_delivery);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            hook = (uint64_t)sqlite3_column_int64(st, 0);
+            attempts = (uint32_t)sqlite3_column_int(st, 1);
+            failing = (uint64_t)sqlite3_column_int64(st, 2);
+        }
+    }
+    sqlite3_finalize(st);
+    r->message_id = hook;
+    if (!hook) return r;                       /* its webhook went meanwhile */
+    int own = owh_txn_begin(db);
+    if (j->owh_ok) {
+        owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE id=?1;", j->owh_delivery);
+        owh_exec_id(db, "UPDATE outgoing_webhooks SET failing_since_ms=0 WHERE id=?1;", hook);
+        owh_txn_end(db, own);
+        return r;
+    }
+    attempts++;
+    if (attempts >= OC_OUTWH_ATTEMPTS) {
+        owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE id=?1;", j->owh_delivery);
+    } else {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE webhook_deliveries SET attempts=?2, next_at_ms=?3, last_reason=?4 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->owh_delivery);
+            sqlite3_bind_int  (st, 2, (int)attempts);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)(now + ((uint64_t)OC_OUTWH_FIRST_RETRY_MS << (attempts - 1))));
+            sqlite3_bind_text (st, 4, j->owh_reason ? j->owh_reason : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    if (!failing) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE outgoing_webhooks SET failing_since_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)hook);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    } else if (now - failing >= OC_OUTWH_DISABLE_MS) {
+        char *url = owh_url_of(db, hook);
+        owh_exec_id(db, "UPDATE outgoing_webhooks SET enabled=0,"
+                        " disabled_reason='its address failed every delivery for a day' WHERE id=?1;", hook);
+        audit_log(db, OC_AUDIT_ADMIN, "webhook.outgoing.disable", 0, NULL, hook, url, 1,
+                  "failed every delivery for a day");
+        size_t n = 0;
+        uint64_t *who = ids_of(db, "SELECT id FROM users WHERE role IN ('owner','admin') AND disabled=0"
+                                   " AND kind='human' AND is_system=0 AND ?1=?1;", 0, &n);
+        for (size_t i = 0; i < n; i++)
+            notice_person(db, who[i], "The outgoing webhook to %s was turned off: every delivery to it failed "
+                          "for a day. Turn it on again in Admin, Webhooks, once its address answers.",
+                          url ? url : "its address");
+        free(who);
+        free(url);
+        r->owh_disabled = 1;
+    }
+    owh_txn_end(db, own);
+    return r;
 }
 
 /* A channel's groups, in the order they were added. */
@@ -5226,6 +6011,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
      * client that dies between the send and its own cleanup would otherwise
      * leave the sent text sitting in the composer of every other device. */
     drop_draft(db, j->user_id, j->channel_id, 0);
+    owh_message(db, mid, OWH_MSG_NEW);   /* queued with the message it carries */
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -5352,6 +6138,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     /* An edit can make an action or unmake one (REQ-058). */
     store_action(db, j->message_id);
+    owh_message(db, j->message_id, OWH_MSG_CHANGED);
     sum_purge_msg(db, j->message_id);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -5599,6 +6386,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     holds_purge(db, ts, w->restore_window_ms);
     hold_deleted(db, j->message_id, j->user_id, ts);   /* before anything below gives it up */
     sqlite3_stmt *st = NULL;
+    int own = owh_txn_begin(db);   /* the tombstone and its webhooks' event together */
     sqlite3_prepare_v2(db,
         "UPDATE messages SET body=NULL, deleted_at_ms=?, deleted_by=? WHERE id=?;",
         -1, &st, NULL);
@@ -5608,6 +6396,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
+        if (own) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     sum_purge_msg(db, j->message_id);
@@ -5653,6 +6442,8 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     /* Nor a question to vote on: the poll goes with it (REQ-225). A restore
      * brings back the question as a message, not the poll -- as with pins. */
     drop_poll(db, j->message_id);
+    owh_message(db, j->message_id, OWH_MSG_DELETED);
+    owh_txn_end(db, own);
 
     /* Only a MODERATOR delete is auditable governance; a user removing their
      * own message is ordinary use and would drown the log (REQ-032 already
@@ -5927,10 +6718,13 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         sqlite3_finalize(st);
         if (taken) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r; }
 
+        int own = owh_txn_begin(db);
         sqlite3_prepare_v2(db, "UPDATE channels SET name=? WHERE id=?;", -1, &st, NULL);
         sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
+        owh_channel(db, j->channel_id, j->user_id, "channel_rename");
+        owh_txn_end(db, own);
         /* The id is untouched, so membership, history and cursors all follow the
          * rename for free — nothing durable was ever keyed on the name. */
         audit_actor_in(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, j->channel_id, 0, j->ch_name, 1, NULL);
@@ -5979,7 +6773,10 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         if (on) sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
         else    sqlite3_bind_null(st, 1);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        int own = owh_txn_begin(db);
         sqlite3_step(st); sqlite3_finalize(st);
+        owh_channel(db, j->channel_id, j->user_id, on ? "channel_archive" : "channel_unarchive");
+        owh_txn_end(db, own);
         audit_actor_in(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
                        j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, on ? "archived this channel." : "unarchived this channel.");
@@ -8044,8 +8841,15 @@ static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
         sqlite3_bind_text(st, 3, j->emoji, (int)elen, SQLITE_STATIC);
     }
+    int own = owh_txn_begin(db);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    if (sqlite3_changes(db) > 0) {   /* a reaction already there, or already gone, is no event */
+        char *em = strndup(j->emoji, elen);
+        owh_reaction(db, j->channel_id, j->message_id, j->user_id, em, j->react_op == OC_REACT_ADD);
+        free(em);
+    }
+    owh_txn_end(db, own);
 
     uint64_t count = 0;
     sqlite3_prepare_v2(db,
@@ -8481,6 +9285,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     store_action(db, mid);   /* a reply can be an action too (REQ-058) */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* and a poll (REQ-225) */
     if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
+    owh_message(db, mid, OWH_MSG_NEW);
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -12790,8 +13595,11 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_text (st, 5, j->pf_timezone  ? j->pf_timezone  : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
     sqlite3_bind_text (st, 7, j->pf_voice_id  ? j->pf_voice_id  : "", -1, SQLITE_TRANSIENT);
+    int own = owh_txn_begin(db);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    owh_user_change(db, j->user_id);
+    owh_txn_end(db, own);
     build_profile(db, j->user_id, r);
     r->pf_fanout = 1;
     return r;
@@ -15341,6 +16149,12 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OAUTH_LOOKUP)    return process_oauth_lookup(w->db, j);
     if (j->type == OC_JOB_OAUTH_LIST)      return process_oauth_list(w->db, j);
     if (j->type == OC_JOB_OAUTH_REVOKE)    return process_oauth_revoke(w->db, j);
+    if (j->type == OC_JOB_OUTWH_CREATE)   return process_owh_create(w, j);
+    if (j->type == OC_JOB_OUTWH_LIST)     return process_owh_list(w->db, j);
+    if (j->type == OC_JOB_OUTWH_SET)      return process_owh_set(w->db, j);
+    if (j->type == OC_JOB_OUTWH_DELETE)   return process_owh_delete(w->db, j);
+    if (j->type == OC_JOB_OUTWH_TAKE)     return process_owh_take(w->db, j);
+    if (j->type == OC_JOB_OUTWH_DONE)     return process_owh_done(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);
@@ -16760,6 +17574,12 @@ oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w) {
 }
 
 int oc_dbwriter_eventfd(oc_dbwriter *w) { return w->evfd; }
+
+int oc_dbwriter_factor_key(oc_dbwriter *w, uint8_t key[OC_FACTOR_KEY_LEN]) {
+    if (!w || !w->have_factor_key) return -1;
+    memcpy(key, w->factor_key, OC_FACTOR_KEY_LEN);
+    return 0;
+}
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,

@@ -456,6 +456,12 @@ int main(int argc, char **argv) {
     { static oc_list_connections m; FRAME("list_connections", oc_encode_list_connections(&w, V, &m)); }
     { static oc_connection_list m; FRAME("connection_list", oc_encode_connection_list(&w, V, &m)); }
     { static oc_revoke_connection m; FRAME("revoke_connection", oc_encode_revoke_connection(&w, V, &m)); }
+    { static oc_create_outgoing_webhook m; FRAME("create_outgoing_webhook", oc_encode_create_outgoing_webhook(&w, V, &m)); }
+    { static oc_outgoing_webhook_secret m; FRAME("outgoing_webhook_secret", oc_encode_outgoing_webhook_secret(&w, V, &m)); }
+    FRAME("list_outgoing_webhooks", oc_encode_list_outgoing_webhooks(&w, V));
+    { static oc_outgoing_webhook_list m; FRAME("outgoing_webhook_list", oc_encode_outgoing_webhook_list(&w, V, &m)); }
+    { static oc_set_outgoing_webhook m; FRAME("set_outgoing_webhook", oc_encode_set_outgoing_webhook(&w, V, &m)); }
+    { static oc_delete_outgoing_webhook m; FRAME("delete_outgoing_webhook", oc_encode_delete_outgoing_webhook(&w, V, &m)); }
     { static oc_error m; FRAME("error", oc_encode_error(&w, V, &m)); }
 
     static const uint16_t one[] = { 1 }, small[] = { 3, 7, 64 }, whole[] = { 16384 }, mixed[] = { 9, 4096, 2, 300 };

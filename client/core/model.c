@@ -214,6 +214,15 @@ int oc_model_user_is_agent(const oc_model *m, uint64_t user_id) {
     return 0;
 }
 
+int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id) {
+    if (!m || !m->outwh_secret[0]) return 0;
+    if (out && cap) snprintf(out, cap, "%s", m->outwh_secret);
+    if (webhook_id) *webhook_id = m->outwh_secret_id;
+    for (volatile char *z = m->outwh_secret; z < m->outwh_secret + sizeof m->outwh_secret; z++) *z = 0;
+    m->outwh_secret_id = 0;
+    return 1;
+}
+
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
                               char *scopes, size_t scopes_cap) {
     if (!m || !m->agent_token[0]) return 0;
@@ -3603,6 +3612,29 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(m->agent_token_scopes, sizeof m->agent_token_scopes, "%s", e->topic ? e->topic : "");
         m->agent_token_agent = e->user_id;
         m->agent_token_id = e->message_id;
+        break;
+    case OC_EV_OUTWH_SECRET:
+        snprintf(m->outwh_secret, sizeof m->outwh_secret, "%s", e->body ? e->body : "");
+        m->outwh_secret_id = e->message_id;
+        break;
+    case OC_EV_OUTWH_BEGIN:
+        m->n_outwhs = 0;
+        m->outwhs_have = 1;
+        break;
+    case OC_EV_OUTWH_ROW:
+        if (m->n_outwhs < OC_OUTWH_LIST_MAX) {
+            oc_outwh_view *o = &m->outwhs[m->n_outwhs++];
+            memset(o, 0, sizeof *o);
+            o->id = e->message_id;
+            o->created_by = e->author_id;
+            o->created_at = e->created_at;
+            o->enabled = e->status;
+            snprintf(o->url, sizeof o->url, "%s", e->body ? e->body : "");
+            snprintf(o->events, sizeof o->events, "%s", e->topic ? e->topic : "");
+            snprintf(o->reason, sizeof o->reason, "%s", e->preview ? e->preview : "");
+            for (size_t i = 0; i < e->n_ids && o->n_channels < OC_OUTWH_MAX_CHANNELS; i++)
+                o->channels[o->n_channels++] = e->ids[i];
+        }
         break;
     case OC_EV_AGENT_TOKENS_BEGIN:
         m->atokens_agent = e->user_id;

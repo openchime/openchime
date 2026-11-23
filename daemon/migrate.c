@@ -2048,6 +2048,48 @@ static const char MIGRATION_0091[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX mcp_access_tokens_connection ON mcp_access_tokens(connection_id);"
     "ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT '';";
+static const char MIGRATION_0092[] =
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): an address the workspace
+     * POSTs its events to, signed as APPS.md §5 says. `secret_sealed` is the
+     * signing secret sealed under the factor key (daemon/totp.h), the webhook's
+     * id its associated data: the secret has to be opened to sign, so it cannot
+     * be kept as a hash, and only the delivery worker opens it. `events` is the
+     * space-separated event types it was given; the channels it watches are
+     * rows of outgoing_webhook_channels, none meaning user_change alone.
+     * `failing_since_ms` is when its deliveries began to fail, 0 while they
+     * succeed; after a day of it the writer disables the webhook and says why
+     * in `disabled_reason`. A delivery is one event for one webhook, queued in
+     * the transaction that wrote the event, so a restart loses none:
+     * `event_id` is the same on every attempt, `next_at_ms` when it is next
+     * due, `last_reason` the last failure's retry reason. */
+    "CREATE TABLE outgoing_webhooks ("
+    "  id               INTEGER PRIMARY KEY,"
+    "  url              TEXT NOT NULL,"
+    "  events           TEXT NOT NULL,"
+    "  secret_sealed    BLOB NOT NULL,"
+    "  enabled          INTEGER NOT NULL DEFAULT 1,"
+    "  disabled_reason  TEXT NOT NULL DEFAULT '',"
+    "  created_by       INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms    INTEGER NOT NULL,"
+    "  failing_since_ms INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE outgoing_webhook_channels ("
+    "  webhook_id INTEGER NOT NULL REFERENCES outgoing_webhooks(id),"
+    "  channel_id INTEGER NOT NULL REFERENCES channels(id),"
+    "  PRIMARY KEY (webhook_id, channel_id)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX outgoing_webhook_channels_channel ON outgoing_webhook_channels(channel_id);"
+    "CREATE TABLE webhook_deliveries ("
+    "  id          INTEGER PRIMARY KEY,"
+    "  webhook_id  INTEGER NOT NULL REFERENCES outgoing_webhooks(id),"
+    "  event_id    TEXT NOT NULL,"
+    "  payload     TEXT NOT NULL,"
+    "  attempts    INTEGER NOT NULL DEFAULT 0,"
+    "  next_at_ms  INTEGER NOT NULL,"
+    "  last_reason TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at_ms);"
+    "CREATE INDEX webhook_deliveries_webhook ON webhook_deliveries(webhook_id);";
 
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
@@ -2141,6 +2183,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 89, MIGRATION_0089 },
     { 90, MIGRATION_0090 },
     { 91, MIGRATION_0091 },
+    { 92, MIGRATION_0092 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

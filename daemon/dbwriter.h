@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "protocol.h"   /* OC_SESSION_TOKEN_LEN, OC_AUTH_*, OC_ROLE_* */
+#include "totp.h"       /* the sealed length of an outgoing webhook's secret */
 
 #define OC_IDEM_LEN 16
 
@@ -452,7 +453,50 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_OAUTH_REGISTER = 269, OC_JOB_OAUTH_DOC_STORE = 270, OC_JOB_OAUTH_BEGIN = 271,
        OC_JOB_OAUTH_POLL = 272, OC_JOB_OAUTH_CODE_FIND = 273, OC_JOB_OAUTH_DECIDE = 274,
        OC_JOB_OAUTH_EXCHANGE = 275, OC_JOB_OAUTH_REFRESH = 276, OC_JOB_OAUTH_LOOKUP = 277,
-       OC_JOB_OAUTH_LIST = 278, OC_JOB_OAUTH_REVOKE = 279 };
+       OC_JOB_OAUTH_LIST = 278, OC_JOB_OAUTH_REVOKE = 279,
+       /* Outgoing webhooks (docs/details/WEBHOOKS.md; SCHEMA.md
+        * `outgoing_webhooks`). All but TAKE and DONE are an owner's or admin's,
+        * user_id the actor. OUTWH_CREATE: owh_url, owh_events, owh_channels.
+        * Without owh_verified it is checked and answered OC_RES_OUTWH_CHECK
+        * with a new secret, for the endpoint check; with it (and that secret,
+        * owh_secret) it is saved, answered OC_RES_OUTWH_SECRET. OUTWH_LIST;
+        * OUTWH_SET, owh_id and owh_enabled; OUTWH_DELETE, owh_id: each
+        * answered OC_RES_OUTWH_LIST. Each refused as OC_RES_OUTWH_ERR.
+        * OUTWH_TAKE (the net thread, for the worker): up to owh_limit
+        * deliveries due, each held for OC_OUTWH_LEASE_MS, answered
+        * OC_RES_OUTWH_DUE. OUTWH_DONE: delivery owh_delivery succeeded (owh_ok)
+        * or failed with owh_reason, answered OC_RES_OUTWH_DONE. */
+       OC_JOB_OUTWH_CREATE = 280, OC_JOB_OUTWH_LIST = 281, OC_JOB_OUTWH_SET = 282,
+       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285 };
+
+/* Outgoing webhooks (docs/details/WEBHOOKS.md). A signing secret is 20 random
+ * bytes, shown and used as its 40 hex digits; it is kept sealed under the
+ * factor key (daemon/totp.h). */
+#define OC_OUTWH_SECRET_LEN   OC_TOTP_SECRET_LEN
+#define OC_OUTWH_ATTEMPTS     8                       /* the first included */
+#define OC_OUTWH_FIRST_RETRY_MS 1000u                 /* doubling after */
+#define OC_OUTWH_DISABLE_MS   (24ull * 60 * 60 * 1000) /* failing this long: disabled */
+#define OC_OUTWH_LEASE_MS     60000u                  /* a taken delivery's hold */
+#define OC_OUTWH_TAKE_MAX     16
+
+/* One outgoing webhook, as the list shows it: never its secret. */
+typedef struct {
+    uint64_t id, created_by, created_at_ms;
+    char    *url, *events, *disabled_reason;   /* heap */
+    uint8_t  enabled;
+    uint16_t n_channels;
+    uint64_t channels[OC_OUTWH_MAX_CHANNELS];
+} oc_outwh_row;
+
+/* One delivery due, for the worker: the webhook's secret still sealed. */
+typedef struct {
+    uint64_t id, webhook_id;
+    uint32_t attempts;                     /* made before this one */
+    char     last_reason[24];              /* the last one's retry reason */
+    char    *url, *event_id, *payload;     /* heap */
+    uint8_t  sealed[OC_TOTP_SEALED_LEN];
+    size_t   sealed_len;
+} oc_outwh_due;
 
 /* At most this many tokens an agent holds (docs/details/MCP.md §3.1). */
 #define OC_AGENT_MAX_TOKENS 10
@@ -894,6 +938,14 @@ typedef struct oc_job {
     uint8_t        pfd_op, pfd_kind;
     uint16_t       pfd_position;
     uint64_t       ooo_start, ooo_end;   /* SET_OUT_OF_OFFICE */
+    /* Outgoing webhooks (OC_JOB_OUTWH_*). owh_url, owh_events and owh_reason
+     * heap. */
+    char          *owh_url, *owh_events, *owh_reason;
+    uint16_t       owh_n_channels, owh_limit;
+    uint64_t       owh_channels[OC_OUTWH_MAX_CHANNELS];
+    uint8_t        owh_secret[OC_OUTWH_SECRET_LEN];
+    uint8_t        owh_verified, owh_enabled, owh_ok;
+    uint64_t       owh_id, owh_delivery;
 } oc_job;
 
 /* CALL_AUTH's question: who of call_uids may be invited to call_id (CALLS.md
@@ -1131,7 +1183,14 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* A person's AI clients (OC_JOB_OAUTH_*): what each job above answers. */
        OC_RES_OAUTH_CLIENT = 156, OC_RES_OAUTH_PAGE = 157, OC_RES_OAUTH_REDIRECT = 158,
        OC_RES_OAUTH_NEED_FETCH = 159, OC_RES_OAUTH_TOKENS = 160, OC_RES_OAUTH_ERR = 161,
-       OC_RES_OAUTH_APPROVAL = 162, OC_RES_OAUTH_DECIDED = 163, OC_RES_OAUTH_LIST = 164 };
+       OC_RES_OAUTH_APPROVAL = 162, OC_RES_OAUTH_DECIDED = 163, OC_RES_OAUTH_LIST = 164,
+       /* Outgoing webhooks: a creation may be checked (owh_url, owh_events,
+        * owh_channels, and owh_secret, new); one saved (message_id its id,
+        * owh_secret, shown once); the list (owh_rows); a refusal (err_code);
+        * deliveries due (owh_due); a delivery's outcome written (owh_disabled
+        * when it turned its webhook off). */
+       OC_RES_OUTWH_CHECK = 165, OC_RES_OUTWH_SECRET = 166, OC_RES_OUTWH_LIST = 167,
+       OC_RES_OUTWH_ERR = 168, OC_RES_OUTWH_DUE = 169, OC_RES_OUTWH_DONE = 170 };
 
 /* One AI-client connection as a list shows it: never a token. */
 typedef struct {
@@ -1969,6 +2028,16 @@ typedef struct oc_dbres {
     size_t                  n_pfd;
     struct oc_pfv_row { uint64_t field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } *pfv;
     size_t                  n_pfv;
+    /* Outgoing webhooks (OC_RES_OUTWH_*). Strings and arrays heap. */
+    char                   *owh_url, *owh_events;
+    uint16_t                owh_n_channels;
+    uint64_t                owh_channels[OC_OUTWH_MAX_CHANNELS];
+    uint8_t                 owh_secret[OC_OUTWH_SECRET_LEN];
+    uint8_t                 owh_disabled;
+    oc_outwh_row           *owh_rows;
+    size_t                  n_owh_rows;
+    oc_outwh_due           *owh_due;
+    size_t                  n_owh_due;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -2001,6 +2070,9 @@ void         oc_dbwriter_stop(oc_dbwriter *w);
 
 /* The eventfd the net thread registers in epoll; readable when results wait. */
 int  oc_dbwriter_eventfd(oc_dbwriter *w);
+/* The factor key, for the outgoing webhooks' worker, which alone opens their
+ * secrets (docs/details/WEBHOOKS.md): 0 and the key, or -1 when there is none. */
+int  oc_dbwriter_factor_key(oc_dbwriter *w, uint8_t key[OC_FACTOR_KEY_LEN]);
 
 /* Enable the relay source (AUTH.md §3, §8): AUTH{oidc} tokens are verified
  * against the pinned ES256 keys. Other sources are left as they are. Copies its

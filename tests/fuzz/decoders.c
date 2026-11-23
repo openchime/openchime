@@ -149,6 +149,14 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_mint_agent_token mat; D(oc_decode_mint_agent_token(&p, &mat));
     oc_list_agent_tokens lat; D(oc_decode_list_agent_tokens(&p, &lat));
     oc_revoke_agent_token rat; D(oc_decode_revoke_agent_token(&p, &rat));
+    oc_create_outgoing_webhook cow; D(oc_decode_create_outgoing_webhook(&p, &cow));
+    oc_outgoing_webhook_secret ows; D(oc_decode_outgoing_webhook_secret(&p, &ows));
+    oc_set_outgoing_webhook sow; D(oc_decode_set_outgoing_webhook(&p, &sow));
+    oc_delete_outgoing_webhook dow; D(oc_decode_delete_outgoing_webhook(&p, &dow));
+    { oc_outgoing_webhook_entry we2[2]; uint16_t nc = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_outgoing_webhook_list(&p, we2, 2, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_outgoing_webhook_list"); }
     { oc_agent_token_entry te[4]; uint16_t nc = 0; uint64_t aid = 0;
       oc_rbuf_init(&p, buf, len);
       rc = oc_decode_agent_token_list(&p, &aid, te, 4, &nc);

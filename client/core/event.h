@@ -452,7 +452,17 @@ enum {
     OC_EV_CONNECTION_REQUEST,
     OC_EV_CONNECTION_DECIDED,
     OC_EV_CONNECTIONS_BEGIN,
-    OC_EV_CONNECTION_ROW
+    OC_EV_CONNECTION_ROW,
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md). OUTWH_SECRET: a webhook
+     * saved, the only time its secret is sent -- `message_id` its id, `body`
+     * the secret. OUTWH_BEGIN: the list follows, replacing what was held.
+     * OUTWH_ROW: one webhook, never its secret -- `message_id` its id, `body`
+     * its address, `topic` its events, `preview` why it was turned off,
+     * `status` 1 on, `author_id` who made it, `created_at`, `ids` its
+     * channels. */
+    OC_EV_OUTWH_SECRET,
+    OC_EV_OUTWH_BEGIN,
+    OC_EV_OUTWH_ROW
 };
 
 /* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
@@ -860,6 +870,14 @@ enum {
     OC_CMD_CONNECTION_DECIDE,
     OC_CMD_LIST_CONNECTIONS,
     OC_CMD_REVOKE_CONNECTION,
+    /* Outgoing webhooks: CREATE_OUTWH body = the address, body2 = the events,
+     * body3 = the channels' ids, in decimal, separated by spaces; LIST_OUTWH;
+     * SET_OUTWH message_id = the webhook, channel_id = 1 on, 0 off;
+     * DELETE_OUTWH message_id = the webhook. */
+    OC_CMD_CREATE_OUTWH,
+    OC_CMD_LIST_OUTWH,
+    OC_CMD_SET_OUTWH,
+    OC_CMD_DELETE_OUTWH,
     OC_CMD_QUIT
 };
 

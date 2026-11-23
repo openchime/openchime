@@ -735,6 +735,15 @@ typedef enum {
     OC_MSG_LIST_CONNECTIONS     = 0x0151, /* C->S, one's own, or everyone's */
     OC_MSG_CONNECTION_LIST      = 0x0152, /* S->C, the list */
     OC_MSG_REVOKE_CONNECTION    = 0x0153, /* C->S, revoke one; answered with the list */
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): an owner's or admin's. The
+     * signing secret is answered once, to the connection that created the
+     * webhook, and never listed. New frames, so no version bump. */
+    OC_MSG_CREATE_OUTGOING_WEBHOOK = 0x0154, /* C->S, a webhook: URL, events, channels */
+    OC_MSG_OUTGOING_WEBHOOK_SECRET = 0x0155, /* S->C, its signing secret, shown once */
+    OC_MSG_LIST_OUTGOING_WEBHOOKS  = 0x0156, /* C->S, the workspace's webhooks */
+    OC_MSG_OUTGOING_WEBHOOK_LIST   = 0x0157, /* S->C, the list: never a secret */
+    OC_MSG_SET_OUTGOING_WEBHOOK    = 0x0158, /* C->S, enable or disable one */
+    OC_MSG_DELETE_OUTGOING_WEBHOOK = 0x0159, /* C->S, delete one */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -866,6 +875,9 @@ typedef enum {
     OC_ERR_UNKNOWN_CONNECTION  = 3082, /* no such AI-client connection, or not the caller's to revoke (AUTH.md §8.13) */
     OC_ERR_BAD_LIFETIME        = 3083, /* a connection's lifetime other than never, 30, 90 or 365 days (AUTH.md §8.13) */
     OC_ERR_CONNECTIONS_OFF     = 3084, /* the workspace does not let people connect AI clients (OPENCHIME_MCP_CONNECTIONS) */
+    OC_ERR_WEBHOOK_URL         = 3085, /* an outgoing webhook's URL is not https (docs/details/WEBHOOKS.md) */
+    OC_ERR_WEBHOOK_EVENT       = 3086, /* an outgoing webhook named an event it may not select */
+    OC_ERR_WEBHOOK_UNVERIFIED  = 3087, /* the endpoint did not answer the url_verification challenge */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -2160,6 +2172,21 @@ typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_end;
  * (shared/scopes.h) separated by single spaces; `token` is
  * OC_PRINCIPAL_TOKEN_PREFIX and 32 bytes in base64url. */
 #define OC_AGENT_TOKEN_LIST_MAX 16
+
+/* Outgoing webhooks. `events` is event names separated by single spaces;
+ * `channels` the conversations whose events it receives (none: only
+ * `user_change`). */
+#define OC_OUTWH_MAX_CHANNELS 32
+#define OC_OUTWH_LIST_MAX     32
+typedef struct { oc_slice url; oc_slice events; uint16_t n_channels; uint64_t channels[OC_OUTWH_MAX_CHANNELS]; }
+    oc_create_outgoing_webhook;
+typedef struct { uint64_t webhook_id; oc_slice secret; } oc_outgoing_webhook_secret;
+typedef struct { uint64_t webhook_id; oc_slice url; oc_slice events; uint8_t enabled; oc_slice disabled_reason;
+                 uint64_t created_by; uint64_t created_at_ms; uint16_t n_channels;
+                 uint64_t channels[OC_OUTWH_MAX_CHANNELS]; } oc_outgoing_webhook_entry;
+typedef struct { uint16_t count; const oc_outgoing_webhook_entry *entries; } oc_outgoing_webhook_list;
+typedef struct { uint64_t webhook_id; uint8_t enabled; } oc_set_outgoing_webhook;
+typedef struct { uint64_t webhook_id; } oc_delete_outgoing_webhook;
 typedef struct { oc_slice name; oc_slice token_name; oc_slice scopes; } oc_create_agent;
 typedef struct { uint64_t agent_id; uint64_t token_id; oc_slice token; oc_slice scopes; } oc_agent_token;
 typedef struct { uint64_t agent_id; } oc_remove_agent;
@@ -2672,6 +2699,12 @@ oc_result oc_encode_connection_decided(oc_wbuf *w, uint16_t version, const oc_co
 oc_result oc_encode_list_connections(oc_wbuf *w, uint16_t version, const oc_list_connections *m);
 oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_connection_list *m);
 oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m);
+oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m);
+oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m);
+oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m);
+oc_result oc_encode_set_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_set_outgoing_webhook *m);
+oc_result oc_encode_delete_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_delete_outgoing_webhook *m);
 oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
 oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
 oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
@@ -2940,6 +2973,14 @@ oc_result oc_decode_list_connections(oc_rbuf *p, oc_list_connections *m);
 oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entry *entries, uint16_t cap,
                                     uint16_t *out_count);
 oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
+/* More than OC_OUTWH_MAX_CHANNELS channels is MALFORMED. */
+oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m);
+oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,
+                                          uint16_t *out_count);
+oc_result oc_decode_set_outgoing_webhook(oc_rbuf *p, oc_set_outgoing_webhook *m);
+oc_result oc_decode_delete_outgoing_webhook(oc_rbuf *p, oc_delete_outgoing_webhook *m);
 oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
 oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
 oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);

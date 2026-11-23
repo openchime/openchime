@@ -11,6 +11,7 @@
 #include "config.h"
 #include "push.h"
 #include "invite_mail.h"
+#include "webhooks_out.h"
 #include "enroll.h"    /* the address proof (AUTH.md §3.6) */
 #include "json.h"
 #include "unfurl.h"
@@ -1406,6 +1407,37 @@ void oc_netloop_set_push(struct oc_push *push) {
 
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m) {
     __atomic_store_n(&g_invite_mail, m, __ATOMIC_RELEASE);
+}
+
+/* Outgoing webhooks' delivery worker (webhooks_out.h), NULL = none: without a
+ * factor key no secret can be opened, so none is started. Published like push. */
+static oc_webhooks_out *g_owh;
+
+void oc_netloop_set_webhooks_out(struct oc_webhooks_out *o) {
+    __atomic_store_n(&g_owh, o, __ATOMIC_RELEASE);
+}
+
+/* A creation waiting on its endpoint check: what the writer checked, and who
+ * asked. The webhook is saved only when the check comes back good. */
+typedef struct owh_wait {
+    uint64_t tag, conn_id, user_id;
+    char    *url, *events;
+    uint16_t n_channels;
+    uint64_t channels[OC_OUTWH_MAX_CHANNELS];
+    uint8_t  secret[OC_OUTWH_SECRET_LEN];
+    struct owh_wait *next;
+} owh_wait;
+static __thread owh_wait *g_owh_waits;
+static __thread uint64_t  g_owh_tag;
+static __thread int       g_owh_taking;      /* a TAKE is with the writer */
+static __thread uint64_t  g_owh_last_take;
+static __thread int       g_owh_fd = -1;
+
+static void owh_wait_free(owh_wait *x) {
+    if (!x) return;
+    free(x->url); free(x->events);
+    for (volatile uint8_t *z = x->secret; z < x->secret + sizeof x->secret; z++) *z = 0;
+    free(x);
 }
 
 /* The enrollment the address proof signs with (AUTH.md §3.6), published once
@@ -4456,6 +4488,38 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_LIST_WEBHOOKS, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id; j->channel_id = lw.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        /* Outgoing webhooks (docs/details/WEBHOOKS.md): an owner's or an
+         * admin's, which the writer checks. A creation is checked by the
+         * writer, then its endpoint by the worker, and saved only after. */
+        if (hdr.msg_type == OC_MSG_CREATE_OUTGOING_WEBHOOK || hdr.msg_type == OC_MSG_LIST_OUTGOING_WEBHOOKS ||
+            hdr.msg_type == OC_MSG_SET_OUTGOING_WEBHOOK || hdr.msg_type == OC_MSG_DELETE_OUTGOING_WEBHOOK) {
+            oc_job *j = NULL;
+            if (hdr.msg_type == OC_MSG_CREATE_OUTGOING_WEBHOOK) {
+                oc_create_outgoing_webhook m;
+                if (oc_decode_create_outgoing_webhook(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OUTWH_CREATE, c->conn_id))) return -1;
+                j->owh_url = slice_dup(m.url);
+                j->owh_events = slice_dup(m.events);
+                j->owh_n_channels = m.n_channels;
+                memcpy(j->owh_channels, m.channels, m.n_channels * sizeof m.channels[0]);
+            } else if (hdr.msg_type == OC_MSG_LIST_OUTGOING_WEBHOOKS) {
+                if (!(j = oc_job_new(OC_JOB_OUTWH_LIST, c->conn_id))) return -1;
+            } else if (hdr.msg_type == OC_MSG_SET_OUTGOING_WEBHOOK) {
+                oc_set_outgoing_webhook m;
+                if (oc_decode_set_outgoing_webhook(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OUTWH_SET, c->conn_id))) return -1;
+                j->owh_id = m.webhook_id;
+                j->owh_enabled = m.enabled ? 1 : 0;
+            } else {
+                oc_delete_outgoing_webhook m;
+                if (oc_decode_delete_outgoing_webhook(&p, &m) != OC_OK) return -1;
+                if (!(j = oc_job_new(OC_JOB_OUTWH_DELETE, c->conn_id))) return -1;
+                j->owh_id = m.webhook_id;
+            }
+            j->user_id = c->user_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -10054,6 +10118,85 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
         break;
     }
+    case OC_RES_OUTWH_CHECK: {
+        /* Checked by the writer: the endpoint is asked next, off the loop. */
+        conn *c = find_by_id(conns, r->conn_id);
+        oc_webhooks_out *o = __atomic_load_n(&g_owh, __ATOMIC_ACQUIRE);
+        owh_wait *x = c && o ? calloc(1, sizeof *x) : NULL;
+        if (!x) {
+            if (c) {
+                oc_error e = { OC_ERR_INTERNAL, 0, { NULL, 0 }, oc_slice_str("outgoing webhooks are not available") };
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+            }
+            break;
+        }
+        x->tag = ++g_owh_tag;
+        x->conn_id = r->conn_id;
+        x->user_id = r->user_id;
+        x->url = strdup(r->owh_url ? r->owh_url : "");
+        x->events = strdup(r->owh_events ? r->owh_events : "");
+        x->n_channels = r->owh_n_channels;
+        memcpy(x->channels, r->owh_channels, sizeof x->channels);
+        memcpy(x->secret, r->owh_secret, sizeof x->secret);
+        x->next = g_owh_waits;
+        g_owh_waits = x;
+        oc_webhooks_out_check(o, x->tag, x->url, x->secret);
+        break;
+    }
+    case OC_RES_OUTWH_SECRET: {
+        /* Saved: its secret to the connection that made it, once. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        char text[2 * OC_OUTWH_SECRET_LEN + 1];
+        oc_owh_secret_text(r->owh_secret, text);
+        oc_outgoing_webhook_secret m = { r->message_id, { (const uint8_t *)text, strlen(text) } };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_outgoing_webhook_secret(&w, OC_PROTOCOL_VERSION, &m) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        for (volatile char *z = text; z < text + sizeof text; z++) *z = 0;
+        break;
+    }
+    case OC_RES_OUTWH_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        size_t n = r->n_owh_rows > OC_OUTWH_LIST_MAX ? OC_OUTWH_LIST_MAX : r->n_owh_rows;
+        oc_outgoing_webhook_entry *ents = n ? calloc(n, sizeof *ents) : NULL;
+        if (n && !ents) break;
+        for (size_t i = 0; i < n; i++) {
+            const oc_outwh_row *o = &r->owh_rows[i];
+            ents[i].webhook_id = o->id;
+            ents[i].url = oc_slice_str(o->url ? o->url : "");
+            ents[i].events = oc_slice_str(o->events ? o->events : "");
+            ents[i].enabled = o->enabled;
+            ents[i].disabled_reason = oc_slice_str(o->disabled_reason ? o->disabled_reason : "");
+            ents[i].created_by = o->created_by;
+            ents[i].created_at_ms = o->created_at_ms;
+            ents[i].n_channels = o->n_channels;
+            memcpy(ents[i].channels, o->channels, o->n_channels * sizeof o->channels[0]);
+        }
+        oc_outgoing_webhook_list l = { (uint16_t)n, ents };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_outgoing_webhook_list(&w, OC_PROTOCOL_VERSION, &l) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_OUTWH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("outgoing webhook refused") };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_OUTWH_DUE: {
+        /* Due deliveries, to the worker; the next take once it has room. */
+        oc_webhooks_out *o = __atomic_load_n(&g_owh, __ATOMIC_ACQUIRE);
+        g_owh_taking = 0;
+        for (size_t i = 0; o && i < r->n_owh_due; i++) oc_webhooks_out_deliver(o, &r->owh_due[i]);
+        break;
+    }
+    case OC_RES_OUTWH_DONE:
+        break;   /* a webhook turned off has told its owners and admins already */
     case OC_RES_AGENT_TOKEN: {
         /* A token minted: to the connection that minted it, once. A new
          * agent's roster row goes to everyone. */
@@ -11316,6 +11459,59 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     oc_dbwriter_submit(dbw, j);
 }
 
+/* Outgoing webhooks, each turn: what the worker finished goes to the writer
+ * -- a delivery's outcome, or a checked creation to save -- and, once a second
+ * while the worker has room, the deliveries due are asked for. */
+static void owh_tick(int ep, conn **conns, oc_dbwriter *dbw) {
+    oc_webhooks_out *o = __atomic_load_n(&g_owh, __ATOMIC_ACQUIRE);
+    if (!o) return;
+    oc_owh_result res;
+    while (oc_webhooks_out_next(o, &res)) {
+        if (res.check_tag) {
+            owh_wait **pp = &g_owh_waits, *x = NULL;
+            for (; *pp; pp = &(*pp)->next)
+                if ((*pp)->tag == res.check_tag) { x = *pp; *pp = x->next; break; }
+            if (!x) continue;
+            conn *c = find_by_id(conns, x->conn_id);
+            if (c && res.ok) {
+                oc_job *j = oc_job_new(OC_JOB_OUTWH_CREATE, x->conn_id);
+                if (j) {
+                    j->user_id = x->user_id;
+                    j->owh_url = strdup(x->url);
+                    j->owh_events = strdup(x->events);
+                    j->owh_n_channels = x->n_channels;
+                    memcpy(j->owh_channels, x->channels, sizeof j->owh_channels);
+                    memcpy(j->owh_secret, x->secret, sizeof j->owh_secret);
+                    j->owh_verified = 1;
+                    oc_dbwriter_submit(dbw, j);
+                }
+            } else if (c) {
+                oc_error e = { OC_ERR_WEBHOOK_UNVERIFIED, 0, { NULL, 0 }, oc_slice_str("the endpoint did not answer the check") };
+                oc_wbuf w;
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+            }
+            owh_wait_free(x);
+            continue;
+        }
+        oc_job *j = oc_job_new(OC_JOB_OUTWH_DONE, 0);
+        if (!j) continue;
+        j->owh_delivery = res.delivery;
+        j->owh_ok = res.ok ? 1 : 0;
+        j->owh_reason = strdup(res.reason);
+        oc_dbwriter_submit(dbw, j);
+    }
+    uint64_t now = now_ms();
+    int room = OC_OUTWH_INFLIGHT_MAX - oc_webhooks_out_pending(o);
+    if (g_owh_taking || room <= 0 || now - g_owh_last_take < 1000) return;
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_TAKE, 0);
+    if (!j) return;
+    j->owh_limit = (uint16_t)room;
+    g_owh_taking = 1;
+    g_owh_last_take = now;
+    oc_dbwriter_submit(dbw, j);
+}
+
 /* Recordings made, or not (CALLS.md §8): written to their rows. */
 static void deliver_callrec_results(oc_dbwriter *dbw) {
     oc_callrec_result res;
@@ -12058,6 +12254,15 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * stopped in the middle of are given it again now. */
     g_callrec_fd = -1;
     callrec_ensure(ep, dbw);
+    /* The outgoing webhooks' worker wakes the loop when it finishes one. */
+    g_owh_taking = 0; g_owh_last_take = 0;
+    g_owh_fd = oc_webhooks_out_eventfd(__atomic_load_n(&g_owh, __ATOMIC_ACQUIRE));
+    if (g_owh_fd >= 0) {
+        struct epoll_event oev;
+        memset(&oev, 0, sizeof oev);
+        oev.events = EPOLLIN; oev.data.fd = g_owh_fd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_owh_fd, &oev);
+    }
 #ifdef OC_TTS
     g_tts_fresh = NULL;   /* another loop's store is not this one's */
     g_tts_out = NULL; g_n_tts_out = g_cap_tts_out = 0; g_tts_lookup_seq = 0;
@@ -12259,6 +12464,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         expire_snoozes(ep, conns);
         pdm_expire(ep, conns);
         call_recorders_tick();
+        owh_tick(ep, conns, dbw);
         if (__atomic_exchange_n(&g_sum_failed_pending, 0, __ATOMIC_ACQ_REL)) {
             oc_job *j = oc_job_new(OC_JOB_SUMMARY_FAIL, 0);
             if (j) oc_dbwriter_submit(dbw, j);
@@ -12312,6 +12518,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 #endif
+            if (g_owh_fd >= 0 && fd == g_owh_fd) {
+                uint64_t cnt;
+                while (read(g_owh_fd, &cnt, sizeof cnt) > 0) { /* drain: owh_tick reads the results */ }
+                continue;
+            }
             if (g_callrec_fd >= 0 && fd == g_callrec_fd) {
                 uint64_t cnt;
                 while (read(g_callrec_fd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
@@ -12402,6 +12613,10 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_callrec_worker_stop(g_callrec);
     g_callrec = NULL;
     g_callrec_fd = -1;
+    if (g_owh_fd >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, g_owh_fd, NULL);
+    g_owh_fd = -1;
+    for (owh_wait *x = g_owh_waits, *next; x; x = next) { next = x->next; owh_wait_free(x); }
+    g_owh_waits = NULL;
     oc_export_worker_stop(g_export);
     g_export = NULL;
     for (export_wait *wt = g_export_waits, *next; wt; wt = next) { next = wt->next; free(wt); }

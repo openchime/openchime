@@ -79,7 +79,8 @@ need "the client holds an access token" [ "${ACCESS:0:5}" = ocpa_ ]
 need "the tab is pressed again" press admin.tab.connections
 mine() { gui_snap; [ "$(cn mine)" = 1 ]; }
 check "the owner's own list shows it" waitfor 10 mine
-check "its Revoke is published" grep -q '^a11yitem settings.conn.[0-9]*.revoke ' "$D"
+own_revoke() { gui_snap; grep -q '^a11yitem settings.conn.[0-9]*.revoke ' "$D"; }
+check "its Revoke is published" waitfor 5 own_revoke
 
 step "a post through it reads via the client"
 need "the client posts" [ "$(post_mcp "$ACCESS" '"name":"post","arguments":{"channel":"#general","text":"drafted by the client"}')" = 200 ]

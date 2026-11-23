@@ -2306,6 +2306,36 @@ rule.
 
 ---
 
+### 5.15a Outgoing webhooks (REQ-173)
+
+An **outgoing webhook** sends a workspace's events to an `https` endpoint an
+owner or admin names (docs/details/WEBHOOKS.md has what it receives, the
+signing and the delivery). Every frame here is an owner's or an admin's; from
+anyone else it is refused `FORBIDDEN`. All are new frames, so no version bump.
+
+- **`CREATE_OUTGOING_WEBHOOK` (C → S), `0x0154`** `{ url: str, events: str,
+  n_channels: u16, channels: [u64] }` — `events` is event names separated by
+  single spaces; `channels` (at most 32) the conversations whose events it
+  receives, none for only `user_change`. The daemon checks the endpoint first
+  (`url_verification`) and saves the webhook only when it answers. Answered
+  `OUTGOING_WEBHOOK_SECRET`.
+- **`OUTGOING_WEBHOOK_SECRET` (S → C), `0x0155`** `{ webhook_id: u64, secret:
+  str }` — the signing secret, sent once, to the connection that created it.
+- **`LIST_OUTGOING_WEBHOOKS` (C → S), `0x0156`** `{}`, answered
+- **`OUTGOING_WEBHOOK_LIST` (S → C), `0x0157`** `{ count: u16, entries: [ {
+  webhook_id: u64, url: str, events: str, enabled: u8, disabled_reason: str,
+  created_by: u64, created_at_ms: u64, n_channels: u16, channels: [u64] } ] }` —
+  never a secret.
+- **`SET_OUTGOING_WEBHOOK` (C → S), `0x0158`** `{ webhook_id: u64, enabled: u8
+  }` — enable or disable it. Answered `OUTGOING_WEBHOOK_LIST`.
+- **`DELETE_OUTGOING_WEBHOOK` (C → S), `0x0159`** `{ webhook_id: u64 }` — the
+  webhook and its waiting deliveries go. Answered `OUTGOING_WEBHOOK_LIST`.
+
+Refusals are `ERROR` frames: `FORBIDDEN` (not an owner or admin, or a DM or
+group DM named), **`WEBHOOK_URL` 3085** (not `https`), **`WEBHOOK_EVENT` 3086**
+(an event a plain webhook may not select), and **`WEBHOOK_UNVERIFIED` 3087**
+(the endpoint did not answer the check).
+
 ### 5.16a Synced client settings
 
 The daemon-side layer of the client config: portable UI prefs a frontend syncs
@@ -4017,6 +4047,9 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3082` | `UNKNOWN_CONNECTION` | account | no    | A `REVOKE_CONNECTION` for a connection that is not in force, or not the caller's to revoke (§5.16q). |
 | `3083` | `BAD_LIFETIME` | account | no    | A `CONNECTION_DECIDE` approving with a lifetime other than 0, 30, 90 or 365 days (§5.16q). |
 | `3084` | `CONNECTIONS_OFF` | account | no    | Any §5.16q frame while `OPENCHIME_MCP_CONNECTIONS` is off. |
+| `3085` | `WEBHOOK_URL` | admin | no    | An outgoing webhook's URL is not `https` (§5.15a). |
+| `3086` | `WEBHOOK_EVENT` | admin | no    | An outgoing webhook named an event it may not select (§5.15a). |
+| `3087` | `WEBHOOK_UNVERIFIED` | admin | no    | The endpoint did not answer the `url_verification` check (§5.15a). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -4337,6 +4370,12 @@ this table cannot silently gain a shared value.
 | `0x014A` | `LIST_AGENT_TOKENS` | C → S | an agent's tokens (§5.16p) |
 | `0x014B` | `AGENT_TOKEN_LIST` | S → C | the list, never a token (§5.16p) |
 | `0x014C` | `REVOKE_AGENT_TOKEN` | C → S | revoke one token (§5.16p) |
+| `0x0154` | `CREATE_OUTGOING_WEBHOOK` | C → S | an outgoing webhook (§5.15a) |
+| `0x0155` | `OUTGOING_WEBHOOK_SECRET` | S → C | its signing secret, shown once (§5.15a) |
+| `0x0156` | `LIST_OUTGOING_WEBHOOKS` | C → S | the workspace's outgoing webhooks (§5.15a) |
+| `0x0157` | `OUTGOING_WEBHOOK_LIST` | S → C | the list, never a secret (§5.15a) |
+| `0x0158` | `SET_OUTGOING_WEBHOOK` | C → S | enable or disable one (§5.15a) |
+| `0x0159` | `DELETE_OUTGOING_WEBHOOK` | C → S | delete one (§5.15a) |
 
 ## 10. Connection state machine
 

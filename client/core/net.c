@@ -2780,6 +2780,44 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->count = ce[i].lifetime_days;
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_OUTGOING_WEBHOOK_SECRET) {
+            /* A webhook's secret, shown once: held for the frontend, which takes it. */
+            oc_outgoing_webhook_secret ws;
+            if (oc_decode_outgoing_webhook_secret(&p, &ws) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_OUTWH_SECRET);
+            if (e) {
+                e->message_id = ws.webhook_id;
+                e->body = slice_text(ws.secret);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_OUTGOING_WEBHOOK_LIST) {
+            oc_outgoing_webhook_entry *we = calloc(OC_OUTWH_LIST_MAX, sizeof *we);
+            uint16_t count = 0;
+            if (!we) return -1;
+            if (oc_decode_outgoing_webhook_list(&p, we, OC_OUTWH_LIST_MAX, &count) != OC_OK) { free(we); return -1; }
+            if (count > OC_OUTWH_LIST_MAX) count = OC_OUTWH_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_OUTWH_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_OUTWH_ROW);
+                if (!e) continue;
+                e->message_id = we[i].webhook_id;
+                e->body = slice_text(we[i].url);
+                e->topic = slice_text(we[i].events);
+                e->preview = slice_text(we[i].disabled_reason);
+                e->status = we[i].enabled ? 1 : 0;
+                e->author_id = we[i].created_by;
+                e->created_at = we[i].created_at_ms;
+                if (we[i].n_channels) {
+                    e->ids = malloc(we[i].n_channels * sizeof *e->ids);
+                    if (e->ids) {
+                        memcpy(e->ids, we[i].channels, we[i].n_channels * sizeof *e->ids);
+                        e->n_ids = we[i].n_channels;
+                    }
+                }
+                oc_queue_push(to_ui, e);
+            }
+            free(we);
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
             if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
@@ -4514,6 +4552,37 @@ static int run_connection(oc_net *n, int reconnecting,
                 } else {
                     oc_revoke_connection m = { c->message_id, (uint8_t)(c->op ? 1 : 0) };
                     er = oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_OUTWH && c->body && c->body2) {
+                uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_outgoing_webhook m;
+                memset(&m, 0, sizeof m);
+                m.url = oc_slice_str(c->body);
+                m.events = oc_slice_str(c->body2);
+                for (const char *q = c->body3 ? c->body3 : ""; *q && m.n_channels < OC_OUTWH_MAX_CHANNELS; ) {
+                    char *end = NULL;
+                    unsigned long long v = strtoull(q, &end, 10);
+                    if (end == q) break;
+                    if (v) m.channels[m.n_channels++] = (uint64_t)v;
+                    q = end;
+                    while (*q == ' ') q++;
+                }
+                if (oc_encode_create_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_OUTWH || c->type == OC_CMD_SET_OUTWH || c->type == OC_CMD_DELETE_OUTWH) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_LIST_OUTWH) {
+                    er = oc_encode_list_outgoing_webhooks(&w, OC_PROTOCOL_VERSION);
+                } else if (c->type == OC_CMD_SET_OUTWH) {
+                    oc_set_outgoing_webhook m = { c->message_id, (uint8_t)(c->channel_id ? 1 : 0) };
+                    er = oc_encode_set_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_delete_outgoing_webhook m = { c->message_id };
+                    er = oc_encode_delete_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m);
                 }
                 if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

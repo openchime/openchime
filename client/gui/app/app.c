@@ -2060,7 +2060,7 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_PFIELD_DELETE,
        CONF_WS_FORGET_SET,
        /* Admin > Agents: remove an agent, revoke one of its tokens. */
-       CONF_AGENT_REMOVE, CONF_AGENT_REVOKE, CONF_CONN_REVOKE, CONF_CONN_REVOKE_ALL };
+       CONF_AGENT_REMOVE, CONF_AGENT_REVOKE, CONF_CONN_REVOKE, CONF_CONN_REVOKE_ALL, CONF_OUTWH_DELETE };
 static uint64_t g_agt_sel;   /* Admin > Agents: the agent whose tokens are open; 0: the list of agents */
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
@@ -16732,6 +16732,7 @@ static void confirm_run(oc_win *hwnd) {
     case CONF_AGENT_REVOKE: oc_client_revoke_agent_token(g_client, g_agt_sel, g_confirm_id); break;
     case CONF_CONN_REVOKE: oc_client_revoke_connection(g_client, g_confirm_id, 0); break;
     case CONF_CONN_REVOKE_ALL: oc_client_revoke_connection(g_client, g_confirm_id, 1); break;
+    case CONF_OUTWH_DELETE: oc_client_delete_outgoing_webhook(g_client, g_confirm_id); break;
     case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_PDM_TRUST:  oc_client_pdm_trust(g_client, g_confirm_id); break;
     case CONF_PDM_SAFETY: break;   /* shown, nothing to do */
@@ -19876,7 +19877,7 @@ static int shell_visible(void) {
 /* adds Custom emoji (REQ-072), the one tab a member is shown too: the
  * catalogue is everyone's, and its creator may delete an emoji they added. */
 enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_EMOJI, ADM_USAGE, ADM_BLOCKS, ADM_PFIELDS,
-       ADM_AGENTS, ADM_CONNECTIONS, ADM_COUNT };
+       ADM_AGENTS, ADM_CONNECTIONS, ADM_WEBHOOKS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -20212,6 +20213,194 @@ static void draw_agents_admin(gfx *rt, const oc_model *m, rectf body) {
 }
 
 
+/* ---- Admin > Webhooks (docs/details/WEBHOOKS.md) ------------------------------
+ * The workspace's outgoing webhooks: each with its address, events, channels
+ * and whether it is on; New webhook asks for the address, the channels and the
+ * events, each event with what it carries. The daemon checks the address
+ * answers before saving it, and the signing secret is shown here once, with
+ * Copy, until Done. Every button is one entry in g_whbtns, so a click, the
+ * keyboard's invoke and the harness press the same thing. */
+enum { WHB_NEW = 1, WHB_ON, WHB_OFF, WHB_DELETE, WHB_COPY, WHB_DONE };
+static struct { rectf r; int kind; uint64_t id; char aid[OC_ACC_AID_MAX]; char name[96]; } g_whbtns[96];
+static int      g_n_whbtns;
+static char     g_wh_secret[64];          /* a new webhook's secret, shown until Done */
+static uint64_t g_wh_secret_id;
+static char     g_wh_note[160];           /* why New webhook sent nothing */
+
+static const struct { const char *name, *desc; } WH_EVENTS[] = {
+    { "message",               "Messages posted, edited and deleted" },
+    { "reaction_added",        "A reaction added" },
+    { "reaction_removed",      "A reaction taken away" },
+    { "member_joined_channel", "Someone joined a channel" },
+    { "member_left_channel",   "Someone left a channel" },
+    { "channel_rename",        "A channel renamed" },
+    { "channel_archive",       "A channel archived" },
+    { "channel_unarchive",     "A channel unarchived" },
+    { "user_change",           "A person's profile changed, in any channel" },
+};
+#define WH_N_EVENTS (sizeof WH_EVENTS / sizeof WH_EVENTS[0])
+
+/* A new webhook's secret: taken from the model, which forgets it, to be shown once. */
+static void webhooks_take_secret(void) {
+    oc_model *m = (oc_model *)model();
+    if (m && m->outwh_secret[0]) oc_model_take_outwh_secret(m, g_wh_secret, sizeof g_wh_secret, &g_wh_secret_id);
+}
+
+static void whbtn(gfx *rt, rectf r, const char *label, int danger, int kind, uint64_t id,
+                  const char *aid, const char *name) {
+    mem_button(rt, r, label, danger, 0);
+    if (g_n_whbtns >= (int)(sizeof g_whbtns / sizeof g_whbtns[0])) return;
+    g_whbtns[g_n_whbtns].r = r;
+    g_whbtns[g_n_whbtns].kind = kind;
+    g_whbtns[g_n_whbtns].id = id;
+    snprintf(g_whbtns[g_n_whbtns].aid, sizeof g_whbtns[0].aid, "%s", aid);
+    snprintf(g_whbtns[g_n_whbtns].name, sizeof g_whbtns[0].name, "%s", name);
+    g_n_whbtns++;
+}
+
+/* A named channel's id by its name (a leading '#' allowed), or 0. */
+static uint64_t webhooks_channel(const oc_model *m, const char *name, size_t len) {
+    if (len && name[0] == '#') { name++; len--; }
+    for (size_t i = 0; m && len && i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind == OC_CHANNEL_KIND && c->name && strlen(c->name) == len && !strncmp(c->name, name, len))
+            return c->channel_id;
+    }
+    return 0;
+}
+
+/* A channel's name for a list, or its id when this client does not know it. */
+static void webhooks_channel_name(const oc_model *m, uint64_t id, char *out, size_t cap) {
+    for (size_t i = 0; m && i < m->n_channels; i++)
+        if (m->channels[i].channel_id == id && m->channels[i].name) { snprintf(out, cap, "#%s", m->channels[i].name); return; }
+    snprintf(out, cap, "channel %llu", (unsigned long long)id);
+}
+
+static void webhooks_new(oc_win *hwnd) {
+    const oc_model *m = model();
+    oc_field f[2 + WH_N_EVENTS];
+    int n = 0;
+    memset(f, 0, sizeof f);
+    f[n].kind = FF_TEXT; f[n].label = "Address";
+    f[n].hint = "Where the events are sent: an https:// address, which must answer the check.";
+    snprintf(f[n].value, sizeof f[n].value, "https://");
+    n++;
+    f[n].kind = FF_TEXT; f[n].label = "Channels";
+    f[n].hint = "Channel names, separated by spaces, such as #general #ops. With none, only profile changes are sent.";
+    n++;
+    for (size_t i = 0; i < WH_N_EVENTS; i++) {
+        f[n].kind = FF_CHECK; f[n].label = WH_EVENTS[i].name; f[n].hint = WH_EVENTS[i].desc;
+        snprintf(f[n].value, sizeof f[n].value, "0");
+        n++;
+    }
+    if (!form_dialog(hwnd, "New webhook", f, n)) return;
+    g_wh_note[0] = '\0';
+    uint64_t chans[OC_OUTWH_MAX_CHANNELS];
+    size_t nc = 0;
+    for (const char *p = f[1].value; *p; ) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        size_t len = strcspn(p, " ,");
+        uint64_t id = webhooks_channel(m, p, len);
+        if (!id) {
+            snprintf(g_wh_note, sizeof g_wh_note, "No channel is called %.*s: nothing was made.", (int)len, p);
+            return;
+        }
+        if (nc < OC_OUTWH_MAX_CHANNELS) chans[nc++] = id;
+        p += len;
+    }
+    char events[256] = "";
+    size_t at = 0;
+    for (int i = 2; i < n; i++)
+        if (!strcmp(f[i].value, "1")) {
+            int k = snprintf(events + at, sizeof events - at, "%s%s", at ? " " : "", f[i].label);
+            if (k < 0 || (size_t)k >= sizeof events - at) break;
+            at += (size_t)k;
+        }
+    if (!events[0]) { snprintf(g_wh_note, sizeof g_wh_note, "Choose at least one event: nothing was made."); return; }
+    oc_client_create_outgoing_webhook(g_client, f[0].value, events, chans, nc);
+}
+
+static void webhooks_press(oc_win *hwnd, int kind, uint64_t id) {
+    if (!model() || !g_client) return;
+    switch (kind) {
+    case WHB_NEW: webhooks_new(hwnd); break;
+    case WHB_ON:  oc_client_set_outgoing_webhook(g_client, id, 1); break;
+    case WHB_OFF: oc_client_set_outgoing_webhook(g_client, id, 0); break;
+    case WHB_DELETE:
+        confirm_open(hwnd, CONF_OUTWH_DELETE, id, "Delete this webhook?",
+                     "Its address is sent nothing more, and the events still waiting for it are dropped.", "Delete");
+        break;
+    case WHB_COPY: oc_plat_clipboard_set_text(g_wh_secret); break;
+    case WHB_DONE:
+        for (volatile char *z = g_wh_secret; z < g_wh_secret + sizeof g_wh_secret; z++) *z = 0;
+        g_wh_secret_id = 0;
+        oc_client_list_outgoing_webhooks(g_client);
+        break;
+    }
+    invalidate();
+}
+
+static void draw_webhooks_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_whbtns = 0;
+    float x = body.left + 20, right = body.right - 20, y = body.top + 14;
+    char aid[OC_ACC_AID_MAX], nm[96], line[1024];
+    if (g_wh_secret[0]) {
+        /* The secret, once: copied now or never seen again. */
+        draw_text(rt, "The new webhook's signing secret", g_title, rf(x, y, right, y + 24), OC_COL_TEXT);
+        y += 28;
+        draw_text(rt, "Copy it now: it is not shown again. The receiver checks each request's signature with it.",
+                  g_meta, rf(x, y, right, y + 20), OC_COL_MUTED);
+        y += 26;
+        rectf tb = rf(x, y, right, y + 34);
+        fill_round(rt, tb, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, tb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        draw_text(rt, g_wh_secret, g_ui, rf(tb.left + 10, tb.top + 8, tb.right - 10, tb.bottom), OC_COL_TEXT);
+        y += 48;
+        whbtn(rt, rf(x, y, x + 90, y + 28), "Copy", 0, WHB_COPY, 0, "admin.webhooks.secret.copy", "Copy the signing secret");
+        whbtn(rt, rf(x + 100, y, x + 190, y + 28), "Done", 0, WHB_DONE, 0, "admin.webhooks.secret.done", "Done");
+        return;
+    }
+    whbtn(rt, rf(x, y, x + 130, y + 28), "New webhook", 0, WHB_NEW, 0, "admin.webhooks.new", "New webhook");
+    if (g_wh_note[0]) draw_text(rt, g_wh_note, g_meta, rf(x + 144, y + 4, right, y + 26), OC_COL_MUTED);
+    y += 42;
+    if (!m->outwhs_have) { overlay_empty(rt, rf(body.left, y, body.right, body.bottom), "Loading webhooks."); return; }
+    if (!m->n_outwhs) {
+        overlay_empty(rt, rf(body.left, y, body.right, body.bottom),
+                      "No webhooks yet. A webhook sends this workspace's events to an address you choose.");
+        return;
+    }
+    for (uint8_t i = 0; i < m->n_outwhs && y < body.bottom - 60; i++) {
+        const oc_outwh_view *o = &m->outwhs[i];
+        char when[24] = "", chans[512] = "";
+        rel_time(o->created_at, when, sizeof when);
+        size_t at = 0;
+        for (uint16_t k = 0; k < o->n_channels && at < sizeof chans - 1; k++) {
+            char cn[80];
+            webhooks_channel_name(m, o->channels[k], cn, sizeof cn);
+            int w = snprintf(chans + at, sizeof chans - at, "%s%s", at ? " " : "", cn);
+            if (w < 0) break;
+            at += (size_t)w < sizeof chans - at ? (size_t)w : sizeof chans - at - 1;
+        }
+        draw_text(rt, o->url, g_ui_b, rf(x, y, right - 200, y + 20), o->enabled ? OC_COL_TEXT : OC_COL_MUTED);
+        snprintf(line, sizeof line, "%s  \xC2\xB7  %s  \xC2\xB7  made %s", o->events,
+                 o->n_channels ? chans : "no channels: profile changes only", when);
+        draw_text(rt, line, g_meta, rf(x, y + 20, right - 200, y + 40), OC_COL_MUTED);
+        if (!o->enabled) {
+            snprintf(line, sizeof line, "Off%s%s", o->reason[0] ? ": " : "", o->reason);
+            draw_text(rt, line, g_meta, rf(x, y + 40, right - 200, y + 60), OC_COL_DANGER);
+        }
+        snprintf(aid, sizeof aid, "admin.webhook.%llu.%s", (unsigned long long)o->id, o->enabled ? "off" : "on");
+        snprintf(nm, sizeof nm, "%s the webhook to %.60s", o->enabled ? "Turn off" : "Turn on", o->url);
+        whbtn(rt, rf(right - 190, y + 6, right - 100, y + 32), o->enabled ? "Turn off" : "Turn on", 0,
+              o->enabled ? WHB_OFF : WHB_ON, o->id, aid, nm);
+        snprintf(aid, sizeof aid, "admin.webhook.%llu.delete", (unsigned long long)o->id);
+        snprintf(nm, sizeof nm, "Delete the webhook to %.60s", o->url);
+        whbtn(rt, rf(right - 90, y + 6, right, y + 32), "Delete", 1, WHB_DELETE, o->id, aid, nm);
+        y += o->enabled ? 50 : 70;
+    }
+}
+
 static void admin_select(int t) {
     g_adm_tab = t;
     grp_pick_close();
@@ -20228,6 +20417,7 @@ static void admin_select(int t) {
     else if (t == ADM_BLOCKS)   oc_client_list_blocks(g_client);
     else if (t == ADM_AGENTS)   agents_back();
     else if (t == ADM_CONNECTIONS) conns_refresh();
+    else if (t == ADM_WEBHOOKS) { g_wh_note[0] = '\0'; oc_client_list_outgoing_webhooks(g_client); }
 }
 
 /* The picker's Manage link: Admin > Custom emoji, which a member is shown too. */
@@ -20818,6 +21008,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Profile fields", OC_ICON_USER },
         { "Agents",    OC_ICON_USER },
         { "AI clients", OC_ICON_USER },
+        { "Webhooks",  OC_ICON_SEND },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     int admin = self_role(m) >= OC_ROLE_ADMIN;
@@ -20851,6 +21042,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
     else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
     else if (g_adm_tab == ADM_AGENTS)  draw_agents_admin(rt, m, body);
+    else if (g_adm_tab == ADM_WEBHOOKS) draw_webhooks_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -29003,6 +29195,7 @@ enum {
     AT_TOAST,         /* payload: toast id * 2, + 1 for its close */
     AT_ALERTACK,      /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
     AT_AGENTBTN,      /* payload: Admin > Agents button index (g_agtbtns) — press it */
+    AT_WEBHOOKBTN,    /* payload: Admin > Webhooks button index (g_whbtns) — press it */
     AT_SUMITEM,       /* payload: a citation's number (go to its message), or 100000 + a topic (show/hide its details) */
     AT_SUMCAL,        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
     AT_TABLEED,       /* payload: a table editor control (TEA_*) */
@@ -29287,7 +29480,7 @@ static void a11y_publish_scene(const oc_model *m) {
     /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
     if (g_view == VIEW_ADMIN) {
         static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts", "emoji", "usage", "blocks",
-                                                       "profile-fields", "agents", "connections" };
+                                                       "profile-fields", "agents", "connections", "webhooks" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
             if (!admin && t != ADM_EMOJI && t != ADM_CONNECTIONS) continue;
@@ -29311,6 +29504,10 @@ static void a11y_publish_scene(const oc_model *m) {
             for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
                 acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
                          ATOK(AT_AGENTBTN, (uint64_t)i));
+        if (g_adm_tab == ADM_WEBHOOKS)
+            for (int i = 0; i < g_n_whbtns && n < OC_ACC_MAX; i++)
+                acc_push(items, &n, OC_ACC_BUTTON, g_whbtns[i].aid, g_whbtns[i].name, g_whbtns[i].r,
+                         ATOK(AT_WEBHOOKBTN, (uint64_t)i));
         if (g_adm_tab == ADM_EMOJI) {
             if (g_efind && g_efind->visible && n < OC_ACC_MAX)
                 acc_push(items, &n, OC_ACC_BUTTON, "admin.emoji.search", "Search custom emoji",
@@ -33661,6 +33858,9 @@ static int on_click(oc_win *hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && !modal_open())
         for (int i = 0; i < g_n_agtbtns; i++)
             if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS && !modal_open())
+        for (int i = 0; i < g_n_whbtns; i++)
+            if (in_rect(g_whbtns[i].r, x, y)) { webhooks_press(hwnd, g_whbtns[i].kind, g_whbtns[i].id); return 1; }
     /* A spoiler is revealed, or covered again, by a click on it. */
     if (!modal_open())
         for (int i = 0; i < g_n_splhits; i++)
@@ -41479,6 +41679,20 @@ static void test_dump(const char *path) {
     fprintf(f, "agenttags transcript=%d members=%d mention=%d profile=%d search=%d summary=%d\n",
             g_atag_n[ATAG_TRANSCRIPT], g_atag_n[ATAG_MEMBERS], g_atag_n[ATAG_MENTION], g_atag_n[ATAG_PROFILE],
             g_atag_n[ATAG_SEARCH], g_atag_n[ATAG_SUMMARY]);
+    {   /* Admin > Webhooks: what it shows, never the secret itself. */
+        int hexok = g_wh_secret[0] != 0;
+        for (const char *p = g_wh_secret; *p; p++) hexok &= (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f');
+        fprintf(f, "webhookadmin shown=%d secret=%d secretlen=%u hex=%d have=%d count=%d note=%d\n",
+                g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS, g_wh_secret[0] != 0, (unsigned)strlen(g_wh_secret),
+                hexok, m ? m->outwhs_have : 0, m ? (int)m->n_outwhs : -1, g_wh_note[0] != 0);
+        for (uint8_t i = 0; m && i < m->n_outwhs; i++)
+            fprintf(f, "  whrow id=%llu enabled=%u channels=%u events=\"%s\" url=\"%s\"\n",
+                    (unsigned long long)m->outwhs[i].id, m->outwhs[i].enabled, m->outwhs[i].n_channels,
+                    m->outwhs[i].events, m->outwhs[i].url);
+        for (int i = 0; i < g_n_whbtns; i++)
+            fprintf(f, "  whbtn %s r=%.0f,%.0f,%.0f,%.0f\n", g_whbtns[i].aid, g_whbtns[i].r.left,
+                    g_whbtns[i].r.top, g_whbtns[i].r.right, g_whbtns[i].r.bottom);
+    }
     {   /* Admin > Agents: what it shows, never the token itself. */
         int descs = 0;
         for (const char *p = g_agt_tok_scopes; *p; ) {
@@ -44681,6 +44895,8 @@ static int on_tick(oc_win *hwnd) {
             }
             /* A token minted: shown once, in Admin > Agents. */
             if (m->agent_token[0]) { agents_take_token(); invalidate(); }
+            /* A webhook's secret: shown once, in Admin > Webhooks. */
+            if (m->outwh_secret[0]) { webhooks_take_secret(); invalidate(); }
                         /* An inline image arrived: decode and cache it. */
             {
                 uint64_t fid = 0; size_t flen = 0;
@@ -45804,6 +46020,10 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_AGENTBTN:
             if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && (int)arg < g_n_agtbtns)
                 agents_press(hwnd, g_agtbtns[arg].kind, g_agtbtns[arg].id);
+            break;
+        case AT_WEBHOOKBTN:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS && (int)arg < g_n_whbtns)
+                webhooks_press(hwnd, g_whbtns[arg].kind, g_whbtns[arg].id);
             break;
         case AT_SUMITEM:
             if (g_show_members && g_rp_mode == RP_SUMMARY)

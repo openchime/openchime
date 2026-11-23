@@ -2541,3 +2541,60 @@ code, the refresh token and each access token.
 *Read* by the token lookup at `/mcp`, which refuses a token past its expiry, a
 connection revoked or past its lifetime, and a person removed. *Written* only
 by the writer's OAuth jobs; removing a person revokes their connections.
+
+## 3ce. Migration 0092 — outgoing webhooks (WEBHOOKS.md)
+
+```sql
+CREATE TABLE outgoing_webhooks (
+  id               INTEGER PRIMARY KEY,
+  url              TEXT NOT NULL,
+  events           TEXT NOT NULL,
+  secret_sealed    BLOB NOT NULL,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  disabled_reason  TEXT NOT NULL DEFAULT '',
+  created_by       INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms    INTEGER NOT NULL,
+  failing_since_ms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE outgoing_webhook_channels (
+  webhook_id INTEGER NOT NULL REFERENCES outgoing_webhooks(id),
+  channel_id INTEGER NOT NULL REFERENCES channels(id),
+  PRIMARY KEY (webhook_id, channel_id)) WITHOUT ROWID;
+CREATE INDEX outgoing_webhook_channels_channel ON outgoing_webhook_channels(channel_id);
+CREATE TABLE webhook_deliveries (
+  id          INTEGER PRIMARY KEY,
+  webhook_id  INTEGER NOT NULL REFERENCES outgoing_webhooks(id),
+  event_id    TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  next_at_ms  INTEGER NOT NULL,
+  last_reason TEXT NOT NULL DEFAULT '');
+CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at_ms);
+CREATE INDEX webhook_deliveries_webhook ON webhook_deliveries(webhook_id);
+```
+
+The addresses the workspace POSTs its events to (docs/details/WEBHOOKS.md).
+
+- `url` — the https address; the writer refuses any other.
+- `events` — the event types it receives, space-separated, each one of the
+  allowed set (WEBHOOKS.md §2).
+- `secret_sealed` — the **signing secret sealed under the factor key**
+  (`oc_factor_seal`, daemon/totp.h; the webhook's id is the associated data).
+  It keys an HMAC, so it cannot be kept as a hash; it is shown once at creation,
+  never listed, and opened only by the delivery worker.
+- `enabled`, `disabled_reason` — whether deliveries are made; why not, when the
+  writer disabled it after a day of failures ("" when a person did).
+- `created_by`, `created_at_ms` — the owner or admin who made it, and when.
+- `failing_since_ms` — when its deliveries began failing; 0 while they succeed.
+- `outgoing_webhook_channels` — the named channels it watches, public or
+  private, never a DM or group DM. None means it receives `user_change` alone.
+- `webhook_deliveries` — one event for one webhook: `event_id` is the same on
+  every attempt, `payload` the envelope as sent, `attempts` how many were made,
+  `next_at_ms` when the next is due, `last_reason` the last failure's
+  `X-Slack-Retry-Reason`.
+
+*Written* by creating, enabling, disabling and deleting a webhook (owners and
+admins, audited), and by every event write, which queues a delivery for each
+enabled webhook that receives it in the same transaction. *Read* by the list,
+which never returns the secret, and by the delivery worker. *Deleted*: a
+delivery when it succeeds or its eighth attempt fails; a webhook's rows, its
+channels and its deliveries together when it is deleted.

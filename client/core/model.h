@@ -347,6 +347,16 @@ typedef struct {
     char     user_name[64];
     char     client_name[104];
 } oc_conn_view;
+/* One outgoing webhook, as Admin lists it: never its secret. */
+typedef struct {
+    uint64_t id, created_by, created_at;
+    char     url[512];
+    char     events[256];
+    char     reason[160];     /* why it was turned off, when the daemon did */
+    uint8_t  enabled;
+    uint16_t n_channels;
+    uint64_t channels[OC_OUTWH_MAX_CHANNELS];
+} oc_outwh_view;
 
 /* A workspace's own profile field, and one person's value for one. */
 typedef struct { uint64_t id; uint8_t kind; uint16_t position;
@@ -807,6 +817,13 @@ typedef struct {
     oc_conn_view *my_conns, *all_conns;
     size_t    n_my_conns, n_all_conns;
     uint8_t   all_conns_known;
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): the list, once asked for
+     * (`outwhs_have`), and a new one's secret, held until a frontend takes it
+     * (oc_model_take_outwh_secret). */
+    oc_outwh_view outwhs[OC_OUTWH_LIST_MAX];
+    uint8_t   n_outwhs, outwhs_have;
+    char      outwh_secret[64];
+    uint64_t  outwh_secret_id;
     /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
     uint64_t  reset_user_id;
     char      reset_token[80];
@@ -1295,6 +1312,9 @@ uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, 
 int oc_model_user_is_agent(const oc_model *m, uint64_t user_id);
 /* The token just minted, copied to `out` (with its agent, id and scopes when
  * asked) and forgotten: it is shown once. 1 when there was one, else 0. */
+/* A new outgoing webhook's secret, once: 1 with it in `out` (and the webhook's
+ * id), the model's copy wiped; 0 when there is none. */
+int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id);
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
                               char *scopes, size_t scopes_cap);
 

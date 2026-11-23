@@ -146,6 +146,11 @@ void oc_netloop_set_push(struct oc_push *push);
 struct oc_invite_mail;
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
 
+/* Wire the outgoing webhooks' delivery worker (webhooks_out.h), before the loop
+ * runs; NULL (the default) delivers nothing and refuses creations. */
+struct oc_webhooks_out;
+void oc_netloop_set_webhooks_out(struct oc_webhooks_out *o);
+
 /* The enrollment the address proof signs with (AUTH.md §3.6): set once the
  * binding is active, after which POST /enroll-proof answers central's check of
  * the address this workspace reported. NULL (the default) answers 404. Both

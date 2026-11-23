@@ -707,6 +707,17 @@ void oc_client_connection_code(oc_client *c, const char *code);
 void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days);
 void oc_client_list_connections(oc_client *c, int everyone);
 void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int everyone);
+/* Outgoing webhooks (docs/details/WEBHOOKS.md): an owner's or an admin's.
+ * `events` is event names separated by single spaces; `channels` the named
+ * channels it watches (none: it is sent user_change alone). The daemon checks
+ * the address answers before saving it; the secret arrives once, held in the
+ * model until oc_model_take_outwh_secret. Each change answers with the list,
+ * which replaces the model's `outwhs`. */
+void oc_client_create_outgoing_webhook(oc_client *c, const char *url, const char *events,
+                                       const uint64_t *channels, size_t n_channels);
+void oc_client_list_outgoing_webhooks(oc_client *c);
+void oc_client_set_outgoing_webhook(oc_client *c, uint64_t webhook_id, int enabled);
+void oc_client_delete_outgoing_webhook(oc_client *c, uint64_t webhook_id);
 
 /* Transfers wait their turn in a queue rather than being refused while another
  * runs; each carries a tag that its OC_EV_XFER progress and completion events

@@ -1687,6 +1687,12 @@ const char *oc_error_text(uint16_t code) {
         return "a connection lasts for ever, or 30, 90 or 365 days";
     case OC_ERR_CONNECTIONS_OFF:
         return "this workspace does not let people connect AI clients";
+    case OC_ERR_WEBHOOK_URL:
+        return "a webhook's address must start with https://";
+    case OC_ERR_WEBHOOK_EVENT:
+        return "a webhook can only be sent the events listed";
+    case OC_ERR_WEBHOOK_UNVERIFIED:
+        return "that address did not answer the check, so the webhook was not saved";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -3169,10 +3175,64 @@ oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_conne
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_OUTGOING_WEBHOOK);
+    oc_w_str(w, m->url);
+    oc_w_str(w, m->events);
+    uint16_t n = m->n_channels > OC_OUTWH_MAX_CHANNELS ? OC_OUTWH_MAX_CHANNELS : m->n_channels;
+    oc_w_u16(w, n);
+    for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->channels[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OUTGOING_WEBHOOK_SECRET);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_str(w, m->secret);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_OUTGOING_WEBHOOKS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OUTGOING_WEBHOOK_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_outgoing_webhook_entry *e = &m->entries[i];
+        oc_w_u64(w, e->webhook_id);
+        oc_w_str(w, e->url);
+        oc_w_str(w, e->events);
+        oc_w_u8(w, e->enabled);
+        oc_w_str(w, e->disabled_reason);
+        oc_w_u64(w, e->created_by);
+        oc_w_u64(w, e->created_at_ms);
+        uint16_t n = e->n_channels > OC_OUTWH_MAX_CHANNELS ? OC_OUTWH_MAX_CHANNELS : e->n_channels;
+        oc_w_u16(w, n);
+        for (uint16_t k = 0; k < n; k++) oc_w_u64(w, e->channels[k]);
+    }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_CONNECTION);
     oc_w_u64(w, m->connection_id);
     oc_w_u8(w, m->all ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_set_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_OUTGOING_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_u8(w, m->enabled);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_delete_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_delete_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE_OUTGOING_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
     return oc_frame_end(w, off);
 }
 
@@ -4661,10 +4721,57 @@ oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entr
     return r_done(p);
 }
 
+oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m) {
+    m->url = oc_r_str(p);
+    m->events = oc_r_str(p);
+    m->n_channels = oc_r_u16(p);
+    if (m->n_channels > OC_OUTWH_MAX_CHANNELS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < m->n_channels; i++) m->channels[i] = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->secret = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,
+                                          uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_outgoing_webhook_entry e;
+        e.webhook_id = oc_r_u64(p);
+        e.url = oc_r_str(p);
+        e.events = oc_r_str(p);
+        e.enabled = oc_r_u8(p);
+        e.disabled_reason = oc_r_str(p);
+        e.created_by = oc_r_u64(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.n_channels = oc_r_u16(p);
+        if (e.n_channels > OC_OUTWH_MAX_CHANNELS) return OC_E_MALFORMED;
+        for (uint16_t k = 0; k < e.n_channels; k++) e.channels[k] = oc_r_u64(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
 oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m) {
     m->connection_id = oc_r_u64(p);
     m->all = oc_r_u8(p);
     if (m->all > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_set_outgoing_webhook(oc_rbuf *p, oc_set_outgoing_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->enabled = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_delete_outgoing_webhook(oc_rbuf *p, oc_delete_outgoing_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
     return r_done(p);
 }
 

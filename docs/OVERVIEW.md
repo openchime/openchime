@@ -80,6 +80,7 @@ the map behind it.
 | [PRIVATE-DM.md](./details/PRIVATE-DM.md) | End-to-end encrypted DMs. | ARCH-118; REQ-314 |
 | [MARKDOWN.md](./details/MARKDOWN.md) | The message formatting dialect and where it is parsed. | ARCH-100; REQ-220 |
 | [MCP.md](./details/MCP.md) | The Model Context Protocol surface for agents and people's AI clients: the endpoint, its tools, paging, agent tokens and audit. | ARCH-120; REQ-320–325 |
+| [WEBHOOKS.md](./details/WEBHOOKS.md) | Outgoing webhooks: managing them, the events and the envelope, signing, delivery and retries. | ARCH-131; REQ-173 |
 | [EMAIL.md](./details/EMAIL.md) | Notification email and invitations: the three levels, providers, the outbox. | ARCH-125, 126; REQ-280, 365–370 |
 | [EXPORT.md](./details/EXPORT.md) | The export format, version 1. | ARCH-124; REQ-360 |
 

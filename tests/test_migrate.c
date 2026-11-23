@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 91);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections */
+    CHECK(oc_schema_version(db) == 92);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections/outgoing-webhooks */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -120,7 +120,8 @@ static void test_embedded_schema(void) {
                              "calls", "call_participants", "call_invitees", "call_events",
                              "call_recordings", "call_transcripts", "call_transcript_lines",
                              "call_transcripts_fts", "attachment_previews", "principal_tokens",
-                             "oauth_clients", "oauth_approvals", "mcp_connections", "mcp_access_tokens" };
+                             "oauth_clients", "oauth_approvals", "mcp_connections", "mcp_access_tokens",
+                             "outgoing_webhooks", "outgoing_webhook_channels", "webhook_deliveries" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -411,6 +412,37 @@ static void test_also_channel(void) {
     sqlite3_close(db);
 }
 
+/* Outgoing webhooks (0092), from 0090: the three tables are made; a webhook
+ * keeps its sealed secret as written, its channels are one row each, and a
+ * delivery is due by its index. */
+static void test_outgoing_webhooks_0092(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 90, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 90);
+    CHECK(!table_exists(db, "outgoing_webhooks"));
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 92);
+    CHECK(table_exists(db, "outgoing_webhooks"));
+    CHECK(table_exists(db, "outgoing_webhook_channels"));
+    CHECK(table_exists(db, "webhook_deliveries"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(7,'channel','general',1,1);"
+        "INSERT INTO outgoing_webhooks(id,url,events,secret_sealed,created_by,created_at_ms)"
+        " VALUES(3,'https://example.test/hook','message',x'0102',1,5);"
+        "INSERT INTO outgoing_webhook_channels(webhook_id,channel_id) VALUES(3,7);"
+        "INSERT INTO webhook_deliveries(webhook_id,event_id,payload,next_at_ms)"
+        " VALUES(3,'Ev1','{}',9);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT enabled FROM outgoing_webhooks WHERE id=3;") == 1);
+    CHECK(scalar(db, "SELECT failing_since_ms FROM outgoing_webhooks WHERE id=3;") == 0);
+    CHECK(scalar(db, "SELECT length(secret_sealed) FROM outgoing_webhooks WHERE id=3;") == 2);
+    CHECK(scalar(db, "SELECT attempts FROM webhook_deliveries WHERE event_id='Ev1';") == 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE channel_id=7;") == 1);
+    sqlite3_close(db);
+}
+
 /* Which messages a rendering was looked up for (0089), from 0088: the table
  * is made, a use is one row per message and handle, and a second use of the
  * same pair is no second row. */
@@ -629,6 +661,7 @@ int run_migrate_tests(void) {
     test_previews_0088();
     test_rendered_audio_uses_0089();
     test_connections_0091();
+    test_outgoing_webhooks_0092();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

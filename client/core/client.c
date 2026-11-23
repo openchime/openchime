@@ -1922,6 +1922,41 @@ void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int every
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_create_outgoing_webhook(oc_client *c, const char *url, const char *events,
+                                       const uint64_t *channels, size_t n_channels) {
+    if (!c || !url || !url[0] || !events) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_OUTWH);
+    if (!cmd) return;
+    char ids[OC_OUTWH_MAX_CHANNELS * 21 + 1] = "";
+    size_t at = 0;
+    for (size_t i = 0; i < n_channels && i < OC_OUTWH_MAX_CHANNELS; i++) {
+        int k = snprintf(ids + at, sizeof ids - at, "%s%llu", at ? " " : "", (unsigned long long)channels[i]);
+        if (k < 0 || (size_t)k >= sizeof ids - at) break;
+        at += (size_t)k;
+    }
+    cmd->body = strdup(url);
+    cmd->body2 = strdup(events);
+    cmd->body3 = strdup(ids);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void outwh_cmd(oc_client *c, int type, uint64_t id, uint64_t arg) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = id;
+    cmd->channel_id = arg;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_outgoing_webhooks(oc_client *c) { outwh_cmd(c, OC_CMD_LIST_OUTWH, 0, 0); }
+void oc_client_set_outgoing_webhook(oc_client *c, uint64_t webhook_id, int enabled) {
+    if (webhook_id) outwh_cmd(c, OC_CMD_SET_OUTWH, webhook_id, enabled ? 1 : 0);
+}
+void oc_client_delete_outgoing_webhook(oc_client *c, uint64_t webhook_id) {
+    if (webhook_id) outwh_cmd(c, OC_CMD_DELETE_OUTWH, webhook_id, 0);
+}
+
 void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
     if (!c || !attachment_id) return;
     if (rung != OC_PREVIEW_RUNG_INLINE_WIRE && rung != OC_PREVIEW_RUNG_EXPANDED_WIRE) {
