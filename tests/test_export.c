@@ -10,6 +10,7 @@
 #include "dbwriter.h"
 #include "protocol.h"
 
+#include <stdatomic.h>
 #include <sqlite3.h>
 #include <sys/time.h>
 
@@ -283,9 +284,9 @@ static void test_render(void) {
 
 /* The gate a read-aloud rendering holds: closed while `closed`, and counting how
  * often the worker asked, so a test sees it waiting without timing it. */
-static volatile int gate_closed;
-static volatile int gate_asks;
-static int test_gate(void *ctx) { (void)ctx; gate_asks++; return gate_closed; }
+static atomic_int gate_closed;   /* shared with the worker's thread */
+static atomic_int gate_asks;
+static int test_gate(void *ctx) { (void)ctx; atomic_fetch_add(&gate_asks, 1); return atomic_load(&gate_closed); }
 
 /* The worker's temporary files left in `dir`. */
 static int tmp_files(const char *dir) {
@@ -326,8 +327,8 @@ static void test_worker(void) {
     CHECK(src && put_blob(bs, "00000000000000a2", src, len) == 0);
     free(src);
 
-    gate_closed = 1;
-    gate_asks = 0;
+    atomic_store(&gate_closed, 1);
+    atomic_store(&gate_asks, 0);
     oc_export_worker *w = oc_export_worker_start(&oc_export_stub_codecs, bs, tmp, test_gate, NULL);
     CHECK(w != NULL);
     if (!w) { oc_blobstore_close(bs); oc_test_rmtree(dir); return; }
@@ -336,7 +337,7 @@ static void test_worker(void) {
     /* While a rendering runs nothing starts: the worker asks the gate, again and
      * again, and starts nothing. */
     CHECK(oc_export_worker_submit(w, 1, 7, 0xa1, "00000000000000a1", len) == 0);
-    CHECK(WAIT_UNTIL(gate_asks >= 3, 2000));
+    CHECK(WAIT_UNTIL(atomic_load(&gate_asks) >= 3, 2000));
     CHECK(oc_export_worker_started(w) == 0);
 
     /* The same video again joins it; a person's fourth is refused, another's is not. */
@@ -347,7 +348,7 @@ static void test_worker(void) {
     CHECK(oc_export_worker_submit(w, 6, 9, 0xa2, "00000000000000a2", len) == 1);
 
     /* The rendering ends: the exports run, one after another, in order. */
-    gate_closed = 0;
+    atomic_store(&gate_closed, 0);
     oc_export_result r1, r2, r3;
     memset(&r1, 0, sizeof r1); memset(&r2, 0, sizeof r2); memset(&r3, 0, sizeof r3);
     CHECK(WAIT_UNTIL(oc_export_worker_next_result(w, &r1), 5000));
@@ -381,7 +382,7 @@ static void test_worker(void) {
     oc_export_result_free(&r4);
 
     /* Stopped with work queued behind a closed gate: nothing left behind. */
-    gate_closed = 1;
+    atomic_store(&gate_closed, 1);
     CHECK(oc_export_worker_submit(w, 8, 7, 0xa2, "00000000000000a2", len) == 0);
     oc_export_worker_stop(w);
     CHECK(tmp_files(tmp) == 0);
