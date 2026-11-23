@@ -79,7 +79,7 @@ the map behind it.
 | [SUMMARIES.md](./details/SUMMARIES.md) | Summaries of a conversation: the standard, the pipeline, the model. | ARCH-116; REQ-310–313 |
 | [PRIVATE-DM.md](./details/PRIVATE-DM.md) | End-to-end encrypted DMs. | ARCH-118; REQ-314 |
 | [MARKDOWN.md](./details/MARKDOWN.md) | The message formatting dialect and where it is parsed. | ARCH-100; REQ-220 |
-| [MCP.md](./details/MCP.md) | The Model Context Protocol surface for agents and people's AI clients. | ARCH-120; REQ-320–325 |
+| [MCP.md](./details/MCP.md) | The Model Context Protocol surface for agents and people's AI clients: the endpoint, its tools, paging, agent tokens and audit. | ARCH-120; REQ-320–325 |
 | [EMAIL.md](./details/EMAIL.md) | Notification email and invitations: the three levels, providers, the outbox. | ARCH-125, 126; REQ-280, 365–370 |
 | [EXPORT.md](./details/EXPORT.md) | The export format, version 1. | ARCH-124; REQ-360 |
 
@@ -110,7 +110,6 @@ the map behind it.
 | [BOLT.md](./plans/BOLT.md) | Research: what apps written with Bolt assume, and the decision that they run unchanged. | ARCH-131 |
 | [QUICKJS.md](./plans/QUICKJS.md) | Research: QuickJS's costs and limits as the in-workspace runtime. | ARCH-133 |
 | [HTTP-API.md](./plans/HTTP-API.md) | The documented HTTP API for integrations. | ARCH-123; REQ-176, 350–354 |
-| [MCP.md](./plans/MCP.md) | The MCP surface's tools, paging, agent tokens and audit. | ARCH-120; REQ-320–325 |
 | [ASSISTANT.md](./plans/ASSISTANT.md) | The assistant that answers from what a person can read. | ARCH-121; REQ-330–334 |
 | [COMPLIANCE-CAPTURE.md](./plans/COMPLIANCE-CAPTURE.md) | Compliance capture: the log, the extract schema, the file drop, the pull API. | ARCH-122; REQ-276, 340–345 |
 | [MODERATION.md](./plans/MODERATION.md) | The moderator role, reports, and the three permissions. | ARCH-128; REQ-371–374 |

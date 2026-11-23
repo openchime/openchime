@@ -5641,6 +5641,272 @@ static void test_agent_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* The MCP endpoint over the wire (docs/details/MCP.md): off, /mcp is not there;
+ * on, discovery needs no token, everything else a valid agent token (401 with
+ * a challenge otherwise); tools/list's channel enum is the agent's channels;
+ * read_history pages back by cursor; search finds; a post reaches a member as a
+ * BROADCAST from the agent, and the same key posts once; a channel the agent is
+ * not in and a missing scope are tool errors; every tool call is one audit row. */
+#define MCP_V "2026-07-28"
+
+/* One request to /mcp: the status, with the answer's body in `out`. */
+static int mcp_call(int port, const uint8_t *pin, const char *verb, const char *token, const char *method,
+                    const char *name, const char *params, char *out, size_t cap) {
+    client h;
+    if (http_client_open(&h, port, pin) != 0) return -1;
+    char body[2048], req[4096], auth[160] = "", mh[96] = "", nh[96] = "";
+    int bn = snprintf(body, sizeof body,
+                      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":{%s%s\"_meta\":"
+                      "{\"io.modelcontextprotocol/protocolVersion\":\"" MCP_V "\"}}}",
+                      method ? method : "", params ? params : "", params && params[0] ? "," : "");
+    if (token) snprintf(auth, sizeof auth, "Authorization: Bearer %s\r\n", token);
+    if (method) snprintf(mh, sizeof mh, "Mcp-Method: %s\r\n", method);
+    if (name) snprintf(nh, sizeof nh, "Mcp-Name: %s\r\n", name);
+    int rn = snprintf(req, sizeof req,
+                      "%s /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nMCP-Protocol-Version: " MCP_V
+                      "\r\n%s%s%sContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                      verb, auth, mh, nh, strcmp(verb, "POST") ? 0 : bn, strcmp(verb, "POST") ? "" : body);
+    int st = -1;
+    if (write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0) {
+        http_read_response(&h, out, cap);
+        if (strncmp(out, "HTTP/1.1 ", 9) == 0) st = atoi(out + 9);
+    }
+    client_close(&h);
+    return st;
+}
+
+static void test_mcp_off(int port, const uint8_t *pin) {
+    char resp[4096];
+    CHECK(mcp_call(port, pin, "POST", NULL, "server/discover", NULL, "", resp, sizeof resp) == 404);
+}
+
+static int64_t mcp_scalar(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int64_t v = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        v = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
+/* alice sends `text` to channel 1 over her socket; the message's id. */
+static uint64_t mcp_seed(client *a, const char *text, uint8_t tag) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = OC_DEFAULT_CHANNEL; memset(s.idem, tag, OC_IDEM_SIZE);
+    s.body = oc_slice_str(text);
+    if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || send_frame(a, buf, w.len) != 0) return 0;
+    oc_header hdr; oc_rbuf p;
+    if (read_type(a, OC_MSG_SEND_ACK, &hdr, &p) != 0) return 0;
+    oc_send_ack ack;
+    if (oc_decode_send_ack(&p, &ack) != OC_OK) return 0;
+    if (read_type(a, OC_MSG_BROADCAST, &hdr, &p) != 0) return 0;
+    return ack.message_id;
+}
+
+static void test_mcp_wire(void) {
+    setenv("OPENCHIME_MCP", "on", 1);
+    /* A refill of one a minute: within this test the budget is spent by count
+     * alone, never earned back by how long it takes. */
+    setenv("OPENCHIME_MCP_CALLS_PER_MINUTE", "1", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_mcp.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_mcp.db"));
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);
+    CHECK(dbw2 != NULL);
+    if (!dbw2) { unsetenv("OPENCHIME_MCP"); unsetenv("OPENCHIME_MCP_CALLS_PER_MINUTE"); return; }
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+    char resp[65536];
+
+    /* Discovery asks no token; a GET is not served; no token or a wrong one is
+     * challenged. */
+    CHECK(mcp_call(port, pin2, "POST", NULL, "server/discover", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"supportedVersions\":[\"" MCP_V "\"]") != NULL);
+    CHECK(mcp_call(port, pin2, "GET", NULL, NULL, NULL, NULL, resp, sizeof resp) == 405);
+    CHECK(mcp_call(port, pin2, "DELETE", NULL, NULL, NULL, NULL, resp, sizeof resp) == 405);
+    /* The earlier era's handshake is refused with the revision this speaks. */
+    CHECK(mcp_call(port, pin2, "POST", NULL, "initialize", NULL, "", resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "UnsupportedProtocolVersionError") && strstr(resp, "\"" MCP_V "\""));
+    {   /* A body over the route's limit is refused before it is read. */
+        client h;
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *big = "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 10000000\r\nConnection: close\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)big, strlen(big)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 413", 12) == 0);
+        client_close(&h);
+    }
+    CHECK(mcp_call(port, pin2, "POST", NULL, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(strstr(resp, "WWW-Authenticate: Bearer") != NULL);   /* contract: the challenge RFC 6750 names */
+    CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                   resp, sizeof resp) == 401);
+
+    /* An agent with two tokens: one reads and posts, one only posts; in the
+     * general channel; and a private channel it is not in. */
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    oc_header hdr; oc_rbuf p; uint8_t buf[512]; oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_agent ca = { oc_slice_str("Robo"), oc_slice_str("ci"), oc_slice_str("chat:write channels:history groups:history") };
+    CHECK(oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at; CHECK(oc_decode_agent_token(&p, &at) == OC_OK);
+    uint64_t agent = at.agent_id;
+    char tok[96] = "", tok2[96] = "";
+    if (at.token.len < sizeof tok) { memcpy(tok, at.token.ptr, at.token.len); tok[at.token.len] = '\0'; }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt = { agent, oc_slice_str("poster"), oc_slice_str("chat:write") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at2; CHECK(oc_decode_agent_token(&p, &at2) == OC_OK);
+    if (at2.token.len < sizeof tok2) { memcpy(tok2, at2.token.ptr, at2.token.len); tok2[at2.token.len] = '\0'; }
+    char tok3[96] = "";
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt3 = { agent, oc_slice_str("burst"), oc_slice_str("channels:history") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt3) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at3; CHECK(oc_decode_agent_token(&p, &at3) == OC_OK);
+    if (at3.token.len < sizeof tok3) { memcpy(tok3, at3.token.ptr, at3.token.len); tok3[at3.token.len] = '\0'; }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op inv = { OC_DEFAULT_CHANNEL, agent };
+    CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("mcp-secret"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    static oc_channel_info info;
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    uint64_t secret = info.channel_id;
+
+    /* Three messages to page through and search. */
+    uint64_t m1 = mcp_seed(&a, "alpha deploy started", 0x41);
+    uint64_t m2 = mcp_seed(&a, "beta checks green", 0x42);
+    uint64_t m3 = mcp_seed(&a, "gamma deploy finished", 0x43);
+    CHECK(m1 && m2 && m3 && m1 < m2 && m2 < m3);
+
+    /* tools/list: the three tools, the enum the agent's channels only. */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"read_history\"") && strstr(resp, "\"search\"") && strstr(resp, "\"post\""));
+    CHECK(strstr(resp, "\"enum\":[\"#") != NULL && strstr(resp, "mcp-secret") == NULL);
+    CHECK(strstr(resp, "\"cacheScope\":\"private\"") != NULL);
+
+    /* read_history: the newest two, then the one before by the cursor. */
+    char args[512], want[64];
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"limit\":2}", resp, sizeof resp) == 200);
+    snprintf(want, sizeof want, "\"older\":%llu", (unsigned long long)m2);
+    CHECK(strstr(resp, "\"isError\":false") && strstr(resp, "gamma deploy finished") && strstr(resp, want) &&
+          !strstr(resp, "alpha deploy started"));
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"limit\":2,\"before\":%llu}",
+             (unsigned long long)m2);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "alpha deploy started") && !strstr(resp, "beta checks green") && !strstr(resp, "\"older\""));
+
+    /* search: both deploys, by their excerpts. */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "search",
+                   "\"name\":\"search\",\"arguments\":{\"query\":\"deploy\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"excerpt\"") && strstr(resp, "alpha deploy started") && strstr(resp, "gamma deploy finished") &&
+          !strstr(resp, "beta checks green"));
+
+    /* post: alice receives it as a BROADCAST from the agent; the same key
+     * again posts nothing new and answers the same id. */
+    const char *pa = "\"name\":\"post\",\"arguments\":{\"channel\":1,\"text\":\"hello from robo\",\"key\":\"k-1\"}";
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", pa, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":false") != NULL);
+    char first_id[64] = "";
+    const char *idp = strstr(resp, "\\\"id\\\":");
+    if (idp) snprintf(first_id, sizeof first_id, "%.20s", idp);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.author_id == agent && bc.channel_id == OC_DEFAULT_CHANNEL && bc.body.len == 15);
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", pa, resp, sizeof resp) == 200);
+    CHECK(first_id[0] && strstr(resp, first_id) != NULL);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(tpath("itest_mcp.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM messages WHERE author_id=%llu;", (unsigned long long)agent);
+    CHECK(mcp_scalar(db, q) == 1);
+
+    /* A reply in a thread: the thread's first message counts it, and `thread`
+     * reads the replies alone. */
+    snprintf(args, sizeof args, "\"name\":\"post\",\"arguments\":{\"channel\":1,\"thread\":%llu,\"text\":\"on it\"}",
+             (unsigned long long)m1);
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":false") != NULL);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"replies\":1") != NULL && strstr(resp, "on it") == NULL);
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"thread\":%llu}",
+             (unsigned long long)m1);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "on it") != NULL && strstr(resp, "gamma deploy finished") == NULL);
+
+    /* Refused as tool errors: a channel it is not in, said as if it did not
+     * exist; and a token without the scope to read. */
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":%llu}", (unsigned long long)secret);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":true") && strstr(resp, "no such conversation"));   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"#nope\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "no such conversation") != NULL);   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":true") && strstr(resp, "channels:history"));
+
+    /* One audit row a tool call: four reads, a search, three posts, three
+     * refusals; none of it text, a query or a token. */
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5;") == 11, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND (detail LIKE '%deploy%' OR detail LIKE '%hello%'"
+                         " OR detail LIKE '%ocpt_%');") == 0);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.post' AND detail LIKE 'token=poster %';") == 3);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 1);
+
+    /* The budget, by count: a burst of 20 holds six searches of three; the
+     * seventh is 429 with Retry-After before anything is read, and is still a
+     * row, refused, holding no query. */
+    const char *sq = "\"name\":\"search\",\"arguments\":{\"query\":\"zebra\"}";
+    for (int i = 0; i < 6; i++)
+        CHECK(mcp_call(port, pin2, "POST", tok3, "tools/call", "search", sq, resp, sizeof resp) == 200);
+    CHECK(mcp_call(port, pin2, "POST", tok3, "tools/call", "search", sq, resp, sizeof resp) == 429);
+    CHECK(strstr(resp, "Retry-After: ") != NULL);   /* contract: the header RFC 9110 names */
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.search'"
+                                    " AND outcome=0 AND detail='token=burst over the limit';") == 1, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.search' AND outcome=1"
+                         " AND detail LIKE 'token=burst %';") == 6);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND detail LIKE '%zebra%';") == 0);
+
+    /* Refused tokens count against the source (REQ-191): after twenty, the
+     * next request is refused as rate-limited, a valid token or not, without a
+     * lookup or a row of its own. */
+    for (int i = 0; i < 20; i++)
+        CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                       resp, sizeof resp) == 401);
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 21, 5000));
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/list", NULL, "", resp, sizeof resp) == 429);
+    CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                   resp, sizeof resp) == 429);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 21);
+    sqlite3_close(db);
+
+    client_close(&a);
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unsetenv("OPENCHIME_MCP");
+    unsetenv("OPENCHIME_MCP_CALLS_PER_MINUTE");
+    db_unlink("itest_mcp.db");
+}
+
 static void test_webhook_vertical(int port, const uint8_t *pin) {
     client a;
     CHECK(client_open(&a, port, pin) == 0);
@@ -10049,6 +10315,8 @@ int run_netloop_tests(void) {
         test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_agent_vertical(arg.port, pin);
+        test_mcp_off(arg.port, pin);
+        test_mcp_wire();
         test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and

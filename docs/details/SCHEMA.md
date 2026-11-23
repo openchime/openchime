@@ -577,7 +577,7 @@ moderation actions, account changes) for owner/admin review — never message co
 
 ### `audit_log`
 - `id` (INTEGER PK, AUTOINCREMENT); `at_ms` (event time).
-- `family` (INTEGER) — 1 admin, 2 account, 3 security, 4 moderation.
+- `family` (INTEGER) — 1 admin, 2 account, 3 security, 4 moderation, 5 MCP access (MCP.md §11, kept 365 days whatever the others' age).
 - `action` (TEXT) — e.g. `auth.failed`, `webhook.create`.
 - `actor_id` / `actor_name` — the actor (NULL id for an unauthenticated event; the name
   is denormalized so a later-removed actor is still legible).

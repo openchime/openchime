@@ -714,7 +714,7 @@ typedef enum {
     OC_MSG_PREVIEW_INFO         = 0x0143, /* S->C, its size, dimensions and type */
     OC_MSG_PREVIEW_CHUNK        = 0x0144, /* S->C, a slice of the preview */
     OC_MSG_PREVIEW_END          = 0x0145, /* S->C, the whole preview is sent */
-    /* Agents and their tokens (docs/details/MCP.md §3.1, docs/plans/MCP.md §3):
+    /* Agents and their tokens (docs/details/MCP.md §3.1, §10):
      * an owner's or admin's. A token is answered once, to the connection that
      * minted it, and never listed. New frames, so no version bump. */
     OC_MSG_CREATE_AGENT         = 0x0146, /* C->S, an agent, and its first token */
@@ -2191,7 +2191,7 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
 #define OC_USER_AGENT  0x02u
 /* An agent's token as it is shown once and presented: this prefix, then its
  * 32 random bytes in base64url, so a secret scanner can recognise a leaked
- * one (docs/plans/MCP.md §3.1). */
+ * one (docs/details/MCP.md §10.1). */
 #define OC_PRINCIPAL_TOKEN_PREFIX "ocpt_"
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;

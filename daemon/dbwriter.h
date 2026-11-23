@@ -412,7 +412,17 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * token/token_len the presented token, token_from its address; answered
         * OC_RES_TOKEN_PRINCIPAL, or OC_RES_AGENT_ERR when it is no token. */
        OC_JOB_AGENT_CREATE = 259, OC_JOB_AGENT_REMOVE = 260, OC_JOB_TOKEN_MINT = 261,
-       OC_JOB_TOKEN_LIST = 262, OC_JOB_TOKEN_REVOKE = 263, OC_JOB_TOKEN_LOOKUP = 264 };
+       OC_JOB_TOKEN_LIST = 262, OC_JOB_TOKEN_REVOKE = 263, OC_JOB_TOKEN_LOOKUP = 264,
+       /* The MCP surface (docs/details/MCP.md), as an agent, user_id. Reads:
+        * MCP_CHANNELS, the conversations it is a member of (OC_RES_MCP_CHANNELS);
+        * MCP_READ, channel_id's messages or thread mcp_thread's replies, paged by
+        * mcp_before / mcp_after / mcp_since and mcp_limit; MCP_SEARCH, mcp_query
+        * over its channels (channel_id 0: all), mcp_from, mcp_since, mcp_until,
+        * after the cursor (mcp_rank, mcp_after), in public channels only when
+        * mcp_pub and private ones when mcp_priv; both answered
+        * OC_RES_MCP_MESSAGES, or that with err_code. MCP_AUDIT (write, fire and
+        * forget): one row in family mcp_family. */
+       OC_JOB_MCP_CHANNELS = 265, OC_JOB_MCP_READ = 266, OC_JOB_MCP_SEARCH = 267, OC_JOB_MCP_AUDIT = 268 };
 
 /* At most this many tokens an agent holds (docs/details/MCP.md §3.1). */
 #define OC_AGENT_MAX_TOKENS 10
@@ -610,6 +620,17 @@ typedef struct oc_job {
      * TOKEN_LOOKUP's address. All heap. */
     char          *agent_name, *token_name, *token_scopes, *token_from;
     uint64_t       token_id;
+
+    /* The MCP surface's reads and audit rows (OC_JOB_MCP_*). Strings heap. */
+    uint64_t       mcp_thread, mcp_before, mcp_after, mcp_since, mcp_until;
+    uint8_t        mcp_has_before, mcp_has_after, mcp_has_since, mcp_has_until;
+    uint16_t       mcp_limit;
+    uint8_t        mcp_pub, mcp_priv, mcp_has_cursor;
+    double         mcp_rank;
+    char          *mcp_query, *mcp_from;
+    int            mcp_family;
+    uint8_t        mcp_outcome;
+    char          *mcp_action, *mcp_target, *mcp_detail;
 
     /* Image previews (ARCH-137): PREVIEW_STORE's and PREVIEW_LOOKUP's
      * fields, with attachment_id. pv_keys and pv_mime are heap. */
@@ -1061,7 +1082,26 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * (user_id, ptokens); a refusal (err_code); and a token found
         * (user_id its agent, message_id its id, tok_scopes). */
        OC_RES_AGENT_TOKEN = 150, OC_RES_TOKEN_LIST = 151, OC_RES_AGENT_ERR = 152,
-       OC_RES_TOKEN_PRINCIPAL = 153 };
+       OC_RES_TOKEN_PRINCIPAL = 153,
+       /* The MCP surface: an agent's conversations (mcp_chans), and a page of
+        * messages (mcp_rows, in id order, with mcp_more_older / mcp_more_newer,
+        * and mcp_newest_kept when it was read backwards). */
+       OC_RES_MCP_CHANNELS = 154, OC_RES_MCP_MESSAGES = 155 };
+
+/* A conversation an agent may read, as the MCP surface names it. */
+typedef struct { uint64_t id; char *name; uint8_t is_public; } oc_mcp_chan;
+/* A message as the MCP surface returns it; every string heap. */
+typedef struct {
+    uint64_t id, channel_id, at_ms;
+    char    *author, *handle, *kind, *text, *channel;
+    size_t   text_len;
+    uint8_t  edited;
+    uint32_t replies;
+    double   rank;              /* search: bm25, lower is better */
+    size_t   n_files;
+    char   **file_names, **file_types;
+    uint64_t *file_sizes;
+} oc_mcp_row;
 
 /* A line of a call's transcript as the daemon's transcript function takes it:
  * the speaker (0 unknown), from and to in ms from the call's start, the text. */
@@ -1224,7 +1264,12 @@ typedef struct { uint64_t id, channel_id, thread_root, send_at_ms, created_ms;
 /* Audit families (REQ-251, ARCH-79). The cap is applied per family so a flood of
  * attacker-controlled security events cannot evict administrative history. */
 enum { OC_AUDIT_ADMIN = 1, OC_AUDIT_ACCOUNT = 2,
-       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4 };
+       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4,
+       /* What reached the MCP surface (REQ-325): one row per tool call. Kept
+        * 365 days whatever the other families' age, so heavy reading cannot
+        * push their entries out. */
+       OC_AUDIT_MCP = 5 };
+#define OC_AUDIT_MCP_KEEP_MS (365ull * 24 * 60 * 60 * 1000)
 
 enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
        OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3,
@@ -1735,6 +1780,12 @@ typedef struct oc_dbres {
     oc_token_row           *ptokens;
     size_t                  n_ptokens;
     char                   *tok_scopes;
+    /* OC_RES_MCP_CHANNELS and OC_RES_MCP_MESSAGES. */
+    oc_mcp_chan            *mcp_chans;
+    size_t                  n_mcp_chans;
+    oc_mcp_row             *mcp_rows;
+    size_t                  n_mcp_rows;
+    uint8_t                 mcp_more_older, mcp_more_newer, mcp_newest_kept;
     /* OC_RES_PREVIEW_META and OC_RES_PREVIEW_STORED (ARCH-137). */
     char                   *pv_key, *pv_mime;
     uint64_t                pv_size;

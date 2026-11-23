@@ -76,6 +76,8 @@ typedef struct oc_io_event {
      * same-origin check), and whether the body is a form. */
     size_t     host_len, origin_len;
     int        is_form;
+    /* ...and, after those, the headers the MCP endpoint reads (http.h). */
+    size_t     auth_len, mcpv_len, mcpm_len, mcpn_len;
     struct oc_io_event *next;
 } oc_io_event;
 

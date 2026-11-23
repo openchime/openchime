@@ -1949,7 +1949,7 @@ static const char MIGRATION_0089[] =
 
 static const char MIGRATION_0090[] =
     /* The token store for the principals that are not people (docs/details/
-     * MCP.md §3.1, docs/plans/MCP.md §3): an agent's tokens now, an app's bot
+     * MCP.md §3.1, §10): an agent's tokens now, an app's bot
      * later, in the one table -- `users.kind` (0071) says which. A token is
      * stored as the webhook tokens are (0010): its SHA-256 alone, under a unique
      * index, so a request's lookup is one probe and the raw token is in no row.

@@ -341,6 +341,7 @@ static void job_free(oc_job *j) {
     free(j->exp_blob_key);
     for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
     free(j->agent_name); free(j->token_name); free(j->token_scopes); free(j->token_from);
+    free(j->mcp_query); free(j->mcp_from); free(j->mcp_action); free(j->mcp_target); free(j->mcp_detail);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -913,6 +914,15 @@ void oc_dbres_free(oc_dbres *r) {
     }
     free(r->ptokens);
     free(r->tok_scopes);
+    for (size_t i = 0; i < r->n_mcp_chans; i++) free(r->mcp_chans[i].name);
+    free(r->mcp_chans);
+    for (size_t i = 0; i < r->n_mcp_rows; i++) {
+        oc_mcp_row *m = &r->mcp_rows[i];
+        free(m->author); free(m->handle); free(m->kind); free(m->text); free(m->channel);
+        for (size_t k = 0; k < m->n_files; k++) { free(m->file_names[k]); free(m->file_types[k]); }
+        free(m->file_names); free(m->file_types); free(m->file_sizes);
+    }
+    free(r->mcp_rows);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
@@ -11004,6 +11014,292 @@ static oc_dbres *process_preview_touch(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- The MCP surface's reads (docs/details/MCP.md §4) ----------------------------
+ * An agent reads the channels it is a member of and nothing else: no DM, no
+ * group DM, no end-to-end channel (the daemon holds only ciphertext), no
+ * public channel it has not been put in. Every read checks that
+ * here, at the moment it is made. Deleted messages are not returned. */
+
+static char *mcp_dup(sqlite3_stmt *st, int i) {
+    const char *t = (const char *)sqlite3_column_text(st, i);
+    return strdup(t ? t : "");
+}
+
+static int agent_reads(sqlite3 *db, uint64_t channel, uint64_t agent) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
+            " WHERE c.id=?1 AND cm.user_id=?2 AND c.kind='channel' AND c.e2e=0;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)agent);
+        ok = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static oc_dbres *process_mcp_channels(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_CHANNELS;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.name, c.is_public FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
+            " WHERE cm.user_id=?1 AND c.kind='channel' AND c.e2e=0 ORDER BY c.name, c.id;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_mcp_chan *g = realloc(r->mcp_chans, (r->n_mcp_chans + 1) * sizeof *g);
+            if (!g) break;
+            r->mcp_chans = g;
+            oc_mcp_chan *c = &r->mcp_chans[r->n_mcp_chans++];
+            c->id = (uint64_t)sqlite3_column_int64(st, 0);
+            c->name = mcp_dup(st, 1);
+            c->is_public = (uint8_t)sqlite3_column_int(st, 2);
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* The columns every MCP read takes, in this order (mcp_row_fill). */
+#define MCP_COLS \
+    "m.id, m.channel_id, m.created_at_ms, m.body, (m.edited_at_ms IS NOT NULL)," \
+    " (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id AND c.deleted_at_ms IS NULL)," \
+    " COALESCE(NULLIF(m.author_name,''), u.display_name, '')," \
+    " CASE WHEN COALESCE(m.author_name,'') <> '' THEN 'webhook' WHEN u.kind='agent' THEN 'agent' ELSE 'person' END," \
+    " CASE WHEN substr(u.subject, 1, 6)='local:' THEN substr(u.subject, 7) ELSE '' END," \
+    " ch.name"
+
+static void mcp_row_fill(sqlite3 *db, sqlite3_stmt *st, oc_mcp_row *m) {
+    memset(m, 0, sizeof *m);
+    m->id = (uint64_t)sqlite3_column_int64(st, 0);
+    m->channel_id = (uint64_t)sqlite3_column_int64(st, 1);
+    m->at_ms = (uint64_t)sqlite3_column_int64(st, 2);
+    const void *b = sqlite3_column_blob(st, 3);
+    int bl = sqlite3_column_bytes(st, 3);
+    m->text = malloc((size_t)(bl > 0 ? bl : 0) + 1);
+    if (m->text) { if (bl > 0) memcpy(m->text, b, (size_t)bl); m->text[bl > 0 ? bl : 0] = '\0'; m->text_len = (size_t)(bl > 0 ? bl : 0); }
+    m->edited = (uint8_t)sqlite3_column_int(st, 4);
+    m->replies = (uint32_t)sqlite3_column_int64(st, 5);
+    m->author = mcp_dup(st, 6);
+    m->kind = mcp_dup(st, 7);
+    m->handle = mcp_dup(st, 8);
+    m->channel = mcp_dup(st, 9);
+    sqlite3_stmt *fs = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT filename, mime, size FROM attachments WHERE message_id=?1 AND reclaimed_at_ms=0 ORDER BY id;",
+            -1, &fs, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(fs, 1, (sqlite3_int64)m->id);
+        while (sqlite3_step(fs) == SQLITE_ROW) {
+            size_t k = m->n_files;
+            char **gn = realloc(m->file_names, (k + 1) * sizeof *gn);
+            if (gn) m->file_names = gn;
+            char **gt = realloc(m->file_types, (k + 1) * sizeof *gt);
+            if (gt) m->file_types = gt;
+            uint64_t *gs = realloc(m->file_sizes, (k + 1) * sizeof *gs);
+            if (gs) m->file_sizes = gs;
+            if (!gn || !gt || !gs) break;
+            m->file_names[k] = mcp_dup(fs, 0);
+            m->file_types[k] = mcp_dup(fs, 1);
+            m->file_sizes[k] = (uint64_t)sqlite3_column_int64(fs, 2);
+            m->n_files++;
+        }
+    }
+    sqlite3_finalize(fs);
+}
+
+static int mcp_row_add(oc_dbres *r) {
+    oc_mcp_row *g = realloc(r->mcp_rows, (r->n_mcp_rows + 1) * sizeof *g);
+    if (!g) return -1;
+    r->mcp_rows = g;
+    r->n_mcp_rows++;
+    return 0;
+}
+
+static int mcp_exists(sqlite3 *db, const char *sql, uint64_t a, uint64_t b, uint64_t c) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)a);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)b);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)c);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* MCP_READ: a conversation's top-level messages, or one thread's replies,
+ * newest first by page unless after or since asks for the other way. */
+static oc_dbres *process_mcp_read(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_MESSAGES;
+    r->channel_id = j->channel_id;
+    if (!agent_reads(db, j->channel_id, j->user_id)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (j->mcp_thread &&
+        !mcp_exists(db, "SELECT 1 FROM messages WHERE id=?1 AND channel_id=?2 AND parent_id IS NULL AND ?3=?3;",
+                    j->mcp_thread, j->channel_id, 0)) {
+        r->err_code = OC_ERR_UNKNOWN_MESSAGE;
+        return r;
+    }
+    int forward = j->mcp_has_after || (j->mcp_has_since && !j->mcp_has_before);
+    uint16_t lim = j->mcp_limit ? j->mcp_limit : 50;
+    char sql[1600];
+    snprintf(sql, sizeof sql,
+             "SELECT " MCP_COLS " FROM messages m LEFT JOIN users u ON u.id=m.author_id JOIN channels ch ON ch.id=m.channel_id"
+             " WHERE m.channel_id=?1 AND m.deleted_at_ms IS NULL AND m.body IS NOT NULL"
+             " AND %s"
+             " AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?6 AND wm.message_id=m.id)"
+             " AND (?2=0 OR m.id < ?2) AND (?3=0 OR m.id > ?3) AND (?4=0 OR m.created_at_ms >= ?4)"
+             " ORDER BY m.id %s LIMIT ?5;",
+             j->mcp_thread ? "m.parent_id=?7" : "(m.parent_id IS NULL OR m.also_channel=1) AND ?7=?7",
+             forward ? "ASC" : "DESC");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(j->mcp_has_before ? j->mcp_before : 0));
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)(j->mcp_has_after ? j->mcp_after : 0));
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)(j->mcp_has_since ? j->mcp_since : 0));
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)lim + 1);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)j->mcp_thread);
+    size_t got = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (got++ == lim) { if (forward) r->mcp_more_newer = 1; else r->mcp_more_older = 1; break; }
+        if (mcp_row_add(r) != 0) break;
+        mcp_row_fill(db, st, &r->mcp_rows[r->n_mcp_rows - 1]);
+    }
+    sqlite3_finalize(st);
+    /* In id order, whichever way it was read. */
+    if (!forward)
+        for (size_t a = 0, b = r->n_mcp_rows; a + 1 < b; a++, b--) {
+            oc_mcp_row t = r->mcp_rows[a]; r->mcp_rows[a] = r->mcp_rows[b - 1]; r->mcp_rows[b - 1] = t;
+        }
+    r->mcp_newest_kept = (uint8_t)!forward;
+    /* What lies beyond the page's other end: before it when read forwards, after
+     * it when read backwards from a cursor. */
+    if (r->n_mcp_rows) {
+        const char *older = j->mcp_thread
+            ? "SELECT 1 FROM messages WHERE channel_id=?1 AND parent_id=?3 AND deleted_at_ms IS NULL AND id < ?2;"
+            : "SELECT 1 FROM messages WHERE channel_id=?1 AND (parent_id IS NULL OR also_channel=1) AND deleted_at_ms IS NULL AND id < ?2 AND ?3=?3;";
+        const char *newer = j->mcp_thread
+            ? "SELECT 1 FROM messages WHERE channel_id=?1 AND parent_id=?3 AND deleted_at_ms IS NULL AND id > ?2;"
+            : "SELECT 1 FROM messages WHERE channel_id=?1 AND (parent_id IS NULL OR also_channel=1) AND deleted_at_ms IS NULL AND id > ?2 AND ?3=?3;";
+        if (forward) r->mcp_more_older = (uint8_t)mcp_exists(db, older, j->channel_id, r->mcp_rows[0].id, j->mcp_thread);
+        else r->mcp_more_newer = (uint8_t)mcp_exists(db, newer, j->channel_id, r->mcp_rows[r->n_mcp_rows - 1].id, j->mcp_thread);
+    }
+    return r;
+}
+
+/* The words of a query as an FTS5 expression: each a quoted phrase, all
+ * required, so nothing the caller types is taken as an operator. */
+static int mcp_fts_query(const char *q, char *out, size_t cap) {
+    size_t o = 0;
+    int words = 0;
+    while (*q) {
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (!*q) break;
+        if (o + 3 >= cap) return -1;
+        if (words++) out[o++] = ' ';
+        out[o++] = '"';
+        while (*q && *q != ' ' && *q != '\t' && *q != '\n') {
+            if (o + 3 >= cap) return -1;
+            if (*q == '"') out[o++] = '"';
+            out[o++] = *q++;
+        }
+        out[o++] = '"';
+    }
+    out[o] = '\0';
+    return words ? 0 : -1;
+}
+
+static oc_dbres *process_mcp_search(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_MESSAGES;
+    if (j->channel_id && !agent_reads(db, j->channel_id, j->user_id)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    char fq[1200];
+    if (!j->mcp_query || mcp_fts_query(j->mcp_query, fq, sizeof fq) != 0) return r;
+    uint64_t from_uid = 0;
+    if (j->mcp_from && j->mcp_from[0]) {
+        const char *h = j->mcp_from[0] == '@' ? j->mcp_from + 1 : j->mcp_from;
+        sqlite3_stmt *u = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject='local:'||?1 OR display_name=?1 ORDER BY id LIMIT 1;",
+                               -1, &u, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(u, 1, h, -1, SQLITE_STATIC);
+            if (sqlite3_step(u) == SQLITE_ROW) from_uid = (uint64_t)sqlite3_column_int64(u, 0);
+        }
+        sqlite3_finalize(u);
+        if (!from_uid) return r;                       /* nobody by that name wrote anything */
+    }
+    uint16_t lim = j->mcp_limit ? j->mcp_limit : 20;
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "SELECT * FROM (SELECT " MCP_COLS ", bm25(messages_fts) AS rank"
+        "  FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid"
+        "  JOIN channels ch ON ch.id=m.channel_id AND ch.kind='channel' AND ch.e2e=0"
+        "  JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.user_id=?2"
+        "  LEFT JOIN users u ON u.id=m.author_id"
+        " WHERE messages_fts MATCH ?1 AND m.deleted_at_ms IS NULL AND m.body IS NOT NULL"
+        "   AND ((ch.is_public=1 AND ?3=1) OR (ch.is_public=0 AND ?4=1))"
+        "   AND (?5=0 OR m.channel_id=?5) AND (?6=0 OR m.author_id=?6)"
+        "   AND (?7=0 OR m.created_at_ms >= ?7) AND (?8=0 OR m.created_at_ms < ?8))"
+        " WHERE (?9=0 OR rank > ?10 OR (rank = ?10 AND id > ?11))"
+        " ORDER BY rank, id LIMIT ?12;";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_bind_text (st, 1, fq, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int  (st, 3, j->mcp_pub);
+    sqlite3_bind_int  (st, 4, j->mcp_priv);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)from_uid);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)(j->mcp_has_since ? j->mcp_since : 0));
+    sqlite3_bind_int64(st, 8, (sqlite3_int64)(j->mcp_has_until ? j->mcp_until : 0));
+    sqlite3_bind_int  (st, 9, j->mcp_has_cursor);
+    sqlite3_bind_double(st, 10, j->mcp_rank);
+    sqlite3_bind_int64(st, 11, (sqlite3_int64)j->mcp_after);
+    sqlite3_bind_int64(st, 12, (sqlite3_int64)lim + 1);
+    size_t got = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (got++ == lim) { r->mcp_more_newer = 1; break; }   /* another page follows */
+        if (mcp_row_add(r) != 0) break;
+        oc_mcp_row *m = &r->mcp_rows[r->n_mcp_rows - 1];
+        mcp_row_fill(db, st, m);
+        m->rank = sqlite3_column_double(st, 10);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* MCP_AUDIT: the row, its detail led by the token's name (token_id), so an
+ * owner sees which of an agent's tokens did it; never the token itself. */
+static oc_dbres *process_mcp_audit(sqlite3 *db, const oc_job *j) {
+    char *nm = j->user_id ? audit_name_of(db, j->user_id) : NULL;
+    char tok[128] = "", detail[512];
+    if (j->token_id) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM principal_tokens WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                snprintf(tok, sizeof tok, "%s", (const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+    }
+    if (tok[0]) snprintf(detail, sizeof detail, "token=%s%s%s", tok, j->mcp_detail ? " " : "", j->mcp_detail ? j->mcp_detail : "");
+    else snprintf(detail, sizeof detail, "%s", j->mcp_detail ? j->mcp_detail : "");
+    audit_log(db, j->mcp_family ? j->mcp_family : OC_AUDIT_MCP, j->mcp_action ? j->mcp_action : "mcp",
+              j->user_id, nm, j->target_user_id, j->mcp_target, j->mcp_outcome, detail[0] ? detail : NULL);
+    free(nm);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) { r->type = OC_RES_OK; r->conn_id = 0; }
+    return r;
+}
+
 /* --- Agents and their tokens (docs/details/MCP.md §3.1, §6, §7) ---------------
  * An agent is a `users` row of kind 'agent' with a name and nothing of a
  * person's: no password, no identity-provider subject, no session, no device.
@@ -13854,6 +14150,7 @@ static int is_read_job(int type) {
            type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
            type == OC_JOB_EXPORT_LOOKUP || type == OC_JOB_PREVIEW_LOOKUP ||
+           type == OC_JOB_MCP_CHANNELS || type == OC_JOB_MCP_READ || type == OC_JOB_MCP_SEARCH ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
 }
@@ -13887,6 +14184,9 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_EXPORT_LOOKUP)  return process_export_lookup(rdb, j);
     if (j->type == OC_JOB_PREVIEW_LOOKUP) return process_preview_lookup(rdb, j);
+    if (j->type == OC_JOB_MCP_CHANNELS)  return process_mcp_channels(rdb, j);
+    if (j->type == OC_JOB_MCP_READ)      return process_mcp_read(rdb, j);
+    if (j->type == OC_JOB_MCP_SEARCH)    return process_mcp_search(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
@@ -14406,6 +14706,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_TOKEN_LIST)     return process_token_list(w->db, j);
     if (j->type == OC_JOB_TOKEN_REVOKE)   return process_token_revoke(w->db, j);
     if (j->type == OC_JOB_TOKEN_LOOKUP)   return process_token_lookup(w->db, j);
+    if (j->type == OC_JOB_MCP_AUDIT)      return process_mcp_audit(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);
@@ -14761,8 +15062,18 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
  * evidence. Each family is pruned against its own age budget instead, so
  * security noise can only evict security noise. */
 static void prune_audit(sqlite3 *db, uint64_t max_age_ms) {
-    if (!max_age_ms) return;
     uint64_t now = dbw_now_ms();
+    /* The MCP access family has its own age, whatever the others' (REQ-325). */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "DELETE FROM audit_log WHERE family=?1 AND at_ms < ?2;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(st, 1, OC_AUDIT_MCP);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(now > OC_AUDIT_MCP_KEEP_MS ? now - OC_AUDIT_MCP_KEEP_MS : 0));
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    if (!max_age_ms) return;
     uint64_t cutoff = (now > max_age_ms) ? now - max_age_ms : 0;
     static const int FAMILIES[] = { OC_AUDIT_ADMIN, OC_AUDIT_ACCOUNT,
                                     OC_AUDIT_SECURITY, OC_AUDIT_MODERATION };

@@ -12845,6 +12845,64 @@ static oc_dbres *ret_pass(oc_dbwriter *w, uint32_t days, uint32_t batch) {
 
 static int64_t ret_count(const char *path, const char *sql, uint64_t arg) { return e2e_scalar(path, sql, arg); }
 
+/* The MCP access family (docs/details/MCP.md §11): a tool call's row names the
+ * token and the ids, never what was read, searched for or posted, and it ages
+ * out at 365 days whatever age the other families keep. */
+static void test_mcp_audit(void) {
+    const char *path = tdb("mcp_audit.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t a = reg(w, "mcp-agent", "pw", OC_ROLE_MEMBER);
+    oc_job *j = oc_job_new(OC_JOB_MCP_AUDIT, 0);
+    j->user_id = a;
+    j->mcp_family = OC_AUDIT_MCP;
+    j->mcp_outcome = 1;
+    j->mcp_action = strdup("mcp.search");
+    j->mcp_target = strdup("#general");
+    j->mcp_detail = strdup("token=ci results=3 conversations=1");
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.search'"
+                           " AND detail='token=ci results=3 conversations=1';", OC_AUDIT_MCP) == 1);
+    /* Nothing of a message, a query or a token rides in it. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND (detail LIKE '%ocpt_%'"
+                           " OR detail LIKE '%query%' OR detail LIKE '%text%');", OC_AUDIT_MCP) == 0);
+
+    /* Rows either side of 365 days, and an admin row as old. */
+    uint64_t now = wall_ms_now();
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO audit_log(at_ms, family, action, outcome) VALUES"
+             " (%llu, %d, 'mcp.read_history', 1), (%llu, %d, 'mcp.post', 1), (%llu, 1, 'user.remove', 1);",
+             (unsigned long long)(now - 366 * RET_DAY), OC_AUDIT_MCP,
+             (unsigned long long)(now - 364 * RET_DAY), OC_AUDIT_MCP,
+             (unsigned long long)(now - 366 * RET_DAY));
+    ret_sql(path, sql);
+    /* The others kept 1000 days: the old MCP row goes, the admin row stays. */
+    j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = 8;
+    j->audit_max_age_ms = 1000 * RET_DAY;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.read_history';", OC_AUDIT_MCP) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.post';", OC_AUDIT_MCP) == 1);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1;", 1) == 1);
+    /* The others kept 30 days: the admin row goes, the younger MCP row stays. */
+    j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = 8;
+    j->audit_max_age_ms = 30 * RET_DAY;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1;", 1) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.post';", OC_AUDIT_MCP) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_retention_off(void) {
     const char *path = tdb("ret_off.db");
     cleanup_db(path);
@@ -13428,6 +13486,7 @@ int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
     test_call_recordings();
+    test_mcp_audit();
     test_retention_off();
     test_retention_boundary();
     test_retention_linked_rows();

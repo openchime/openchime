@@ -40,6 +40,7 @@
 #include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
 #include "ratelimit.h"
+#include "mcp.h"
 #include "listen.h"
 #include "proxyproto.h"
 #include "idmap.h"
@@ -224,6 +225,9 @@ typedef struct web_req {
     unsigned left_min;
 } web_req;
 
+struct mcp_req;
+static void mcp_req_free(struct mcp_req *m);
+
 typedef struct conn_s {
     int          fd;
     uint64_t     conn_id;
@@ -303,6 +307,7 @@ typedef struct conn_s {
     int          http;
     int          http_pending;
     struct web_req *web;         /* a sign-in page's post awaiting its check (AUTH.md §8.10) */
+    struct mcp_req *mcp;         /* an MCP request awaiting the writer (docs/details/MCP.md) */
     int          groups_sent;    /* this session's groups have followed its user list (REQ-307) */
     /* The indexes (below): where this connection sits in the live list, its
      * neighbours among its user's connections once authenticated, and the last
@@ -488,6 +493,7 @@ static __thread uint64_t      g_max_video  = 0;   /* OPENCHIME_MAX_VIDEO_SIZE, s
  * channel. Created in oc_netloop_run. */
 static __thread oc_ratelimit *g_webhook_rl;
 static __thread oc_ratelimit *g_proof_rl;   /* /enroll-proof, per caller */
+static __thread oc_ratelimit *g_mcp_fail_rl; /* /mcp, failed sign-ins per source */
 /* Device codes (AUTH.md §8.11): the pending requests, and how often one source
  * may look a code up on the /device page -- a guessed code is the attack. */
 static __thread oc_devcodes  *g_devcodes;
@@ -1055,6 +1061,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     for (int i = 0; i < c->bf_n; i++) oc_dbres_free(c->bf[i]);
     free(c->dq);
     if (c->web) { oc_e2e_wipe(c->web, sizeof *c->web); free(c->web); }
+    mcp_req_free(c->mcp);
     flush_out(c);   /* what was staged goes, if the socket takes it now */
     oc_ioloop_close(g_io, c->conn_id, fd);
     for (oc_io_event *e = c->fq_head, *n; e; e = n) { n = e->next; oc_io_event_free(e); }
@@ -5765,6 +5772,12 @@ static void http_reply(conn *c, int status, const char *ctype, const char *body,
  * state and so is the loop's. On the health port (ARCH-25): `/healthz`, and the
  * landing page for every other path, both answered on the I/O thread. */
 #define WEBHOOK_PREFIX "/webhook/"
+/* The MCP endpoint (docs/details/MCP.md): its path, its body's bound, and how
+ * many failed sign-ins a source may make in a window (REQ-191). */
+#define OC_MCP_PATH         "/mcp"
+#define OC_MCP_MAX_BODY     (4u * OC_MAX_BODY_SIZE)   /* a post's 64 KiB text, escaped, and the envelope */
+#define OC_MCP_FAIL_MAX     20u                       /* failed sign-ins a source may make... */
+#define OC_MCP_FAIL_WINDOW  60000u                    /* ...in this many ms (REQ-191) */
 /* The sign-in pages (AUTH.md §8.10): a GET shows one, a POST is its form. */
 #define WEB_MAX_BODY 8192u
 /* The browser client's way onto the wire (CLIENT.md §4, ARCH-74): a WebSocket
@@ -5901,12 +5914,19 @@ void oc_netloop_set_adopted_address(const char *name) {
  * wasm is beside the binary (webapp.h) -- on the TLS port only, where the
  * sign-in pages it chains to live; the health port stays health and the
  * harness's WebSocket, nothing a person signs in through in the clear. */
-static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 8];
+static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 9];
 static void sites_init(void) {
     size_t na = 0;
     const oc_http_route *app = oc_webapp_routes(&na);
     size_t nt = sizeof TLS_ROUTES / sizeof TLS_ROUTES[0];
     memcpy(g_tls_routes, TLS_ROUTES, sizeof TLS_ROUTES);
+    /* The MCP endpoint, when it is on (docs/details/MCP.md): POST only, so a GET
+     * or DELETE of it is answered 405 by the I/O thread. Off, it is not a route. */
+    if (oc_config_get()->mcp.enabled) {
+        static const oc_http_route MCP_ROUTE =
+            { "POST", OC_MCP_PATH, 0, OC_HTTP_LOOP, OC_MCP_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL };
+        g_tls_routes[nt++] = MCP_ROUTE;
+    }
     for (size_t i = 0; i < na && i < 8; i++) g_tls_routes[nt + i] = app[i];
     g_tls_site.routes = g_tls_routes; g_tls_site.n = nt + (na < 8 ? na : 8); g_tls_site.fallback = NULL;
     g_health_site.routes = HEALTH_ROUTES; g_health_site.n = sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0];
@@ -6963,6 +6983,412 @@ static int on_address_proof(conn *c, const oc_http_req *req) {
     return -1;
 }
 
+/* --- The MCP endpoint (docs/details/MCP.md, ARCH-120) ------------------------
+ * POST /mcp, one JSON-RPC request and one JSON answer, as an agent holding a
+ * token. The request is read and checked by daemon/mcp.c; here it is
+ * authenticated (OC_JOB_TOKEN_LOOKUP, never cached), budgeted per token, sent
+ * to the writer's readers or its send path as the agent, audited (one row per
+ * tool call, OC_AUDIT_MCP) and answered. Each step's result comes back through
+ * deliver_result_to, which hands it to mcp_result while the connection carries
+ * an mcp_req. */
+
+#define OC_MCP_TOKENS_MAX   1024u                     /* budgets kept; the least recently used goes */
+
+typedef struct mcp_req {
+    oc_mcp_call call;
+    uint64_t    agent, token_id;
+    char        scopes[512];
+    uint64_t    channel_id;
+    char        channel[160];    /* "#name", as answered and audited */
+} mcp_req;
+
+static void mcp_req_free(mcp_req *m) {
+    if (!m) return;
+    oc_mcp_call_free(&m->call);
+    free(m);
+}
+
+/* One token's budget: its bucket, and its posts' window (REQ-190). */
+typedef struct { uint64_t token_id, used_ms; oc_mcp_bucket bucket; struct rate_win sends; } mcp_tok;
+static __thread mcp_tok *g_mcp_toks;
+static __thread size_t   g_mcp_ntoks;
+
+static mcp_tok *mcp_tok_of(uint64_t token_id, uint64_t now) {
+    if (!g_mcp_toks && !(g_mcp_toks = calloc(OC_MCP_TOKENS_MAX, sizeof *g_mcp_toks))) return NULL;
+    size_t lru = 0;
+    for (size_t i = 0; i < g_mcp_ntoks; i++) {
+        if (g_mcp_toks[i].token_id == token_id) { g_mcp_toks[i].used_ms = now; return &g_mcp_toks[i]; }
+        if (g_mcp_toks[i].used_ms < g_mcp_toks[lru].used_ms) lru = i;
+    }
+    mcp_tok *t = g_mcp_ntoks < OC_MCP_TOKENS_MAX ? &g_mcp_toks[g_mcp_ntoks++] : &g_mcp_toks[lru];
+    memset(t, 0, sizeof *t);
+    t->token_id = token_id;
+    t->used_ms = now;
+    return t;
+}
+
+static const char *mcp_version(void) {
+    static char v[16];
+    if (!v[0]) snprintf(v, sizeof v, "%u", (unsigned)OC_PROTOCOL_VERSION);
+    return v;
+}
+
+/* Queue an answer of `b` (or `body`) with `status`, plus `extra` headers. */
+static void mcp_reply(conn *c, int status, const oc_mcp_buf *b, const char *extra) {
+    static const char OOM[] = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+    const char *body = b && b->p && !b->failed ? b->p : OOM;
+    size_t len = b && b->p && !b->failed ? b->len : sizeof OOM - 1;
+    if (!(b && b->p && !b->failed)) status = 500;
+    char hdr[OC_HTTP_HEAD_MAX];
+    size_t n = oc_http_head_ex(hdr, sizeof hdr, status, "application/json", len, extra ? extra : "");
+    if (!n) return;
+    out_append(c, (const uint8_t *)hdr, n);
+    out_append(c, (const uint8_t *)body, len);
+}
+
+/* Answer a request whose result came back, and close its connection. */
+static void mcp_finish(int ep, conn **conns, conn *c, int status, oc_mcp_buf *b, const char *extra) {
+    mcp_reply(c, status, b, extra);
+    oc_mcp_buf_free(b);
+    flush_out(c);
+    conn_close(ep, conns, c->fd);
+}
+
+static void mcp_challenge(int ep, conn **conns, conn *c, const char *id) {
+    oc_mcp_buf b = { 0 };
+    oc_mcp_error(&b, id, -32001, "Unauthorized", NULL);
+    if (ep < 0) { mcp_reply(c, 401, &b, "WWW-Authenticate: Bearer\r\n"); oc_mcp_buf_free(&b); return; }
+    mcp_finish(ep, conns, c, 401, &b, "WWW-Authenticate: Bearer\r\n");
+}
+
+/* One audit row: `family` OC_AUDIT_MCP for a tool call, OC_AUDIT_SECURITY for a
+ * refused token. `detail` names ids and counts, never text, a query or a token;
+ * the writer puts the token's name in front. Fire and forget. */
+static void mcp_audit(oc_dbwriter *dbw, int family, const mcp_req *m, const char *action, int ok,
+                      const char *detail) {
+    oc_job *j = oc_job_new(OC_JOB_MCP_AUDIT, 0);
+    if (!j) return;
+    j->user_id = m ? m->agent : 0;
+    j->token_id = m ? m->token_id : 0;
+    j->mcp_family = family;
+    j->mcp_outcome = (uint8_t)(ok ? 1 : 0);
+    j->mcp_action = strdup(action);
+    j->mcp_target = m && m->channel[0] ? strdup(m->channel) : NULL;
+    j->mcp_detail = detail ? strdup(detail) : NULL;
+    oc_dbwriter_submit(dbw, j);
+}
+
+static const char *mcp_action(const mcp_req *m) {
+    return m->call.tool == OC_MCP_READ_HISTORY ? "mcp.read_history" : m->call.tool == OC_MCP_SEARCH ? "mcp.search"
+                                                                                                    : "mcp.post";
+}
+
+/* A tool call refused as a tool error: answered 200, audited as not done. */
+static void mcp_tool_refuse(int ep, conn **conns, oc_dbwriter *dbw, conn *c, const char *why) {
+    mcp_req *m = c->mcp;
+    oc_mcp_buf b = { 0 };
+    oc_mcp_tool_error(&b, m->call.id, mcp_version(), why);
+    mcp_audit(dbw, OC_AUDIT_MCP, m, mcp_action(m), 0, "refused");
+    mcp_finish(ep, conns, c, 200, &b, NULL);
+}
+
+static int has_scope(const char *list, const char *want) {
+    size_t n = strlen(want);
+    for (const char *p = list; p && *p;) {
+        const char *e = strchr(p, ' ');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && memcmp(p, want, n) == 0) return 1;
+        p = e ? e + 1 : p + l;
+    }
+    return 0;
+}
+
+static int on_mcp(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
+    oc_mcp_headers h = { req->mcp_version, req->mcp_version_len, req->mcp_method, req->mcp_method_len,
+                         req->mcp_name, req->mcp_name_len, req->origin, req->origin_len, req->host, req->host_len };
+    mcp_req *m = calloc(1, sizeof *m);
+    oc_mcp_buf b = { 0 };
+    if (!m) { mcp_reply(c, 500, &b, NULL); return -1; }
+    int rc = oc_mcp_parse(req->body, req->body_len, &h, &m->call, &b);
+    if (rc) { mcp_reply(c, rc, &b, NULL); oc_mcp_buf_free(&b); mcp_req_free(m); return -1; }
+    if (m->call.method == OC_MCP_DISCOVER) {              /* asks no token: it says how to get one */
+        oc_mcp_discover(&b, m->call.id, mcp_version());
+        mcp_reply(c, 200, &b, NULL);
+        oc_mcp_buf_free(&b);
+        mcp_req_free(m);
+        return -1;
+    }
+    uint64_t now = now_ms();
+    if (g_mcp_fail_rl && oc_ratelimit_blocked(g_mcp_fail_rl, c->source, now)) {
+        oc_mcp_error(&b, m->call.id, -32000, "Too many failed sign-ins", NULL);
+        mcp_reply(c, 429, &b, "Retry-After: 60\r\n");
+        oc_mcp_buf_free(&b);
+        mcp_req_free(m);
+        return -1;
+    }
+    static const char BEARER[] = "bearer ";
+    const char *a = req->authorization;
+    size_t al = req->authorization_len;
+    if (!a || al <= sizeof BEARER - 1 || strncasecmp(a, BEARER, sizeof BEARER - 1) != 0) {
+        mcp_challenge(-1, NULL, c, m->call.id);
+        mcp_req_free(m);
+        return -1;
+    }
+    a += sizeof BEARER - 1;
+    al -= sizeof BEARER - 1;
+    while (al && *a == ' ') { a++; al--; }
+    oc_job *j = oc_job_new(OC_JOB_TOKEN_LOOKUP, c->conn_id);
+    if (!j || !(j->token = malloc(al + 1))) { oc_job_free(j); mcp_reply(c, 500, &b, NULL); mcp_req_free(m); return -1; }
+    memcpy(j->token, a, al);
+    j->token[al] = '\0';
+    j->token_len = al;
+    j->token_from = strdup(c->source);
+    c->mcp = m;
+    c->http_pending = 1;
+    oc_dbwriter_submit(dbw, j);
+    return 0;
+}
+
+/* The channel `want` names among the agent's (a name with or without '#', or
+ * an id): its index, or -1. */
+static long mcp_find_channel(const oc_dbres *r, const char *want) {
+    const char *nm = want[0] == '#' ? want + 1 : want;
+    uint64_t id = 0;
+    int numeric = want[0] != '\0';
+    for (const char *p = want; *p; p++) {
+        if (*p < '0' || *p > '9') { numeric = 0; break; }
+        id = id * 10 + (uint64_t)(*p - '0');
+    }
+    for (size_t i = 0; i < r->n_mcp_chans; i++) {
+        if (numeric && r->mcp_chans[i].id == id) return (long)i;
+        if (r->mcp_chans[i].name && strcmp(r->mcp_chans[i].name, nm) == 0) return (long)i;
+    }
+    return -1;
+}
+
+static void mcp_channels(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbres *r) {
+    mcp_req *m = c->mcp;
+    oc_mcp_buf b = { 0 };
+    if (m->call.method == OC_MCP_TOOLS_LIST) {
+        size_t n = r->n_mcp_chans;
+        char **names = n ? calloc(n, sizeof *names) : NULL;
+        size_t k = 0;
+        for (size_t i = 0; names && i < n; i++) {
+            size_t l = strlen(r->mcp_chans[i].name ? r->mcp_chans[i].name : "");
+            if ((names[k] = malloc(l + 2))) { names[k][0] = '#'; memcpy(names[k] + 1, r->mcp_chans[i].name, l + 1); k++; }
+        }
+        oc_mcp_tools_list(&b, m->call.id, mcp_version(), (const char *const *)names, k);
+        for (size_t i = 0; i < k; i++) free(names[i]);
+        free(names);
+        mcp_finish(ep, conns, c, 200, &b, NULL);
+        return;
+    }
+    oc_mcp_call *q = &m->call;
+    if (q->arg_error[0]) { mcp_tool_refuse(ep, conns, dbw, c, q->arg_error); return; }
+    long ci = -1;
+    if (q->channel[0]) {
+        ci = mcp_find_channel(r, q->channel);
+        /* The same words whether it exists or not: an agent learns nothing of a
+         * conversation it is not in. */
+        if (ci < 0) { mcp_tool_refuse(ep, conns, dbw, c, "no such conversation"); return; }
+        m->channel_id = r->mcp_chans[ci].id;
+        snprintf(m->channel, sizeof m->channel, "#%s", r->mcp_chans[ci].name ? r->mcp_chans[ci].name : "");
+    }
+    int pub = has_scope(m->scopes, "channels:history"), priv = has_scope(m->scopes, "groups:history");
+    if (q->tool == OC_MCP_POST) {
+        if (!has_scope(m->scopes, "chat:write")) { mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the chat:write scope"); return; }
+        if (q->text_len > OC_MAX_BODY_SIZE) { mcp_tool_refuse(ep, conns, dbw, c, "text is longer than 64 KiB"); return; }
+        if (!demo_ok(OC_DL_MESSAGE, m->agent)) { mcp_tool_refuse(ep, conns, dbw, c, "posting is closed here"); return; }
+        oc_job *j = oc_job_new(q->thread ? OC_JOB_SEND_REPLY : OC_JOB_SEND, c->conn_id);
+        if (!j) { mcp_tool_refuse(ep, conns, dbw, c, "the post could not be made"); return; }
+        j->user_id = m->agent;
+        j->channel_id = m->channel_id;
+        j->parent_id = q->thread;
+        /* The same key from the same token is the same post (ARCH-44): its
+         * idempotency token is the key hashed with the token's id. */
+        uint8_t idem[OC_SHA256_LEN];
+        if (q->key[0]) {
+            char seed[128];
+            int sn = snprintf(seed, sizeof seed, "mcp:%llu:%s", (unsigned long long)m->token_id, q->key);
+            if (sn < 0 || oc_sha256(seed, (size_t)sn, idem) != 0) memset(idem, 0, sizeof idem);
+        } else if (oc_rand_bytes(idem, OC_IDEM_LEN) != 0) memset(idem, 0, sizeof idem);
+        memcpy(j->idem, idem, OC_IDEM_LEN);
+        if (oc_job_set_body(j, q->text, q->text_len) != 0) { oc_job_free(j); mcp_tool_refuse(ep, conns, dbw, c, "the post could not be made"); return; }
+        oc_dbwriter_submit(dbw, j);
+        return;
+    }
+    if (ci >= 0) {
+        int is_pub = r->mcp_chans[ci].is_public;
+        if (is_pub && !pub) { mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the channels:history scope"); return; }
+        if (!is_pub && !priv) { mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the groups:history scope"); return; }
+    } else if (!pub && !priv) {
+        mcp_tool_refuse(ep, conns, dbw, c, "this token lacks the channels:history and groups:history scopes");
+        return;
+    }
+    oc_job *j = oc_job_new(q->tool == OC_MCP_SEARCH ? OC_JOB_MCP_SEARCH : OC_JOB_MCP_READ, c->conn_id);
+    if (!j) { mcp_tool_refuse(ep, conns, dbw, c, "the read could not be made"); return; }
+    j->user_id = m->agent;
+    j->channel_id = m->channel_id;
+    j->mcp_limit = (uint16_t)q->limit;
+    j->mcp_since = q->since_ms; j->mcp_has_since = (uint8_t)q->has_since;
+    if (q->tool == OC_MCP_READ_HISTORY) {
+        j->mcp_thread = q->thread;
+        j->mcp_before = q->before; j->mcp_has_before = (uint8_t)q->has_before;
+        j->mcp_after = q->after;   j->mcp_has_after = (uint8_t)q->has_after;
+    } else {
+        j->mcp_until = q->until_ms; j->mcp_has_until = (uint8_t)q->has_until;
+        j->mcp_pub = (uint8_t)pub;
+        j->mcp_priv = (uint8_t)priv;
+        j->mcp_query = strdup(q->query);
+        j->mcp_from = q->from[0] ? strdup(q->from) : NULL;
+        if (q->cursor[0]) {
+            double rank = 0;
+            unsigned long long after = 0;
+            char tail = 0;
+            if (sscanf(q->cursor, "%lf/%llu%c", &rank, &after, &tail) != 2) {
+                oc_job_free(j);
+                mcp_tool_refuse(ep, conns, dbw, c, "cursor is not one this gave");
+                return;
+            }
+            j->mcp_has_cursor = 1;
+            j->mcp_rank = rank;
+            j->mcp_after = after;
+        }
+    }
+    oc_dbwriter_submit(dbw, j);
+}
+
+static void mcp_messages(int ep, conn **conns, oc_dbwriter *dbw, conn *c, oc_dbres *r) {
+    mcp_req *m = c->mcp;
+    if (r->err_code) {
+        mcp_tool_refuse(ep, conns, dbw, c, r->err_code == OC_ERR_UNKNOWN_MESSAGE ? "no such thread" : "no such conversation");
+        return;
+    }
+    int search = m->call.tool == OC_MCP_SEARCH;
+    size_t n = r->n_mcp_rows;
+    oc_mcp_msg *msgs = n ? calloc(n, sizeof *msgs) : NULL;
+    char (*chn)[168] = search && n ? calloc(n, sizeof *chn) : NULL;
+    if (n && (!msgs || (search && !chn))) { free(msgs); free(chn); mcp_tool_refuse(ep, conns, dbw, c, "the read could not be made"); return; }
+    for (size_t i = 0; i < n; i++) {
+        const oc_mcp_row *w = &r->mcp_rows[i];
+        oc_mcp_msg *x = &msgs[i];
+        x->id = w->id; x->author = w->author; x->handle = w->handle; x->author_kind = w->kind;
+        x->at_ms = w->at_ms; x->text = w->text; x->text_len = w->text_len; x->edited = w->edited;
+        x->replies = w->replies; x->channel_id = w->channel_id;
+        x->n_files = w->n_files;
+        x->file_names = (const char *const *)w->file_names;
+        x->file_types = (const char *const *)w->file_types;
+        x->file_sizes = w->file_sizes;
+        if (search) { snprintf(chn[i], sizeof chn[i], "#%s", w->channel ? w->channel : ""); x->channel = chn[i]; }
+    }
+    oc_mcp_buf s = { 0 };
+    oc_mcp_put(&s, "{");
+    size_t kept = oc_mcp_page(&s, msgs, n, search ? 0 : r->mcp_newest_kept, r->mcp_more_older, search ? 0 : r->mcp_more_newer,
+                              search, m->call.query);
+    char detail[160];
+    if (search) {
+        /* The next page starts after the last result kept, by its rank. */
+        if (kept && (kept < n || r->mcp_more_newer))
+            oc_mcp_putf(&s, ",\"cursor\":\"%.17g/%llu\"", r->mcp_rows[kept - 1].rank, (unsigned long long)r->mcp_rows[kept - 1].id);
+        size_t convs = 0;
+        for (size_t i = 0; i < kept; i++) {
+            size_t k = 0;
+            while (k < i && r->mcp_rows[k].channel_id != r->mcp_rows[i].channel_id) k++;
+            if (k == i) convs++;
+        }
+        snprintf(detail, sizeof detail, "results=%zu conversations=%zu", kept, convs);
+    } else {
+        size_t lo = r->mcp_newest_kept ? n - kept : 0;
+        snprintf(detail, sizeof detail, "first=%llu last=%llu count=%zu",
+                 (unsigned long long)(kept ? msgs[lo].id : 0), (unsigned long long)(kept ? msgs[lo + kept - 1].id : 0), kept);
+    }
+    oc_mcp_put(&s, "}");
+    free(msgs);
+    free(chn);
+    oc_mcp_buf b = { 0 };
+    if (s.failed) b.failed = 1;
+    else oc_mcp_tool_result(&b, m->call.id, mcp_version(), s.p, 0);
+    oc_mcp_buf_free(&s);
+    mcp_audit(dbw, OC_AUDIT_MCP, m, mcp_action(m), 1, detail);
+    mcp_finish(ep, conns, c, 200, &b, NULL);
+}
+
+/* A result for a connection carrying an MCP request: 1 when it is consumed,
+ * 0 when the ordinary handling goes on (a post's fan-out, the connection by
+ * then answered and closed, so no frame is written to it). */
+static int mcp_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
+    conn *c = find_by_id(conns, r->conn_id);
+    if (!c || !c->mcp) return 0;
+    mcp_req *m = c->mcp;
+    switch (r->type) {
+    case OC_RES_AGENT_ERR:
+        if (g_mcp_fail_rl) oc_ratelimit_record(g_mcp_fail_rl, c->source, now_ms());
+        mcp_audit(dbw, OC_AUDIT_SECURITY, NULL, "mcp.auth_failed", 0, NULL);
+        mcp_challenge(ep, conns, c, m->call.id);
+        return 1;
+    case OC_RES_TOKEN_PRINCIPAL: {
+        m->agent = r->user_id;
+        m->token_id = r->message_id;
+        snprintf(m->scopes, sizeof m->scopes, "%s", r->tok_scopes ? r->tok_scopes : "");
+        if (g_mcp_fail_rl) oc_ratelimit_reset(g_mcp_fail_rl, c->source);
+        if (m->call.method == OC_MCP_TOOLS_CALL) {
+            /* The budget, before anything is read: a search costs three; a post
+             * also counts against the agent's sends (REQ-190). */
+            const oc_config *cfg = oc_config_get();
+            uint64_t now = now_ms();
+            mcp_tok *t = mcp_tok_of(m->token_id, now);
+            unsigned wait = t ? oc_mcp_bucket_take(&t->bucket, now, m->call.tool == OC_MCP_SEARCH ? OC_MCP_SEARCH_COST : 1,
+                                                   (unsigned)cfg->mcp.per_minute, (unsigned)cfg->mcp.burst) : 1;
+            if (!wait && t && m->call.tool == OC_MCP_POST && c->send_rate_max &&
+                !win_ok(&t->sends, c->send_rate_max, OC_SEND_RATE_WINDOW_MS))
+                wait = (unsigned)(OC_SEND_RATE_WINDOW_MS / 1000);
+            if (wait) {
+                oc_mcp_buf b = { 0 };
+                char extra[48];
+                snprintf(extra, sizeof extra, "Retry-After: %u\r\n", wait);
+                oc_mcp_error(&b, m->call.id, -32000, "Rate limited", NULL);
+                /* Refused over a limit is still a tool call: its row, not done. */
+                mcp_audit(dbw, OC_AUDIT_MCP, m, mcp_action(m), 0, "over the limit");
+                mcp_finish(ep, conns, c, 429, &b, extra);
+                return 1;
+            }
+        }
+        oc_job *j = oc_job_new(OC_JOB_MCP_CHANNELS, c->conn_id);
+        if (!j) { oc_mcp_buf b = { 0 }; b.failed = 1; mcp_finish(ep, conns, c, 500, &b, NULL); return 1; }
+        j->user_id = m->agent;
+        oc_dbwriter_submit(dbw, j);
+        return 1;
+    }
+    case OC_RES_MCP_CHANNELS: mcp_channels(ep, conns, dbw, c, r); return 1;
+    case OC_RES_MCP_MESSAGES: mcp_messages(ep, conns, dbw, c, r); return 1;
+    case OC_RES_SEND_OK:
+    case OC_RES_REPLY_OK: {
+        oc_mcp_buf s = { 0 }, b = { 0 };
+        oc_mcp_putf(&s, "{\"id\":%llu,\"at\":", (unsigned long long)r->message_id);
+        oc_mcp_put_time(&s, r->server_time);
+        oc_mcp_put(&s, "}");
+        if (s.failed) b.failed = 1;
+        else oc_mcp_tool_result(&b, m->call.id, mcp_version(), s.p, 0);
+        oc_mcp_buf_free(&s);
+        char detail[64];
+        snprintf(detail, sizeof detail, "message=%llu", (unsigned long long)r->message_id);
+        mcp_audit(dbw, OC_AUDIT_MCP, m, "mcp.post", 1, detail);
+        mcp_finish(ep, conns, c, 200, &b, NULL);
+        return 0;                                    /* the fan-out goes on */
+    }
+    case OC_RES_SEND_ERR:
+    case OC_RES_REPLY_ERR:
+        mcp_tool_refuse(ep, conns, dbw, c,
+                        r->err_code == OC_ERR_UNKNOWN_MESSAGE ? "no such thread"
+                        : r->err_code == OC_ERR_CHANNEL_ARCHIVED ? "the conversation is archived"
+                        : r->err_code == OC_ERR_UNKNOWN_CHANNEL || r->err_code == OC_ERR_NOT_A_MEMBER ? "no such conversation"
+                        : "the post was refused");
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* An HTTP connection's request for a loop route, parsed and routed by its I/O
  * thread; every refusal was answered there. Returns 0 to keep, -1 to close. */
 static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
@@ -6976,6 +7402,14 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     const char *after = req.body + e->body_len;
     if (e->host_len)   { req.host = after;                 req.host_len = e->host_len; }
     if (e->origin_len) { req.origin = after + e->host_len; req.origin_len = e->origin_len; }
+    const char *xh = after + e->host_len + e->origin_len;
+    if (e->auth_len) { req.authorization = xh; req.authorization_len = e->auth_len; }
+    xh += e->auth_len;
+    if (e->mcpv_len) { req.mcp_version = xh; req.mcp_version_len = e->mcpv_len; }
+    xh += e->mcpv_len;
+    if (e->mcpm_len) { req.mcp_method = xh; req.mcp_method_len = e->mcpm_len; }
+    xh += e->mcpm_len;
+    if (e->mcpn_len) { req.mcp_name = xh; req.mcp_name_len = e->mcpn_len; }
     req.is_json = e->is_json;
     req.is_form = e->is_form;
     static const char PFX[] = WEBHOOK_PREFIX;
@@ -6984,6 +7418,9 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     if (req.path_len == sizeof OC_ADDRESS_PROOF_PATH - 1 &&
         memcmp(req.path, OC_ADDRESS_PROOF_PATH, req.path_len) == 0)
         return on_address_proof(c, &req);
+    if (req.path_len >= sizeof OC_MCP_PATH - 1 && memcmp(req.path, OC_MCP_PATH, sizeof OC_MCP_PATH - 1) == 0 &&
+        (req.path_len == sizeof OC_MCP_PATH - 1 || req.path[sizeof OC_MCP_PATH - 1] == '?'))
+        return on_mcp(c, &req, dbw);
     return on_web_page(c, &req, dbw);
 }
 
@@ -7263,8 +7700,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     g_fan_only = NULL;
 }
 static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
-    (void)dbw;
     oc_wbuf w;
+    /* An MCP request's steps come back here; a post's answer then goes on to
+     * its fan-out below, the HTTP connection already answered and closed. */
+    if (r->conn_id && mcp_result(ep, conns, dbw, r)) return;
     /* Somebody joined -- by invitation, a first sign-in, an account made on the
      * pages: everyone connected learns them now, not at their next LIST_USERS.
      * Before the answer, so the newcomer's own first connection, not signed in
@@ -11118,6 +11557,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * endpoint still works, just unthrottled. */
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
     g_proof_rl = oc_ratelimit_new(OC_PROOF_RATE_MAX, OC_PROOF_RATE_WINDOW, 256);
+    g_mcp_fail_rl = oc_ratelimit_new(OC_MCP_FAIL_MAX, OC_MCP_FAIL_WINDOW, 1024);
     g_devcodes = oc_devcodes_new();
     g_websteps = oc_websteps_new();
     if (g_devcodes) {
@@ -11431,6 +11871,11 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_ratelimit_free(g_device_rl);
     g_device_rl = NULL;
     oc_ratelimit_free(g_proof_rl);
+    oc_ratelimit_free(g_mcp_fail_rl);
+    g_mcp_fail_rl = NULL;
+    free(g_mcp_toks);
+    g_mcp_toks = NULL;
+    g_mcp_ntoks = 0;
     g_proof_rl = NULL;
     g_webhook_rl = NULL;
     oc_trusted_proxies_free(trusted);

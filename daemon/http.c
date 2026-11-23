@@ -48,6 +48,18 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req) {
             continue;
         }
         if (!h[i].name) continue;                       /* a folded continuation line */
+        {
+            static const char *const XH[4] = { "authorization", "mcp-protocol-version", "mcp-method", "mcp-name" };
+            const char **xv[4] = { &req->authorization, &req->mcp_version, &req->mcp_method, &req->mcp_name };
+            size_t *xl[4] = { &req->authorization_len, &req->mcp_version_len, &req->mcp_method_len, &req->mcp_name_len };
+            int k = 0;
+            while (k < 4 && !ci_eq(h[i].name, h[i].name_len, XH[k])) k++;
+            if (k < 4) {
+                if (*xv[k]) return -1;                  /* one of each */
+                *xv[k] = h[i].value; *xl[k] = h[i].value_len;
+                continue;
+            }
+        }
         if (ci_eq(h[i].name, h[i].name_len, "upgrade")) {
             if (h[i].value_len == 9 && ci_eq(h[i].value, 9, "websocket")) req->upgrade_ws = 1;
             continue;

@@ -29,6 +29,12 @@ typedef struct {
     int         is_form;                     /* ...application/x-www-form-urlencoded */
     const char *host;   size_t host_len;     /* the Host header; NULL if none */
     const char *origin; size_t origin_len;   /* the Origin header; NULL if none */
+    /* What the MCP endpoint reads (docs/details/MCP.md): Authorization, and the
+     * revision, method and tool name it must find again in the body. */
+    const char *authorization; size_t authorization_len;
+    const char *mcp_version;   size_t mcp_version_len;
+    const char *mcp_method;    size_t mcp_method_len;
+    const char *mcp_name;      size_t mcp_name_len;
     /* A WebSocket opening handshake (RFC 6455 §4): `Upgrade: websocket` with
      * its key, and the first subprotocol it asked for, if any. The route of
      * kind OC_HTTP_WS takes it; every other route ignores these. */

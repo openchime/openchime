@@ -114,7 +114,9 @@ during the TLS handshake:
 
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
-which serves `POST /webhook/<token>` (§5.15), the WebSocket upgrade `GET /ws`
+which serves `POST /webhook/<token>` (§5.15), `POST /mcp` when the operator
+turns MCP on (MCP.md: one JSON-RPC request per POST, `GET` and `DELETE` `405`),
+the WebSocket upgrade `GET /ws`
 (§1.2), `POST /enroll-proof` (central's check of the address an enrolled
 workspace reported, AUTH.md §3.6), the daemon's own sign-in pages (AUTH.md
 §8.10/§8.11) and, when its wasm
@@ -2404,11 +2406,11 @@ paging back by `before_ms` keeps the filter. The three filter fields since
 protocol 33.
 
 **`AUDIT_PAGE` (S → C), `0x009A`** — a page of entries, newest first: time,
-family (admin / account / security / moderation), action, actor, target, outcome,
+family (admin / account / security / moderation / MCP access), action, actor, target, outcome,
 detail:
 
     count (u16), then count × { at_ms (u64), actor_id (u64), target_id (u64),
-    family (u8 — 1 admin · 2 account · 3 security · 4 moderation),
+    family (u8 — 1 admin · 2 account · 3 security · 4 moderation · 5 MCP access),
     outcome (u8 — 1 ok, 0 denied/failed), actor_name (str), action (str),
     target (str), detail (str), channel_id (u64) }
 
