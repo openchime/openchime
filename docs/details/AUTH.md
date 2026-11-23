@@ -1199,9 +1199,9 @@ a dash or spaces anywhere) and is shown the client's name and where it will
 return; they approve choosing the connection's **lifetime** — never ending, 30,
 90 or 365 days — or decline. An unknown, expired or used code is refused
 `UNKNOWN_CODE`; a visitor, an agent or a removed account is refused. Approving
-and declining are audited in the account family. In the GUI this is the AI
-clients tab, reached from the profile menu; in the terminal client, the
-launcher's "Approve an AI client".
+and declining are audited in the account family. In the GUI this is
+Preferences > AI clients, reached too from the profile menu; in the terminal
+client, the launcher's "Approve an AI client".
 
 **Tokens.** The authorization code (`ocac_`) is good **once, within 60
 seconds**: `POST /oauth/token` with `grant_type=authorization_code` checks the
@@ -1227,5 +1227,7 @@ budget of its own (`OPENCHIME_MCP_CALLS_PER_MINUTE`, `OPENCHIME_MCP_BURST`).
 **Connections.** A person lists their own (the client, when it was approved and
 last used, when it ends; never a token) and revokes any; an owner or admin
 lists everyone's and revokes any — audited in the account family for one's
-own, the administrative for another's. Revoking deletes the connection's
-tokens, so its next request is `401`. Removing a person revokes theirs.
+own, the administrative for another's. In the GUI a person's own are in
+Preferences > AI clients, and everyone's on Admin's AI clients tab, which only
+owners and admins are shown. Revoking deletes the connection's tokens, so its
+next request is `401`. Removing a person revokes theirs.

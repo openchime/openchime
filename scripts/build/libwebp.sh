@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Build the committed libwebp (static) from third_party/libwebp -- the 1.6.0
 # release tarball as the WebM project published it, committed
-# (docs/VENDORS.md §1) -- into third_party/libwebp-<version>[-arch]. Nothing is
+# (docs/details/VENDORS.md §1) -- into third_party/libwebp-<version>[-arch]. Nothing is
 # downloaded.
 #
 #   scripts/build/libwebp.sh           native (Linux; the daemon and `make test` link it)
 #
 # The daemon's WebP decoder and encoder for image previews (ARCH-137,
-# docs/Plans/IMAGE-PREVIEWS.md): libwebp and libsharpyuv alone. No tools, no
+# docs/details/IMAGE-PREVIEWS.md): libwebp and libsharpyuv alone. No tools, no
 # extras, no mux or demux libraries, no threads (the transfer worker is the
 # thread). No client links it.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time").
+# One compile at a time (docs/details/TESTING.md, "One build at a time").
 unset MAKEFLAGS MFLAGS
 
 LIBWEBP_VERSION=1.6.0

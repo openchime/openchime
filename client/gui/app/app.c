@@ -11798,13 +11798,16 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_COUNT };
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS, PC_COUNT };
 /* SYSTEM is where the application behaves as an application rather than as a
  * chat surface: what the close button does, whether it starts with Windows.
  * Those had no home, which is why closing to the tray shipped with no way to
  * turn it off. */
+/* AI CLIENTS is a person's own connections (docs/details/AUTH.md §8.13): what
+ * they let act as them is theirs, so it lives with their other settings. It is
+ * not part of Save and Cancel: approving and revoking act at once. */
 static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications",
-                                         "System" };
+                                         "System", "AI clients" };
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
@@ -11856,6 +11859,8 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
     fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
     return y + 62;
 }
+
+static float draw_my_connections(gfx *rt, const oc_model *m, rectf body, float y);   /* fwd */
 
 static void draw_prefs(gfx *rt, rectf reg) {
     g_n_pref_hits = 0;
@@ -12077,6 +12082,8 @@ static void draw_prefs(gfx *rt, rectf reg) {
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
+    } else if (g_pref_cat == PC_AICLIENTS) {
+        y = draw_my_connections(rt, model(), body, y);
     }
 
     g_prefs_content_h = y - rows_top;
@@ -19888,7 +19895,7 @@ static rectf g_adm_tabs[ADM_COUNT];
  * g_agtbtns, so a click, the keyboard's invoke and the harness press the same
  * thing. */
 enum { AGB_NEW = 1, AGB_TOKENS, AGB_REMOVE, AGB_BACK, AGB_MINT, AGB_REVOKE, AGB_COPY, AGB_DONE,
-       /* AI clients (AUTH.md §8.13), on the tab of their own: the same buttons. */
+       /* AI clients (AUTH.md §8.13), in Preferences and on Admin's tab: the same buttons. */
        AGB_CN_APPROVE, AGB_CN_LIFE, AGB_CN_ALLOW, AGB_CN_DECLINE, AGB_CN_REVOKE, AGB_CN_REVOKE_ALL };
 static struct { rectf r; int kind; uint64_t id; char aid[OC_ACC_AID_MAX]; char name[96]; } g_agtbtns[96];
 static int      g_n_agtbtns;
@@ -19956,10 +19963,10 @@ static int agents_ask(oc_win *hwnd, int with_agent, char *agent_name, size_t an_
 }
 
 /* ---- AI clients (docs/details/AUTH.md §8.13) -----------------------------------
- * One tab, reached by everyone from the profile menu: the person's own AI
- * clients, each with Revoke, and Approve an AI client -- the code its page
- * shows, then what is asking and where it returns, a lifetime and Approve or
- * Decline. An owner or admin sees everyone's below, each with Revoke. */
+ * A person's own, in Preferences (reached too from the profile menu): each with
+ * Revoke, and Approve an AI client -- the code its page shows, then what is
+ * asking and where it returns, a lifetime and Approve or Decline. Everyone's,
+ * each with Revoke, is Admin's tab, an owner's or admin's. */
 static uint32_t g_cn_life = 30;   /* the lifetime chosen, in days; 0 never */
 
 static void conns_refresh(void) {
@@ -19967,6 +19974,12 @@ static void conns_refresh(void) {
     if (!g_client || !m) return;
     oc_client_list_connections(g_client, 0);
     if (self_role(m) >= OC_ROLE_ADMIN) oc_client_list_connections(g_client, 1);
+}
+
+/* Preferences' category shown; its AI clients are asked for as it opens. */
+static void pref_cat_select(int i) {
+    g_pref_cat = i;
+    if (i == PC_AICLIENTS) conns_refresh();
 }
 
 static void conns_press(oc_win *hwnd, int kind, uint64_t id) {
@@ -20012,13 +20025,17 @@ static void conn_line(const oc_conn_view *v, int with_person, char *out, size_t 
              with_person ? v->user_name : "", with_person ? "" : "", made, used, ends);
 }
 
-static void draw_connections(gfx *rt, const oc_model *m, rectf body) {
+/* Preferences > AI clients: the person's own, Approve an AI client, and the
+ * request a code named. Returns where it ended, for the card's scroller. */
+static float draw_my_connections(gfx *rt, const oc_model *m, rectf body, float y) {
     g_n_agtbtns = 0;
-    float x = body.left + 20, right = body.right - 20, y = body.top + 14;
+    float x = body.left + 24, right = body.right - 24;
     char aid[OC_ACC_AID_MAX], nm[160], line[400];
+    if (!m) return y;
     if (!oc_model_connections_on(m)) {
-        overlay_empty(rt, body, "This workspace does not let people connect their own AI clients.");
-        return;
+        draw_text(rt, "This workspace does not let people connect their own AI clients.", g_meta,
+                  rf(x, y, right, y + 22), OC_COL_MUTED);
+        return y + 30;
     }
     draw_text(rt, "Your AI clients", g_title, rf(x, y, right - 200, y + 26), OC_COL_TEXT);
     agtbtn(rt, rf(right - 190, y, right, y + 28), "Approve an AI client", 0, AGB_CN_APPROVE, 0, "settings.conn.approve",
@@ -20057,7 +20074,7 @@ static void draw_connections(gfx *rt, const oc_model *m, rectf body) {
         draw_text(rt, "None connected.", g_meta, rf(x, y, right, y + 22), OC_COL_MUTED);
         y += 30;
     }
-    for (size_t i = 0; i < m->n_my_conns && y < body.bottom - 40; i++) {
+    for (size_t i = 0; i < m->n_my_conns; i++) {
         const oc_conn_view *v = &m->my_conns[i];
         draw_text(rt, v->client_name, g_ui_b, rf(x, y, right - 90, y + 20), OC_COL_TEXT);
         conn_line(v, 0, line, sizeof line);
@@ -20067,8 +20084,18 @@ static void draw_connections(gfx *rt, const oc_model *m, rectf body) {
         agtbtn(rt, rf(right - 80, y + 6, right, y + 32), "Revoke", 1, AGB_CN_REVOKE, v->id, aid, nm);
         y += 48;
     }
-    if (self_role(m) < OC_ROLE_ADMIN) return;
-    y += 12;
+    return y;
+}
+
+/* Admin > AI clients, an owner's or admin's: everyone's, each with Revoke. */
+static void draw_connections(gfx *rt, const oc_model *m, rectf body) {
+    g_n_agtbtns = 0;
+    float x = body.left + 20, right = body.right - 20, y = body.top + 14;
+    char aid[OC_ACC_AID_MAX], nm[160], line[400];
+    if (!oc_model_connections_on(m)) {
+        overlay_empty(rt, body, "This workspace does not let people connect their own AI clients.");
+        return;
+    }
     draw_text(rt, "Everyone's AI clients", g_title, rf(x, y, right, y + 26), OC_COL_TEXT);
     y += 34;
     if (!m->n_all_conns) { draw_text(rt, "None connected.", g_meta, rf(x, y, right, y + 22), OC_COL_MUTED); return; }
@@ -21015,7 +21042,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     for (int i = 0; i < ADM_COUNT; i++) {
         /* A member reaches Admin only through the picker's Manage link, and is
          * shown the one tab it opens. */
-        if (!admin && i != ADM_EMOJI && i != ADM_CONNECTIONS) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
+        if (!admin && i != ADM_EMOJI) { g_adm_tabs[i] = rf(0, 0, 0, 0); continue; }
         float tw = 26 + text_width(T[i].label, g_ui) + 16;
         rectf r = rf(tx, ty + 2, tx + tw, ty + TABBAR_H - 1);
         int on = (g_adm_tab == i);
@@ -21029,7 +21056,6 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
 
     rectf body = rf(reg.left, ty + TABBAR_H, reg.right, reg.bottom);
     if (g_adm_tab == ADM_EMOJI) { draw_emoji_admin(rt, m, body); return; }
-    if (g_adm_tab == ADM_CONNECTIONS) { draw_connections(rt, m, body); return; }
     if (!admin) {
         overlay_empty(rt, body, "Admin only.");
         return;
@@ -21042,6 +21068,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     else if (g_adm_tab == ADM_USAGE)   draw_usage(rt, m, body);
     else if (g_adm_tab == ADM_BLOCKS)  draw_blocks_admin(rt, m, body);
     else if (g_adm_tab == ADM_AGENTS)  draw_agents_admin(rt, m, body);
+    else if (g_adm_tab == ADM_CONNECTIONS) draw_connections(rt, m, body);
     else if (g_adm_tab == ADM_WEBHOOKS) draw_webhooks_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
@@ -29196,6 +29223,7 @@ enum {
     AT_ALERTACK,      /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
     AT_AGENTBTN,      /* payload: Admin > Agents button index (g_agtbtns) — press it */
     AT_WEBHOOKBTN,    /* payload: Admin > Webhooks button index (g_whbtns) — press it */
+    AT_PREFCAT,       /* payload: Preferences' category (PC_*) — show it */
     AT_SUMITEM,       /* payload: a citation's number (go to its message), or 100000 + a topic (show/hide its details) */
     AT_SUMCAL,        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
     AT_TABLEED,       /* payload: a table editor control (TEA_*) */
@@ -29483,7 +29511,7 @@ static void a11y_publish_scene(const oc_model *m) {
                                                        "profile-fields", "agents", "connections", "webhooks" };
         int admin = self_role(m) >= OC_ROLE_ADMIN;
         for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
-            if (!admin && t != ADM_EMOJI && t != ADM_CONNECTIONS) continue;
+            if (!admin && t != ADM_EMOJI) continue;
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "admin.tab.%s", TABAID[t]);
             acc_push(items, &n, OC_ACC_BUTTON, aid, TABAID[t], g_adm_tabs[t], ATOK(AT_ADMTAB, (uint64_t)t));
@@ -30225,6 +30253,18 @@ modal_items:
             }
         }
         if (g_prefs_open) {
+            for (int i = 0; i < PC_COUNT && n < OC_ACC_MAX; i++)
+                if (g_pref_cats[i].right > g_pref_cats[i].left) {
+                    static const char *const CATAID[PC_COUNT] = { "appearance", "messages", "notifications",
+                                                                  "system", "aiclients" };
+                    char aid[OC_ACC_AID_MAX];
+                    snprintf(aid, sizeof aid, "prefs.cat.%s", CATAID[i]);
+                    acc_push(items, &n, OC_ACC_BUTTON, aid, PC_NAME[i], g_pref_cats[i], ATOK(AT_PREFCAT, (uint64_t)i));
+                }
+            if (g_pref_cat == PC_AICLIENTS)
+                for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
+                    acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
+                             ATOK(AT_AGENTBTN, (uint64_t)i));
             for (int i = 0; i < QUICK_SLOTS && n < OC_ACC_MAX; i++) {
                 char aid[OC_ACC_AID_MAX], nm[40], label[64];
                 quick_slot_get(i, nm, sizeof nm);
@@ -34624,7 +34664,10 @@ static int on_click(oc_win *hwnd, int x, int y) {
             }
         }
         for (int i = 0; i < PC_COUNT; i++)
-            if (in_rect(g_pref_cats[i], x, y)) { g_pref_cat = i; invalidate(); return 1; }
+            if (in_rect(g_pref_cats[i], x, y)) { pref_cat_select(i); invalidate(); return 1; }
+        if (g_pref_cat == PC_AICLIENTS)
+            for (int i = 0; i < g_n_agtbtns; i++)
+                if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
             int v = g_pref_hits[i].val;
@@ -40238,11 +40281,10 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         modal_enter(hwnd, &g_notify_open);
         break;
     case 70: modal_enter(hwnd, &g_prefs_open); break;
-    case 76:   /* a person's AI clients (AUTH.md §8.13): Admin's tab, which everyone is shown */
-        close_overlays();
-        g_view = VIEW_ADMIN; layout_composer(hwnd);
-        admin_select(ADM_CONNECTIONS);
-        invalidate();
+    case 76:   /* a person's AI clients (AUTH.md §8.13): Preferences, at their category */
+        g_pref_cat = PC_AICLIENTS;
+        conns_refresh();
+        modal_enter(hwnd, &g_prefs_open);
         break;
     case 73: {   /* catch-up, in ONE frame (MARK_ALL_READ). This was a loop over
                   * CLIENT_ACK, which cost a round trip per unread conversation
@@ -41703,8 +41745,8 @@ static void test_dump(const char *path) {
         }
         int live = 0;
         for (size_t i = 0; m && i < m->n_users; i++) live += m->users[i].agent && !m->users[i].disabled;
-        fprintf(f, "connections shown=%d open=%d client=\"%s\" decided=%d mine=%d all=%d life=%u vias=%d\n",
-                g_view == VIEW_ADMIN && g_adm_tab == ADM_CONNECTIONS, m ? m->conn_req_open : 0, m ? m->conn_req_client : "",
+        fprintf(f, "connections shown=%d admin=%d open=%d client=\"%s\" decided=%d mine=%d all=%d life=%u vias=%d\n",
+                g_prefs_open && g_pref_cat == PC_AICLIENTS, g_view == VIEW_ADMIN && g_adm_tab == ADM_CONNECTIONS, m ? m->conn_req_open : 0, m ? m->conn_req_client : "",
                 m ? m->conn_decided : 0, m ? (int)m->n_my_conns : 0, m ? (int)m->n_all_conns : 0, g_cn_life, g_via_n);
         for (size_t i = 0; m && i < m->n_all_conns; i++)
             fprintf(f, "  conn id=%llu uid=%llu client=\"%s\"\n", (unsigned long long)m->all_conns[i].id,
@@ -46018,8 +46060,12 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
             break;
         case AT_AGENTBTN:
-            if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && (int)arg < g_n_agtbtns)
+            if (((g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS)) ||
+                 (g_prefs_open && g_pref_cat == PC_AICLIENTS)) && (int)arg < g_n_agtbtns)
                 agents_press(hwnd, g_agtbtns[arg].kind, g_agtbtns[arg].id);
+            break;
+        case AT_PREFCAT:
+            if (g_prefs_open && arg < PC_COUNT) { pref_cat_select((int)arg); invalidate(); }
             break;
         case AT_WEBHOOKBTN:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS && (int)arg < g_n_whbtns)

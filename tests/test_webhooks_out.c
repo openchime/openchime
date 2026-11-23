@@ -456,11 +456,129 @@ static void test_path(void) {
     oc_test_rmtree(dir);
 }
 
+/* A delivery queued before a stop is sent after the next start: the queue is
+ * the database's, so a new writer and a new worker on the same file deliver
+ * it, once, as the event it was queued as. */
+static void test_restart(void) {
+    char dir[256], path[300];
+    CHECK(oc_test_mkdtemp("webhooks-restart", dir, sizeof dir) == 0);
+    oc_test_path(path, sizeof path, dir, "w.db");
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    oc_dbwriter_set_pw_mem(w, 2048);
+    oc_dbwriter_set_factor_key(w, KEY);
+    uint64_t own = oc_dbwriter_register_local(w, "restart-own", "pw-own-1", OC_ROLE_OWNER, 2048);
+    CHECK(own != 0);
+    oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, 1);
+    j->user_id = own; j->ch_is_public = 1; j->ch_name = strdup("restart-hooks");
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_type(w, OC_RES_CHANNEL_INFO);
+    uint64_t ch = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(ch != 0);
+
+    receiver rx;
+    pthread_t th;
+    char url[96];
+    const int modes[] = { RX_ECHO, RX_OK };   /* the check, then the one delivery */
+    CHECK(rx_start(&rx, &th, modes, 2, url, sizeof url) == 0);
+    oc_webhooks_out *o = oc_webhooks_out_start(KEY, NULL, test_clock, NULL);
+    CHECK(o != NULL);
+    if (!o) { oc_dbwriter_stop(w); return; }
+
+    j = oc_job_new(OC_JOB_OUTWH_CREATE, 2);
+    j->user_id = own; j->owh_url = strdup("https://receiver.test/events"); j->owh_events = strdup("message");
+    j->owh_n_channels = 1; j->owh_channels[0] = ch;
+    oc_dbwriter_submit(w, j);
+    r = wait_type(w, OC_RES_OUTWH_CHECK);
+    CHECK(r != NULL);
+    uint8_t secret[OC_OUTWH_SECRET_LEN] = { 0 };
+    if (r) memcpy(secret, r->owh_secret, sizeof secret);
+    oc_dbres_free(r);
+    oc_webhooks_out_check(o, 9, url, secret);
+    oc_owh_result res;
+    CHECK(next_result(o, &res) && res.check_tag == 9 && res.ok == 1);
+    j = oc_job_new(OC_JOB_OUTWH_CREATE, 2);
+    j->user_id = own; j->owh_url = strdup("https://receiver.test/events"); j->owh_events = strdup("message");
+    j->owh_n_channels = 1; j->owh_channels[0] = ch; j->owh_verified = 1;
+    memcpy(j->owh_secret, secret, sizeof secret);
+    oc_dbwriter_submit(w, j);
+    r = wait_type(w, OC_RES_OUTWH_SECRET);
+    uint64_t hook = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(hook != 0);
+
+    /* Queued, and the worker and the writer stopped before anything is taken. */
+    j = oc_job_new(OC_JOB_SEND, 3);
+    j->user_id = own; j->channel_id = ch;
+    memset(j->idem, 0x61, OC_IDEM_LEN);
+    oc_job_set_body(j, "before the stop", 15);
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_type(w, OC_RES_SEND_OK));
+    oc_webhooks_out_stop(o);
+    oc_dbwriter_stop(w);
+
+    /* What the queue holds across the stop: one delivery, and its event. The
+     * receiver's address is a test's, written in as test_path does. */
+    char queued[64] = "";
+    int rows = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_open(path, &db) == SQLITE_OK) {
+            if (sqlite3_prepare_v2(db, "SELECT event_id FROM webhook_deliveries;", -1, &st, NULL) == SQLITE_OK)
+                while (sqlite3_step(st) == SQLITE_ROW) {
+                    rows++;
+                    snprintf(queued, sizeof queued, "%s", (const char *)sqlite3_column_text(st, 0));
+                }
+            sqlite3_finalize(st);
+            st = NULL;
+            if (sqlite3_prepare_v2(db, "UPDATE outgoing_webhooks SET url=?1 WHERE id=?2;", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(st, 1, url, -1, SQLITE_STATIC);
+                sqlite3_bind_int64(st, 2, (sqlite3_int64)hook);
+                CHECK(sqlite3_step(st) == SQLITE_DONE);
+            }
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+    }
+    CHECK(rows == 1 && queued[0]);
+
+    /* Started again on the same file: it is taken and delivered, once. */
+    w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    o = oc_webhooks_out_start(KEY, NULL, test_clock, NULL);
+    CHECK(o != NULL);
+    if (w && o) {
+        oc_dbwriter_set_factor_key(w, KEY);
+        CHECK(pass(w, o, &res) == 1 && res.ok == 1);
+        CHECK(pass(w, o, NULL) == 0);                       /* delivered: nothing more due */
+    }
+    if (o) oc_webhooks_out_stop(o);
+    rx_end(&rx, th);
+    CHECK(rx.seen == 2);
+    char text[2 * OC_OUTWH_SECRET_LEN + 1];
+    oc_owh_secret_text(secret, text);
+    CHECK(signed_by(rx.head[1], rx.body[1], text));
+    char got[64] = "";
+    const char *p = strstr(rx.body[1], "\"event_id\":\"");
+    CHECK(p != NULL);
+    if (p) snprintf(got, sizeof got, "%.*s", (int)strcspn(p + 12, "\""), p + 12);
+    CHECK(strcmp(got, queued) == 0);
+    CHECK(strstr(rx.body[1], "\"text\":\"before the stop\"") != NULL);   /* contract: the message as sent */
+
+    if (w) oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
+    oc_test_rmtree(dir);
+}
+
 int run_webhooks_out_tests(void) {
-    printf("test_webhooks_out: the signature, the endpoint check, deliveries and their retries, the path from the queue\n");
+    printf("test_webhooks_out: the signature, the endpoint check, deliveries and their retries, the path from the queue, a restart\n");
     test_signature();
     test_check();
     test_deliveries();
     test_path();
+    test_restart();
     return failures;
 }

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # A person's AI clients (docs/details/AUTH.md §8.13): a client registers and
 # sends its person to the daemon's authorize page, which shows a code; the
-# person approves it in the app (Approve an AI client, the code, the client and
-# where it returns, a lifetime) and the page sends them back with a code the
-# client exchanges; their list shows the connection; a post through it reads
-# "via <client>" beside the author; an owner sees another person's connection
-# in everyone's and revokes it; and the person revokes their own, after which
-# the client is refused.
+# person approves it in the app, in Preferences > AI clients (Approve an AI
+# client, the code, the client and where it returns, a lifetime) and the page
+# sends them back with a code the client exchanges; their list there shows the
+# connection; a post through it reads "via <client>" beside the author; an
+# owner sees another person's connection in Admin's everyone's and revokes it;
+# and the person revokes their own, after which the client is refused.
 #
 #   tools/gui/features/connections.sh          # run; the client and daemon stop at the end
 #   tools/gui/features/connections.sh --keep   # ... and leave them running
@@ -35,14 +35,15 @@ post_mcp() {   # <token> <json params>: the HTTP status
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{$2,\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 }
 
-step "the owner opens AI clients"
+step "the owner opens AI clients from the profile menu"
 gui_launch
 act size 1400 900
 act channel 1
-act view admin
-need "the AI clients tab is published" press admin.tab.connections
-shown() { gui_snap; [ "$(cn shown)" = 1 ]; }
-check "AI clients is open" waitfor 5 shown
+act menu 76
+shown() { gui_snap; [ "$(cn shown)" = 1 ] && grep -q '^modal=prefs ' "$D"; }
+check "Preferences opens at AI clients" waitfor 5 shown
+cat_pub() { gui_snap; grep -q '^a11yitem prefs.cat.aiclients ' "$D"; }
+check "the AI clients category is published" waitfor 5 cat_pub
 approve_pub() { gui_snap; grep -q '^a11yitem settings.conn.approve ' "$D"; }
 check "Approve an AI client is published" waitfor 5 approve_pub
 
@@ -76,7 +77,7 @@ ACCESS="$(curl -sk -X POST "$BASE/oauth/token" -H 'Content-Type: application/x-w
   --data "grant_type=authorization_code&code=$AUTH&code_verifier=$VER&redirect_uri=$CB&client_id=$CLIENT&resource=$RES" \
   | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("access_token",""))')"
 need "the client holds an access token" [ "${ACCESS:0:5}" = ocpa_ ]
-need "the tab is pressed again" press admin.tab.connections
+need "the AI clients category is pressed again" press prefs.cat.aiclients
 mine() { gui_snap; [ "$(cn mine)" = 1 ]; }
 check "the owner's own list shows it" waitfor 10 mine
 own_revoke() { gui_snap; grep -q '^a11yitem settings.conn.[0-9]*.revoke ' "$D"; }
@@ -84,6 +85,9 @@ check "its Revoke is published" waitfor 5 own_revoke
 
 step "a post through it reads via the client"
 need "the client posts" [ "$(post_mcp "$ACCESS" '"name":"post","arguments":{"channel":"#general","text":"drafted by the client"}')" = 200 ]
+act key esc
+closed() { gui_snap; ! grep -q '^modal=prefs ' "$D"; }
+check "Preferences closes" waitfor 5 closed
 act view home
 act channel 1
 via_shown() { gui_snap; [ "$(cn vias)" -ge 1 ]; }
@@ -101,6 +105,10 @@ db.commit()
 PY
 act view admin
 need "the tab is pressed" press admin.tab.connections
+on_tab() { gui_snap; [ "$(cn admin)" = 1 ]; }
+check "Admin's AI clients is open" waitfor 5 on_tab
+own_none() { ! grep -q '^a11yitem settings.conn.approve ' "$D"; }
+check "the tab holds no person's own controls" own_none
 both() { gui_snap; [ "$(cn all)" = 2 ] && grep -q '^  conn id=[0-9]* uid=[0-9]* client="Bob Helper"' "$D"; }
 check "everyone's lists both" waitfor 10 both
 BOBCONN="$(grep -m1 '^  conn id=[0-9]* uid=[0-9]* client="Bob Helper"' "$D" | grep -o 'id=[0-9]*' | head -1 | cut -d= -f2)"
@@ -112,6 +120,9 @@ one_left() { gui_snap; [ "$(cn all)" = 1 ] && ! grep -q 'client="Bob Helper"' "$
 check "bob's leaves everyone's list" waitfor 10 one_left
 
 step "the owner revokes their own; the client is refused"
+act menu 76
+check "Preferences opens at AI clients" waitfor 5 shown
+check "its Revoke is published" waitfor 5 own_revoke
 MINE="$(grep -o '^a11yitem settings\.conn\.[0-9]*\.revoke' "$D" | head -1 | cut -d. -f3)"
 need "Revoke is pressed on their own" press "settings.conn.$MINE.revoke"
 check "Revoke asks first" waitfor 5 asked

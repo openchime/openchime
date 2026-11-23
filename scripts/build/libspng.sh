@@ -2,13 +2,13 @@
 # Build the committed libspng (static), with the committed miniz as its zlib,
 # from third_party/libspng -- the v0.7.4 release as randy408 published it -- and
 # third_party/miniz -- the 3.1.2 release's amalgamated miniz.c and miniz.h --
-# both committed (docs/VENDORS.md §1), into third_party/libspng-<version>[-arch].
+# both committed (docs/details/VENDORS.md §1), into third_party/libspng-<version>[-arch].
 # Nothing is downloaded.
 #
 #   scripts/build/libspng.sh           native (Linux; the daemon and `make test` link it)
 #
 # The daemon's PNG decoder and encoder for image previews (ARCH-137,
-# docs/Plans/IMAGE-PREVIEWS.md). libspng is one source file and miniz is one,
+# docs/details/IMAGE-PREVIEWS.md). libspng is one source file and miniz is one,
 # so both are compiled as plain C by the compiler make names; upstream's Meson
 # and CMake projects are not used. SPNG_USE_MINIZ points libspng at miniz's
 # zlib-compatible API, so no system zlib is linked. No client links it.

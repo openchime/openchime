@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Build the committed libjpeg-turbo (static) from third_party/libjpeg-turbo --
 # the 3.2.1 release tarball as the libjpeg-turbo Project published it,
-# committed (docs/VENDORS.md §1) -- into third_party/libjpeg-turbo-<version>[-arch].
+# committed (docs/details/VENDORS.md §1) -- into third_party/libjpeg-turbo-<version>[-arch].
 # Nothing is downloaded.
 #
 #   scripts/build/libjpeg-turbo.sh     native (Linux; the daemon and `make test` link it)
 #
 # The daemon's JPEG decoder and encoder for image previews (ARCH-137,
-# docs/Plans/IMAGE-PREVIEWS.md): the libjpeg API alone, 8-bit, with its SIMD
+# docs/details/IMAGE-PREVIEWS.md): the libjpeg API alone, 8-bit, with its SIMD
 # (nasm on x86_64, NEON on aarch64). No TurboJPEG API, no tools, no tests, no
 # shared library. No client links it.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time").
+# One compile at a time (docs/details/TESTING.md, "One build at a time").
 unset MAKEFLAGS MFLAGS
 
 LIBJPEG_TURBO_VERSION=3.2.1
