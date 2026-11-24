@@ -1485,6 +1485,17 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max);
 
+/* Which message does "react to the newest message" act on?
+ *
+ * The conversation's newest message that can take a reaction: it walks the
+ * channel's scroll from the newest and returns the first that is not
+ * tombstoned (REQ-052: nothing left to react to), is an ordinary message
+ * rather than a call event (OC_MSG_KIND_*: a line of history, not something
+ * said, REQ-304), and has a `message_id` (a reaction names the message by it).
+ * NULL when there is none, or no channel. Thread replies are not in the scroll
+ * (REQ-060), so the answer is always the main transcript's. */
+const oc_msg *oc_model_last_reactable(const oc_channel *c);
+
 /* The latest notice for transfer `tag`, or NULL once it has aged out of the
  * table (the oldest go first, finished ones before any still running). */
 const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);

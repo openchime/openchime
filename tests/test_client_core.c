@@ -595,6 +595,48 @@ static void test_missed_calls_model(void) {
     oc_model_free(&m);
 }
 
+/* The message a "react to the newest" shortcut acts on (REQ-070): the newest that
+ * can take a reaction, past a newer tombstone and a newer call event. */
+static void lr_msg(oc_model *m, uint64_t ch, uint64_t id, uint8_t kind) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = ch; e.message_id = id; e.author_id = 2;
+    e.server_time = 1000 + id; e.msg_kind = kind; e.body = strdup("said");
+    oc_model_apply(m, &e);
+}
+static void lr_delete(oc_model *m, uint64_t ch, uint64_t id) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = ch; e.message_id = id;
+    oc_model_apply(m, &e);
+}
+
+static void test_last_reactable(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 5;
+    lr_msg(&m, 10, 1, OC_MSG_KIND_MESSAGE);     /* an ordinary message */
+    lr_msg(&m, 10, 2, OC_MSG_KIND_MESSAGE);     /* ...one tombstoned after it */
+    lr_delete(&m, 10, 2);
+    lr_msg(&m, 10, 3, OC_MSG_KIND_CALL);        /* ...and a call event after that */
+    const oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->n_msgs == 3 && c->msgs[1].deleted == 1 && c->msgs[2].kind == OC_MSG_KIND_CALL);
+    const oc_msg *r = oc_model_last_reactable(c);
+    CHECK(r && r->message_id == 1);
+    /* A channel of only those: nothing to react to. */
+    lr_msg(&m, 11, 4, OC_MSG_KIND_MESSAGE);
+    lr_delete(&m, 11, 4);
+    lr_msg(&m, 11, 5, OC_MSG_KIND_CALL);
+    c = oc_model_channel(&m, 11);
+    CHECK(c && c->n_msgs == 2);
+    CHECK(oc_model_last_reactable(c) == NULL);
+    /* An empty channel, and none at all. */
+    oc_channel empty;
+    memset(&empty, 0, sizeof empty);
+    CHECK(oc_model_last_reactable(&empty) == NULL);
+    CHECK(oc_model_last_reactable(NULL) == NULL);
+    oc_model_free(&m);
+}
+
 static void test_capabilities(void) {
     oc_model m; oc_model_init(&m);
     CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
@@ -7184,6 +7226,7 @@ int run_client_core_tests(void) {
 
     test_group_dm_title();
     test_missed_calls_model();
+    test_last_reactable();
     test_snippet_offer();
     test_action_pairing();
     test_groups_model();

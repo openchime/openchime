@@ -2082,6 +2082,16 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     }
 }
 
+const oc_msg *oc_model_last_reactable(const oc_channel *c) {
+    if (!c) return NULL;
+    for (size_t i = c->n_msgs; i-- > 0;) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->deleted || msg->kind != OC_MSG_KIND_MESSAGE || !msg->message_id) continue;
+        return msg;
+    }
+    return NULL;
+}
+
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max) {
     if (!m) return 0;

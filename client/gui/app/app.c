@@ -10463,7 +10463,7 @@ enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
        ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW, ACC_JUMP_DATE,
-       ACC_NEW_CALL };
+       ACC_NEW_CALL, ACC_REACT_LAST };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -10517,6 +10517,10 @@ static const struct {
     { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
     { AM_CTRL | AM_SHIFT, 'J',        ACC_JUMP_DATE, "Ctrl+Shift+J",   "Jump to a date in this conversation" },
     { AM_CTRL | AM_SHIFT, 'L',        ACC_NEW_CALL,  "Ctrl+Shift+L",   "New call: from this conversation, its people asked" },
+    /* Ctrl+Shift+\, as the reference client binds it: the picker, so the
+     * reaction is still the person's choice, for the main transcript's newest
+     * message that can take one (REQ-070). */
+    { AM_CTRL | AM_SHIFT, OCK_BACKSLASH, ACC_REACT_LAST, "Ctrl+Shift+\\", "React to the newest message" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -10562,6 +10566,7 @@ static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Dow
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
 static int  kb_msg_cmd(int key);                   /* fwd — a single key's menu command */
 static void kb_msg_key(oc_win *hwnd, int key);     /* fwd — ...run on the focused message */
+static void picker_open(oc_win *hwnd, uint64_t mid);   /* fwd — Ctrl+Shift+\ */
 static void call_start_here(oc_win *hwnd, uint64_t ch);   /* fwd */
 static void call_cmd(oc_win *hwnd, int cmd);              /* fwd */
 static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y);   /* fwd */
@@ -10602,6 +10607,15 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_PREVIEW:
         if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
+        break;
+    case ACC_REACT_LAST:
+        /* The same picker the hover strip's kebab and the message menu open, so
+         * a pick reacts, or takes back one already yours, by the one path. */
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) {
+            const oc_model *rm = model();
+            const oc_msg *last = rm ? oc_model_last_reactable(oc_model_channel((oc_model *)rm, g_sel)) : NULL;
+            if (last) picker_open(hwnd, last->message_id);
+        }
         break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
@@ -42372,8 +42386,8 @@ static void test_dump(const char *path) {
             fprintf(f, "  statuschip %d r=%.0f,%.0f,%.0f,%.0f\n", k,
                     g_status_chip_hits[k].left, g_status_chip_hits[k].top,
                     g_status_chip_hits[k].right, g_status_chip_hits[k].bottom);
-        fprintf(f, "pickstate open=%d target=%d slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
-                g_pick_open, g_pick_target, g_pick_quick_slot,
+        fprintf(f, "pickstate open=%d target=%d mid=%llu slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
+                g_pick_open, g_pick_target, (unsigned long long)g_pick_mid, g_pick_quick_slot,
                 g_pick_panel.left, g_pick_panel.top,
                 g_pick_panel.right, g_pick_panel.bottom);
         /* The first cells, so a driven pick can click a real one and a

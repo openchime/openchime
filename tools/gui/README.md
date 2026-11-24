@@ -821,7 +821,13 @@ nor does Ctrl+Up, which walks the transcript; and in a channel where only bob
 has spoken, Up leaves the box empty. It reads the dump's `marks ch … unread=`,
 `toast[n]`, `workspaces=/active=` and `ed` lines, `edit=` there being the
 message the box is editing (0 for none) and the message's id its newest
-`msgrow`'s `mid=`. Not in CI, for the smoke's reason.
+`msgrow`'s `mid=`. Then `Ctrl+Shift+\`: with bob's message newest in
+#general, the key opens the emoji picker to react to a message (`pickstate`
+`open=1 target=1` and a nonzero `mid=`); picking its first cell (`pickcell 0`)
+closes it, and the who-reacted pane on the newest message (the `reactors 0`
+verb) is for that `mid=` and shows one chip, alice's (`reactors … msg= chips=`,
+`rxnchip 0 … mine=1`); in the Files view (`view=3`) the key opens no picker.
+Not in CI, for the smoke's reason.
 
 ## Reading the composer harness
 

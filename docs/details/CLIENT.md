@@ -1221,6 +1221,9 @@ picker the status dialog uses, floating over the card that owns it
 never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
+`Ctrl+Shift+\` opens the emoji picker to react to the conversation's newest
+message (`oc_model_last_reactable`: not a deleted one, not a call event), as
+the reference client binds it.
 
 **A time is never typed either.** Pause notifications' custom end time is a
 select of the day's half-hour slots, in the user's 12- or 24-hour format. The

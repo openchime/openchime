@@ -15,6 +15,8 @@
 #   - Up in an empty message box opens your newest message for editing, as its
 #     Edit does; with text in the box, or with Ctrl held, it does what it did,
 #     and where you have said nothing it does nothing.
+#   - Ctrl+Shift+\ opens the emoji picker for the newest message, and a pick
+#     reacts to it; outside a conversation (the Files view) it opens nothing.
 #
 # Two clients over tools/gui/harness/win32/pair.sh, so there is something unread to mark: bob says
 # things in a conversation alice is not looking at.
@@ -177,4 +179,41 @@ start_at 0 on_first
 # paced: an absence -- the time Ctrl+9 would have taken to switch, were it going to
 sleep 0.5
 check "Ctrl+9, with two signed in, leaves it where it was" on_first
+
+step "Ctrl+Shift+\ reacts to the newest message"
+# Wide enough, at 96 dpi, for the context pane the who-reacted list lives in
+# (tools/gui/features/reactions.sh says why).
+"$PAIR" a size 1200 820 >/dev/null || gui_abort "alice's window did not take its size"
+"$PAIR" a dpi 96 >/dev/null || gui_abort "alice's client did not take 96 dpi"
+"$PAIR" a channel 1 >/dev/null || gui_abort "alice did not open #general"
+"$PAIR" b send "react to me" >/dev/null || gui_abort "bob's client did not take the message"
+waitfor 10 newest_is a 1 "react to me" || gui_abort "bob's message did not reach alice"
+pick()  { gui_snap a; field "$DA" '^pickstate ' "$1"; }
+closed() { [ "$(pick open)" = 0 ]; }
+waitfor 5 closed || gui_abort "the picker was open before the key"
+"$PAIR" a key ctrl+shift+backslash >/dev/null
+for_msg() { [ "$(pick open)" = 1 ] && [ "$(pick target)" = 1 ] && [ "$(pick mid)" -gt 0 ] 2>/dev/null; }
+check "the picker opens to react to a message" waitfor 5 for_msg
+"$PAIR" a shot shortcuts_react >/dev/null
+PICKED="$(pick mid)"
+cell0() { gui_snap a; field "$DA" '^  pickcell 0 ' r; }
+check "its first emoji can be picked" click_rect a "$(cell0)"
+check "...and the picker closes" waitfor 5 closed
+# The newest message's who-reacted pane: one chip, alice's.
+"$PAIR" a reactors 0 >/dev/null
+chip() { gui_snap a; field "$DA" '^  rxnchip 0 ' "$1"; }
+pane() { gui_snap a; field "$DA" '^reactors ' "$1"; }
+reacted() { [ "$(pane open)" = 1 ] && [ "$(pane msg)" = "$PICKED" ] &&
+            [ "$(pane chips)" = 1 ] && [ "$(chip mine)" = 1 ]; }
+check "the newest message, the one picked for, carries one reaction, alice's" waitfor 10 reacted
+
+step "...and outside a conversation it opens nothing"
+"$PAIR" a view files >/dev/null || gui_abort "alice's client did not open Files"
+in_files() { gui_snap a; grep -q '^view=3 ' "$DA"; }
+waitfor 5 in_files || gui_abort "alice's client is not showing Files"
+waitfor 5 closed || gui_abort "the picker was open before the key"
+"$PAIR" a key ctrl+shift+backslash >/dev/null
+# paced: an absence -- the time the key would have taken to open the picker
+sleep 0.5
+check "in the Files view the key opens no picker" closed
 gui_end

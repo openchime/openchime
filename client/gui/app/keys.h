@@ -18,7 +18,7 @@ enum {
     OCK_LEFT, OCK_UP, OCK_RIGHT, OCK_DOWN,
     OCK_DELETE, OCK_APPS,
     OCK_F1, OCK_F2, OCK_F3, OCK_F4, OCK_F5, OCK_F6, OCK_F7, OCK_F8, OCK_F9, OCK_F10, OCK_F11, OCK_F12,
-    OCK_SLASH, OCK_COMMA, OCK_MINUS, OCK_PLUS
+    OCK_SLASH, OCK_BACKSLASH, OCK_COMMA, OCK_MINUS, OCK_PLUS
 };
 
 static inline int oc_key_from_sdl(SDL_Keycode k) {
@@ -48,6 +48,7 @@ static inline int oc_key_from_sdl(SDL_Keycode k) {
     case SDLK_F7: return OCK_F7;   case SDLK_F8: return OCK_F8;   case SDLK_F9: return OCK_F9;
     case SDLK_F10: return OCK_F10; case SDLK_F11: return OCK_F11; case SDLK_F12: return OCK_F12;
     case SDLK_SLASH: case SDLK_QUESTION: return OCK_SLASH;
+    case SDLK_BACKSLASH: case SDLK_PIPE: return OCK_BACKSLASH;
     case SDLK_COMMA:     return OCK_COMMA;
     case SDLK_MINUS: case SDLK_KP_MINUS: return OCK_MINUS;
     case SDLK_EQUALS: case SDLK_PLUS: case SDLK_KP_PLUS: return OCK_PLUS;
@@ -71,6 +72,7 @@ static inline int oc_key_from_name(const char *k) {
         { "tab", OCK_TAB }, { "up", OCK_UP }, { "down", OCK_DOWN }, { "left", OCK_LEFT }, { "right", OCK_RIGHT },
         { "home", OCK_HOME }, { "end", OCK_END }, { "pgup", OCK_PRIOR }, { "pageup", OCK_PRIOR },
         { "pgdn", OCK_NEXT }, { "pagedown", OCK_NEXT }, { "space", OCK_SPACE }, { "slash", OCK_SLASH },
+        { "backslash", OCK_BACKSLASH },
         { "back", OCK_BACK }, { "backspace", OCK_BACK }, { "del", OCK_DELETE }, { "delete", OCK_DELETE },
         { "menu", OCK_APPS }, { "apps", OCK_APPS }, { "plus", OCK_PLUS }, { "equals", OCK_PLUS },
         { "minus", OCK_MINUS }, { "comma", OCK_COMMA },
