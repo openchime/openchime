@@ -710,7 +710,14 @@ surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
 `InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/harness/win32/uia_probe.ps1`. The recording and sharing bars are
+the process by `tools/gui/harness/win32/uia_probe.ps1`. What a message says to a screen reader
+is the person's to choose, in Preferences > Accessibility: the sender, the time,
+the reactions and the replies, each on or off, the text before or after the
+sender and the time, and whether a new message from someone else is read out
+as it arrives. One function builds every message's name from those settings
+(`client/core/spoken.c`); the defaults read as the client always has, "<who>,
+<when>: <text>", with arrivals announced. The settings are synced with the other
+preferences. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
 `sharebar`: the line as Text, the buttons invokable), read and pressed by
 `tools/gui/harness/win32/uia_recbar.ps1`. Rich text and its toolbar

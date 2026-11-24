@@ -44,6 +44,7 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the voice harness](#reading-the-voice-harness)
 - [Reading the cursor harness](#reading-the-cursor-harness)
 - [Reading the caret harness](#reading-the-caret-harness)
+- [Reading the announce harness](#reading-the-announce-harness)
 - [Seeing the whole window](#seeing-the-whole-window)
 - [`clipped=`: text that does not fit its own box](#clipped-text-that-does-not-fit-its-own-box)
 - [Observing the tray balloon](#observing-the-tray-balloon)
@@ -341,6 +342,7 @@ when reading its output.
 | Test | Platforms | Needs | Port | What it checks | Notes |
 |---|---|---|---|---|---|
 | `admin_rows` | win32 | | 9565 | the audit log's rows: a menu each, by right-click and from the keyboard | its header |
+| `announce` | win32 | | 9605 | what each message says to a screen reader, and whether a new one is announced | [Reading the announce harness](#reading-the-announce-harness) |
 | `balloon` | win32 | | 9786 | the tray balloon is drawn on the desktop | [Observing the tray balloon](#observing-the-tray-balloon) |
 | `calls` | win32 web | | 9620 | a call between two clients, its sound both ways, sharing a screen | [Reading the calls harness](#reading-the-calls-harness) |
 | `calls_tcp` | win32 web | | 9670 | a call when UDP cannot reach the relay | [Reading the calls harness](#reading-the-calls-harness) |
@@ -1123,6 +1125,28 @@ search box (its `searchbox srch edit=` rect) when that takes focus, and back to
 the message box when Escape leaves the search box; and that it is gone,
 `owned=0 sys=0`, in the Files view, where no field has focus. Not in CI, for the smoke's reason. Run it when a change touches a
 drawn field, focus, or the platform's text input.
+
+## Reading the announce harness
+
+Preferences > Accessibility chooses what a screen reader is given for each
+message -- the sender, the time, the reactions, the replies, and whether the
+text comes first -- and whether a message from someone else is read out as it
+arrives (REQ-269, ARCH-99). `tools/gui/features/announce.sh` drives two Win32
+clients against its own fixture daemon (port 9605): bob writes, alice listens.
+It asserts that Accessibility is the sixth category, after the others, with its
+six rows, and that a choice clicked there is put back by Cancel; that with the
+defaults a message's accessible name is `<who>, <when>: <text>`, as it always
+was; that with everything on, once the message has a reaction and a reply, the
+text comes first and the name carries `reactions:` and `1 reply`; that with
+every part off it is the text alone; that with announcing off a message
+arriving from bob leaves the announcement count where it was, and with it on
+adds one; and that the settings last chosen are there again after both clients
+start again. It reads the dump's `spoken` line (the six settings, which the
+`spoken <sender> <time> <reactions> <replies> <text_first> <announce_new>` verb
+sets through the rows' own path and saves), `a11yname <aid> "<name>"` (what each
+message on the transcript says) and `a11y ... announced=`. Not in CI, for the
+smoke's reason. Run it when a change touches a message's accessible name, the
+arrival announcement or the preferences string.
 
 ## Seeing the whole window
 

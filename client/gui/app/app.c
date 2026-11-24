@@ -81,6 +81,7 @@
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
 #include "env.h"            /* the development inputs */
 #include "emoticon.h"       /* typed emoticons (compose.emoticons) */
+#include "spoken.h"         /* what a message says to a screen reader (REQ-269) */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -1208,6 +1209,13 @@ static int g_pref_enter_newline = 0;
  * (compose.emoticons, a setting of its own: the terminal client reads it too). */
 static int g_pref_emoticons = 0;
 #define EMOTICONS_SETTING_KEY "compose.emoticons"
+/* What each message says to a screen reader (REQ-269, ARCH-99): which of its
+ * parts are read and in what order (client/core/spoken.h), and whether a new
+ * message from someone else is announced as it arrives. The defaults are how
+ * the client has always read, so nobody's screen reader changes until they
+ * choose to change it. */
+static oc_spoken_opts g_pref_spoken = { 1, 1, 0, 0, 0 };   /* oc_spoken_defaults() */
+static int g_pref_announce_new = 1;
 /* The formatting toolbar belongs to the rich editor. In plain text it would
  * offer buttons for markup already on screen, and the honest shape of that mode
  * is a plain box. */
@@ -11846,6 +11854,26 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
        PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS,
        PREF_ROW_ENTER };
+/* Accessibility's rows: what each message says to a screen reader. */
+enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
+       PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
+
+/* One of Accessibility's rows set to choice `v`: the one path the rows' clicks
+ * and the harness's `spoken` verb both take. 0 when `row` is not one of them.
+ * Saved by the caller (Save, or the verb), as every other row is. */
+static int spoken_pref_set(int row, int v) {
+    v = v ? 1 : 0;
+    switch (row) {
+    case PREF_ROW_SAY_SENDER:    g_pref_spoken.sender = v; break;
+    case PREF_ROW_SAY_TIME:      g_pref_spoken.time = v; break;
+    case PREF_ROW_SAY_REACTIONS: g_pref_spoken.reactions = v; break;
+    case PREF_ROW_SAY_REPLIES:   g_pref_spoken.replies = v; break;
+    case PREF_ROW_SAY_ORDER:     g_pref_spoken.text_first = v; break;
+    case PREF_ROW_ANNOUNCE_NEW:  g_pref_announce_new = v; break;
+    default: return 0;
+    }
+    return 1;
+}
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -11855,7 +11883,10 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS, PC_COUNT };
+/* ACCESSIBILITY comes last, after the categories that were here before it, so
+ * each of theirs keeps its index (`prefs <index>` in the harness). */
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS,
+       PC_ACCESSIBILITY, PC_COUNT };
 /* SYSTEM is where the application behaves as an application rather than as a
  * chat surface: what the close button does, whether it starts with Windows.
  * Those had no home, which is why closing to the tray shipped with no way to
@@ -11864,7 +11895,7 @@ enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS
  * they let act as them is theirs, so it lives with their other settings. It is
  * not part of Save and Cancel: approving and revoking act at once. */
 static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications",
-                                         "System", "AI clients" };
+                                         "System", "AI clients", "Accessibility" };
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
@@ -12148,6 +12179,30 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
     } else if (g_pref_cat == PC_AICLIENTS) {
         y = draw_my_connections(rt, model(), body, y);
+    } else if (g_pref_cat == PC_ACCESSIBILITY) {
+        /* What a screen reader says for each message (REQ-269). The defaults
+         * are how the client has always read: the sender, the time, the text,
+         * and a new message read out as it arrives. */
+        static const char *ORDER[2] = { "Sender first", "Text first" };
+        y = pref_row(rt, body, y, PREF_ROW_SAY_SENDER, "Say the sender",
+                     "Each message is read with the name of who sent it.",
+                     ONOFF, 2, g_pref_spoken.sender);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_TIME, "Say the time",
+                     "And when it was sent, as the transcript shows it.",
+                     ONOFF, 2, g_pref_spoken.time);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_REACTIONS, "Say reactions",
+                     "Each reaction on the message, with how many people chose it.",
+                     ONOFF, 2, g_pref_spoken.reactions);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_REPLIES, "Say replies",
+                     "How many replies its thread has.",
+                     ONOFF, 2, g_pref_spoken.replies);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_ORDER, "Order",
+                     "Text first reads what was said before who said it and when.",
+                     ORDER, 2, g_pref_spoken.text_first);
+        y = pref_row(rt, body, y, PREF_ROW_ANNOUNCE_NEW, "Announce new messages",
+                     "A message from someone else is read out as it arrives, unless "
+                     "its conversation is muted.",
+                     ONOFF, 2, g_pref_announce_new);
     }
 
     g_prefs_content_h = y - rows_top;
@@ -17706,6 +17761,8 @@ static struct {
     int  emoticons;
     int  flash;
     int  toastpos;
+    oc_spoken_opts spoken;
+    int  announce_new;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17722,6 +17779,8 @@ static void prefs_snapshot(void) {
     g_prefs_snap.richtext = g_pref_richtext;
     g_prefs_snap.enter_newline = g_pref_enter_newline;
     g_prefs_snap.emoticons = g_pref_emoticons;
+    g_prefs_snap.spoken   = g_pref_spoken;
+    g_prefs_snap.announce_new = g_pref_announce_new;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -17747,6 +17806,8 @@ static void prefs_restore(void) {
     g_pref_richtext = g_prefs_snap.richtext;
     g_pref_enter_newline = g_prefs_snap.enter_newline;
     g_pref_emoticons = g_prefs_snap.emoticons;
+    g_pref_spoken = g_prefs_snap.spoken;
+    g_pref_announce_new = g_prefs_snap.announce_new;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -29518,15 +29579,11 @@ static void a11y_publish_scene(const oc_model *m) {
         const char *who = msg->author_name[0] ? msg->author_name
                                               : oc_model_user_name(m, msg->author_id);
         char when[24]; rel_time(msg->server_time, when, sizeof when);
-        if (msg->deleted)
-            snprintf(it->name, sizeof it->name, "%s, %s, message deleted",
-                     who ? who : "someone", when);
-        else {
-            char said[1024];   /* an action is read as "<name> <text>" (REQ-058) */
-            oc_model_msg_preview(m, msg, said, sizeof said);
-            snprintf(it->name, sizeof it->name, "%s, %s: %s",
-                     who ? who : "someone", when, said);
-        }
+        /* Read the way the person chose (Preferences > Accessibility). */
+        char said[1024] = "";   /* an action is read as "<name> <text>" (REQ-058) */
+        if (!msg->deleted) oc_model_msg_preview(m, msg, said, sizeof said);
+        oc_spoken_msg(&g_pref_spoken, who, when, said, msg->reactions, msg->n_reactions,
+                      msg->reply_count, msg->deleted, it->name, sizeof it->name);
     }
 
     /* The tables in those messages (MARKDOWN.md §1a): the grid, named for its
@@ -30359,7 +30416,7 @@ modal_items:
             for (int i = 0; i < PC_COUNT && n < OC_ACC_MAX; i++)
                 if (g_pref_cats[i].right > g_pref_cats[i].left) {
                     static const char *const CATAID[PC_COUNT] = { "appearance", "messages", "notifications",
-                                                                  "system", "aiclients" };
+                                                                  "system", "aiclients", "accessibility" };
                     char aid[OC_ACC_AID_MAX];
                     snprintf(aid, sizeof aid, "prefs.cat.%s", CATAID[i]);
                     acc_push(items, &n, OC_ACC_BUTTON, aid, PC_NAME[i], g_pref_cats[i], ATOK(AT_PREFCAT, (uint64_t)i));
@@ -34824,6 +34881,10 @@ static int on_click(oc_win *hwnd, int x, int y) {
             case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
             case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
+            case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
+            case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
+                spoken_pref_set(g_pref_hits[i].row, v);
+                break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
             case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
             case PREF_ROW_CLOSE:   g_pref_close = v; break;
@@ -38317,6 +38378,11 @@ static void prefs_save(void) {
         /* ...and what Enter does in the composer. */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";N:%d", g_pref_enter_newline);
+        /* ...and what a message says to a screen reader: its parts as bits
+         * (oc_spoken_bits), and whether arrivals are announced. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";R:%u;A:%d", oc_spoken_bits(&g_pref_spoken),
+                 g_pref_announce_new);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38329,6 +38395,9 @@ static void prefs_load(const oc_model *m) {
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
     int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
+    /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
+    oc_spoken_opts spk = oc_spoken_defaults();
+    int an = 1;
     /* Tolerant of missing keys and of any order, so a value written by a newer
      * build with extra fields still loads what this one understands. */
     for (const char *p = v; *p; ) {
@@ -38369,6 +38438,8 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'l') g_call_layout = val ? 1 : 0;
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
             else if (k == 'N') nl = val ? 1 : 0;
+            else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
+            else if (k == 'A') an = val ? 1 : 0;
             else if (k == 'b') {
                 /* The missed calls already seen, and the history asked for, so
                  * those missed while away are marked. */
@@ -38391,6 +38462,8 @@ static void prefs_load(const oc_model *m) {
     g_pref_members = mm ? 1 : 0;
     g_pref_daysep  = d ? 1 : 0;
     g_pref_enter_newline = nl;
+    g_pref_spoken = spk;
+    g_pref_announce_new = an;
     g_show_members = g_pref_members;
     theme_set(t);
     /* After theme_set: the accent pair is resolved per mode, so the mode has to be
@@ -41202,6 +41275,16 @@ static void test_dump_a11y(FILE *f) {
         fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
                 a->l, a->t, a->r, a->b);
     }
+    /* What each message on the transcript says to a screen reader, under the
+     * person's settings (Preferences > Accessibility): one line each, a line
+     * break in it read as a space. */
+    for (int i = 0; i < g_a11y_n; i++) {
+        const oc_acc_item *a = &g_acc_items[i];
+        if (a->kind != OC_ACC_MESSAGE) continue;
+        fprintf(f, "a11yname %s \"", a->aid[0] ? a->aid : "-");
+        for (const char *q = a->name; *q; q++) fputc(*q == '\n' || *q == '\r' ? ' ' : *q, f);
+        fprintf(f, "\"\n");
+    }
 }
 
 static void test_dump(const char *path) {
@@ -41256,6 +41339,10 @@ static void test_dump(const char *path) {
             m->unresolved.can_add, m->unresolved.is_private, m->unresolved.names);
     fprintf(f, "a11y avail=%d items=%d announced=%u\n",
             oc_a11y_available(), g_a11y_n, oc_a11y_announced());
+    /* What a message says to a screen reader, as chosen (REQ-269). */
+    fprintf(f, "spoken sender=%d time=%d reactions=%d replies=%d text_first=%d announce_new=%d\n",
+            g_pref_spoken.sender, g_pref_spoken.time, g_pref_spoken.reactions,
+            g_pref_spoken.replies, g_pref_spoken.text_first, g_pref_announce_new);
     /* The system caret (ARCH-99). Reported because it is invisible by design —
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
@@ -43778,6 +43865,21 @@ static void test_poll(oc_win *hwnd) {
         int v = atoi(arg);
         if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "spoken")) {
+        /* `spoken <sender> <time> <reactions> <replies> <text_first>
+         * <announce_new>`, each 0 or 1: Accessibility's six rows, set through
+         * the path their clicks take, and saved as Save saves them. */
+        int v[6];
+        static const int ROWS[6] = { PREF_ROW_SAY_SENDER, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
+                                     PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
+        int ok = sscanf(arg, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6;
+        for (int i = 0; ok && i < 6; i++) if (v[i] != 0 && v[i] != 1) ok = 0;
+        if (ok) {
+            for (int i = 0; i < 6; i++) spoken_pref_set(ROWS[i], v[i]);
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "prefs")) {
         /* `prefs [category]` — the category by INDEX, because the alternative
          * is clicking a row whose y moves with the DPI and the text size, and
@@ -44948,7 +45050,9 @@ static int on_tick(oc_win *hwnd) {
                      * Muted conversations still say nothing: mute means "do not
                      * interrupt me about this", which is a statement about
                      * attention, not about eyesight. */
-                    if (g_pref_notify != NOTIFY_OFF &&
+                    /* And not at all when the person has turned arrivals off
+                     * (Preferences > Accessibility, "Announce new messages"). */
+                    if (g_pref_notify != NOTIFY_OFF && g_pref_announce_new &&
                         is_active && !c->muted && oc_a11y_available()) {
                         const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
                         /* Not your own — you just sent it, and being read your

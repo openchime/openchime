@@ -501,6 +501,17 @@ framework.
   follows typing and the arrow keys, moves to the search box when that takes
   focus and back when Escape leaves it, and is gone when no field has focus (tools/gui/README.md, "Reading the
   caret harness").
+- **What a message says to a screen reader** (REQ-269, ARCH-99) —
+  `tests/test_spoken.c` (fast) builds a message's spoken name from its parts:
+  the defaults reproduce the transcript's two forms exactly, present and
+  deleted; each switch on its own adds or removes only its part; reactions in
+  the message's order, replies at none, one and many, the text first, nobody
+  named read as "someone", and the cut at a small buffer on a whole UTF-8
+  character. `tools/gui/features/announce.sh`, on Win32, drives two clients:
+  Preferences > Accessibility and its Cancel, the defaults, everything on with a
+  reaction and a reply, the text alone, arrivals announced or not, and the
+  settings kept across a restart (tools/gui/README.md, "Reading the announce
+  harness").
 - **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tools/gui/features/calls.sh`
   and `callhome.sh` (`# needs: callrec`), `newcall.sh`, `prejoin.sh` and
   `camera.sh`, on Win32 and in the browser. `calls.sh`: New Call opened from a
