@@ -565,28 +565,46 @@ static void draw_conn_dot(gfx *rt, float cx, float cy, float r, int live) {
 /* `dnd` is do-not-disturb (REQ-122/278) and is deliberately NOT a third presence
  * value: somebody can be online and paused, so it is drawn as a crescent carved
  * out of the same dot rather than as a colour that would have to replace one.
- * Slack shows a moon for exactly this reason. */
+ * Slack shows a moon for exactly this reason.
+ *
+ * WHICH shape is oc_presence_mark()'s (theme.c), not this function's: presence
+ * is never told by colour alone (REQ-122), so each state is a shape and the
+ * colour repeats it. This draws whatever mark it is handed and does no presence
+ * branching of its own, so no caller can show a state the test has not seen. */
 static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
                                   uint8_t presence, uint32_t surface, int dnd,
                                   float ring) {
-    uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
-               : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+    int mark = oc_presence_mark(presence, dnd);
+    uint32_t c = mark == OC_PMARK_ONLINE ? OC_COL_ONLINE
+               : mark == OC_PMARK_AWAY   ? OC_COL_AWAY
+               : mark == OC_PMARK_DND    ? OC_COL_MUTED : OC_COL_FAINT;
     /* A ring in the surface colour, as Slack's has: the dot sits ON the
      * avatar, and without a ring it reads as a speck stuck to the edge. The
      * WIDTH is the caller's, because a ring that stays 2 DIP while the dot
      * scales with its tile is most of a small marker. */
-        gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
-        gfx_ellipse(rt, cx, cy, r, r, dnd ? OC_COL_MUTED : c, 1.0f);
+    gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
+    if (mark == OC_PMARK_AWAY) {
+        /* Half filled, as the terminal client's away glyph is: a ring of the
+         * away colour with its left half solid. The ring's width is a fraction
+         * of the dot for the same reason the offline hole is, and it sits
+         * inside the dot's radius so away is no larger than online. */
+        float w = r * 0.3f;
+        if (w < 1.0f) w = 1.0f;
+        gfx_ellipse_stroke(rt, cx, cy, r - w / 2.0f, r - w / 2.0f, w, c, 1.0f);
+        gfx_clip_push(rt, (gfx_rect){ cx - r - 1.0f, cy - r - 1.0f, r + 1.0f, 2.0f * r + 2.0f });
+        gfx_ellipse(rt, cx, cy, r, r, c, 1.0f);
+        gfx_clip_pop(rt);
+        return;
+    }
+    gfx_ellipse(rt, cx, cy, r, r, c, 1.0f);
     /* Offline reads as an outline, so "not here" is not just a dim fill. The
      * hole is a fraction of the dot for the same reason the ring is: a fixed
      * 1.3 DIP hole in a small dot is a filled dot, and in a large one it is a
      * hairline. */
-    if (!dnd && presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
-                gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
-    }
-    if (dnd) {   /* carve the crescent with the surface colour */
-                gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
-    }
+    if (mark == OC_PMARK_OFFLINE)
+        gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
+    if (mark == OC_PMARK_DND)   /* carve the crescent with the surface colour */
+        gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
 }
 
 /* ONE presence marker on an avatar, sized and seated BY THE TILE.
@@ -41992,18 +42010,26 @@ static void test_dump(const char *path) {
                 g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
                 g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
     /* The members pane's rows, so a row can be pointed at by who it is. */
+    static const char *const PMARK_NAME[OC_PMARK_COUNT] = {
+        [OC_PMARK_ONLINE] = "online", [OC_PMARK_AWAY] = "away",
+        [OC_PMARK_OFFLINE] = "offline", [OC_PMARK_DND] = "dnd" };
     /* The roster, and how far through it the pane is looking: rows= is what is
      * DRAWN, n= what the channel has, so a harness can tell "the rest is below"
      * from "the rest is not there". */
     fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
             m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f via=%d agent=%d\n",
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f mark=%s via=%d agent=%d\n",
                 (unsigned long long)g_memrows[i].uid,
                 g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
                 m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
                     ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
                 g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
+                /* The shape the row's dot is drawn as (REQ-122), from the same
+                 * oc_presence_mark() the drawing asks. */
+                PMARK_NAME[m ? oc_presence_mark(oc_model_presence_of(m, g_memrows[i].uid),
+                                                oc_model_dnd_of(m, g_memrows[i].uid))
+                             : OC_PMARK_OFFLINE],
                 g_memrows[i].via, m ? oc_model_user_is_agent(m, g_memrows[i].uid) : 0);
     /* Agents (docs/details/MCP.md §7): the members pane's label over its
      * agents, and the tags each surface drew in the last frame. */

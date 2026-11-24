@@ -14,7 +14,10 @@
 #   - it stops at the end rather than scrolling into nothing, and the top is the
 #     top;
 #   - an owner's menu on a member is wide enough for its longest item;
-#   - switching channel puts the pane back at its own top.
+#   - switching channel puts the pane back at its own top;
+#   - each row reports the shape its presence dot is drawn as (REQ-122):
+#     alice, signed in, is online, and a member who has never signed in is
+#     offline.
 #
 # And, last, that a reset's dialog shows the whole message to send, its code
 # included, without scrolling.
@@ -59,6 +62,15 @@ check "...and the pane says the rest is below it" more_below
 at_top() { [ "$(mem scroll)" = 0 ]; }
 check "it starts at the top" at_top
 "$DRIVE" shot members_top >/dev/null
+
+step "a row's presence is a shape, not only a colour"
+# The dump's mark= is the shape the row's dot is drawn as, from the one place
+# that decides it. alice is the one signed in; member01 never has been.
+mark_of() { grep "^memrow .*name=\"$1\"" "$D" | head -1 | grep -o 'mark=[a-z]*' | cut -d= -f2; }
+alice_on()  { gui_snap; [ "$(mark_of alice)" = online ]; }
+check "alice, signed in, is marked online" waitfor 10 alice_on
+never_off() { gui_snap; [ "$(mark_of member01)" = offline ]; }
+check "a member who has never signed in is marked offline" waitfor 10 never_off
 
 step "the wheel reaches every member"
 # Walk the whole list, collecting the members DRAWN at each position: the point

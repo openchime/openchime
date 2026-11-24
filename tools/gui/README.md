@@ -928,7 +928,10 @@ cuts none of its items (the dump's `menurow … cut=` says whether a label was w
 than its row as drawn); and that switching channel puts the pane back at its own
 top. It reads the dump's
 `members n= rows= scroll= max=` line and the `memrow uid= r=` lines, and drives
-the `wheel` verb in detents of 120. Last, the owner's "Reset password…" on a
+the `wheel` verb in detents of 120. Each `memrow` carries `mark=`, the shape the
+row's presence dot is drawn as (`online`, `away`, `offline` or `dnd`, from
+`oc_presence_mark()`, REQ-122): alice, the one signed in, is `mark=online`, and
+`member01`, who never has been, is `mark=offline`. Last, the owner's "Reset password…" on a
 member opens the reset to send with all of it shown: the dump's `formlines` line
 is the field's own wrapped line count against the lines its box shows, and the
 first one visible.

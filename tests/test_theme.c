@@ -12,6 +12,7 @@
 
 #include "check.h"
 #include "theme.h"
+#include "protocol.h"   /* OC_PRESENCE_* */
 
 #include <stdio.h>
 
@@ -149,15 +150,68 @@ static void test_contrast_arithmetic(void) {
     CHECK(oc_theme_luminance(0xFFFFFF) > 0.9999f);
 }
 
+/* Presence is never told by colour alone (REQ-122): each state is a shape of
+ * its own, so a reader who cannot tell the green from the amber still can tell
+ * online from away. */
+static void test_presence_marks_are_distinct(void) {
+    int on   = oc_presence_mark(OC_PRESENCE_ONLINE,  0);
+    int away = oc_presence_mark(OC_PRESENCE_AWAY,    0);
+    int off  = oc_presence_mark(OC_PRESENCE_OFFLINE, 0);
+    int dnd  = oc_presence_mark(OC_PRESENCE_ONLINE,  1);
+    CHECK(on == OC_PMARK_ONLINE && away == OC_PMARK_AWAY &&
+          off == OC_PMARK_OFFLINE && dnd == OC_PMARK_DND);
+    /* Four states, four shapes: no two share one. */
+    int m[4] = { on, away, off, dnd };
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++)
+            CHECK(m[i] != m[j]);
+    /* The pair the colours alone could not separate. */
+    CHECK(on != away);
+    /* Do-not-disturb is its own shape whatever the presence under it, and a
+     * presence value the client does not know is offline, not online. */
+    CHECK(oc_presence_mark(OC_PRESENCE_AWAY, 1)    == OC_PMARK_DND);
+    CHECK(oc_presence_mark(OC_PRESENCE_OFFLINE, 1) == OC_PMARK_DND);
+    CHECK(oc_presence_mark(7, 0) == OC_PMARK_OFFLINE);
+}
+
+/* The away mark is a ring and a half fill in TH_AWAY, so its outline has to
+ * read on every surface a presence dot sits on, in every scheme and mode. The
+ * dot's own surface ring separates it from the tile under it; this is the
+ * colour against the row, the field and the canvas around it. */
+static void test_away_ring_clears_the_floor(void) {
+    int checked = 0;
+    for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++) {
+        for (int light = 0; light < 2; light++) {
+            oc_theme_set_scheme(scheme);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            for (int s = 0; s < N_SURFACES; s++) {
+                float c = oc_theme_contrast(oc_theme[TH_AWAY], oc_theme[SURFACES[s].tok]);
+                checked++;
+                if (c < FLOOR)
+                    printf("  contrast: AWAY ring on %s, %s %s: %06X on %06X is "
+                           "%.2f:1, under %.0f:1\n",
+                           SURFACES[s].name, oc_theme_scheme_name(scheme),
+                           light ? "light" : "dark", oc_theme[TH_AWAY],
+                           oc_theme[SURFACES[s].tok], (double)c, (double)FLOOR);
+                CHECK(c >= FLOOR);
+            }
+        }
+    }
+    /* 6 surfaces x 4 schemes x 2 modes. */
+    CHECK(checked == N_SURFACES * OC_SCHEME_COUNT * 2);
+}
+
 int run_theme_tests(void) {
     printf("test_theme: the contrast floor over every ink x surface x scheme x mode, "
            "one-way escalation, the faint tier survives, the reported pairs, "
-           "the ratio arithmetic\n");
+           "the ratio arithmetic, distinct presence marks, the away ring\n");
     test_contrast_arithmetic();
     test_every_pair_clears_the_floor();
     test_escalation_is_one_way();
     test_the_faint_tier_still_exists();
     test_the_reported_pairs();
+    test_presence_marks_are_distinct();
+    test_away_ring_clears_the_floor();
     /* Leave the palette as the rest of the suite expects to find it. */
     oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
     oc_theme_apply(OC_THEME_DARK);

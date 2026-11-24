@@ -1597,7 +1597,14 @@ from a bounding box is not a point on a circle. `draw_avatar_presence()` takes
 the tile and nothing else — size is a fraction of it, the ring scales with the
 dot, and the seat is where the bottom-right diagonal crosses the edge. A call
 site cannot pass an inset, so no call site can get one wrong, and a new avatar
-size is right on the day it is added.
+size is right on the day it is added. **The marker's shape says the state, not
+only its colour** (REQ-122): online is a filled disc, away a half-filled disc
+(the left half filled, inside a ring of the away colour), offline a ring, and
+do-not-disturb a crescent, whatever the presence under it. Green against amber
+is the pair red-green colour blindness confuses, so the colour only repeats
+what the shape already says. `oc_presence_mark()` (`theme.c`) decides the
+shape in one place and `draw_presence_dot_dnd()` draws whatever it returns, so
+the sidebar, the members pane, avatars, menus and the profile all agree.
 
 **A person is a rounded square, everywhere.** The reference product draws every
 person that way — message authors, DM rows, the profile pane, the popover and the

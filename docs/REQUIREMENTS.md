@@ -732,9 +732,10 @@ where one exists.
 - **REQ-122.** A user's **do-not-disturb and custom status** (REQ-136/278/241)
   has been surfaced to other users alongside their presence (REQ-120) — a
   distinct indicator on the presence dot plus a status line in the roster — so a
-  colleague has known someone was unavailable before messaging them. This has
-  been display only: it has not changed delivery, which the schedule and the
-  pause govern separately.
+  colleague has known someone was unavailable before messaging them. Presence
+  has never been shown by colour alone: each state, and do-not-disturb, has had
+  a marker shape of its own. This has been display only: it has not changed
+  delivery, which the schedule and the pause govern separately.
   **Being away for days has an out-of-office of its own**, apart from the
   custom status, which shows beside it: a start, an end and an optional message.
   It is in force between the two and ends by itself, so there is nothing to
