@@ -22459,8 +22459,13 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
             float h = box.bottom - box.top;
             if (cr.y + cr.h - f->scroll > h) f->scroll = cr.y + cr.h - h;
             if (cr.y - f->scroll < 0) f->scroll = cr.y;
-            if (f->scroll < 0) f->scroll = 0;
             st_metrics m; st_layout_metrics(l, &m);
+            /* Never scrolled past the text: a field that was shorter when it
+             * last scrolled (a form's first paint, before its fields are sized
+             * to their lines) and has grown shows its text from the top again. */
+            float over = m.h - h;
+            if (f->scroll > over) f->scroll = over;
+            if (f->scroll < 0) f->scroll = 0;
             f->lines = m.lines < 1 ? 1 : m.lines;
             /* Never scrolled past what the text can fill: a scroll set while
              * the box was shorter must not outlive it, or a box that now holds
