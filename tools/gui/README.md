@@ -359,6 +359,7 @@ when reading its output.
 | `entersend` | win32 web | | 9606 | what Enter does in the composer, in each mode of its preference | its header |
 | `files` | win32 web | | 9590 | paging the Files view | [Reading the files harness](#reading-the-files-harness) |
 | `fonts` | win32 web | | 9655 | each interface font, and a family the system lacks | [Reading the fonts harness](#reading-the-fonts-harness) |
+| `form_scroll` | win32 | | 9635 | Edit profile's rows: measured as drawn, and scrolled when they do not fit | its header |
 | `groups` | win32 | | 9640 | user groups, two clients | [Reading the calls harness](#reading-the-calls-harness) (its last part) |
 | `jumpdate` | win32 | | 9760 | jump to a date | [Reading the jump-to-date harness](#reading-the-jump-to-date-harness) |
 | `keymenu` | win32 | | 9610 | the keyboard's route to the context menu | [Reading the keyboard-menu harness](#reading-the-keyboard-menu-harness) |

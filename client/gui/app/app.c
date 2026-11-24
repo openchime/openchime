@@ -734,6 +734,12 @@ static oc_field  *g_form_f;                           /* the CALLER's array */
 static int        g_form_n;
 static field     *g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD / FF_MULTILINE only */
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
+/* The body the rows were last drawn in (Tab scrolls to a row in it), and, for
+ * the harness, each row's drawn extent (its label's top to its hint's or its
+ * box's bottom; 0,0 for a row not drawn), so "drawn within the height measured
+ * for it" is checkable. */
+static rectf g_form_body;
+static float g_form_row_top[FORM_MAX_FIELDS], g_form_row_bot[FORM_MAX_FIELDS];
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
 /* An optional photo column beside the fields (REQ-240: identity includes the
@@ -17388,8 +17394,46 @@ static float form_hint_h(const char *hint, float w) {
     return h > UIS(20.0f) ? h : UIS(20.0f);
 }
 
+/* A form row's geometry, named once and scaled with the text (UIS), so the
+ * row form_rowh measures and the row draw_form paints are the same row. When
+ * the painter placed its label, box and hint at fixed pixels while the measure
+ * scaled, Small text measured Edit profile's rows shorter than they were drawn:
+ * the card believed they fitted, gave no scroll, and its last row was drawn
+ * half under the edge. Every vertical offset in a row comes from here. */
+#define FORM_LABEL_H     UIS(20.0f)   /* the label's line, at the row's top */
+#define FORM_BOX_TOP     UIS(22.0f)   /* a box's top: the label and the gap under it */
+#define FORM_BOX_H       UIS(28.0f)   /* a single-line box, a select, a chip, a check's target */
+#define FORM_BOX_PAD_Y   UIS(5.0f)    /* the text inside a box, from its top and bottom */
+#define FORM_HINT_GAP    UIS(3.0f)    /* a box's bottom to its hint */
+#define FORM_ROW_GAP     UIS(4.0f)    /* below a single-line or select row */
+#define FORM_MULTI_GAP   UIS(6.0f)    /* below a multi-line row */
+#define FORM_CHECK_BOX   UIS(20.0f)   /* a check's square, centred in its target */
+#define FORM_CHECK_LBL_X UIS(30.0f)   /* a check's label, from the row's left */
+#define FORM_CHECK_GAP   UIS(6.0f)    /* below a check row */
+#define FORM_CHIP_TOP    UIS(24.0f)   /* a choice's first line of chips, below the row's top */
+#define FORM_CHIP_PITCH  UIS(34.0f)   /* one line of chips to the next */
+#define FORM_CHIP_PAD_X  UIS(24.0f)   /* a chip's width beyond its text */
+#define FORM_CHIP_GAP_X  UIS(8.0f)    /* between chips on a line */
+#define FORM_CHOICE_GAP  UIS(8.0f)    /* below a choice row's last chip */
+#define FORM_SEL_TEXT_Y  UIS(4.0f)    /* a select's value, from its box's top */
+#define FORM_SEL_CHEV_Y  UIS(5.0f)    /* its chevron, from the box's top */
+#define FORM_SEL_CHEV_L  UIS(22.0f)   /* the chevron's left, in from the box's right */
+#define FORM_SEL_CHEV_R  UIS(6.0f)    /* its right, in from the box's right */
+#define FORM_SEL_TEXT_R  UIS(26.0f)   /* the value stops short of the chevron */
+/* A text box's text, in from its sides. Not scaled: it is the inset the
+ * multi-line field's line count is taken at (form_multi_h, form_dialog), and a
+ * field narrower than it was counted at could wrap a line its box has no room
+ * for. Horizontal, so no row's height depends on it. */
+#define FORM_TEXT_X      9.0f
+
+/* The width a choice chip takes: one measure for form_rowh's wrap and the
+ * painter's. */
+static float form_chip_w(const char *opt) {
+    return text_width(opt, g_meta) + FORM_CHIP_PAD_X;
+}
+
 static float form_rowh(const oc_field *f, float w) {
-    if (f->kind == FF_CHECK)  return UIS(34);
+    if (f->kind == FF_CHECK)  return FORM_BOX_H + FORM_CHECK_GAP;
     if (f->kind == FF_CHOICE) {
         /* Measured, and wrapped like the painter wraps: a five-option row at
          * Large text does not fit one line, and a height that ignores that is
@@ -17403,23 +17447,32 @@ static float form_rowh(const oc_field *f, float w) {
             while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
             opt[oi] = '\0';
             if (*p2 == '|') p2++;
-            float bw = text_width(opt, g_meta) + 24;
+            float bw = form_chip_w(opt);
             if (bx > 0 && bx + bw > w) { rows++; bx = 0; }
-            bx += bw + 8;
+            bx += bw + FORM_CHIP_GAP_X;
             k++;
         }
-        return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
+        return FORM_CHIP_TOP + (float)(rows - 1) * FORM_CHIP_PITCH + FORM_BOX_H + FORM_CHOICE_GAP;
     }
     /* A select's `hint` is its options, not a line under it: measured as one,
      * the time zone list wrapped to a row two hundred pixels tall and pushed
      * the read-aloud voice off the bottom of Edit profile. */
-    if (f->kind == FF_SELECT) return UIS(54.0f);
+    if (f->kind == FF_SELECT) return FORM_BOX_TOP + FORM_BOX_H + FORM_ROW_GAP;
     /* A hint wraps, and its row grows by the lines it takes: one cut to a
      * single line lost the half of a sentence that said what to do. */
     float hint = (f->hint && f->hint[0]) ? form_hint_h(f->hint, w) : 0;
     if (f->kind == FF_MULTILINE)
-        return UIS(22.0f) + form_multi_h(f, w) + (hint > 0 ? hint + UIS(6.0f) : UIS(6.0f));
-    return UIS(54.0f) + hint;
+        return FORM_BOX_TOP + form_multi_h(f, w) + hint + FORM_MULTI_GAP;
+    return FORM_BOX_TOP + FORM_BOX_H + hint + FORM_ROW_GAP;
+}
+
+/* Each row's top below the body's, and the rows' whole height, as draw_form
+ * lays them out in a body `w` wide: one count for the painter and for Tab's
+ * scroll to a row out of sight. */
+static float form_row_tops(float w, float *tops) {
+    float total = 4;
+    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], w); }
+    return total;
 }
 
 static void draw_form(gfx *rt, rectf body) {
@@ -17432,9 +17485,13 @@ static void draw_form(gfx *rt, rectf body) {
      * A row is drawn whole or not at all, so a text field is never half
      * under the edge with its keyboard still in it; and when the keyboard
      * moves to a row out of sight, the rows move to show it. */
-    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
-    float tops[FORM_MAX_FIELDS], total = 4, view = body.bottom - body.top;
-    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], body.right - body.left); }
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) {
+        g_form_erect[i] = rf(0, 0, 0, 0);
+        g_form_row_top[i] = g_form_row_bot[i] = 0;
+    }
+    g_form_body = body;
+    float tops[FORM_MAX_FIELDS], view = body.bottom - body.top;
+    float total = form_row_tops(body.right - body.left, tops);
     g_form_scroll_max = total > view ? total - view : 0;
     {
         int fk = -1;
@@ -17453,9 +17510,13 @@ static void draw_form(gfx *rt, rectf body) {
     for (int i = 0; i < g_form_n; i++) {
         const oc_field *f = &g_form_f[i];
         float rh = form_rowh(f, body.right - body.left);
-        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 4.5f)) { y += rh; continue; }
+        /* Whole or not at all: a row whose measured bottom crosses the body's is
+         * skipped (half a pixel for rounding), and the measure is the drawn row. */
+        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 0.5f)) { y += rh; continue; }
+        float drawn_bot = y;
         if (f->kind == FF_CHECK) {
-            rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
+            float cy0 = y + (FORM_BOX_H - FORM_CHECK_BOX) / 2;
+            rectf box = rf(body.left, cy0, body.left + FORM_CHECK_BOX, cy0 + FORM_CHECK_BOX);
             int on = atoi(f->value) != 0;
             fill_round(rt, box, OC_R_CONTROL, on ? OC_COL_ACCENT : OC_COL_INPUT);
             /* The ring says where the keyboard is, on a drawn field exactly as on
@@ -17469,29 +17530,30 @@ static void draw_form(gfx *rt, rectf body) {
                 draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
                 g_meta->align = ST_ALIGN_LEFT;
             }
-            draw_text(rt, f->label, g_ui, rf(body.left + 30, y + 2, body.right, y + 26), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui, rf(body.left + FORM_CHECK_LBL_X, y, body.right, y + FORM_BOX_H), OC_COL_TEXT);
             if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
                 /* The label is part of the target: a 20px box is not a click. */
-                g_form_hits[g_n_form_hits].r = rf(body.left, y, body.right, y + 28);
+                g_form_hits[g_n_form_hits].r = rf(body.left, y, body.right, y + FORM_BOX_H);
                 g_form_hits[g_n_form_hits].field = i;
                 g_form_hits[g_n_form_hits].val = !on;
                 g_n_form_hits++;
             }
+            drawn_bot = y + FORM_BOX_H;
         } else if (f->kind == FF_CHOICE) {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             int cur = atoi(f->value), k = 0;
-            float bx = body.left, cy = y + 24;
+            float bx = body.left, cy = y + FORM_CHIP_TOP;
             const char *p2 = f->hint ? f->hint : "";
             while (*p2 && k < 8) {
                 char opt[48]; int oi = 0;
                 while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
                 opt[oi] = '\0';
                 if (*p2 == '|') p2++;
-                float bw = text_width(opt, g_meta) + 24;
+                float bw = form_chip_w(opt);
                 /* Wrap, exactly as form_rowh counted: a chip that would cross
                  * the body edge starts a new line instead of vanishing. */
-                if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += UIS(34.0f); }
-                rectf b = rf(bx, cy, bx + bw, cy + 28);
+                if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += FORM_CHIP_PITCH; }
+                rectf b = rf(bx, cy, bx + bw, cy + FORM_BOX_H);
                 int on = (k == cur);
                 draw_chip_r(rt, b, opt, on);
                 /* The chosen chip wears the ring when the row has the keyboard,
@@ -17504,17 +17566,18 @@ static void draw_form(gfx *rt, rectf body) {
                     g_form_hits[g_n_form_hits].val = k;
                     g_n_form_hits++;
                 }
-                bx = b.right + 8;
+                bx = b.right + FORM_CHIP_GAP_X;
                 k++;
             }
+            drawn_bot = cy + FORM_BOX_H;
         } else if (f->kind == FF_SELECT) {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             float action_w = 0;
             if (i == g_form_action_field && g_form_on_action) {
                 const char *lbl = g_form_action_busy ? g_form_action_busy_label : g_form_action_label;
                 action_w = text_width(lbl, g_ui) + UIS(28);
-                g_form_action_btn = rf(body.right - FORM_BOX_INSET - action_w, y + 22,
-                                       body.right - FORM_BOX_INSET, y + 50);
+                g_form_action_btn = rf(body.right - FORM_BOX_INSET - action_w, y + FORM_BOX_TOP,
+                                       body.right - FORM_BOX_INSET, y + FORM_BOX_TOP + FORM_BOX_H);
                 int hot = !g_form_action_busy && in_rect(g_form_action_btn, g_mouse_x, g_mouse_y);
                 fill_round(rt, g_form_action_btn, OC_R_CONTROL,
                            g_form_action_busy ? OC_COL_INPUT : hot ? OC_COL_HOVER : OC_COL_INPUT);
@@ -17528,8 +17591,8 @@ static void draw_form(gfx *rt, rectf body) {
                 g_ui->align = ST_ALIGN_LEFT;
                 action_w += UIS(8);
             }
-            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET - action_w, y + 50);
+            rectf box = rf(body.left + FORM_BOX_INSET, y + FORM_BOX_TOP,
+                           body.right - FORM_BOX_INSET - action_w, y + FORM_BOX_TOP + FORM_BOX_H);
             int open = (g_form_sel_field == i) || (g_form_focus == i && !g_form_focus_btn);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The accent ring while the list is open, matching what a focused
@@ -17539,17 +17602,20 @@ static void draw_form(gfx *rt, rectf body) {
             g_form_sel_box[i] = box;
             char cur[96];
             if (!sel_opt(f->hint, atoi(f->value), cur, sizeof cur)) cur[0] = '\0';
-            draw_text(rt, cur, g_ui, rf(box.left + 9, box.top + 4, box.right - 26, box.bottom),
+            draw_text(rt, cur, g_ui, rf(box.left + FORM_TEXT_X, box.top + FORM_SEL_TEXT_Y,
+                                        box.right - FORM_SEL_TEXT_R, box.bottom),
                       cur[0] ? OC_COL_TEXT : OC_COL_FAINT);
             /* A chevron, so the field reads as one that opens rather than one
              * you type into — the only thing distinguishing the two shapes. */
             draw_text(rt, open ? "▴" : "▾", g_meta,
-                      rf(box.right - 22, box.top + 5, box.right - 6, box.bottom), OC_COL_FAINT);
+                      rf(box.right - FORM_SEL_CHEV_L, box.top + FORM_SEL_CHEV_Y,
+                         box.right - FORM_SEL_CHEV_R, box.bottom), OC_COL_FAINT);
+            drawn_bot = box.bottom;
         } else {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
-            float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : 28.0f;
-            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET, y + 22 + bh);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
+            float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : FORM_BOX_H;
+            rectf box = rf(body.left + FORM_BOX_INSET, y + FORM_BOX_TOP,
+                           body.right - FORM_BOX_INSET, y + FORM_BOX_TOP + bh);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
              * field itself draws no border. */
@@ -17565,13 +17631,18 @@ static void draw_form(gfx *rt, rectf body) {
                          i == g_form_err_field ? OC_COL_DANGER : focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (g_form_edit[i])
-                field_draw(rt, g_form_edit[i], rf(box.left + 9, box.top + 5, box.right - 9, box.bottom - 5), OC_COL_TEXT);
-            if (f->hint && f->hint[0])
+                field_draw(rt, g_form_edit[i], rf(box.left + FORM_TEXT_X, box.top + FORM_BOX_PAD_Y,
+                                                  box.right - FORM_TEXT_X, box.bottom - FORM_BOX_PAD_Y), OC_COL_TEXT);
+            drawn_bot = box.bottom;
+            if (f->hint && f->hint[0]) {
+                drawn_bot = box.bottom + FORM_HINT_GAP + form_hint_h(f->hint, body.right - body.left);
                 draw_text(rt, f->hint, g_meta_w,
-                          rf(body.left, box.bottom + 3, body.right,
-                             box.bottom + 3 + form_hint_h(f->hint, body.right - body.left)),
+                          rf(body.left, box.bottom + FORM_HINT_GAP, body.right, drawn_bot),
                           i == g_form_err_field ? OC_COL_DANGER : OC_COL_FAINT);
+            }
         }
+        g_form_row_top[i] = y;
+        g_form_row_bot[i] = drawn_bot;
         y += rh;
     }
     /* Where the rows are, when there are more than fit: a thin bar on the
@@ -19834,6 +19905,24 @@ static int form_field_is_drawn(int i) {
 /* Tab and Shift+Tab across every stop in the form: each field, plus the action
  * button beside one of them. Text fields take focus through focus_set; checks,
  * choices and selects hold it here, which is what makes them reachable at all. */
+/* Scroll the form so row `i` is in view, in the body last drawn. A text field
+ * in a row out of sight is hidden, and focus_set refuses a hidden field: Tab
+ * onto one dropped the keyboard instead of moving it, and the rows never
+ * scrolled to it. So the row is brought into view first, as draw_form's
+ * keep-in-view rule would, and its field shown; the next paint places it. */
+static void form_scroll_to_row(int i) {
+    float w = g_form_body.right - g_form_body.left, view = g_form_body.bottom - g_form_body.top;
+    if (i < 0 || i >= g_form_n || w <= 0 || view <= 0) return;
+    float tops[FORM_MAX_FIELDS];
+    float total = form_row_tops(w, tops);
+    float max = total > view ? total - view : 0;
+    float rb = (i + 1 < g_form_n ? tops[i + 1] : total);
+    if (tops[i] - 4 < g_form_scroll) g_form_scroll = tops[i] - 4;
+    else if (rb > g_form_scroll + view) g_form_scroll = rb - view;
+    if (g_form_scroll > max) g_form_scroll = max;
+    if (g_form_scroll < 0) g_form_scroll = 0;
+}
+
 static void form_focus_step(oc_win *owner, int dir) {
     (void)owner;
     if (!g_form_open || g_form_n <= 0) return;
@@ -19859,6 +19948,8 @@ static void form_focus_step(oc_win *owner, int dir) {
         }
         if (g_form_edit[at]) {
             g_form_focus = -1;
+            form_scroll_to_row(at);
+            field_show(g_form_edit[at], 1);
             focus_set(g_form_edit[at]);
             field_select_all(g_form_edit[at]);
             return;
@@ -42479,10 +42570,20 @@ static void test_dump(const char *path) {
             float lh = g_meta_w && g_meta_w->f ? st_line_height(g_st, g_meta_w->f) : UIS(18.0f);
             fprintf(f, "  formlines %d lines=%d shown=%d first=%d\n", i,
                     g_form_edit[i]->lines,
-                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 10) / (lh > 0 ? lh : 1)),
+                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 2 * FORM_BOX_PAD_Y) / (lh > 0 ? lh : 1)),
                     (int)(g_form_edit[i]->scroll / (lh > 0 ? lh : 1)));
         }
     }
+    /* The rows against the body they scroll in: each row's drawn extent beside
+     * the height form_rowh gives it, so "measured as drawn" is checkable, and
+     * the scroll, so a row left undrawn is seen to be reachable. Unrounded: a
+     * pixel's rounding is the size of what is being checked. */
+    fprintf(f, "formscroll scroll=%.2f max=%.2f body=%.2f,%.2f,%.2f,%.2f\n",
+            g_form_open ? g_form_scroll : 0, g_form_open ? g_form_scroll_max : 0,
+            g_form_body.left, g_form_body.top, g_form_body.right, g_form_body.bottom);
+    for (int i = 0; i < g_form_n && g_form_f && g_form_open; i++)
+        fprintf(f, "  formrow %d top=%.2f bottom=%.2f h=%.2f\n", i, g_form_row_top[i], g_form_row_bot[i],
+                form_rowh(&g_form_f[i], g_form_body.right - g_form_body.left));
     fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
             g_form_sel_field >= 0, g_form_sel_field, g_form_sel_scroll, g_n_form_sel_rows,
             g_form_sel_panel.left, g_form_sel_panel.top,
@@ -46398,8 +46499,12 @@ static int on_key_down(oc_win *hwnd, int wp) {
         if (g_lightbox && (wp == OCK_LEFT || wp == OCK_RIGHT)) { lb_step(wp == OCK_LEFT ? -1 : +1); return 0; }
         if (g_lightbox && wp == OCK_RETURN) { lb_play(hwnd); invalidate(); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
-         * the middle column's overlays — the pane is what you just opened. */
-        if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS) {
+         * the middle column's overlays — the pane is what you just opened. Not
+         * under a modal: the card is over the pane, and Esc is the card's
+         * (modal_key, below). With a form's select or check holding the
+         * keyboard, no field claims Esc first, and it popped the profile pane
+         * behind Edit profile while the card stayed open. */
+        if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS && !modal_open()) {
             rp_pop(); invalidate(); return 0;
         }
         if (wp == OCK_ESCAPE && g_sub_open) { submenu_close(); invalidate(); return 0; }
