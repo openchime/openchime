@@ -495,6 +495,12 @@ framework.
   rows for the poll asked about only -- and the live run posts, votes and asks who
   voted between two clients through the real daemon. `tools/gui/features/polls.sh`
   drives the card in both GUI clients (tools/gui/README.md).
+- **The system caret** (REQ-269, ARCH-99) — `tools/gui/features/caret.sh`, on
+  Win32: the caret Windows reports for the client's thread, read back into the
+  dump's `caret` line, sits at the drawn caret while the message box has focus,
+  follows typing and the arrow keys, moves to the search box when that takes
+  focus and back when Escape leaves it, and is gone when no field has focus (tools/gui/README.md, "Reading the
+  caret harness").
 - **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tools/gui/features/calls.sh`
   and `callhome.sh` (`# needs: callrec`), `newcall.sh`, `prejoin.sh` and
   `camera.sh`, on Win32 and in the browser. `calls.sh`: New Call opened from a

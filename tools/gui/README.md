@@ -43,6 +43,7 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the search-box harness](#reading-the-search-box-harness)
 - [Reading the voice harness](#reading-the-voice-harness)
 - [Reading the cursor harness](#reading-the-cursor-harness)
+- [Reading the caret harness](#reading-the-caret-harness)
 - [Seeing the whole window](#seeing-the-whole-window)
 - [`clipped=`: text that does not fit its own box](#clipped-text-that-does-not-fit-its-own-box)
 - [Observing the tray balloon](#observing-the-tray-balloon)
@@ -344,6 +345,7 @@ when reading its output.
 | `calls` | win32 web | | 9620 | a call between two clients, its sound both ways, sharing a screen | [Reading the calls harness](#reading-the-calls-harness) |
 | `calls_tcp` | win32 web | | 9670 | a call when UDP cannot reach the relay | [Reading the calls harness](#reading-the-calls-harness) |
 | `camera` | win32 web | | 9676 | cameras in the call view, both ways | [Reading the calls harness](#reading-the-calls-harness) |
+| `caret` | win32 | | 9600 | the system caret assistive technology follows, at the drawn one | [Reading the caret harness](#reading-the-caret-harness) |
 | `chords` | web | | 9750 | a shortcut pressed quickly in the browser is still the shortcut | [Driving the web client](#driving-the-web-client) |
 | `collapse` | win32 web | | 9700 | long messages collapsed by the reader | its header |
 | `composer` | win32 | | 9540 | the composer's layout | [Reading the composer harness](#reading-the-composer-harness) |
@@ -1079,6 +1081,23 @@ the signed-in dump and the signed-out one alike, is the shape it last set
 (`none` before any). `tools/gui/features/cursor.sh` (Windows and the web) sends a
 message with a link, then hovers the composer's text, the link and empty space
 with `move`, and asserts `ibeam`, `hand` and `arrow` in turn.
+
+## Reading the caret harness
+
+The client draws its own caret, and screen readers and magnifiers follow the
+system caret instead (REQ-269, ARCH-99), so the client creates one wherever a
+drawn field puts its caret, and never shows it. Being invisible by design, it
+is read from the dump's `caret` line: `owned= x= y=` is the client's record of
+where it put it, `sys= sx= sy= sh=` what Windows says the thread's caret is
+(`GetGUIThreadInfo`, `GetCaretPos`), `sys=0` when there is none.
+`tools/gui/features/caret.sh` drives the Win32 client against its own fixture
+daemon (port 9600) and asserts that, with the message box focused, there is a
+system caret at the drawn one (`sx`/`sy` equal to `x`/`y`); that it follows the
+caret as text is typed, and as Left and Right move it; that it moves into the
+search box (its `searchbox srch edit=` rect) when that takes focus, and back to
+the message box when Escape leaves the search box; and that it is gone,
+`owned=0 sys=0`, in the Files view, where no field has focus. Not in CI, for the smoke's reason. Run it when a change touches a
+drawn field, focus, or the platform's text input.
 
 ## Seeing the whole window
 

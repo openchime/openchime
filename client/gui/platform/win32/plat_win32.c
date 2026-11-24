@@ -266,6 +266,46 @@ static HWND msgwnd(void) {
 }
 
 void oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) { SDL_SetTextInputArea(w, r, 0); }
+
+/* The system caret (REQ-269, ARCH-99): created on SDL's HWND, 1 pixel wide and
+ * as tall as the drawn caret, and moved with it. Never ShowCaret: an
+ * XOR-painted GDI caret over the renderer's surface would flicker, and the
+ * application draws the caret people see. Created again only when its height
+ * changes -- CreateCaret replaces the thread's caret, and each one is an
+ * object-created event to whatever is watching. */
+static HWND g_caret_hwnd;
+static int  g_caret_h;
+
+void oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r) {
+    if (!r) {
+        if (g_caret_hwnd) DestroyCaret();
+        g_caret_hwnd = NULL; g_caret_h = 0;
+        return;
+    }
+    HWND h = hwnd_of(w);
+    if (!h) return;
+    int ch = r->h < 1 ? 1 : r->h;
+    if (h != g_caret_hwnd || ch != g_caret_h) {
+        if (!CreateCaret(h, NULL, 1, ch)) { g_caret_hwnd = NULL; g_caret_h = 0; return; }
+        g_caret_hwnd = h; g_caret_h = ch;
+    }
+    SetCaretPos(r->x, r->y);
+}
+
+/* Windows' own account of the caret, not ours: the thread's caret window and
+ * height from GetGUIThreadInfo, its position from GetCaretPos. */
+int oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out) {
+    HWND h = hwnd_of(w);
+    GUITHREADINFO gi; memset(&gi, 0, sizeof gi); gi.cbSize = sizeof gi;
+    if (!h || !GetGUIThreadInfo(GetCurrentThreadId(), &gi) || gi.hwndCaret != h) return 0;
+    POINT p;
+    if (!GetCaretPos(&p)) return 0;
+    out->x = p.x; out->y = p.y;
+    out->w = gi.rcCaret.right - gi.rcCaret.left;
+    out->h = gi.rcCaret.bottom - gi.rcCaret.top;
+    return 1;
+}
+
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 1920; *max_h = 1080; }
 void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 30; }
 const char *oc_plat_mic_settings_name(void) { return "Windows privacy settings"; }

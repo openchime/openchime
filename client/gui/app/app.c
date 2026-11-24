@@ -4316,7 +4316,8 @@ static int g_n_sbsel;
 static int ws_unread_elsewhere(void);   /* fwd */
 static int main_is_conversation(void); /* fwd — the sidebar's selection asks it too */
 static void ed_caret_kill(void);       /* fwd — the paint pass owns the caret's life */
-static int  g_caret_placed;            /* set by ed_caret_sync, cleared each paint */
+static void caret_place(SDL_Rect area); /* fwd — the system caret, for every drawn field */
+static int  g_caret_placed;            /* set by caret_place, cleared each paint */
 
 static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
@@ -22265,9 +22266,16 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
         gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(cx, oy + cr.y + 1, cx + 1.0f, oy + cr.y + cr.h - 1), OC_COL_TEXT);
         gfx_tag(rt, NULL);
-        /* Where an IME should put its candidates (and what a magnifier follows). */
+    }
+    /* Where an IME should put its candidates, and the system caret screen
+     * readers and magnifiers follow (REQ-269, ARCH-99): every frame the field
+     * has focus, not only in the blink's lit phase, or the system caret would
+     * come and go with it. */
+    if (focused && l) {
+        st_rect cr = fld_caret_rect(f, l, f->caret);
+        float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
         SDL_Rect area = { PX(cx), PX(oy + cr.y), 1, PX(cr.h) };
-        oc_plat_text_input_area(g_win, &area);
+        caret_place(area);
     }
     gfx_clip_pop(rt);
     if (l) st_layout_destroy(l);
@@ -27333,38 +27341,53 @@ static int ed_lines(float w) {
 
 /* The caret's rect, in the coordinate space of `box`. */
 /* ---- the system caret (REQ-269, ARCH-99) ----------------------------------
- * A self-drawn text field still has to tell Windows where the caret is. The
- * system caret is what screen readers and magnifiers track, and what a
- * `WM_GETOBJECT`-less app has never had here. ed_caret_sync tells the platform
- * through oc_plat_text_input_area; `g_caret_owned` and `g_caret_at` are our own
- * record of having done so and where, so an unchanged caret is not re-sent. */
+ * A self-drawn text field still has to give the platform a caret where it
+ * draws one. The system caret is what screen readers and magnifiers track;
+ * without it they cannot follow typing at all. caret_place tells the platform
+ * twice over, with the same rect: oc_plat_text_input_area (where an IME puts
+ * its candidates) and oc_plat_text_caret (the system caret, created and moved
+ * but never shown -- the drawn caret is the one people see). The composer
+ * comes through ed_caret_sync, every other drawn field through field_draw.
+ * `g_caret_owned`, `g_caret_at` and `g_caret_h` are our own record of having
+ * done so and where, so an unchanged caret is not re-sent; the dump reports
+ * it beside what the platform says it has (oc_plat_text_caret_at). */
 /* g_caret_placed (declared above, with the paint pass that clears it): a caret
  * nobody placed this frame belongs to a field that is no longer on screen, and
  * ed_caret_kill forgets it -- otherwise it would stay wherever it was last put.
  * That is the bar once left sitting at the bottom of the Drafts pane. */
 static int    g_caret_owned;
 static ipoint g_caret_at = { -32768, -32768 };
+static int    g_caret_h;
 
 static void ed_caret_kill(void) {
     if (!g_caret_owned) return;
     g_caret_owned = 0;
     g_caret_at.x = g_caret_at.y = -32768;
+    g_caret_h = 0;
+    oc_plat_text_caret(g_win, NULL);
 }
 
-/* `cr` is the caret rect in DIPs, as the field draws it. Told to the platform
- * as the text input area: what an IME puts its candidates by and what a
- * magnifier follows. */
-static void ed_caret_sync(rectf cr) {
-    if (!ed_focused()) { ed_caret_kill(); return; }
+/* `area` is the caret in window pixels, as a field draws it. Placed this
+ * frame, so the paint pass keeps it; re-sent only when it moved or changed
+ * height. */
+static void caret_place(SDL_Rect area) {
     g_caret_placed = 1;
-    int h = PX(cr.bottom - cr.top);
-    if (h < 1) h = 1;
+    if (area.h < 1) area.h = 1;
     g_caret_owned = 1;
-    ipoint p = { PX(cr.left), PX(cr.top) };
-    if (p.x == g_caret_at.x && p.y == g_caret_at.y) return;   /* no event churn */
-    g_caret_at = p;
-    SDL_Rect area = { p.x, p.y, 1, h };
+    if (area.x == g_caret_at.x && area.y == g_caret_at.y && area.h == g_caret_h)
+        return;   /* no event churn */
+    g_caret_at.x = area.x; g_caret_at.y = area.y; g_caret_h = area.h;
     oc_plat_text_input_area(g_win, &area);
+    oc_plat_text_caret(g_win, &area);
+}
+
+/* `cr` is the composer's caret rect in DIPs, as it draws it. Not focused, it
+ * places nothing: another drawn field may hold the caret this frame, and a
+ * caret nobody placed is removed at the end of the paint (g_caret_placed). */
+static void ed_caret_sync(rectf cr) {
+    if (!ed_focused()) return;
+    SDL_Rect area = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
+    caret_place(area);
 }
 
 static int ed_caret_rect(rectf box, rectf *out) {
@@ -28939,10 +28962,7 @@ static int ed_select_word(oc_win *hwnd, float x, float y) {
 static void ed_ime_place(oc_win *hwnd) {
     (void)hwnd;
     rectf cr;
-    if (ed_caret_rect(g_ed_box, &cr)) {
-        SDL_Rect a = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
-        oc_plat_text_input_area(g_win, &a);
-    }
+    if (ed_caret_rect(g_ed_box, &cr)) ed_caret_sync(cr);
 }
 
 /* An IME composition in progress (SDL_EVENT_TEXT_EDITING): `comp` is the text
@@ -41064,7 +41084,13 @@ static void test_dump(const char *path) {
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
     {
-        fprintf(f, "caret owned=%d x=%ld y=%ld\n", g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y);
+        /* `sys=` and after: what the platform says it has, read back from it
+         * (on Windows, the thread's caret), not our record of having asked. */
+        SDL_Rect sr = { 0, 0, 0, 0 };
+        int sys = oc_plat_text_caret_at(g_win, &sr);
+        fprintf(f, "caret owned=%d x=%ld y=%ld sys=%d sx=%d sy=%d sh=%d\n",
+                g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y,
+                sys, sys ? sr.x : 0, sys ? sr.y : 0, sys ? sr.h : 0);
     }
     /* The last error the core reported, and its monotonic sequence. Without this
      * a failed intent is indistinguishable from an intent that was never sent —

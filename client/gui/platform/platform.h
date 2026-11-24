@@ -118,6 +118,15 @@ void  oc_plat_window_attach(SDL_Window *w);
  * platform's hidden input element moves there, since the browser's IME
  * composes into an element, not a canvas (plat_web.c). */
 void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r);
+/* The system caret, which screen readers and magnifiers follow (REQ-269,
+ * ARCH-99): placed at `r` (window pixels, `r->h` tall) wherever the drawn
+ * caret is, and removed with `r` NULL. Never shown -- the application draws
+ * the caret people see. A platform whose caret is the text input area itself
+ * (a browser's hidden input element) does nothing more here. */
+void  oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r);
+/* Where the platform's own caret is, read back from the platform (the dump
+ * reports it): 1 with its rect in `out`, 0 when there is none. */
+int   oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out);
 /* Bring the window forward and give it the keyboard, however the platform
  * lets a process that does not own the foreground do that. */
 void  oc_plat_window_front(SDL_Window *w);

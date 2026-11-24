@@ -347,6 +347,11 @@ void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) {
         ime.style.height = Math.max(1, $3) + "px";
     }, r->x, r->y, r->w, r->h);
 }
+/* The browser's caret is the hidden input element's, which
+ * oc_plat_text_input_area already keeps at the drawn caret: nothing more to
+ * place, and no platform caret of its own to read back. */
+void  oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r) { (void)w; (void)r; }
+int   oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out) { (void)w; (void)out; return 0; }
 void  oc_plat_window_front(SDL_Window *w) { (void)w; EM_ASM({ window.focus(); }); }
 int   oc_plat_window_is_front(SDL_Window *w) { (void)w; return EM_ASM_INT({ return document.hasFocus() ? 1 : 0; }); }
 int   oc_plat_window_has_keyboard(SDL_Window *w) { (void)w; return 1; }
