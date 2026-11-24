@@ -811,8 +811,15 @@ past the last one doing nothing. The workspace half starts a **second daemon** o
 the next port, because a client keys a workspace by its address and signing in
 twice to one address is one workspace; and it sets the starting point through the
 switcher's own path before each key, so a check cannot begin where it means to
-end. It reads the dump's `marks ch … unread=`, `toast[n]` and
-`workspaces=/active=` lines. Not in CI, for the smoke's reason.
+end. It also covers Up in an empty message box, which opens your newest message
+for editing as its Edit does: in a channel only alice speaks in, Up after her
+message puts its text in the box with the caret at the end, Esc cancels, and
+Enter after fixing it saves the edit; with text in the box Up edits nothing,
+nor does Ctrl+Up, which walks the transcript; and in a channel where only bob
+has spoken, Up leaves the box empty. It reads the dump's `marks ch … unread=`,
+`toast[n]`, `workspaces=/active=` and `ed` lines, `edit=` there being the
+message the box is editing (0 for none) and the message's id its newest
+`msgrow`'s `mid=`. Not in CI, for the smoke's reason.
 
 ## Reading the composer harness
 

@@ -2360,6 +2360,42 @@ static void test_time_preview(void) {
     tzset();
 }
 
+/* An edit to the conversation's newest message, by the preview's author, is
+ * what the sidebar's preview then shows (REQ-051): fixing what you just sent
+ * fixes the line under the conversation's name too. An edit to an older
+ * message leaves the preview alone. */
+static void test_edit_preview(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 76; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 76; e.message_id = 8; e.author_id = 2;
+    e.body = strdup("the first line");
+    oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 76; e.message_id = 9; e.author_id = 2;
+    e.body = strdup("lunch at noon tomorow");
+    oc_model_apply(&m, &e); free(e.body);
+    const oc_channel *c = oc_model_channel(&m, 76);
+    CHECK(c && strcmp(c->preview, "lunch at noon tomorow") == 0);
+
+    /* The older one: its text changes, the preview does not. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 76; e.message_id = 8;
+    e.body = strdup("the first line, fixed");
+    oc_model_apply(&m, &e); free(e.body);
+    c = oc_model_channel(&m, 76);
+    CHECK(c && c->n_msgs == 2 && strcmp(c->msgs[0].body, "the first line, fixed") == 0);
+    CHECK(c && strcmp(c->preview, "lunch at noon tomorow") == 0);
+
+    /* The newest: the preview takes the new text. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 76; e.message_id = 9;
+    e.body = strdup("lunch at noon tomorrow");
+    oc_model_apply(&m, &e); free(e.body);
+    c = oc_model_channel(&m, 76);
+    CHECK(c && c->msgs[1].edited && strcmp(c->preview, "lunch at noon tomorrow") == 0);
+    oc_model_free(&m);
+}
+
 /* A spoiler never shows in an excerpt (MARKDOWN.md §1d): the sidebar's
  * preview, the one-line text a toast or a screen reader gets, and a thread
  * reply's toast. */
@@ -7175,6 +7211,7 @@ int run_client_core_tests(void) {
     test_workspace_sender_model();
     test_time_preview();
     test_spoiler_preview();
+    test_edit_preview();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();

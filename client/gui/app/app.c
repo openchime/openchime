@@ -10461,6 +10461,7 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Esc",                "Close the open pane, popover or picker" },
     { 0,                  0,          ACC_NONE,  "Tab",                "Insert the highlighted completion" },
     { 0,                  0,          ACC_NONE,  "Up / Down",          "Move through completions" },
+    { 0,                  0,          ACC_NONE,  "Up (in an empty message box)", "Edit your last message" },
     { AM_ALT,             OCK_UP,      ACC_NAV_PREV,        "Alt+Up / Alt+Down",   "Previous / next conversation" },
     { AM_ALT,             OCK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
     { AM_ALT | AM_SHIFT,  OCK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
@@ -28538,6 +28539,8 @@ static rectf te_control_rect(uint64_t a) {
 
 static void composer_send(void);            /* fwd */
 static void composer_cancel_edit(void);     /* fwd */
+static void composer_begin_edit(const oc_msg *msg);   /* fwd */
+static const oc_msg *newest_editable(const oc_model *m);   /* fwd: Up in an empty box edits it */
 static int  composer_remeasure(void);       /* fwd */
 static void ac_rebuild(void);               /* fwd */
 static void ac_close(void);                 /* fwd */
@@ -28792,6 +28795,15 @@ static int ed_key(oc_win *hwnd, int vk) {
             g_ac_sel = (g_ac_sel + (vk == OCK_DOWN ? 1 : g_n_ac - 1)) % g_n_ac;
             invalidate();
             return 1;
+        }
+        /* Up with no modifier in an empty box opens your newest message for
+         * editing, as its Edit does -- the habit of fixing what you just sent.
+         * Empty means nothing at all waits here: no text, no composition, no
+         * files, no edit already open. Otherwise Up moves the caret. */
+        if (vk == OCK_UP && !ctrl && !shift && !mod_down(OCK_ALT) && !g_edit_msg &&
+            g_view != VIEW_NEWMSG && ed_len() == 0 && !g_ed_comp_len && !ftray_waiting()) {
+            const oc_msg *em = newest_editable(model());
+            if (em) { composer_begin_edit(em); invalidate(); return 1; }
         }
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
          * "the line above" is a question only the sdltext layout can answer. */
@@ -33035,6 +33047,33 @@ static void upload_file(oc_win *hwnd) {
     for (int i = 0; i < n; i++, p += strlen(p) + 1) ftray_add(hwnd, p);
 }
 
+/* Whether a message may be edited from here, the one test both the message
+ * menu's Edit and Up in an empty message box ask: your own, not deleted, not a
+ * poll (it has Edit poll) or a to-do list (a list is not edited), inside the
+ * workspace's edit window (REQ-051), and not in an ended encrypted DM, which
+ * stands as it is. */
+static int msg_may_edit(const oc_model *m, const oc_msg *msg) {
+    if (!m || !msg || msg->author_id != m->user_id) return 0;
+    if (msg->deleted || msg->poll || msg->todo || conv_e2e_locked()) return 0;
+    return oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
+}
+
+/* Your newest message that may be edited, where the message box posts: the open
+ * thread's replies while one is open, the conversation's messages otherwise.
+ * NULL when there is none. */
+static const oc_msg *newest_editable(const oc_model *m) {
+    if (!m) return NULL;
+    if (m->thread_open) {
+        for (size_t i = m->n_thread_msgs; i > 0; i--)
+            if (msg_may_edit(m, &m->thread_msgs[i - 1])) return &m->thread_msgs[i - 1];
+        return NULL;
+    }
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    for (size_t i = c ? c->n_msgs : 0; i > 0; i--)
+        if (msg_may_edit(m, &c->msgs[i - 1])) return &c->msgs[i - 1];
+    return NULL;
+}
+
 /* The message context menu. Built into the app's own floating menu — see
  * the MENU_* comment for why it stopped being a TrackPopupMenu.
  *
@@ -33142,7 +33181,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
     int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
     if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
-    if (may_edit && !msg->deleted && !locked && !msg->todo) mi_item(21, "Edit");   /* a list is not edited */
+    if (msg_may_edit(m, msg)) mi_item(21, "Edit");
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
     if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
     /* Move (REQ-053): an author's own, or anything for an admin or owner, out
@@ -42042,11 +42081,12 @@ static void test_dump(const char *path) {
          * a box sized for fewer lines than its text has clips the text. */
         float box_w = g_ed_box.right - g_ed_box.left;
         fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d composer_h=%.0f"
-                   " lines=%d fit_lines=%d text=\"%s\"\n",
+                   " lines=%d fit_lines=%d edit=%llu text=\"%s\"\n",
                 ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
                 g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
-                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0, ed8);
+                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0,
+                (unsigned long long)g_edit_msg, ed8);
         /* The composer's Preview: whether it is shown, what the renderer made of
          * the draft, and where its button is. */
         /* frames: what this process has written, which previewing must not move.

@@ -3205,6 +3205,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     msg_clear_unfurls(&c->msgs[i]);
                     /* And the action it may now be, or no longer is (REQ-058). */
                     msg_set_action(&c->msgs[i], e);
+                    /* The conversation's newest, by the preview's author: the
+                     * preview the sidebar reads takes the new text, by the
+                     * rule an action on its own frame uses. An older message's
+                     * edit leaves it as it was. */
+                    oc_msg *msg = &c->msgs[i];
+                    if (i + 1 == c->n_msgs && msg->body && c->preview_author == msg->author_id) {
+                        preview_set(m, c->preview, sizeof c->preview,
+                                    msg->action.present ? msg->body + msg->action.start : msg->body);
+                        c->preview_action = msg->action.present;
+                    }
                     break;
                 }
             }
