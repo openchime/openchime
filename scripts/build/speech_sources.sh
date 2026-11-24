@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch and check the archived inputs of the speech data (docs/VENDORS.md): the
+# Fetch and check the archived inputs of the speech data (docs/details/VENDORS.md): the
 # published files the read-aloud voice model and the voice-input recognizer are
 # converted from.
 #
@@ -14,7 +14,7 @@
 # then unpacks DIR/voice-src and DIR/recognizer-src, and checks every unpacked
 # source file against
 # SHA256SUMS-inputs.txt, itself pinned above; those are the SHA-256s
-# docs/VENDORS.md records. A file that does not match stops it, named. DIR/.checked
+# docs/details/VENDORS.md records. A file that does not match stops it, named. DIR/.checked
 # is written last, only when everything matched, and removed first.
 #
 # `check` repeats every check on what DIR holds, with no network, so a copy of the

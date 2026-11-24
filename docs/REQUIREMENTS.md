@@ -112,8 +112,8 @@ where one exists.
 - **REQ-013.** Every client has offered a **workspace switcher** with the same
   shape across platforms: the remembered workspaces, an indication of unread
   activity and connection state for each, and an always-present entry for
-  signing in to another workspace ("Log in to new workspace" in the TUI, "Add a
-  workspace" on Win32). Switching has been possible at any time without restarting
+  signing in to another workspace ("Sign in to a new workspace" in the TUI, "Add a
+  workspace" in the graphical client). Switching has been possible at any time without restarting
   the client.
 - **REQ-014.** A client has held sessions to **several workspaces at once**, so
   that activity in a workspace the user is not currently looking at has still
@@ -134,7 +134,7 @@ where one exists.
 
 - **REQ-020.** The system has authenticated a user through the
   **identity sources** its deployment enables (ARCH-19, ARCH-55,
-  [AUTH.md](./AUTH.md)): **local** (daemon-managed username+password), the
+  [AUTH.md](./details/AUTH.md)): **local** (daemon-managed username+password), the
   **relay** (social login via the project's central service), or a **direct
   connection** to an OIDC provider the operator names (REQ-027). Local accounts
   and direct connections depend on no project-operated service, so a self-hosted
@@ -222,19 +222,20 @@ where one exists.
   have verified it, and the default has been to refuse. The decision has been the
   daemon's, which owns the `users` table; the central service has held no member
   list (REQ-040). A refusal has been distinguishable to the client from a bad
-  credential, and audited ([AUTH.md](./AUTH.md) §8.4).
+  credential, and audited ([AUTH.md](./details/AUTH.md) §8.4).
 - **REQ-029.** A brokered or direct sign-in has been usable only by the client
   that began it, and only once: the client has held a secret the browser never
   carried, and the daemon has refused a token or code presented without it, or
   presented a second time. A token captured from the redirect, from browser
   history, or by another account on the same machine has granted nothing
-  ([AUTH.md](./AUTH.md) §8.2).
+  ([AUTH.md](./details/AUTH.md) §8.2).
 
 ### 1.3 Authorization and Roles
 
 - **REQ-030.** Every user in a tenant has held exactly one tenant-level role
-  at a time: **owner**, **admin**, or **member**, stored as a `role` column on
-  `users` and enforced in the DB-writer handlers (ARCH-60). A tenant has had at
+  at a time: **owner**, **admin**, **moderator** (REQ-371) or **member**, stored
+  as a `role` column on `users` and enforced in the DB-writer handlers (ARCH-60,
+  ARCH-128). A tenant has had at
   least one owner at all times; the system has refused an action that would
   remove or demote the last owner.
 - **REQ-031.** Channel membership has been independent of tenant role: a
@@ -243,13 +244,15 @@ where one exists.
   has been stored in the `channel_members` table, with `channels.is_public`
   gating read/post on non-public channels (ARCH-50).
 - **REQ-032.** A user has been able to edit or delete only their own
-  messages, with one exception: a tenant admin or owner has been able to
-  delete (not edit) any message in a channel they belong to, for moderation
-  purposes. Deletion by a non-author has been distinguishable in the message
-  record from self-deletion via the `messages.deleted_by` column (REQ-052), with
-  the admin/owner gate enforced in the delete handler (ARCH-60).
-- **REQ-033.** Only an owner or admin has been able to invite or remove a
-  member from the tenant. Channel-level invite/remove for private channels
+  messages, with one exception: an owner, admin or moderator (REQ-371) has been
+  able to delete (not edit) any message in a channel they belong to, for
+  moderation purposes. Deletion by a non-author has been distinguishable in the
+  message record from self-deletion via the `messages.deleted_by` column
+  (REQ-052), with the gate enforced in the delete handler (ARCH-60).
+- **REQ-033.** Only an owner or admin has been able to remove a member from
+  the tenant; who may invite people to it has been the workspace's
+  configuration, owners and admins by default (REQ-374). Channel-level
+  invite/remove for private channels
   has been available to any existing member of that channel, not gated to
   admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
   Removal has deactivated a member and deleted nothing anyone said: every
@@ -408,11 +411,13 @@ where one exists.
 
 ### 1.5 Workspace Administration
 
-- **REQ-042.** An owner/admin has been able to set **workspace-level settings and
-  branding** — the workspace display name and icon, a set of default channels new
-  members auto-join, and the tenant's join/invite policy — stored on the tenant
-  and shown wherever the workspace is presented (the switcher, REQ-013; the
-  client header).
+- **REQ-042.** A workspace has had **workspace-level settings and branding** —
+  the workspace display name and icon, a set of default channels new members
+  auto-join, and the tenant's join/invite policy — shown wherever the workspace
+  is presented (the switcher, REQ-013; the client header). **Workspace settings
+  are the daemon's configuration** (ARCH-127): set by whoever runs it — the
+  control plane for a managed workspace, the operator for a self-hosted one —
+  never from inside the app, and told to every client read-only.
 
   **The workspace speaks for itself,** as configuration rather than an
   in-app setting: a new member is sent its welcome
@@ -563,7 +568,7 @@ where one exists.
   each parent channel. A reply has optionally also been **posted to the channel's
   main scroll** rather than only the thread: one message, stored once with a flag
   and never copied, shown in both places, counted once in the channel's unread
-  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bk).
+  and notifying once (PROTOCOL.md §5.10, SCHEMA.md §3bl).
 - **REQ-282.** A user has been able to **follow every thread in a chosen channel
   or DM** — a per-conversation setting distinct from following one thread
   (REQ-062) — so that every new thread started there, and every reply within it,
@@ -730,10 +735,13 @@ where one exists.
   colleague has known someone was unavailable before messaging them. This has
   been display only: it has not changed delivery, which the schedule and the
   pause govern separately.
-  **Being away is said with the pause and the custom status**, not with a
-  separate out-of-office state: "back Monday" is a status, and not being
-  interrupted until then is a pause. A third mechanism would be a third thing to
-  set and a third thing to forget to clear.
+  **Being away for days has an out-of-office of its own**, apart from the
+  custom status, which shows beside it: a start, an end and an optional message.
+  It is in force between the two and ends by itself, so there is nothing to
+  forget to clear. While it holds, every client marks the person "Out of office
+  until <date>" wherever they appear, and someone writing them a DM or
+  mentioning them is told so, with the message, before sending. Like the status
+  it is display only; not being interrupted is still the pause and the schedule.
 
   **Availability and do-not-disturb are two INDEPENDENT axes, as in Slack.**
   Presence (REQ-120) answers *are they around* — active / away / offline.
@@ -898,8 +906,8 @@ where one exists.
   suggest, and the legitimate need behind it is already served from the right
   side by the VIP list. Recorded here so the difference from Slack is a choice
   rather than an omission (ARCH-72; SCHEMA.md `dnd_until_ms`).
-- **REQ-279.** A workspace **owner or admin has been able to set default
-  do-not-disturb hours** for the workspace, applying to members who have not
+- **REQ-279.** A workspace has had **default do-not-disturb hours**, set in
+  its configuration (ARCH-127), applying to members who have not
   configured their own, and **any member has been able to override them** with
   their own schedule (REQ-136) or turn do-not-disturb off entirely. A default
   that could not be overridden would be an availability policy rather than a
@@ -923,6 +931,24 @@ where one exists.
   REQ-284 answers the finer question — a badge counts what would have notified,
   with the schedule and the pause left out — and mute remains the first thing it
   asks.
+- **REQ-385.** A user has been able to **mute a person**: what that person
+  writes, their mentions of the user, their reactions and their thread replies
+  have notified the user of nothing, counted toward none of the user's unread,
+  and been left out of the user's activity feed and reaction counts — in every
+  conversation, the person's messages still shown. Like a conversation's mute it
+  is absolute, a priority person (REQ-135) included, and it is the user's alone:
+  the muted person is not told, and nothing of theirs changes for anyone else
+  (SCHEMA.md §3bp).
+- **REQ-386.** A user has been able to **block a person**, and to say **who may
+  start a direct conversation with them** — anyone, or nobody. A blocked person
+  has been unable to open a DM or group DM naming the blocker; in a conversation
+  the two already share, what the blocked person writes has reached its other
+  members but not the blocker, anywhere — live, in history, search, threads,
+  pins, files and counts — and lifting the block has not brought it back. The
+  person blocked is never told. Channels are untouched: there, muting the person
+  (REQ-385) is the tool. Placing and lifting a block are audited in the
+  moderation family, and an owner or admin may list blocks (SCHEMA.md §3br,
+  PROTOCOL.md §5.20).
 - **REQ-138.** A client has surfaced **OS-native desktop notifications** (a system
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
@@ -946,10 +972,6 @@ where one exists.
   a server surface — the daemon decides *whether* to notify, never how it sounds.
   Sounds are the system's own, asked for by name (`ms-winsoundevent:` for the
   toast, `PlaySound`/`SND_ALIAS` for the client's window); nothing is bundled.
-  *As built (Win32)*, the sounds are four fixed system sounds the user cannot
-  yet choose — a message; a mention, keyword hit or priority person; a direct
-  message (any notified DM); and a call — and only the mute-all switch is
-  stored, as a client preference.
 - **REQ-139.** A client has offered an **activity feed / notification inbox** — an
   aggregated, filterable view of @mentions (REQ-221), reactions to the user's
   messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a
@@ -984,7 +1006,7 @@ where one exists.
   else has been mailed: not a reaction, not a thread reply that names no one,
   not a reminder (REQ-283) and not a call (REQ-285) — those stay in the
   activity feed (REQ-139), on the desktop (REQ-138) and in push (REQ-133).
-  The design is [EMAIL.md](./EMAIL.md).
+  The design is [EMAIL.md](./details/EMAIL.md).
 
   **This reverses an exclusion, and the two reasons for it have been answered
   rather than dropped.** The exclusion rested on two costs. **Operationally**,
@@ -1037,8 +1059,8 @@ where one exists.
   levels, and has worked only where all three allow it** (ARCH-125):
   - **system:** the operator's choice of email provider (REQ-368), fixed by
     central on a managed box;
-  - **workspace:** an owner's or admin's switches, and the defaults members
-    start from, on the workspace's own settings;
+  - **workspace:** the workspace's switches, and the defaults members start
+    from, in its configuration (ARCH-127);
   - **person:** their own notification settings, the same on all their devices
     (ARCH-72).
 
@@ -1082,13 +1104,14 @@ where one exists.
   precedence order**, and covered by a **truth table** rather than case-by-case
   tests. **The evaluator is** `shared/notify.c` (`oc_notify_decide`, with
   `oc_notify_quiet` for the schedule), which states the precedence — own message never;
-  mute is absolute; a priority person pierces everything else; then the schedule
+  mute is absolute, and so is a person the reader muted (REQ-385), even a
+  priority person; a priority person pierces everything else; then the schedule
   and the pause; then the level, with keywords part of *mentions*. Every input
   feeds that one function: the per-channel level resolved against the global
   default (REQ-130/134), mute (REQ-137), priority people (REQ-135), mention and
   keyword hits (REQ-221/135), thread participation (REQ-061), the schedule
-  (REQ-136) and the pause (REQ-278); follow-every-thread (REQ-282) and the
-  workspace default (REQ-279) will enter through the same inputs.
+  (REQ-136) and the pause (REQ-278). Follow-every-thread (REQ-282) enters as
+  thread participation, and the workspace default (REQ-279) as the schedule.
 
   **This exists because the failure mode is precedence errors assembled
   inline** — silent, and invisible until somebody who muted a conversation is
@@ -1116,8 +1139,8 @@ where one exists.
   surfaced as an activity-feed entry and a notification instead of a synthetic
   message from a fake user.
 
-  **Storage and delivery, as built.** A reminder is a saved item with a time
-  (migration 0072: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
+  **Storage and delivery.** A reminder is a saved item with a time
+  (migration 0075: `remind_at_ms` and `reminded_at_ms` on `saved_items`), set
   through `SAVE_ITEM` and told to the owner's devices in `SAVED_UPDATED`; a
   reminder on an unsaved message saves it. It fires once, within the
   scheduled-message tick of its time (fifteen seconds, the tick scheduled
@@ -1153,14 +1176,14 @@ where one exists.
   about the same count and both looking correct.
 
   **The rule above is fixed, not a preference.**
-- **REQ-285.** A user has been **notified when a call has started** in a channel
-  or DM they are a member of and asks them, subject to the same notification
-  settings as a message (REQ-281) — because a call is time-sensitive in a way a
-  message is not: a missed message is read later, a missed call is simply
-  missed. The notification has named who started it and where, and its Join has
-  landed the user in the call. A call's invitation is how it asks (REQ-302): it
-  follows the conversation's settings as a mention does, rather than being a
-  level of its own.
+- **REQ-285.** A user has been **notified when they are asked to a call**
+  (REQ-302), subject to the same notification settings as a message (REQ-281) —
+  because a call is time-sensitive in a way a message is not: a missed message
+  is read later, a missed call is simply missed. The notification has named who
+  started it and its subject, and its Join has taken the user to the call's
+  pre-join screen. The invitation follows the settings of the conversation the
+  call was started from, if any, as a mention does, rather than being a level of
+  its own.
 - **REQ-286.** A desktop client's **window and notification-area behaviour has
   been specified and user-controllable**: whether closing the window **quits the
   application or leaves it running in the notification area / tray** still
@@ -1204,21 +1227,52 @@ where one exists.
   a filename line, for the common image types. This is a graphical-frontend
   capability; the **text-only TUI is exempt** (ARCH-75, no graphics), continuing
   to show the attachment line. Non-image types have shown a typed placeholder.
-  The Win32 implementation decodes the common image types client-side (WIC) with
-  a client-side thumbnail cache; no server-side thumbnailing exists.
+  The thumbnail and the expanded view are drawn from the daemon's **image
+  previews** at the rung matching their size (REQ-390), and from the original
+  where an image has none; the original is downloaded whole only to be saved or
+  opened.
 - **REQ-143.** A user has been able to browse a channel's **files** — a view
   listing the attachments shared in a channel (and, per-user, files they shared or
   that were shared with them) — building on the attachment metadata already
   stored (REQ-140, SCHEMA.md migration 0009). A channel with thousands of files
   has been browsable past the first page (ARCH-91, PROTOCOL.md `LIST_FILES`).
+- **REQ-390.** The daemon has made **previews** of an uploaded JPEG, PNG or WebP,
+  once, when its upload finished: an **inline** rung for the timeline and an
+  **expanded** rung for the image viewer, each scaled down with its aspect kept
+  and each **in its original's format**, so a screenshot stays lossless and a
+  photo stays lossy (ARCH-137). An image that already fits the inline box and is
+  small has had **no preview**, the original being as cheap to send. An animated
+  GIF has never been previewed, only shown at a capped size; a HEIC, an animated
+  PNG or WebP, and any other type have passed through unpreviewed. A client has
+  asked for the rung matching the size it draws an image at (PROTOCOL.md
+  §5.14f), so a channel of photos has rendered without its originals being
+  downloaded.
+- **REQ-391.** Making a preview has been **bounded four ways**, none of which can be
+  turned off: only hardened decoders (libjpeg-turbo, libspng, libwebp), a cap on
+  the bytes decoded, a cap on the pixels read from the image's header **before
+  any pixel buffer is allocated** (what stops a decompression bomb), and a time
+  limit. An image refused by a bound, or one that does not decode, has simply had
+  no preview, and its uploader has been told of no error. Previews have been made
+  on the transfer workers, never on the network loop (ARCH-69, ARCH-137).
+- **REQ-392.** Previews have been **derived data**: made again from the original,
+  never tombstoned, and **reclaimed before any original** under storage pressure,
+  least recently served first (REQ-215, REQ-217). A preview has gone when its
+  attachment's bytes went. A client that finds a rung missing has shown the
+  original instead, saying nothing of it.
+- **REQ-393.** An operator has been able to turn previews off, and to set each
+  rung's size and the decode's byte cap, pixel cap and time limit (CONFIG.md,
+  `OPENCHIME_IMAGE_PREVIEWS` and the `OPENCHIME_PREVIEW_*` settings). Turned off,
+  no previews have been made and every image has been sent whole; previews already
+  made have still been served.
 
 ### 6.2 Audio Conferencing
 
-*Design: [CALLS.md](./CALLS.md) — the feature and its encryption — and
-[AUDIO.md](./AUDIO.md), the media engine.*
+*Design: [CALLS.md](./details/CALLS.md) — the feature and its encryption — and
+[AUDIO.md](./details/AUDIO.md), the media engine.*
 
-- **REQ-150.** A user has been able to start or join a server-relayed audio call
-  in a channel, a direct message or a group DM, from the Win32 and web clients. No
+- **REQ-150.** A user has been able to start a server-relayed audio call, from
+  Calls home or from a channel, a direct message or a group DM, and to join one
+  they were asked to (REQ-301/302), from the Win32 and web clients. No
   peer-to-peer or ICE negotiation path has existed (ARCH-18).
 - **REQ-151.** Audio has been encoded with Opus by the client — 16 kHz, in-band
   FEC and DTX, through the echo canceller and noise suppression — and relayed
@@ -1232,38 +1286,54 @@ where one exists.
   remains; a TCP disconnect holds the participant's seat for 15 s before it is
   dropped. The client rejoins by itself — after a reconnect, a sweep or a moved
   media path — with a fresh `CALL_JOIN`, and says so while it does (ARCH-73).
-- **REQ-301.** A user has been able to **start a call** from a conversation's
-  header or the **+** on the Calls section. Starting in a channel or a group DM
-  has invited every member up to the cap, and where the members outnumber it the
-  starter has picked, with the most recently active ticked; a DM has invited the
-  other person. The starter has been taken to the call. The call has ended when
-  its last participant left, or when its **starter ended it for everyone**.
+- **REQ-301.** A user has been able to **start a call** with a **subject**, from
+  Calls home (asking anyone in the workspace) or from a conversation's call
+  button, which has opened the same picker with the conversation's subject
+  suggested and its people ticked, up to the cap, the most recently active
+  first. The starter has been taken to the call, and a call started from a
+  conversation has posted one message there that follows it. A call has been an
+  object of its own: its subject, who was in it and when, who was asked, its
+  timeline, a **chat** of its own, and — where the daemon offers it — a
+  **recording** any participant starts and stops, made by the daemon into one
+  video in the call's chat. The call has ended when its last participant left,
+  or when its **starter ended it for everyone** (ARCH-73, ARCH-136).
 - **REQ-302.** An invitation has been **listed and notified** — a toast with
   Join and Decline on the desktop, a push on a phone — through the same decision
   as a mention (REQ-281, ARCH-103), so a muted conversation, the schedule and a
   pause have silenced it. There has been no ringing loop. An invitation has
   lasted until taken, declined or the call ended, and anyone in a call has been
-  able to invite anyone who can read the conversation.
-- **REQ-303.** The Home sidebar has had a **Calls** section beside Channels and
-  Direct messages, listing the active calls in conversations the user belongs
-  to and every call they are invited to, each opening a **call view**: who is
-  in it, with speaking and muted marks and a volume for each, and Mute, push to
-  talk, the microphone and speaker with a live level, noise suppression, Invite,
-  Leave and — for the starter — End.
-- **REQ-304.** A call that ended with nobody but its starter having joined has
-  left a **"Missed call"** line in the conversation's history, a call event
-  rather than a message (ARCH-90), not searched, not read aloud and not
-  notifying.
+  able to invite anyone in the workspace. Only those asked have been able to
+  join a call, see it, or open its page, chat, recording or transcript.
+- **REQ-303.** The Home sidebar has had a **Calls** row opening **Calls home**:
+  the calls going on that the user was asked to, with Join and Decline, their
+  past calls a page at a time, and **New call**. A call has had a **page** — its
+  people and their times, who was asked, its timeline, its chat, its recording
+  to play and its transcript — and a **call view**: its subject, who is in it,
+  with speaking and muted marks and a volume for each, its chat beside it, and
+  Mute, push to talk, the microphone and speaker with a live level, noise
+  suppression, Invite, Record, Leave and — for the starter — End. The terminal
+  client has listed past calls and shown a call's page and chat.
+- **REQ-304.** A call started from a conversation has left **one message** there,
+  a call event rather than a message (ARCH-90), not searched, not read aloud and
+  not notifying, which says what the call is about and follows it — Join while
+  it runs, its page after. A call the user was asked to and missed has been
+  listed as **missed** in their history; missed-call lines stored before have
+  still read as they did.
 - **REQ-305.** A call has held at most **ten** people (`OC_CALL_MAX`); a join
-  or invitation past it has been refused as full.
-- **REQ-306.** A call has been **end-to-end encrypted**: the daemon, the relay
-  and the network have carried audio only the participants' devices could
-  decrypt, with keys that change on every join and leave (ARCH-113).
+  or invitation past it has been refused as full. The Recorder has not counted.
+- **REQ-306.** A call has been **end-to-end encrypted** unless a participant
+  records it: the daemon, the relay and the network have carried audio only the
+  participants' devices could decrypt, with keys that change on every join and
+  leave (ARCH-113). While a participant records it the daemon's Recorder is in
+  it — readable by the daemon from the epoch it joined at to the one it left
+  at, and shown to everyone in the call — and someone joining a recorded call
+  has sent nothing until they acknowledged "This call is being recorded."
+  (ARCH-136).
 
 ### 6.3 Video — camera video and screenshare in calls, and video messages
 
-*Design: [CALLS.md](./CALLS.md) §7 (cameras) and §6 (screenshare),
-[VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md) (video messages).*
+*Design: [CALLS.md](./details/CALLS.md) §7 (cameras) and §6 (screenshare),
+[VIDEO-MESSAGES.md](./details/VIDEO-MESSAGES.md) (video messages).*
 
 - **REQ-160.** A participant in a call has been able to **turn their camera on
   and off**, and the others have seen it, each person with their own picture.
@@ -1304,7 +1374,7 @@ where one exists.
   share, the computer's sound, drawing on a share and simultaneous sharers have
   all been out of scope of a call; a camera beside a share is REQ-160, and a
   *recorded* screen is a video message (REQ-162). A **text-only frontend has been
-  permanently exempt** (ARCH-75 — the TUI renders no graphics). [CALLS.md](./CALLS.md) §6
+  permanently exempt** (ARCH-75 — the TUI renders no graphics). [CALLS.md](./details/CALLS.md) §6
   is the design.
 - **REQ-162.** A user has been able to **record a video message and
   post it** into a channel, a DM or a thread, with the composer's text as its
@@ -1319,9 +1389,9 @@ where one exists.
   capture interface** whose frame format is fixed at the boundary — planar I420,
   BT.709 limited range — so the encoder and the preview see one thing whatever the
   camera delivers. The interface has a backend per platform — Media Foundation
-  (Windows) and `getUserMedia` (web) today; V4L2 (Linux), AVFoundation (macOS),
-  AVCaptureSession (iOS) and Camera2 through the NDK (Android) with those clients.
-  A backend is built together with the client for its platform. **A screen or window
+  (Windows), `getUserMedia` (web), V4L2 (Linux), AVFoundation (macOS),
+  AVCaptureSession (iOS) and Camera2 through the NDK (Android), each built
+  together with the client for its platform. **A screen or window
   is a source behind the same interface** — on Windows, Windows.Graphics.Capture —
   so the camera box is composited and the result encoded exactly as a camera is.
   Microphone, speaker and the computer's own sound have gone through the audio
@@ -1351,10 +1421,24 @@ where one exists.
   own controls out of the picture where the system allows, recorded the computer's
   sound only when that was chosen, and ended, keeping what it had, when the window
   it recorded closed.
+- **REQ-382.** A video message has been **exportable as a copy other players
+  open**: H.264 video and MP3 audio in MP4, made by the workspace's own daemon on
+  request, at the source's picture size, with picture and sound within a frame of
+  each other, and saved by the client as a file (ARCH-135).
+- **REQ-383.** Export has been **off unless the operator turned it on**
+  (`OPENCHIME_H264_EXPORT`), in a build that carries it. Off, a request has been
+  refused by name and nothing else on the connection has changed. The setting has
+  said that turning it on needs the operator's own H.264 patent licence (ARCH-135).
+- **REQ-384.** Export has been **bounded**: the gate has been the download's; one
+  transcode has run at a time, below the daemon's other work, and none while
+  read-aloud renders; a person has had at most three requests in hand; a 1080p
+  export has peaked under 96 MB; a copy has been cached, reclaimed before any
+  attachment and deleted with its video; and no temporary file has outlived its
+  export (ARCH-135).
 
 ### 6.4 Read-aloud
 
-*Design: [READ-ALOUD.md](./READ-ALOUD.md) (the feature), [TTSKIT.md](./TTSKIT.md)
+*Design: [READ-ALOUD.md](./details/READ-ALOUD.md) (the feature), [TTSKIT.md](./details/TTSKIT.md)
 (pronunciation).*
 
 - **REQ-291.** A user has been able to **listen to a
@@ -1391,7 +1475,7 @@ where one exists.
 
 ### 6.5 Voice input
 
-*Design: [VOICE-INPUT.md](./VOICE-INPUT.md).*
+*Design: [VOICE-INPUT.md](./details/VOICE-INPUT.md).*
 
 - **REQ-296.** A user has been able to **speak instead of typing** in
   the composer of a channel, DM or thread, in two modes. In **push to talk**, speech
@@ -1426,7 +1510,7 @@ where one exists.
 
 ### 6.6 Summaries
 
-*Design: [SUMMARIES.md](./SUMMARIES.md).*
+*Design: [SUMMARIES.md](./details/SUMMARIES.md).*
 
 - **REQ-310.** A user has been able to **summarize a channel or DM** they can
   read, from a Summarize button in its header, over one of five spans: what they
@@ -1476,7 +1560,7 @@ where one exists.
 
 ### 6.7 Encrypted direct messages
 
-*Design: [PRIVATE-DM.md](./PRIVATE-DM.md).*
+*Design: [PRIVATE-DM.md](./details/PRIVATE-DM.md).*
 
 - **REQ-314.** Two people have been able to talk in an **encrypted DM**, end to end
   encrypted between one device of each (PRIVATE-DM.md, ARCH-118), started from New
@@ -1507,7 +1591,7 @@ where one exists.
   and respond in channels under a **bot identity** distinct from human users,
   including **slash-command apps** invoked as `/command` from the composer and
   dispatched to a registered integration endpoint. Install has been role-gated to
-  owner/admin. The design is [Plans/APPS.md](./Plans/APPS.md): an app is a
+  owner/admin. The design is [plans/APPS.md](./plans/APPS.md): an app is a
   signed manifest (REQ-376, REQ-377) acting as a bot, a principal of its own
   kind beside agents, either external (code on the developer's server) or
   in-workspace (code the daemon runs, REQ-381), with scopes approved at install
@@ -1522,7 +1606,7 @@ where one exists.
   the signing scheme have been shared** by installed apps and plain outgoing
   webhooks: one set of event names and payloads, following the common
   chat-platform convention, and one `v0=` HMAC-SHA-256 signature over the
-  timestamp and body ([Plans/APPS.md](./Plans/APPS.md) §5, ARCH-131).
+  timestamp and body ([plans/APPS.md](./plans/APPS.md) §5, ARCH-131).
 - **REQ-174.** The system has offered **workflow automation** — declarative
   triggers (a message match, a schedule, a form submission) driving actions (post
   a message, call a webhook) — so common routines could run without an external
@@ -1537,7 +1621,7 @@ where one exists.
   catalog** of the apps registered with its daemon; enrolled deployments have
   also seen the **curated catalog** central serves, each entry's signature
   verified by the daemon before it is offered, in the same package format as
-  the local one ([Plans/APPS.md](./Plans/APPS.md) §12).
+  the local one ([plans/APPS.md](./plans/APPS.md) §12).
 - **REQ-176.** The system has offered a **third-party API / SDK** — a documented
   programmatic surface for external tools to read and post on a user's or bot's
   (REQ-172) behalf — as the general-purpose complement to the single-purpose
@@ -1549,14 +1633,14 @@ where one exists.
   It has been designed as a **documented HTTP API** for reading history,
   searching and posting, kept beside the MCP surface for agents rather than in
   place of it (ARCH-123, REQ-350–354); the proposal is
-  [Plans/HTTP-API.md](./Plans/HTTP-API.md).
+  [plans/HTTP-API.md](./plans/HTTP-API.md).
 - **REQ-376.** An app has been defined by **one manifest**, in OpenChime's own
   schema, kept in the developer's repository: its identity, scopes, commands,
   event subscriptions, endpoints or code, outbound hosts, secrets, schedules and
   providers. No console, catalog or daemon has kept a separate copy of an app's
   definition, and one validator has checked a manifest for both the daemon and
   the developer's tools, with the same plain-language messages
-  ([Plans/APPS.md](./Plans/APPS.md) §3, ARCH-130).
+  ([plans/APPS.md](./plans/APPS.md) §3, ARCH-130).
 - **REQ-377.** **Nothing has loaded unsigned**, in any deployment model. An app
   has been installed only when its package's signature verified against a key
   the daemon trusts: the project's, the daemon's own identity key, or a
@@ -1566,7 +1650,7 @@ where one exists.
   description, approved by an owner or admin at install, and every call and
   every event has been checked against them and against the bot's channel
   memberships. An update asking for a new scope has waited for approval again
-  ([Plans/APPS.md](./Plans/APPS.md) §4, ARCH-131).
+  ([plans/APPS.md](./plans/APPS.md) §4, ARCH-131).
 - **REQ-379.** Slash commands have been **namespaced by app**, `/<app>/<command>`,
   with an unqualified alias only where exactly one app declares it, and a
   channel-scoped command has resolved only where its app is a member
@@ -1580,21 +1664,24 @@ where one exists.
   memory, stack and CPU limits, quarantine for an app that keeps overrunning,
   and a switch per workspace and per app, within the lean memory profile
   (REQ-210) (ARCH-133).
-- **REQ-350.** The HTTP API has been a **stable, versioned contract**: served
-  under a path that names its major version, documented as the reference an
-  integration is written against, and changed within a version only by
-  additions — a new field, a new endpoint, a new optional parameter. A change
-  that could break a working integration has been a new major version, served
-  beside the old one for a stated time, never a silent change to the old
-  (ARCH-123).
-- **REQ-351.** The HTTP API has been **authenticated by agent tokens**, and by
-  nothing else: a request has carried a bearer token the daemon minted for an
-  **agent principal** — a non-human account, distinct from any person, created
-  and revoked by an owner/admin — stored only as its hash, as a session token is
-  (ARCH-58). The agent's **channel memberships have been its only access**: it
-  has read, searched and posted in the channels it was added to, and nowhere
-  else, whatever the role of the person who created it. A person's session
-  token or browser sign-in has not opened the API (ARCH-123).
+- **REQ-350.** The HTTP API has been a **stable contract in the method form
+  the common chat-platform convention uses**: each method served at
+  `/api/<method>` (`chat.postMessage`, `conversations.history`), taking a form
+  or JSON body and answering with `ok`, so an app written against that
+  convention runs pointed at the workspace by configuration (ARCH-123, ARCH-131).
+  It has been documented as the reference an integration is written against and
+  changed only by additions — a new method, a new field, a new optional
+  parameter. A change that could break a working integration has been a new
+  method beside the old one, never a silent change to it.
+- **REQ-351.** The HTTP API has been **authenticated by tokens the daemon
+  minted for a non-human principal**, and by nothing else: an **agent** or an
+  app's **bot** (REQ-172) — an account distinct from any person, created and
+  revoked by an owner/admin — its token stored only as its hash, as a session
+  token is (ARCH-58). A token has carried **scopes** from the app platform's
+  catalog, and the principal's **channel memberships have narrowed them**: it
+  has read, searched and posted only where a scope allows it and only in the
+  channels it was added to, whatever the role of the person who created it. A
+  person's session token or browser sign-in has not opened the API (ARCH-123).
 - **REQ-352.** Every HTTP API request has been checked by **the same membership
   checks as the wire handlers** that do the same thing — reading history,
   searching, posting, replying in a thread — run against the agent's current
@@ -1632,10 +1719,11 @@ where one exists.
 - **REQ-321.** A workspace has been able to have **agents**: an AI agent has been
   an account of its own kind, created and removed by an owner or admin, that
   reads and posts through the MCP surface and nothing else — it has not signed
-  in to a client, been in a DM or group DM, or been reachable by one. **Channel
-  membership has been its only access control**: an agent has read and posted in
-  exactly the channels it has been added to, and in no other, with no scopes or
-  per-tool grants beside that. An agent has **not counted against the
+  in to a client, been in a DM or group DM, or been reachable by one. **Its
+  access has been its token's scopes, narrowed by its channel memberships**: an
+  agent has read and posted only in the channels it has been added to, and only
+  as far as the scopes an owner or admin chose for its token allow (the app
+  platform's catalog, REQ-378). An agent has **not counted against the
   registered-user cap** (AUTH.md §2), and every member surface that lists or
   names one has marked it as an agent.
 - **REQ-322.** An agent has authenticated with a **bearer token the daemon
@@ -1662,11 +1750,16 @@ where one exists.
   exactly their access** — the channels and DMs they can read and post in, no
   more — for as long as the connection stands. The client has signed in through
   **MCP's OAuth authorization flow with the daemon as the authorization
-  server**, the person approving it on the daemon's own pages after signing in
-  there as they normally do; a person has been able to see and end their
-  connections, and an ended connection, or a removed person's, has been refused
-  on the next request. Encrypted DMs (REQ-314) have stayed unreadable through
-  it, since the daemon cannot read them.
+  server**, the person approving it **in their signed-in OpenChime app** by the
+  code the daemon's authorize page showed, after seeing the client's name and
+  where it returns, and **choosing how long it lasts**: never ending, or 30, 90
+  or 365 days. A person has been able to see and revoke their own connections,
+  and an **owner or admin to see and revoke everyone's**; a revoked connection,
+  one past its lifetime, or a removed person's has been refused on the next
+  request. An operator has been able to turn people's connections off
+  (`OPENCHIME_MCP_CONNECTIONS`, shown to clients read-only), refusing every one
+  until it is on again, agents unaffected. Encrypted DMs (REQ-314) have stayed
+  unreadable through it, since the daemon cannot read them.
 - **REQ-324.** A **write through the MCP surface has been visibly attributed**: an
   agent's post has been authored by the agent and shown as an agent's, and a
   post through a person's connection has been authored by the person and shown
@@ -1757,8 +1850,8 @@ where one exists.
 - **REQ-190.** The daemon has rate-limited message-send frequency
   per-connection, rejecting excess sends with a distinct error rather than
   silently dropping them. **Mechanism:** a fixed-window counter in the net loop —
-  **30 sends per 3 s per connection** (`OC_SEND_RATE_MAX` /
-  `OC_SEND_RATE_WINDOW_MS`, `daemon/netloop.c`) — over the limit returns the
+  **30 sends per 3 s per connection** (`OC_SEND_RATE_MAX` in
+  `daemon/config.h`, `OC_SEND_RATE_WINDOW_MS` in `daemon/netloop.c`) — over the limit returns the
   non-fatal `SEND_RATE_LIMITED` (3004). A fixed window rather than a token bucket
   because the check runs per frame on the hot path and the window is short enough
   that the boundary burst it permits is irrelevant at these numbers. The values
@@ -1926,7 +2019,7 @@ keeps to its own share of the free space and gives it back under pressure
   labelled links, parsed by one parser in **`shared/`** that every client and the
   daemon's read-aloud use, returning spans over
   the unchanged body. Full dialect, the escaping rules, and the places we
-  deliberately diverge from Slack are in [MARKDOWN.md](./MARKDOWN.md).
+  deliberately diverge from Slack are in [MARKDOWN.md](./details/MARKDOWN.md).
 - **REQ-221.** A message has been able to **@mention** a user, and the broadcast
   audiences `@here` / `@channel` / `@everyone`. A mention has been written by
   name (`@ada`) or by id (`<@U42>`, optionally `<@U42|label>`, the form apps
@@ -2038,8 +2131,8 @@ keeps to its own share of the free space and gives it back under pressure
   the client has said why and offered a mute. Everyone who gained or lost a channel this way has been told
   at once.
 - **REQ-222.** A URL in a message has been **unfurled** into a preview
-  (title, description, thumbnail) fetched from the linked page. The fetch has been
-  performed **server-side by the daemon or an isolated helper** — never by pushing
+  (its title and description) fetched from the linked page. The fetch has been
+  performed **server-side by the daemon** — never by pushing
   arbitrary client-side fetches — consistent with the island model. **Unfurling
   is simply on — no switch, no per-tenant disable.** The safety this feature
   needs lives in the fetch itself (the SSRF gate and its caps), not in an off
@@ -2132,6 +2225,18 @@ keeps to its own share of the free space and gives it back under pressure
   block of text or code with optional syntax highlighting — as a first-class
   object distinct from an inline fenced code block (REQ-220), so a long paste has
   not flooded the transcript.
+- **REQ-387.** A user has been able to hide part of a message as a
+  **spoiler** — inline (`>!text!<`) or as a block with an optional label — that
+  a reader sees only when they choose to reveal it, in every client (MARKDOWN.md
+  §1d). What a spoiler hides has been left out of search for everyone, its
+  author included, so searching for a word cannot reveal it.
+- **REQ-388.** A user has been able to post a **to-do list** — a message whose
+  body is a title and a task per line — whose tasks anyone who can read it has
+  been able to mark done or not done and add to, each change shown live with who
+  made it, and whose title its author has been able to rename. A list holds at
+  most 200 tasks, each named once; it is placed, permissioned, moved and deleted
+  as its message is, and an encrypted DM holds none (PROTOCOL.md §5.16o,
+  SCHEMA.md §3bx).
 
 ---
 
@@ -2183,6 +2288,10 @@ keeps to its own share of the free space and gives it back under pressure
 - **REQ-238.** A user has been able to **mark all as read** — clearing unread
   state across the workspace, or catching up channel-by-channel — advancing every
   read cursor to the latest message in one action (REQ-090/235).
+- **REQ-389.** A user has been able to **collapse a message** — fold it away to
+  one line in the transcript, and expand it again — for themselves alone. What
+  they collapsed has stayed collapsed on every device they use, and has been
+  nobody else's business: no one else sees it folded (SCHEMA.md §3bi).
 
 ---
 
@@ -2195,6 +2304,11 @@ messages (author name, ARCH-74).*
   image, title/role text, pronouns, phone, timezone, and the voice their messages are
   read aloud in (REQ-292) — set by the user and shown wherever the user appears. Avatars have been stored as image assets in
   object storage (ARCH-17), not SQLite.
+
+  Beside these fixed fields, a workspace has had **profile fields of its own** —
+  department, location, manager — defined by an owner or admin (at most 20, each
+  text or a link) and filled in by each person for themselves, shown on the
+  profile (SCHEMA.md §3bs).
 
   **One screen owns it.** The fields are edited together on a single Edit
   profile card and committed by one button, rather than scattered across a
@@ -2215,9 +2329,10 @@ messages (author name, ARCH-74).*
   The avatar is an ordinary attachment id (`users.avatar_attachment_id`), so it
   lands in the existing blob store — object storage where one is configured —
   rather than inventing storage; it is readable workspace-wide, and only an
-  attachment the setter uploaded can become one. Edit authority is the user's
-  own: no admin-managed fields, which is the simpler half of the choice and the
-  one a self-hosted deployment can live with.
+  attachment the setter uploaded can become one. Edit authority over a
+  person's profile is their own: an owner or admin defines the workspace's own
+  fields, but never fills in anyone's values, which is the simpler half of the
+  choice and the one a self-hosted deployment can live with.
 - **REQ-289.** A user has been able to **browse the people in the workspace** — a
   directory listing everyone with their avatar, display name, title, custom status
   and presence, searchable by name or title, opening a person's profile. Without
@@ -2247,17 +2362,26 @@ messages (author name, ARCH-74).*
   retain forever (the default, REQ-053) or delete messages/attachments older than
   a set age — applied uniformly and irreversibly once messages age out. This has
   been opt-in for organizations with data-minimization obligations and is **not** a
-  paid-tier history *cap* (REQ-053 stands).
+  paid-tier history *cap* (REQ-053 stands). It has been the workspace's
+  configuration, one age for every channel and DM, set by an owner (ARCH-127,
+  ARCH-138). A message past it has gone with its files, search entries, pins,
+  reactions, summaries and spoken copies; a thread has gone only whole, once
+  its newest reply was past it; a forward has kept its excerpt until it aged
+  out itself; and a call has gone, with its recordings, transcripts and chat,
+  once it ended that long ago. Database backups have kept their own window. A
+  change has been audited (REQ-251).
 - **REQ-251.** The daemon has recorded an **audit log** of administrative and
   security-relevant actions, **append-only, admin-readable, and kept apart from
-  the message store** (ARCH-79). The catalog has covered five families:
+  the message store** (ARCH-79). The catalog has covered six families:
   **administrative** (role change, user invite/remove, channel archive,
   retention or storage-policy change), **account lifecycle** (registration,
   password change, invite redeemed, owner bootstrap), **security** (a successful
   sign-in, session revocation, failed authentication, denied privileged action),
   **moderation** (a moderator deleting another user's message, removing a member
-  from a channel), and **MCP access** (each read, search and post made through
-  the MCP surface, REQ-325). A sign-in is recorded when a credential is proven
+  from a channel, filing and resolving a report), **integration access** (each
+  read, search and post made through the MCP surface or the HTTP API, REQ-325,
+  REQ-353), and **compliance capture** (a capture credential's mint, grant,
+  revocation and reads, REQ-341). A sign-in is recorded when a credential is proven
   — a password or an identity-provider token — and not when an
   already-authenticated session reconnects, so the log answers "who signed in,
   when" rather than counting reconnects. Each entry has recorded when, who acted, what action, on what
@@ -2347,7 +2471,7 @@ messages (author name, ARCH-74).*
   capture is a differentiator in this segment, not table stakes.
 
   **Settled by ARCH-122**, with the design in
-  [Plans/COMPLIANCE-CAPTURE.md](./Plans/COMPLIANCE-CAPTURE.md): the file drop is
+  [plans/COMPLIANCE-CAPTURE.md](./plans/COMPLIANCE-CAPTURE.md): the file drop is
   built first, the pull API second and SMTP journaling after them, all three
   reading one record of what changed. What a captured record holds, who may
   read it and how a person becomes an email address are REQ-340–345.
@@ -2369,8 +2493,8 @@ messages (author name, ARCH-74).*
   only as its hash** (as a session token is, ARCH-58), carrying a label and a
   **scope**, **revocable** by any owner with effect on the next request,
   **rate-limited** per credential, and **audited in a family of its own** —
-  each mint, grant, revocation and read recorded beside the four families of
-  REQ-251, never the credential itself. A credential has been able to read
+  each mint, grant, revocation and read recorded as REQ-251's compliance-capture
+  family, never the credential itself. A credential has been able to read
   through the pull API and nothing else: it has opened no session, sent
   nothing and held no role.
 - **REQ-342.** A captured person has been given **an email address by one
@@ -2450,7 +2574,7 @@ messages (author name, ARCH-74).*
 
 - **REQ-360.** A team has been able to **move its history into OpenChime, and an
   operator to take a portable copy out** (ARCH-124). The export has been a
-  **documented, versioned folder** ([EXPORT.md](./EXPORT.md)): one JSON Lines
+  **documented, versioned folder** ([EXPORT.md](./details/EXPORT.md)): one JSON Lines
   file per kind — users, channels and DMs with their members, messages with
   their threads, reactions, pins, attachments — the attachments' bytes beside
   them, and a manifest carrying the format version, record counts and digests.
@@ -2553,7 +2677,8 @@ choose — which makes each one a per-frontend *obligation*.*
   **On Win32 (ARCH-99)** the client is keyboard-operable in the ordinary
   paths (composer, completion, conversation movement, command palette, shortcut
   sheet) and answers `WM_GETOBJECT` with a **UI Automation provider over the
-  self-drawn UI**, raising UIA events; it creates no system caret yet (ARCH-99). The
+  self-drawn UI**, raising UIA events, and keeps a real system caret at the
+  drawn one so assistive technology can follow typing (ARCH-99). The
   **context menus have a keyboard route**: Ctrl+Up / Ctrl+Down put the keyboard on
   a message, Shift+F10 (or the Menu key) opens that message's actions — or, with
   no message under the keyboard, the conversation's own — and the menu that opens
@@ -2631,7 +2756,9 @@ feature.*
   product adjacent to chat, out of scope for a messaging system.
 - **REQ-272.** *(Excluded by decision)* **Lists / tables / project boards** (structured task/records
   surfaces) have not been supported — project-management territory (the space
-  Pumble's sibling product Plaky occupies), out of scope.
+  Pumble's sibling product Plaky occupies), out of scope. A to-do list posted
+  as a message (REQ-388) is not one: it is a message with tasks, placed and
+  permissioned as its message is, not a board or a record store.
 - **REQ-273.** *(Excluded by decision)* **Clips / asynchronous voice messages** (recording a short
   audio-only clip posted into a conversation) have not been supported. Live audio
   is REQ-150–152 and screenshare REQ-161. **Scoped by ARCH-110:** a recorded
@@ -2656,14 +2783,14 @@ feature.*
   (REQ-170/173) and the MCP surface, not a product feature. Two things this once
   excluded have since been admitted, each under requirements of its own in §7: an
   authenticated MCP surface (REQ-320–325, ARCH-120), and a first-party assistant
-  (REQ-330–334, ARCH-121). The assistant is built, and answers only: it answers a
+  (REQ-330–334, ARCH-121). The assistant answers only: it answers a
   person's questions from what they can read, citing the messages it used, and
   takes no action and posts nothing. It runs locally, on the workspace's own
   server with a local model, and nothing it reads or answers leaves the box.
   Summaries of a channel or DM (REQ-310) are a core feature and are not an
   assistant: they answer no questions, take no actions and post nothing.
 - **REQ-315.** *(Excluded by decision)* **Translating the clients' interface** into other
-  languages has not been provided. It touches every string in three clients, and
+  languages has not been provided. It touches every string in every client, and
   is a separate project to be taken up as one, not a feature added piece by piece.
 - **REQ-316.** *(Excluded by decision)* **Public channels readable without an account** have
   not been offered. Every reader is a member of the workspace (REQ-031); an

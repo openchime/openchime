@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild ttskit's data files from sources (docs/TTSKIT.md §8): the pronunciation
+# Rebuild ttskit's data files from sources (docs/details/TTSKIT.md §8): the pronunciation
 # dictionary and the guesser read-aloud uses (ARCH-111).
 #
 #   scripts/build/ttskit_data.sh           build into build/ttskit-data and compare

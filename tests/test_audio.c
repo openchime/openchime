@@ -111,6 +111,7 @@ static void on_tcp(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq, u
 
 static int addressing_tests(void);
 static int stream_tests(void);
+static int record_tests(void);
 
 /* The relay's clock for this suite: it moves only when a test moves it, so who
  * the silence sweep drops is decided here and not by the scheduler. */
@@ -126,7 +127,7 @@ int run_audio_tests(void) {
     relay_addr.sin_family = AF_INET; relay_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CHECK(bind(udp, (struct sockaddr *)&relay_addr, sizeof relay_addr) == 0);
     socklen_t sl = sizeof relay_addr; getsockname(udp, (struct sockaddr *)&relay_addr, &sl);
-    oc_relay_hooks hooks = { on_gone, on_tcp };
+    oc_relay_hooks hooks = { on_gone, on_tcp, NULL };
     oc_relay *r = oc_relay_open(udp, &hooks, NULL);
     CHECK(r != NULL);
     if (!r) return failures;
@@ -285,7 +286,8 @@ int run_audio_tests(void) {
     oc_relay_close(r);
     close(cA); close(cB); close(cC); close(cD); close(udp);
     addressing_tests();
-    return stream_tests();
+    stream_tests();
+    return record_tests();
 }
 
 /* Streams (REQ-160, CALLS.md §5.4): audio and a shared screen go to everyone; a
@@ -294,6 +296,107 @@ int run_audio_tests(void) {
  * passed on as it came; a packet naming no stream there is, or too short to name
  * one, is dropped; and authorizing a token again turns its camera off and its
  * subscription back to every camera. */
+/* What the Recorder is handed (relay.h): each packet of a recorded call. */
+static struct { uint64_t call, sender; uint16_t seq; uint8_t stream; uint8_t ct[64]; size_t len; int n; } g_rec;
+static void on_record(void *ctx, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                      const uint8_t *ct, size_t len) {
+    (void)ctx;
+    g_rec.call = call_id; g_rec.sender = sender; g_rec.seq = seq; g_rec.stream = stream;
+    g_rec.len = len < sizeof g_rec.ct ? len : sizeof g_rec.ct;
+    memcpy(g_rec.ct, ct, g_rec.len);
+    g_rec.n++;
+}
+
+/* A recorded call (CALLS.md §8): the record hook sees each packet of it --
+ * every stream, a camera no participant takes included, by UDP and by the
+ * connection -- and none of another call, no keep-alive and nothing once the
+ * recording stops; what is injected reaches the call's participants, each by
+ * their own transport, as from the Recorder's user, and is not handed back. */
+static int record_tests(void) {
+    printf("test_audio: relay recording -- the record hook, and the Recorder's packets injected\n");
+    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
+    ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(udp, (struct sockaddr *)&ra, sizeof ra) == 0);
+    socklen_t sl = sizeof ra; getsockname(udp, (struct sockaddr *)&ra, &sl);
+    oc_relay_hooks hooks = { on_gone, on_tcp, on_record };
+    oc_relay *r = oc_relay_open(udp, &hooks, NULL);
+    CHECK(r != NULL);
+    if (!r) { close(udp); return failures; }
+    /* A (1) and B (2) on UDP and D (4) on the connection, in call 600; C (3) in 700. */
+    uint8_t tA[16], tB[16], tC[16], tD[16];
+    memset(tA, 0x5A, 16); memset(tB, 0x6B, 16); memset(tC, 0x7C, 16); memset(tD, 0x8D, 16);
+    CHECK(oc_relay_authorize(r, 600, 1, 201, tA, 16) == 0);
+    CHECK(oc_relay_authorize(r, 600, 2, 202, tB, 16) == 0);
+    CHECK(oc_relay_authorize(r, 700, 3, 203, tC, 16) == 0);
+    CHECK(oc_relay_authorize(r, 600, 4, 204, tD, 16) == 0);
+    int cA = mk_client(), cB = mk_client(), cC = mk_client();
+    int cl[3] = { cA, cB, cC }; const uint8_t *tk[3] = { tA, tB, tC };
+    for (int i = 0; i < 3; i++) { udp_send(cl[i], &ra, tk[i], 0, NULL); pump(r, udp); drain(cl[i]); }
+    CHECK(oc_relay_from_tcp(r, 204, 0, OC_CALL_STREAM_AUDIO, NULL, 0) == 0);
+    uint64_t sender; uint16_t seq; char body[64];
+
+    /* Not recorded yet: nothing handed over. */
+    g_rec.n = 0;
+    udp_send(cA, &ra, tA, 1, "before");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 6 && g_rec.n == 0);
+
+    CHECK(oc_relay_set_recorded(r, 600, 1) == 0);
+    /* A's voice: relayed as ever, and handed over whole. */
+    udp_send(cA, &ra, tA, 2, "voice");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 5);
+    CHECK(g_rec.n == 1 && g_rec.call == 600 && g_rec.sender == 1 && g_rec.seq == 2 &&
+          g_rec.stream == OC_CALL_STREAM_AUDIO && g_rec.len == 5 && memcmp(g_rec.ct, "voice", 5) == 0);
+    /* D's, by the connection; a keep-alive is not; C's call is not recorded. */
+    CHECK(oc_relay_from_tcp(r, 204, 3, OC_CALL_STREAM_SHARE, (const uint8_t *)"screen", 6) == 0);
+    CHECK(g_rec.n == 2 && g_rec.sender == 4 && g_rec.stream == OC_CALL_STREAM_SHARE);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 6 && sender == 4);   /* relayed as ever */
+    drain(cA);
+    udp_send(cA, &ra, tA, 4, NULL);
+    pump(r, udp);
+    drain(cA);
+    udp_send(cC, &ra, tC, 5, "elsewhere");
+    pump(r, udp);
+    CHECK(g_rec.n == 2);
+    /* A camera: off, it goes nowhere; on, the Recorder has it though B takes none. */
+    CHECK(oc_relay_subscribe(r, 202, 0, NULL, 0) == 0);
+    udp_send_on(cA, &ra, tA, 6, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(g_rec.n == 2);
+    CHECK(oc_relay_set_camera(r, 201, 1) == 0);
+    g_tcp.n = 0;
+    udp_send_on(cA, &ra, tA, 7, OC_CALL_STREAM_CAMERA, "face");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == -1);
+    CHECK(g_rec.n == 3 && g_rec.stream == OC_CALL_STREAM_CAMERA && g_rec.seq == 7);
+
+    /* The Recorder (user 99) asks for something: A and B have it by UDP, D by
+     * the connection, all as from 99; it is not handed back. */
+    g_tcp.n = 0;
+    CHECK(oc_relay_inject(r, 600, 99, 8, OC_CALL_STREAM_AUDIO, (const uint8_t *)"nack", 4) == 0);
+    CHECK(udp_recv(cA, &sender, &seq, body, sizeof body) == 4 && sender == 99 && seq == 8 && memcmp(body, "nack", 4) == 0);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 4 && sender == 99);
+    CHECK(udp_recv(cC, &sender, &seq, body, sizeof body) == -1);
+    CHECK(g_tcp.n == 1 && g_tcp.conn == 204 && g_tcp.sender == 99 && g_tcp.len == 4);
+    CHECK(g_rec.n == 3);
+    /* Nothing that is not one to send: a camera's, an empty one, a call with nobody. */
+    CHECK(oc_relay_inject(r, 600, 99, 9, OC_CALL_STREAM_CAMERA, (const uint8_t *)"x", 1) == -1);
+    CHECK(oc_relay_inject(r, 600, 99, 9, OC_CALL_STREAM_AUDIO, NULL, 0) == -1);
+    CHECK(oc_relay_inject(r, 800, 99, 9, OC_CALL_STREAM_AUDIO, (const uint8_t *)"x", 1) == -1);
+
+    /* Stopped: nothing more handed over. */
+    CHECK(oc_relay_set_recorded(r, 600, 0) == 0);
+    udp_send(cA, &ra, tA, 10, "after");
+    pump(r, udp);
+    CHECK(udp_recv(cB, &sender, &seq, body, sizeof body) == 5 && g_rec.n == 3);
+
+    oc_relay_close(r);
+    close(cA); close(cB); close(cC); close(udp);
+    return failures;
+}
+
 static int stream_tests(void) {
     printf("test_audio: relay streams -- the tag passed on, cameras by flag and subscription, bad tags dropped\n");
     int udp = socket(AF_INET, SOCK_DGRAM, 0);
@@ -301,7 +404,7 @@ static int stream_tests(void) {
     ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CHECK(bind(udp, (struct sockaddr *)&ra, sizeof ra) == 0);
     socklen_t sl = sizeof ra; getsockname(udp, (struct sockaddr *)&ra, &sl);
-    oc_relay_hooks hooks = { on_gone, on_tcp };
+    oc_relay_hooks hooks = { on_gone, on_tcp, NULL };
     oc_relay *r = oc_relay_open(udp, &hooks, NULL);
     CHECK(r != NULL);
     if (!r) { close(udp); return failures; }

@@ -1,6 +1,6 @@
 /*
  * OpenChime schema migrations runner + embedded migration set (ARCH-27).
- * See migrate.h and docs/SCHEMA.md.
+ * See migrate.h and docs/details/SCHEMA.md.
  */
 
 #include "migrate.h"
@@ -11,7 +11,7 @@
 
 /* --- Embedded migrations ------------------------------------------------ */
 
-/* 0001: foundational tables for the core messaging path (docs/SCHEMA.md).
+/* 0001: foundational tables for the core messaging path (docs/details/SCHEMA.md).
  * Roles (REQ-030), reactions, threads, FTS5, presence, and attachments are
  * deferred to later migrations. */
 static const char MIGRATION_0001[] =
@@ -58,7 +58,7 @@ static const char MIGRATION_0001[] =
     "  PRIMARY KEY (channel_id, idempotency_token)"
     ");";
 
-/* 0002: authentication data model (docs/AUTH.md, SCHEMA.md §3, ARCH-58/59/60).
+/* 0002: authentication data model (docs/details/AUTH.md, SCHEMA.md §3, ARCH-58/59/60).
  * Adds sessions, local passwords, invites, and a role/avatar on users. */
 static const char MIGRATION_0002[] =
     "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member' "
@@ -1518,7 +1518,7 @@ static const char MIGRATION_0056[] =
     "    AND substr(ltrim(substr(CAST(excerpt AS TEXT), 4), ' '), 1, 1) NOT IN ('', char(9), char(10), char(13));";
 
 static const char MIGRATION_0057[] =
-    /* Channel and DM summaries (REQ-310, ARCH-116, docs/SUMMARIES.md). A summary
+    /* Channel and DM summaries (REQ-310, ARCH-116, docs/details/SUMMARIES.md). A summary
      * is a tree: chunk summaries of whole messages, a thread's summary over its
      * chunks when it is too big for one, sections over a long list of children,
      * and the summary of a period on top. Every node lists what it was built
@@ -1582,7 +1582,7 @@ static const char MIGRATION_0058[] =
 
 /* 0060: nothing to the schema. The step marks the point from which the writer
  * indexes mentions for messages that have none (dbwriter's index_mentions at
- * start): a workspace loaded from a Slack export (as the summary evaluation did, docs/SUMMARIES.md) holds its
+ * start): a workspace loaded from a Slack export (as the summary evaluation did, docs/details/SUMMARIES.md) holds its
  * messages but no `mentions` rows, so the server's unread count, which reads
  * that table, said 0 where the client, which reads the text, counted the
  * @channel and @name lines. A database that is already past this step has had
@@ -1760,6 +1760,337 @@ static const char MIGRATION_0069[] =
      * and none is invented for it; INVITE_LIST reports it as 0. */
     "ALTER TABLE invites ADD COLUMN created_at_ms INTEGER;";
 
+
+static const char MIGRATION_0086[] =
+    /* The export of a video message (ARCH-135): the H.264 + MP3 copies the
+     * daemon has already made, so a second request for the same video is served
+     * rather than transcoded again.
+     *
+     * `exported_video` is a CACHE, as `rendered_audio` is (0042): keyed by the
+     * video's attachment and `version`, which names the encoders and their
+     * settings together, so a change to either makes a new copy rather than
+     * serving one made differently. A row points at a blob and holds only what
+     * EXPORT_INFO needs. It is reclaimable storage, taken before any attachment
+     * tier and with no tombstone, least recently used first -- hence the index on
+     * `last_used_ms` -- and it goes when its video goes. Losing a row costs one
+     * transcode. */
+    "CREATE TABLE exported_video ("
+    "  attachment_id INTEGER NOT NULL REFERENCES attachments(id),"
+    "  version       TEXT NOT NULL,"
+    "  blob_key      TEXT NOT NULL,"
+    "  bytes         INTEGER NOT NULL,"
+    "  duration_ms   INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_used_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (attachment_id, version)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX exported_video_lru ON exported_video(last_used_ms);";
+
+static const char MIGRATION_0087[] =
+    /* Calls as objects of their own (CALLS.md §1): until now a call lived only
+     * in the net loop's memory and left nothing behind but a missed-call line.
+     *
+     * `calls` is the call: its subject, who started it, the conversation it was
+     * started from (NULL for one started from Calls home; the call has no other
+     * tie to it), when it started and ended, and how -- 'left' (the last person
+     * left), 'ended' (ended for everyone) or 'stopped' (the daemon stopped with
+     * it open). Its id is the call's id everywhere, the HPKE info included, so
+     * AUTOINCREMENT: an id is never used twice. A row with no end is a call
+     * running, or one the daemon stopped on, which its next start closes. */
+    "CREATE TABLE calls ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  subject       TEXT NOT NULL,"
+    "  starter       INTEGER NOT NULL REFERENCES users(id),"
+    "  from_channel  INTEGER REFERENCES channels(id),"
+    "  started_at_ms INTEGER NOT NULL,"
+    "  ended_at_ms   INTEGER,"
+    "  end_reason    TEXT CHECK (end_reason IN ('left','ended','stopped'))"
+    ");"
+    "CREATE INDEX idx_calls_open ON calls(ended_at_ms) WHERE ended_at_ms IS NULL;"
+    /* A participant's stays: one row from a join to its leave. A reconnect
+     * within the held seat is the same stay, so it writes nothing. */
+    "CREATE TABLE call_participants ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  call_id       INTEGER NOT NULL REFERENCES calls(id),"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  joined_at_ms  INTEGER NOT NULL,"
+    "  left_at_ms    INTEGER"
+    ");"
+    "CREATE INDEX idx_call_parts_call ON call_participants(call_id, joined_at_ms);"
+    "CREATE INDEX idx_call_parts_user ON call_participants(user_id, call_id);"
+    /* Who was asked, by whom and when, and whether they said no. The starter
+     * is the first invitee, asked by themself: being an invitee is what lets
+     * anyone see the call, its chat, recording and transcript. */
+    "CREATE TABLE call_invitees ("
+    "  call_id        INTEGER NOT NULL REFERENCES calls(id),"
+    "  user_id        INTEGER NOT NULL REFERENCES users(id),"
+    "  invited_by     INTEGER NOT NULL REFERENCES users(id),"
+    "  invited_at_ms  INTEGER NOT NULL,"
+    "  declined_at_ms INTEGER,"
+    "  PRIMARY KEY (call_id, user_id)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX idx_call_invitees_user ON call_invitees(user_id, call_id);"
+    /* The timeline: cameras, shares, recording and renames, each with who and
+     * when; a rename's `detail` is the new subject. */
+    "CREATE TABLE call_events ("
+    "  id       INTEGER PRIMARY KEY,"
+    "  call_id  INTEGER NOT NULL REFERENCES calls(id),"
+    "  at_ms    INTEGER NOT NULL,"
+    "  user_id  INTEGER NOT NULL REFERENCES users(id),"
+    "  kind     TEXT NOT NULL CHECK (kind IN ('camera_on','camera_off','share_on','share_off',"
+    "                                         'record_on','record_off','subject')),"
+    "  detail   TEXT"
+    ");"
+    "CREATE INDEX idx_call_events_call ON call_events(call_id, at_ms);"
+    /* A recording: made while the Recorder is in the call ('recording'),
+     * processed from its spool ('processing') into one file ('ready'), or not
+     * ('failed', with why). The file is an attachment of the call's chat, so it
+     * is fetched and played as a video message is. `spool` is the directory its
+     * streams were kept in, under the data directory, until processing removes
+     * it. */
+    "CREATE TABLE call_recordings ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  call_id       INTEGER NOT NULL REFERENCES calls(id),"
+    "  started_by    INTEGER NOT NULL REFERENCES users(id),"
+    "  started_at_ms INTEGER NOT NULL,"
+    "  stopped_at_ms INTEGER,"
+    "  state         TEXT NOT NULL DEFAULT 'recording'"
+    "                CHECK (state IN ('recording','processing','ready','failed')),"
+    "  spool         TEXT,"
+    "  attachment_id INTEGER REFERENCES attachments(id),"
+    "  bytes         INTEGER,"
+    "  duration_ms   INTEGER,"
+    "  error         TEXT"
+    ");"
+    "CREATE INDEX idx_call_recs_call ON call_recordings(call_id);"
+    "CREATE INDEX idx_call_recs_state ON call_recordings(state);"
+    /* A call's transcript, made by the system: lines of speaker, start, end
+     * (from the call's start) and text, indexed for search. Nothing makes one
+     * yet; the place for it is here. */
+    "CREATE TABLE call_transcripts ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  call_id       INTEGER NOT NULL UNIQUE REFERENCES calls(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  language      TEXT"
+    ");"
+    "CREATE TABLE call_transcript_lines ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  transcript_id INTEGER NOT NULL REFERENCES call_transcripts(id),"
+    "  speaker       INTEGER REFERENCES users(id),"
+    "  start_ms      INTEGER NOT NULL,"
+    "  end_ms        INTEGER NOT NULL,"
+    "  text          TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_call_tlines ON call_transcript_lines(transcript_id, start_ms);"
+    "CREATE VIRTUAL TABLE call_transcripts_fts USING fts5("
+    "  text, content='call_transcript_lines', content_rowid='id');"
+    "CREATE TRIGGER call_transcripts_fts_ai AFTER INSERT ON call_transcript_lines BEGIN"
+    "  INSERT INTO call_transcripts_fts(rowid, text) VALUES (new.id, new.text);"
+    "END;"
+    "CREATE TRIGGER call_transcripts_fts_ad AFTER DELETE ON call_transcript_lines BEGIN"
+    "  INSERT INTO call_transcripts_fts(call_transcripts_fts, rowid, text) VALUES('delete', old.id, old.text);"
+    "END;"
+    /* The call's chat is a conversation the call owns: a DM-kind channel whose
+     * members are its invitees, marked with the call, and in no conversation
+     * list. */
+    "ALTER TABLE channels ADD COLUMN call_id INTEGER REFERENCES calls(id);"
+    "CREATE UNIQUE INDEX idx_channels_call ON channels(call_id) WHERE call_id IS NOT NULL;"
+    /* The one message a call started from a conversation leaves there (kind
+     * OC_MSG_KIND_CALL), naming its call. A missed-call line from before has
+     * none, and reads as it always did. */
+    "ALTER TABLE messages ADD COLUMN call_id INTEGER REFERENCES calls(id);"
+    "CREATE INDEX idx_messages_call ON messages(call_id) WHERE call_id IS NOT NULL;";
+
+static const char MIGRATION_0088[] =
+    /* Image previews (ARCH-137): the daemon's smaller copies of an uploaded
+     * JPEG, PNG or WebP, made once at upload on a transfer worker.
+     *
+     * `width` and `height` on `attachments` are the original's, read from its
+     * header when it was previewed; NULL for anything else, and for every
+     * attachment uploaded before this.
+     *
+     * `attachment_previews` holds one row per rung made: 1 the inline rung,
+     * 2 the expanded one, each in its original's format. It is DERIVED data, as
+     * `exported_video` is (0086): made again from the original, reclaimed
+     * before any attachment tier, least recently served first -- hence the
+     * index on `last_used_ms` -- and with no tombstone, since a client that
+     * finds a rung missing shows the original instead. A row goes when its
+     * attachment's bytes go. */
+    "ALTER TABLE attachments ADD COLUMN width INTEGER;"
+    "ALTER TABLE attachments ADD COLUMN height INTEGER;"
+    "CREATE TABLE attachment_previews ("
+    "  attachment_id INTEGER NOT NULL REFERENCES attachments(id),"
+    "  rung          INTEGER NOT NULL,"
+    "  storage_key   TEXT NOT NULL,"
+    "  width         INTEGER NOT NULL,"
+    "  height        INTEGER NOT NULL,"
+    "  size          INTEGER NOT NULL,"
+    "  mime          TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_used_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (attachment_id, rung)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX attachment_previews_lru ON attachment_previews(last_used_ms);";
+
+static const char MIGRATION_0089[] =
+    /* Which messages each read-aloud rendering was looked up for (REQ-250,
+     * ARCH-111). A rendering is keyed by what was said and in whose voice, not
+     * by message, so a handle worked out again when a message ages out would
+     * miss one made before a rename or a change of voice. Recorded as it is
+     * looked up, so the storage pass deletes every rendering a removed message
+     * was spoken under. Losing a row costs only that: the rendering is then
+     * left to the cache's own reclamation. */
+    "CREATE TABLE rendered_audio_uses ("
+    "  message_id INTEGER NOT NULL REFERENCES messages(id),"
+    "  handle     BLOB NOT NULL,"
+    "  PRIMARY KEY (message_id, handle)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX rendered_audio_uses_handle ON rendered_audio_uses(handle);";
+
+static const char MIGRATION_0090[] =
+    /* The token store for the principals that are not people (docs/details/
+     * MCP.md §3.1, §10): an agent's tokens now, an app's bot
+     * later, in the one table -- `users.kind` (0071) says which. A token is
+     * stored as the webhook tokens are (0010): its SHA-256 alone, under a unique
+     * index, so a request's lookup is one probe and the raw token is in no row.
+     * `scopes` is the space-separated names from the scope catalog
+     * (shared/scopes.c) chosen when it was minted; `last_used_at_ms` and
+     * `last_used_from` are written at most once a minute. Removing the
+     * principal deletes its tokens; revoking one deletes its row. */
+    "CREATE TABLE principal_tokens ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  token_hash      BLOB NOT NULL,"
+    "  user_id         INTEGER NOT NULL REFERENCES users(id),"
+    "  name            TEXT NOT NULL,"
+    "  scopes          TEXT NOT NULL DEFAULT '',"
+    "  created_by      INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  last_used_at_ms INTEGER NOT NULL DEFAULT 0,"
+    "  last_used_from  TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE UNIQUE INDEX principal_tokens_hash ON principal_tokens(token_hash);"
+    "CREATE INDEX principal_tokens_user ON principal_tokens(user_id);";
+
+static const char MIGRATION_0091[] =
+    /* A person's own AI clients (docs/details/AUTH.md §8.13, MCP.md §3.2): the
+     * daemon as the MCP endpoint's OAuth authorization server.
+     *
+     * `oauth_clients` holds a client that identified itself: registered
+     * (Dynamic Client Registration, `kind` 'registered', its `client_id` minted
+     * here) or a Client ID Metadata Document (`kind` 'document', its `client_id`
+     * the document's https URL, kept 24 hours from `fetched_at_ms`).
+     * `redirect_uris` is the declared URIs, one to a line.
+     *
+     * `oauth_approvals` holds one authorize request until it is collected: the
+     * page's own handle and the eight-letter code the person types, each as its
+     * SHA-256; the request's checked parameters; and, once the person acted in
+     * their app, who did, the lifetime chosen and the authorization code's
+     * SHA-256, single use. `status` 0 pending, 1 approved, 2 declined, 3 used.
+     *
+     * `mcp_connections` holds what an approval made: the person, the client and
+     * its name as approved, the lifetime chosen (`lifetime_days` 0: never ends)
+     * and its end, the current refresh token's SHA-256, and when it was last
+     * used and from where. Revoking sets `revoked_at_ms`; the row stays for the
+     * list and the audit. `mcp_access_tokens` holds each hour-long access
+     * token's SHA-256 against its connection.
+     *
+     * `messages.via` names the client a post came through, '' for any other. */
+    "CREATE TABLE oauth_clients ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  client_id     TEXT NOT NULL UNIQUE,"
+    "  kind          TEXT NOT NULL CHECK (kind IN ('registered','document')),"
+    "  name          TEXT NOT NULL,"
+    "  redirect_uris TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  created_from  TEXT NOT NULL DEFAULT '',"
+    "  fetched_at_ms INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE oauth_approvals ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  request_hash    BLOB NOT NULL UNIQUE,"
+    "  code_hash       BLOB NOT NULL UNIQUE,"
+    "  client_id       TEXT NOT NULL,"
+    "  client_name     TEXT NOT NULL,"
+    "  redirect_uri    TEXT NOT NULL,"
+    "  code_challenge  TEXT NOT NULL,"
+    "  state           TEXT NOT NULL,"
+    "  resource        TEXT NOT NULL,"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  expires_at_ms   INTEGER NOT NULL,"
+    "  created_from    TEXT NOT NULL DEFAULT '',"
+    "  status          INTEGER NOT NULL DEFAULT 0,"
+    "  approved_by     INTEGER REFERENCES users(id),"
+    "  lifetime_days   INTEGER NOT NULL DEFAULT 0,"
+    "  auth_code_hash  BLOB,"
+    "  auth_code_until INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE UNIQUE INDEX oauth_approvals_auth_code ON oauth_approvals(auth_code_hash) WHERE auth_code_hash IS NOT NULL;"
+    "CREATE TABLE mcp_connections ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  user_id         INTEGER NOT NULL REFERENCES users(id),"
+    "  client_id       TEXT NOT NULL,"
+    "  client_name     TEXT NOT NULL,"
+    "  resource        TEXT NOT NULL,"
+    "  lifetime_days   INTEGER NOT NULL DEFAULT 0,"
+    "  expires_at_ms   INTEGER NOT NULL DEFAULT 0,"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  last_used_at_ms INTEGER NOT NULL DEFAULT 0,"
+    "  last_used_from  TEXT NOT NULL DEFAULT '',"
+    "  refresh_hash    BLOB,"
+    "  revoked_at_ms   INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE UNIQUE INDEX mcp_connections_refresh ON mcp_connections(refresh_hash) WHERE refresh_hash IS NOT NULL;"
+    "CREATE INDEX mcp_connections_user ON mcp_connections(user_id);"
+    "CREATE TABLE mcp_access_tokens ("
+    "  token_hash    BLOB PRIMARY KEY,"
+    "  connection_id INTEGER NOT NULL REFERENCES mcp_connections(id),"
+    "  expires_at_ms INTEGER NOT NULL"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX mcp_access_tokens_connection ON mcp_access_tokens(connection_id);"
+    "ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT '';";
+static const char MIGRATION_0092[] =
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): an address the workspace
+     * POSTs its events to, signed as APPS.md §5 says. `secret_sealed` is the
+     * signing secret sealed under the factor key (daemon/totp.h), the webhook's
+     * id its associated data: the secret has to be opened to sign, so it cannot
+     * be kept as a hash, and only the delivery worker opens it. `events` is the
+     * space-separated event types it was given; the channels it watches are
+     * rows of outgoing_webhook_channels, none meaning user_change alone.
+     * `failing_since_ms` is when its deliveries began to fail, 0 while they
+     * succeed; after a day of it the writer disables the webhook and says why
+     * in `disabled_reason`. A delivery is one event for one webhook, queued in
+     * the transaction that wrote the event, so a restart loses none:
+     * `event_id` is the same on every attempt, `next_at_ms` when it is next
+     * due, `last_reason` the last failure's retry reason. */
+    "CREATE TABLE outgoing_webhooks ("
+    "  id               INTEGER PRIMARY KEY,"
+    "  url              TEXT NOT NULL,"
+    "  events           TEXT NOT NULL,"
+    "  secret_sealed    BLOB NOT NULL,"
+    "  enabled          INTEGER NOT NULL DEFAULT 1,"
+    "  disabled_reason  TEXT NOT NULL DEFAULT '',"
+    "  created_by       INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms    INTEGER NOT NULL,"
+    "  failing_since_ms INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE outgoing_webhook_channels ("
+    "  webhook_id INTEGER NOT NULL REFERENCES outgoing_webhooks(id),"
+    "  channel_id INTEGER NOT NULL REFERENCES channels(id),"
+    "  PRIMARY KEY (webhook_id, channel_id)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX outgoing_webhook_channels_channel ON outgoing_webhook_channels(channel_id);"
+    "CREATE TABLE webhook_deliveries ("
+    "  id          INTEGER PRIMARY KEY,"
+    "  webhook_id  INTEGER NOT NULL REFERENCES outgoing_webhooks(id),"
+    "  event_id    TEXT NOT NULL,"
+    "  payload     TEXT NOT NULL,"
+    "  attempts    INTEGER NOT NULL DEFAULT 0,"
+    "  next_at_ms  INTEGER NOT NULL,"
+    "  last_reason TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at_ms);"
+    "CREATE INDEX webhook_deliveries_webhook ON webhook_deliveries(webhook_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1846,6 +2177,13 @@ const oc_migration OC_MIGRATIONS[] = {
     { 83, MIGRATION_0083 },
     { 84, MIGRATION_0084 },
     { 85, MIGRATION_0085 },
+    { 86, MIGRATION_0086 },
+    { 87, MIGRATION_0087 },
+    { 88, MIGRATION_0088 },
+    { 89, MIGRATION_0089 },
+    { 90, MIGRATION_0090 },
+    { 91, MIGRATION_0091 },
+    { 92, MIGRATION_0092 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -1,5 +1,5 @@
 /* Tests for the video message media core (REQ-162–165, ARCH-110,
- * docs/VIDEO-MESSAGES.md §11): the MP4 writer and reader (including a mutation
+ * docs/details/VIDEO-MESSAGES.md §11): the MP4 writer and reader (including a mutation
  * fuzz of the reader), the VP9 and Opus round trips, the recorder against the
  * synthetic camera and tone, ffprobe's view of a recorded file, and the player
  * with the real-time test sink. */

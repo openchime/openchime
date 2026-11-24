@@ -1,4 +1,4 @@
-/* The recognizer's forward pass (stt_priv.h, docs/STTKIT.md §3): from 16 kHz
+/* The recognizer's forward pass (stt_priv.h, docs/details/STTKIT.md §3): from 16 kHz
  * samples to token ids, on nnkit's kernels.
  *
  * Activations are time-major: a sequence is T rows of its channels, 320 apart

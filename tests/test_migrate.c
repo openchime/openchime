@@ -1,4 +1,4 @@
-/* Unit tests for the schema migrations runner (ARCH-27, docs/TESTING.md §2.2).
+/* Unit tests for the schema migrations runner (ARCH-27, docs/details/TESTING.md §2.2).
  * Links migrate.c's object (TESTING.md §2.1) and the vendored SQLite.
  * All tests run against in-memory databases — no files touched. */
 
@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 85);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists */
+    CHECK(oc_schema_version(db) == 92);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections/outgoing-webhooks */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -116,7 +116,12 @@ static void test_embedded_schema(void) {
                              "profile_fields", "profile_field_values",
                              "channel_managers",
                              "custom_emoji_aliases",
-                             "todo_lists", "todo_tasks" };
+                             "todo_lists", "todo_tasks",
+                             "calls", "call_participants", "call_invitees", "call_events",
+                             "call_recordings", "call_transcripts", "call_transcript_lines",
+                             "call_transcripts_fts", "attachment_previews", "principal_tokens",
+                             "oauth_clients", "oauth_approvals", "mcp_connections", "mcp_access_tokens",
+                             "outgoing_webhooks", "outgoing_webhook_channels", "webhook_deliveries" };
 
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
@@ -407,6 +412,112 @@ static void test_also_channel(void) {
     sqlite3_close(db);
 }
 
+/* Outgoing webhooks (0092), from 0090: the three tables are made; a webhook
+ * keeps its sealed secret as written, its channels are one row each, and a
+ * delivery is due by its index. */
+static void test_outgoing_webhooks_0092(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 90, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 90);
+    CHECK(!table_exists(db, "outgoing_webhooks"));
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 92);
+    CHECK(table_exists(db, "outgoing_webhooks"));
+    CHECK(table_exists(db, "outgoing_webhook_channels"));
+    CHECK(table_exists(db, "webhook_deliveries"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(7,'channel','general',1,1);"
+        "INSERT INTO outgoing_webhooks(id,url,events,secret_sealed,created_by,created_at_ms)"
+        " VALUES(3,'https://example.test/hook','message',x'0102',1,5);"
+        "INSERT INTO outgoing_webhook_channels(webhook_id,channel_id) VALUES(3,7);"
+        "INSERT INTO webhook_deliveries(webhook_id,event_id,payload,next_at_ms)"
+        " VALUES(3,'Ev1','{}',9);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT enabled FROM outgoing_webhooks WHERE id=3;") == 1);
+    CHECK(scalar(db, "SELECT failing_since_ms FROM outgoing_webhooks WHERE id=3;") == 0);
+    CHECK(scalar(db, "SELECT length(secret_sealed) FROM outgoing_webhooks WHERE id=3;") == 2);
+    CHECK(scalar(db, "SELECT attempts FROM webhook_deliveries WHERE event_id='Ev1';") == 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE channel_id=7;") == 1);
+    sqlite3_close(db);
+}
+
+/* Which messages a rendering was looked up for (0089), from 0088: the table
+ * is made, a use is one row per message and handle, and a second use of the
+ * same pair is no second row. */
+static void test_rendered_audio_uses_0089(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
+    CHECK(!table_exists(db, "rendered_audio_uses"));
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == OC_MIGRATIONS_COUNT);
+    CHECK(table_exists(db, "rendered_audio_uses"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(7,1,1,'hello',5);"
+        "INSERT INTO rendered_audio_uses(message_id,handle) VALUES(7,x'01');"
+        "INSERT OR IGNORE INTO rendered_audio_uses(message_id,handle) VALUES(7,x'01');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio_uses;") == 1);
+    sqlite3_close(db);
+}
+
+/* Calls as objects (0087), from 0086: the call tables are made, channels and
+ * messages gain call_id, and a missed-call line already stored is untouched --
+ * still kind 1, its body as written, naming no call. A transcript line is
+ * found by its index and leaves it when deleted. */
+static void test_calls_0087(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 86, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 86);
+    CHECK(!table_exists(db, "calls"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(2,'iss|b',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,kind) VALUES(7,1,1,'Missed call',5,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 87, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 87);
+    const char *tables[] = { "calls", "call_participants", "call_invitees", "call_events",
+                             "call_recordings", "call_transcripts", "call_transcript_lines",
+                             "call_transcripts_fts" };
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) CHECK(table_exists(db, tables[i]));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM messages WHERE id=7 AND kind=1 AND body='Missed call' "
+                     "AND author_id=1 AND call_id IS NULL;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM channels WHERE call_id IS NULL;") == 1);
+    /* A call, its chat and the message it left, its people and timeline. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO calls(id,subject,starter,from_channel,started_at_ms) VALUES(1,'Q3 pricing',1,1,10);"
+        "INSERT INTO call_invitees(call_id,user_id,invited_by,invited_at_ms) VALUES(1,1,1,10),(1,2,1,10);"
+        "INSERT INTO call_participants(call_id,user_id,joined_at_ms) VALUES(1,1,10);"
+        "INSERT INTO call_events(call_id,at_ms,user_id,kind,detail) VALUES(1,11,1,'subject','Q3 pricing review');"
+        "INSERT INTO channels(id,kind,is_public,created_at_ms,call_id) VALUES(2,'dm',0,10,1);"
+        "INSERT INTO messages(channel_id,author_id,body,created_at_ms,kind,call_id) VALUES(1,1,'a call',10,1,1);"
+        "INSERT INTO call_recordings(call_id,started_by,started_at_ms) VALUES(1,1,12);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT state='recording' FROM call_recordings WHERE call_id=1;") == 1);
+    /* How a call ended is one of three; a second chat for one call is refused. */
+    CHECK(sqlite3_exec(db, "UPDATE calls SET ended_at_ms=20, end_reason='gone' WHERE id=1;", NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "UPDATE calls SET ended_at_ms=20, end_reason='stopped' WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO channels(id,kind,created_at_ms,call_id) VALUES(3,'dm',10,1);", NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO call_events(call_id,at_ms,user_id,kind) VALUES(1,1,1,'dance');", NULL, NULL, NULL) != SQLITE_OK);
+    /* The transcript's index. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO call_transcripts(id,call_id,created_at_ms) VALUES(1,1,30);"
+        "INSERT INTO call_transcript_lines(id,transcript_id,speaker,start_ms,end_ms,text) "
+        "VALUES(1,1,2,0,900,'the margin on the enterprise tier');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT rowid FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'margin';") == 1);
+    CHECK(sqlite3_exec(db, "DELETE FROM call_transcript_lines WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'margin';") == 0);
+    sqlite3_close(db);
+}
+
 /* The first column of `sql`'s first row, as text, into `out`. */
 static void text_of(sqlite3 *db, const char *sql, char *out, size_t cap) {
     out[0] = '\0';
@@ -422,6 +533,78 @@ static void text_of(sqlite3 *db, const char *sql, char *out, size_t cap) {
  * has every SQL function the daemon's connections have: the excerpt helper,
  * the spoiler test and the search index's oc_unspoiled, each answering as the
  * daemon's does. */
+/* 0088, image previews (ARCH-137): an attachment uploaded before it keeps its
+ * row, with no dimensions; a preview row is one per attachment and rung, and
+ * the least-recently-used index is there for the reclaim. */
+static void test_previews_0088(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 87, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 87);
+    CHECK(!table_exists(db, "attachment_previews"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+        " VALUES(5,1,1,'00ff','a.jpg','image/jpeg',100,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 88, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 88);
+    CHECK(table_exists(db, "attachment_previews"));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM attachments WHERE id=5 AND width IS NULL AND height IS NULL;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='attachment_previews_lru';") == 1);
+    CHECK(sqlite3_exec(db,
+        "UPDATE attachments SET width=4000, height=3000 WHERE id=5;"
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,1,'00ff-1',480,360,9000,'image/jpeg',2,2);"
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,2,'00ff-2',1600,1200,90000,'image/jpeg',2,2);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM attachment_previews WHERE attachment_id=5;") == 2);
+    /* One row per rung: a second rung 1 is refused. */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+        " VALUES(5,1,'00ff-x',1,1,1,'image/jpeg',3,3);", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
+/* A person's AI-client connections (0091), from 0090: the four tables, a
+ * message's `via` defaulting to '' for what was there, a client id and a
+ * refresh token's hash each unique, and a client's kind one of the two. */
+static void test_connections_0091(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 90, &err) == SQLITE_OK);
+    CHECK(!table_exists(db, "mcp_connections"));
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'local:ann',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(7,1,1,'hello',5);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 91, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 91);
+    CHECK(table_exists(db, "oauth_clients") && table_exists(db, "oauth_approvals") &&
+          table_exists(db, "mcp_connections") && table_exists(db, "mcp_access_tokens"));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM messages WHERE id=7 AND via='';") == 1);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c1','registered','Desk','http://127.0.0.1/cb',1);"
+        "INSERT INTO mcp_connections(id,user_id,client_id,client_name,resource,created_at_ms,refresh_hash)"
+        " VALUES(1,1,'c1','Desk','https://x/mcp',1,x'01');"
+        "INSERT INTO mcp_access_tokens(token_hash,connection_id,expires_at_ms) VALUES(x'02',1,9);"
+        "INSERT INTO oauth_approvals(request_hash,code_hash,client_id,client_name,redirect_uri,code_challenge,state,"
+        " resource,created_at_ms,expires_at_ms) VALUES(x'03',x'04','c1','Desk','http://127.0.0.1/cb','ch','st','https://x/mcp',1,2);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM mcp_connections WHERE id=1 AND lifetime_days=0 AND expires_at_ms=0 AND revoked_at_ms=0;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM oauth_approvals WHERE status=0 AND auth_code_hash IS NULL;") == 1);
+    CHECK(sqlite3_exec(db, "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c1','registered','B','',1);",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO oauth_clients(client_id,kind,name,redirect_uris,created_at_ms) VALUES('c2','other','B','',1);",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    CHECK(sqlite3_exec(db, "INSERT INTO mcp_connections(user_id,client_id,client_name,resource,created_at_ms,refresh_hash)"
+                           " VALUES(1,'c1','Desk','https://x/mcp',1,x'01');", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 static void test_sql_functions(void) {
     sqlite3 *db = open_mem();
     oc_migrate_functions(db);
@@ -474,6 +657,11 @@ int run_migrate_tests(void) {
     test_user_kind();
     test_spoilers_reindexed();
     test_also_channel();
+    test_calls_0087();
+    test_previews_0088();
+    test_rendered_audio_uses_0089();
+    test_connections_0091();
+    test_outgoing_webhooks_0092();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

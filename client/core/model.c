@@ -208,11 +208,44 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
     return m->reconnect_at_ms - now_ms;
 }
 
+int oc_model_user_is_agent(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; m && i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].agent != 0;
+    return 0;
+}
+
+int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id) {
+    if (!m || !m->outwh_secret[0]) return 0;
+    if (out && cap) snprintf(out, cap, "%s", m->outwh_secret);
+    if (webhook_id) *webhook_id = m->outwh_secret_id;
+    for (volatile char *z = m->outwh_secret; z < m->outwh_secret + sizeof m->outwh_secret; z++) *z = 0;
+    m->outwh_secret_id = 0;
+    return 1;
+}
+
+int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
+                              char *scopes, size_t scopes_cap) {
+    if (!m || !m->agent_token[0]) return 0;
+    if (out && cap) snprintf(out, cap, "%s", m->agent_token);
+    if (scopes && scopes_cap) snprintf(scopes, scopes_cap, "%s", m->agent_token_scopes);
+    if (agent_id) *agent_id = m->agent_token_agent;
+    if (token_id) *token_id = m->agent_token_id;
+    for (volatile char *z = m->agent_token; z < m->agent_token + sizeof m->agent_token; z++) *z = 0;
+    m->agent_token_scopes[0] = '\0';
+    m->agent_token_agent = m->agent_token_id = 0;
+    return 1;
+}
+
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
+    return oc_model_take_image(m, attachment_id, len, NULL);
+}
+
+uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, uint8_t *rung) {
     if (!m || !m->n_fetched) return NULL;
     uint8_t *d = m->fetched[0].data;
     if (attachment_id) *attachment_id = m->fetched[0].id;
     if (len) *len = m->fetched[0].len;
+    if (rung) *rung = m->fetched[0].rung;
     memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
     m->n_fetched--;
     return d;
@@ -458,12 +491,23 @@ int oc_model_has_default_quiet_hours(const oc_model *m) {
     return oc_model_workspace_setting(m, "default_quiet_hours", v, sizeof v) && v[0];
 }
 
+int oc_model_connections_on(const oc_model *m) {
+    char v[8];
+    return !oc_model_workspace_setting(m, "mcp_connections", v, sizeof v) || strcmp(v, "off") != 0;
+}
+
 int oc_model_receipts_on(const oc_model *m) {
     char v[8];
     return !oc_model_workspace_setting(m, "read_receipts", v, sizeof v) || strcmp(v, "off") != 0;
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->my_conns); m->my_conns = NULL; m->n_my_conns = 0;
+    free(m->all_conns); m->all_conns = NULL; m->n_all_conns = 0;
+    free(m->call_hist);
+    m->call_hist = NULL; m->n_call_hist = 0;
+    oc_call_page_view_free(m->call_page);
+    m->call_page = NULL;
     memset(m->pdms, 0, sizeof m->pdms);
     m->n_pdms = 0;
     free(m->sum_notices);
@@ -836,6 +880,7 @@ int oc_model_has_capability(const oc_model *m, const char *name) {
     return 0;
 }
 uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
+uint8_t     oc_model_export_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_H264_EXPORT); }
 uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
 uint8_t     oc_model_calls_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_CALLS); }
 uint8_t     oc_model_summarize_available(const oc_model *m) {
@@ -2049,9 +2094,15 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
     return kept;
 }
 
-const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id) {
-    for (size_t i = 0; i < m->n_calls; i++)
-        if (m->calls[i].channel_id == channel_id) return &m->calls[i];
+const oc_call_view *oc_model_call(const oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; call_id && i < m->n_calls; i++)
+        if (m->calls[i].call_id == call_id) return &m->calls[i];
+    return NULL;
+}
+
+const oc_call_view *oc_model_call_from(const oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; channel_id && i < m->n_calls; i++)
+        if (m->calls[i].from_channel == channel_id) return &m->calls[i];
     return NULL;
 }
 
@@ -2068,7 +2119,7 @@ size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
     for (size_t i = 0; i < m->n_call_notices; i++) {
         oc_call_notice *n = &m->call_notices[i];
         const oc_channel *c = oc_model_channel(m, n->channel_id);
-        const oc_call_view *v = oc_model_call_in(m, n->channel_id);
+        const oc_call_view *v = oc_model_call(m, n->call_id);
         /* Still standing: not taken, declined or ended since it arrived. */
         if (!v || v->call_id != n->call_id || !oc_model_call_invited(v, m->user_id)) continue;
         int muted = c ? c->muted : 0;
@@ -2081,15 +2132,51 @@ size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
     return kept;
 }
 
-/* CALL_STATE (REQ-303): upsert the conversation's entry, or drop it when the
- * call is over. An invitation this user did not hold before is queued for the
- * toast pass. */
+/* CALL_STATE (REQ-303): upsert the call's entry, or drop it when the call is
+ * over. An invitation this user did not hold before is queued for the toast
+ * pass, under the conversation it was started from (whose mute and level
+ * apply), if any. */
+/* A call this user has been in: remembered, oldest forgotten first. */
+static void call_joined_note(oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_joined; i++) if (m->call_joined[i] == call_id) return;
+    if (m->n_call_joined == OC_MAX_CALLS_LISTED) {
+        memmove(m->call_joined, m->call_joined + 1, (OC_MAX_CALLS_LISTED - 1) * sizeof m->call_joined[0]);
+        m->n_call_joined--;
+    }
+    m->call_joined[m->n_call_joined++] = call_id;
+}
+
+static int call_was_joined(const oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_joined; i++) if (m->call_joined[i] == call_id) return 1;
+    return 0;
+}
+
+/* A missed call not yet seen: counted once, the newest kept. */
+static void call_missed_note(oc_model *m, uint64_t call_id) {
+    for (size_t i = 0; i < m->n_call_missed; i++) if (m->call_missed[i] == call_id) return;
+    if (m->n_call_missed == OC_MAX_CALLS_LISTED) {
+        memmove(m->call_missed, m->call_missed + 1, (OC_MAX_CALLS_LISTED - 1) * sizeof m->call_missed[0]);
+        m->n_call_missed--;
+    }
+    m->call_missed[m->n_call_missed++] = call_id;
+}
+
+void oc_model_calls_seen(oc_model *m, uint64_t seen_ms) {
+    if (!m) return;
+    m->n_call_missed = 0;
+    if (seen_ms > m->call_missed_seen_ms) m->call_missed_seen_ms = seen_ms;
+}
+
 static void call_state_fold(oc_model *m, const oc_call_view *v) {
     size_t i = 0;
-    while (i < m->n_calls && m->calls[i].channel_id != v->channel_id) i++;
-    int had_invite = i < m->n_calls && m->calls[i].call_id == v->call_id &&
-                     oc_model_call_invited(&m->calls[i], m->user_id);
+    while (i < m->n_calls && m->calls[i].call_id != v->call_id) i++;
+    int had_invite = i < m->n_calls && oc_model_call_invited(&m->calls[i], m->user_id);
+    for (uint16_t k = 0; k < v->n_parts; k++) if (v->parts[k] == m->user_id) call_joined_note(m, v->call_id);
     if (v->ended) {
+        /* Still asked when it ended -- a decline takes you off the list -- and
+         * never in it: missed. */
+        if (had_invite && !call_was_joined(m, v->call_id) && v->started_at > m->call_missed_seen_ms)
+            call_missed_note(m, v->call_id);
         if (i < m->n_calls) m->calls[i] = m->calls[--m->n_calls];
         return;
     }
@@ -2105,7 +2192,7 @@ static void call_state_fold(oc_model *m, const oc_call_view *v) {
             m->n_call_notices--;
         }
         oc_call_notice *n = &m->call_notices[m->n_call_notices++];
-        n->channel_id = v->channel_id;
+        n->channel_id = v->from_channel;
         n->call_id = v->call_id;
         n->starter = v->starter;
     }
@@ -2146,6 +2233,83 @@ int oc_snippet_offer(const char *text, size_t len) {
     for (size_t i = 0; i < len; i++)
         if (text[i] == '\n' && i + 1 < len && ++lines > OC_SNIPPET_PASTE_LINES) return 1;
     return 0;
+}
+
+/* A page of the call history (CALLS.md §1). The first page (asked from the
+ * newest) takes the list's place; one asked from further back goes on the
+ * end, a call already held there not twice. */
+static void call_history_apply(oc_model *m, const oc_call_history_view *v) {
+    int first = !m->call_hist_loaded || (v->count && m->n_call_hist && v->rows[0].started_at >= m->call_hist[0].started_at);
+    size_t keep = first ? 0 : m->n_call_hist;
+    oc_call_hist_view *g = realloc(m->call_hist, (keep + v->count + 1) * sizeof *g);
+    if (!g) return;
+    m->call_hist = g;
+    m->n_call_hist = keep;
+    for (uint16_t i = 0; i < v->count; i++) {
+        const oc_call_hist_view *h = &v->rows[i];
+        if ((h->flags & OC_CALL_HIST_MISSED) && h->started_at > m->call_missed_seen_ms) call_missed_note(m, h->call_id);
+        if (h->flags & OC_CALL_HIST_JOINED) call_joined_note(m, h->call_id);
+        int dup = 0;
+        for (size_t k = 0; k < keep && !dup; k++) dup = g[k].call_id == v->rows[i].call_id;
+        if (!dup) g[m->n_call_hist++] = v->rows[i];
+    }
+    m->call_hist_more = v->more;
+    m->call_hist_loaded = 1;
+    m->call_hist_seq++;
+}
+
+/* A call's page. The same call's transcript continued (its lines from where
+ * the held ones end) is added to them; anything else takes the page's place. */
+static void call_page_apply(oc_model *m, oc_call_page_view *v) {
+    oc_call_page_view *h = m->call_page;
+    if (h && h->call_id == v->call_id && v->line_from && v->line_from == h->n_lines) {
+        /* The held lines first, then these. */
+        oc_call_line_view *g = realloc(h->lines, (h->n_lines + v->n_lines + 1) * sizeof *g);
+        if (!g) { oc_call_page_view_free(v); return; }
+        if (v->n_lines) memcpy(g + h->n_lines, v->lines, v->n_lines * sizeof *g);
+        free(v->lines);
+        v->lines = g;
+        v->n_lines += h->n_lines;
+        h->lines = NULL; h->n_lines = 0;
+    }
+    oc_call_page_view_free(h);
+    v->line_from = 0;
+    m->call_page = v;
+    m->call_page_seq++;
+}
+
+/* An admin deleted a call's transcript or one of its recordings: gone from the
+ * page held, and from the call's row in the history. */
+static void call_deleted_apply(oc_model *m, uint64_t call_id, uint8_t what, uint64_t rec_id) {
+    oc_call_page_view *p = m->call_page;
+    if (p && p->call_id == call_id) {
+        if (what == OC_CALL_DEL_TRANSCRIPT) {
+            for (uint32_t i = 0; i < p->n_lines; i++) free(p->lines[i].text);
+            free(p->lines);
+            p->lines = NULL; p->n_lines = 0; p->n_lines_total = 0;
+            p->has_transcript = 0;
+        } else if (what == OC_CALL_DEL_RECORDING) {
+            for (uint16_t i = 0; i < p->n_recordings; i++)
+                if (p->recordings[i].id == rec_id) { p->recordings[i] = p->recordings[--p->n_recordings]; break; }
+        }
+        m->call_page_seq++;
+    }
+    for (size_t i = 0; i < m->n_call_hist; i++) {
+        if (m->call_hist[i].call_id != call_id) continue;
+        if (what == OC_CALL_DEL_TRANSCRIPT) m->call_hist[i].flags &= (uint8_t)~OC_CALL_HIST_TRANSCRIPT;
+        else if (!p || p->call_id != call_id || !p->n_recordings) m->call_hist[i].flags &= (uint8_t)~OC_CALL_HIST_RECORDING;
+        m->call_hist_seq++;
+    }
+}
+
+/* A call's chat, known as one (CALLS.md §1): there to open from the call,
+ * in no list. */
+static void call_chat_mark(oc_model *m, uint64_t chat, uint64_t call_id) {
+    if (!chat || !call_id) return;
+    oc_channel *c = channel_ensure(m, chat);
+    if (!c) return;
+    c->call_id = call_id;
+    if (c->kind != OC_CHANNEL_KIND_DM) c->kind = OC_CHANNEL_KIND_DM;
 }
 
 void oc_model_apply(oc_model *m, oc_ev *e) {
@@ -2270,6 +2434,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
                                 e->msg_kind, e->broadcast_stored, &e->body)) {
             msg_set_action(&c->msgs[c->n_msgs - 1], e);
+            c->msgs[c->n_msgs - 1].call_id = e->call_id;
+            /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
+             * in the scroll an older page put it. */
+            for (size_t k = c->n_msgs; k-- > 0;)
+                if (c->msgs[k].message_id == e->message_id) {
+                    snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
+                    break;
+                }
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
              * a message mattered, and a badge that emptied itself overnight
@@ -3124,6 +3296,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (m->n_thread_msgs > before) {
                 msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
                 m->thread_msgs[m->n_thread_msgs - 1].broadcast_stored = e->broadcast_stored;   /* REQ-221 */
+                snprintf(m->thread_msgs[m->n_thread_msgs - 1].via, sizeof m->thread_msgs[0].via, "%s", e->via);
             }
         }
         break;
@@ -3389,6 +3562,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_USER:
         if (e->user_system) { m->ws_sender = e->user_id; break; }
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) m->users[i].agent = e->user_agent;
         /* The roster carries the profile fields now (REQ-289), so every surface
          * that shows a person can show them — the profile card included, which
          * used to say they "are not built" because only PROFILE_INFO had them and
@@ -3432,6 +3607,86 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
         break;
+    case OC_EV_AGENT_TOKEN:
+        snprintf(m->agent_token, sizeof m->agent_token, "%s", e->body ? e->body : "");
+        snprintf(m->agent_token_scopes, sizeof m->agent_token_scopes, "%s", e->topic ? e->topic : "");
+        m->agent_token_agent = e->user_id;
+        m->agent_token_id = e->message_id;
+        break;
+    case OC_EV_OUTWH_SECRET:
+        snprintf(m->outwh_secret, sizeof m->outwh_secret, "%s", e->body ? e->body : "");
+        m->outwh_secret_id = e->message_id;
+        break;
+    case OC_EV_OUTWH_BEGIN:
+        m->n_outwhs = 0;
+        m->outwhs_have = 1;
+        break;
+    case OC_EV_OUTWH_ROW:
+        if (m->n_outwhs < OC_OUTWH_LIST_MAX) {
+            oc_outwh_view *o = &m->outwhs[m->n_outwhs++];
+            memset(o, 0, sizeof *o);
+            o->id = e->message_id;
+            o->created_by = e->author_id;
+            o->created_at = e->created_at;
+            o->enabled = e->status;
+            snprintf(o->url, sizeof o->url, "%s", e->body ? e->body : "");
+            snprintf(o->events, sizeof o->events, "%s", e->topic ? e->topic : "");
+            snprintf(o->reason, sizeof o->reason, "%s", e->preview ? e->preview : "");
+            for (size_t i = 0; i < e->n_ids && o->n_channels < OC_OUTWH_MAX_CHANNELS; i++)
+                o->channels[o->n_channels++] = e->ids[i];
+        }
+        break;
+    case OC_EV_AGENT_TOKENS_BEGIN:
+        m->atokens_agent = e->user_id;
+        m->n_atokens = 0;
+        break;
+    case OC_EV_AGENT_TOKEN_ROW:
+        if (e->user_id == m->atokens_agent && m->n_atokens < OC_AGENT_TOKEN_LIST_MAX) {
+            oc_agent_token_row *t = &m->atokens[m->n_atokens++];
+            t->id = e->message_id;
+            t->created_by = e->author_id;
+            t->created_at = e->created_at;
+            t->last_used_at = e->server_time;
+            snprintf(t->name, sizeof t->name, "%s", e->body ? e->body : "");
+            snprintf(t->scopes, sizeof t->scopes, "%s", e->topic ? e->topic : "");
+            snprintf(t->last_from, sizeof t->last_from, "%s", e->preview ? e->preview : "");
+        }
+        break;
+    case OC_EV_CONNECTION_REQUEST:
+        m->conn_req_open = 1;
+        m->conn_decided = 0;
+        snprintf(m->conn_req_code, sizeof m->conn_req_code, "%s", e->preview ? e->preview : "");
+        snprintf(m->conn_req_client, sizeof m->conn_req_client, "%s", e->body ? e->body : "");
+        snprintf(m->conn_req_return, sizeof m->conn_req_return, "%s", e->topic ? e->topic : "");
+        break;
+    case OC_EV_CONNECTION_DECIDED:
+        m->conn_req_open = 0;
+        m->conn_decided = e->status ? 1 : 2;
+        snprintf(m->conn_decided_client, sizeof m->conn_decided_client, "%s", e->body ? e->body : "");
+        set_status(m, e->status ? "AI client approved" : "AI client declined");
+        break;
+    case OC_EV_CONNECTIONS_BEGIN:
+        if (e->status) { m->n_all_conns = 0; m->all_conns_known = 1; }
+        else m->n_my_conns = 0;
+        break;
+    case OC_EV_CONNECTION_ROW: {
+        oc_conn_view **arr = e->status ? &m->all_conns : &m->my_conns;
+        size_t *n = e->status ? &m->n_all_conns : &m->n_my_conns;
+        oc_conn_view *g = realloc(*arr, (*n + 1) * sizeof *g);
+        if (!g) break;
+        *arr = g;
+        oc_conn_view *v = &g[(*n)++];
+        memset(v, 0, sizeof *v);
+        v->id = e->message_id;
+        v->user_id = e->user_id;
+        v->created_at = e->created_at;
+        v->last_used_at = e->server_time;
+        v->expires_at = e->parent_id;
+        v->lifetime_days = e->count;
+        snprintf(v->user_name, sizeof v->user_name, "%s", e->topic ? e->topic : "");
+        snprintf(v->client_name, sizeof v->client_name, "%s", e->body ? e->body : "");
+        break;
+    }
     case OC_EV_ATTACHMENT_DATA:
         /* Held until a frontend takes it. Full means nobody is taking them, and
          * then the oldest goes: a frontend asks again for what it still wants. */
@@ -3443,6 +3698,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->fetched[m->n_fetched].id = e->message_id;
         m->fetched[m->n_fetched].data = (uint8_t *)e->body;
         m->fetched[m->n_fetched].len = e->count;
+        m->fetched[m->n_fetched].rung = (uint8_t)e->op;
         m->n_fetched++;
         e->body = NULL;                      /* the model owns the bytes now */
         break;
@@ -3488,32 +3744,61 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     case OC_EV_CALL_STATE:
+        if (e->call) call_chat_mark(m, e->call->chat_channel, e->call->call_id);
         if (e->call) call_state_fold(m, e->call);
         if (e->call && m->in_call && m->call.call_id == e->call->call_id && !e->call->ended) {
             m->call.starter = e->call->starter;
             m->call.started_at = e->call->started_at;
             m->call.n_invited = e->call->n_invited;
             m->call.sharer = e->call->sharer;
+            m->call.from_channel = e->call->from_channel;
+            m->call.chat_channel = e->call->chat_channel;
+            m->call.recording = e->call->recording;
+            m->call.rec_by = e->call->rec_by;
+            memcpy(m->call.subject, e->call->subject, sizeof m->call.subject);
             memcpy(m->call.invited, e->call->invited, e->call->n_invited * sizeof e->call->invited[0]);
         }
         break;
     case OC_EV_CALL_JOINED:
         if (!e->call) break;
         if (m->call_rejoining) {
-            if (m->call_rejoining == e->call->channel_id) m->call_back_seq++;
+            if (m->call_rejoining == e->call->call_id) m->call_back_seq++;
             m->call_rejoining = 0;
         }
         m->in_call = 1;
         m->call = *e->call;
-        if (m->call_pending == e->call->channel_id) m->call_pending = 0;
+        call_joined_note(m, e->call->call_id);
+        /* What Calls home already knows of it: the joined frame carries no
+         * subject or conversation. */
+        const oc_call_view *known = oc_model_call(m, e->call->call_id);
+        if (known) {
+            m->call.from_channel = known->from_channel;
+            m->call.chat_channel = known->chat_channel;
+            m->call.recording = known->recording;
+            m->call.rec_by = known->rec_by;
+            memcpy(m->call.subject, known->subject, sizeof m->call.subject);
+        }
+        m->call_pending = 0;
         break;
     case OC_EV_CALL_REJOINING:
         /* Out, for now: the view of the call is kept, to say what is coming back. */
         m->in_call = 0;
-        m->call_rejoining = e->channel_id;
+        m->call_rejoining = e->call_id;
+        break;
+    case OC_EV_CALL_HISTORY:
+        for (uint16_t i = 0; e->call_hist && i < e->call_hist->count; i++)
+            call_chat_mark(m, e->call_hist->rows[i].chat_channel, e->call_hist->rows[i].call_id);
+        if (e->call_hist) call_history_apply(m, e->call_hist);
+        break;
+    case OC_EV_CALL_PAGE:
+        if (e->call_page) call_chat_mark(m, e->call_page->chat_channel, e->call_page->call_id);
+        if (e->call_page) { call_page_apply(m, e->call_page); e->call_page = NULL; }
+        break;
+    case OC_EV_CALL_DELETED:
+        call_deleted_apply(m, e->call_id, e->op, e->message_id);
         break;
     case OC_EV_CALL_LOST:
-        if (m->call_rejoining == e->channel_id) {
+        if (m->call_rejoining == e->call_id) {
             m->call_rejoining = 0;
             memset(&m->call, 0, sizeof m->call);
             m->call_lost_seq++;
@@ -3527,9 +3812,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         memcpy(m->call.slots, e->call->slots, e->call->n_parts * sizeof e->call->slots[0]);
         memcpy(m->call.away, e->call->away, e->call->n_parts * sizeof e->call->away[0]);
         memcpy(m->call.camera, e->call->camera, e->call->n_parts * sizeof e->call->camera[0]);
+        memcpy(m->call.recorder, e->call->recorder, e->call->n_parts * sizeof e->call->recorder[0]);
         break;
     case OC_EV_CALL_LEFT:
-        if ((m->in_call || m->call_rejoining) && m->call.channel_id == e->channel_id) {
+        if ((m->in_call || m->call_rejoining) && m->call.call_id == e->call_id) {
             m->in_call = 0;
             m->call_rejoining = 0;
             memset(&m->call, 0, sizeof m->call);
@@ -3972,6 +4258,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
         for (size_t i = 0; tmp && i < m->n_channels; i++) {
             const oc_channel *c = &m->channels[i];
             if (c->e2e && c->forgotten) continue;   /* an encrypted DM put away (PRIVATE-DM.md) */
+            if (c->call_id) continue;               /* a call's chat: reached from the call (CALLS.md §1) */
             int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
             int starred = oc_sidebar_is_starred(o, c->channel_id);
             int inbox = oc_sidebar_section_of(o, c->channel_id);   /* custom, or -1 */

@@ -1,6 +1,6 @@
 /*
  * OpenChime — sumkit: the summary inference engine, in plain C (ARCH-116,
- * docs/SUMKIT.md).
+ * docs/details/SUMKIT.md).
  *
  * Runs a language model of the Qwen3.5 family -- gated DeltaNet layers and
  * gated attention layers -- converted into one file, summary.bin, by

@@ -1,5 +1,5 @@
 # The vendored libraries the host build links, each fetched and built pinned by
-# a script under scripts/build/ (docs/VENDORS.md §2), and the committed SQLite
+# a script under scripts/build/ (docs/details/VENDORS.md §2), and the committed SQLite
 # amalgamation. A build that takes minutes says so before it starts.
 
 # --- SQLite (vendored, third_party/sqlite-3.53.4) -----------------------------
@@ -44,6 +44,22 @@ $(OPUS_A):
 	scripts/build/opus.sh native
 $(SPEEXDSP_A):
 	scripts/build/speexdsp.sh native
+$(LIBAVC_A):
+	scripts/build/libavc.sh
+$(LAME_A):
+	scripts/build/lame.sh
+# The image-preview codecs (ARCH-137), the daemon's own.
+$(LIBJPEG_A):
+	scripts/build/libjpeg-turbo.sh
+$(LIBSPNG_A):
+	scripts/build/libspng.sh
+$(LIBWEBP_A):
+	scripts/build/libwebp.sh
+
+# The font a call's recording names people in (daemon/callrec_render.c), compiled in.
+$(CALLREC_FONT_RES): third_party/fonts/NotoSans-Regular.ttf scripts/build/embed_res.py
+	@mkdir -p $(dir $@)
+	python3 scripts/build/embed_res.py $@ oc_callrec_font=third_party/fonts/NotoSans-Regular.ttf
 
 # The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
 $(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py

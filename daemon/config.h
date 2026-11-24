@@ -181,10 +181,28 @@ typedef struct {
     /* The speech features: built in and on by default (ARCH-111/112); their
      * data is found as every build's is (tts_data.h). */
     struct { int enabled; } tts, stt;
+    /* The export of a video message as H.264 + MP3 (ARCH-135), in a build that
+     * carries it: OPENCHIME_H264_EXPORT, off unless the operator holds the
+     * licence turning it on needs. */
+    struct { int enabled; } export_h264;
+    /* Recording calls (CALLS.md §8), in a build that carries it: on unless an
+     * admin turned it off; recordings kept `days` (0: as long as the call is)
+     * and held to `max_mb` megabytes in all (0: no cap). */
+    struct { int enabled; int days; uint64_t max_mb; } call_recording;
+    /* The MCP endpoint (docs/details/MCP.md): OPENCHIME_MCP, off unless turned
+     * on; each agent token's budget, `per_minute` calls refilled continuously
+     * up to `burst`. */
+    /* connections: people may connect their own AI clients (AUTH.md §8.13). */
+    struct { int enabled; int per_minute; int burst; int connections; } mcp;
+    int retention_days;                 /* OPENCHIME_RETENTION_DAYS: messages older are deleted (REQ-250); 0 keeps them */
     /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;
     uint64_t max_video_size;            /* OPENCHIME_MAX_VIDEO_SIZE: a video message's cap, sent to clients (REQ-164) */
+    /* Image previews (ARCH-137): made at upload unless turned off; each rung's
+     * box (the longer side, px), and the decode's byte cap, pixel cap and time
+     * limit. CONFIG.md, "Image previews". */
+    struct { int enabled; int inline_px, expanded_px; uint64_t max_bytes, max_pixels; int timeout_ms; } previews;
 
     /* Development mode only (OPENCHIME_DEV_*). In any other mode these are the
      * constants and the variables refuse the start. */

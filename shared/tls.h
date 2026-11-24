@@ -8,7 +8,7 @@
  * when the socket would block, which the caller maps to epoll interest.
  *
  * mbedTLS is pinned and vendored (scripts/build/mbedtls.sh) so local, CI, and
- * the Docker image share one version; see docs/TLS.md.
+ * the Docker image share one version; see docs/details/TLS.md.
  */
 
 #ifndef OPENCHIME_TLS_H

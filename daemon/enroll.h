@@ -5,7 +5,7 @@
  * (CA-verified HTTPS) to prove possession of the private key and activate the
  * binding. Central never dials the daemon (ARCH-56); the daemon only ever calls
  * out, and only for its own enrollment function (ARCH-26 is about *config*, which
- * this is not). See docs/AUTH.md §3.6.
+ * this is not). See docs/details/AUTH.md §3.6.
  */
 #ifndef OPENCHIME_ENROLL_H
 #define OPENCHIME_ENROLL_H

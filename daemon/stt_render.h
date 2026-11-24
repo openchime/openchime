@@ -1,6 +1,6 @@
 /*
  * OpenChime — the voice-input recognizer interface (ARCH-112,
- * docs/VOICE-INPUT.md §6).
+ * docs/details/VOICE-INPUT.md §6).
  *
  * The recognizer is behind a small engine interface so the worker and the daemon
  * above it are tested with a stub that turns known audio into known words, and

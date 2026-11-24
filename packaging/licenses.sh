@@ -13,14 +13,18 @@
 # Read-aloud (ARCH-111), voice input (ARCH-112) and summaries are in the
 # release's daemon, and with them the voice model, Opus, CMUdict-derived data
 # and the recognizer; for a daemon built without one, run this with
-# TTS=0, STT=0 or SUM=0.
+# TTS=0, STT=0 or SUM=0. The export of a video message (EXPORT, ARCH-135) brings
+# libavc, LAME, libvpx and Opus; for a daemon built without it, EXPORT=0.
+# Recording calls (CALLREC, CALLS.md §8) brings libvpx and Opus; for a daemon
+# built without it, CALLREC=0. Every daemon draws a recording's people with
+# stb_image and stb_truetype and the Noto Sans font, compiled in.
 #
 # Litestream (Apache-2.0) is not here for the same reason: it is a separate
 # program, in the container image only, never linked into openchimed nor in
 # the tarball this file describes. Its own LICENSE travels beside it in the
 # image (packaging/image-context.sh, /usr/share/doc/litestream/LICENSE).
 #
-#   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
+#   [TTS=0] [STT=0] [SUM=0] [EXPORT=0] [CALLREC=0] licenses.sh <mbedtls-dir>
 #
 # LICENSES_LIST=1 prints the path of each text it would include, one per line,
 # and nothing else: scripts/test/fast/notices.sh compares that list with what the
@@ -31,6 +35,8 @@ MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
 TTS="${TTS:-1}"
 STT="${STT:-1}"
 SUM="${SUM:-1}"
+EXPORT="${EXPORT:-1}"
+CALLREC="${CALLREC:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 LIST="${LICENSES_LIST:-0}"
@@ -96,6 +102,16 @@ in full here, as those licences require.
                                 third_party/ca-roots in the repository above
   SQLite 3.53.4    Public       the message database
                    domain
+  stb_image,       Public       decoding avatars and drawing names in a
+    stb_truetype   domain or    call's recording
+                   MIT
+  Noto Sans        SIL OFL 1.1  the font a call's recording names people in,
+                                embedded as data
+  libjpeg-turbo    IJG, BSD-3-  decoding and encoding JPEG image previews
+    3.2.1          Clause, Zlib
+  libspng 0.7.4    BSD-2-Clause decoding and encoding PNG image previews
+  miniz 3.1.2      MIT          the zlib libspng's PNG previews use
+  libwebp 1.6.0    BSD-3-Clause decoding and encoding WebP image previews
 HEADER
 
 if [ "$TTS" = 1 ]; then
@@ -115,6 +131,32 @@ and, for voice input (built into the binary, its data in stt/):
 
   The recognizer       MIT          voice input's speech recognition model and
                                     tokenizer, shipped as data in stt/
+HEADER
+fi
+
+if [ "$EXPORT" = 1 ]; then
+  header <<'HEADER'
+
+and, for the export of a video message (built into the binary; used only when
+the operator turns OPENCHIME_H264_EXPORT on, which needs their own H.264 patent
+licence):
+
+  libavc 1.10.0        Apache-2.0   encoding H.264
+  LAME 3.100           LGPL-2.0-or- encoding MP3; its source is
+                       later        third_party/lame in the repository above
+  libvpx 1.17.0        BSD-3-Clause decoding the VP9 a video message holds
+  Opus 1.6.1           BSD-3-Clause decoding its audio
+HEADER
+fi
+
+if [ "$CALLREC" = 1 ]; then
+  header <<'HEADER'
+
+and, for recording calls (built into the binary; used unless the operator turns
+OPENCHIME_CALL_RECORDING off):
+
+  libvpx 1.17.0        BSD-3-Clause encoding and decoding a recording's VP9
+  Opus 1.6.1           BSD-3-Clause encoding and decoding its audio
 HEADER
 fi
 
@@ -141,6 +183,14 @@ emit "picohttpparser -- MIT License" "${root}/third_party/picohttpparser/LICENSE
 emit "QR Code generator 1.8.0 -- MIT License" "${root}/third_party/qrcodegen/LICENSE"
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
+emit "stb_image and stb_truetype -- Public Domain or MIT License" "${root}/third_party/stb/LICENSE"
+emit "libjpeg-turbo 3.2.1 -- IJG License, BSD 3-Clause License and zlib License" "${root}/third_party/libjpeg-turbo/LICENSE.md"
+emit "libjpeg-turbo 3.2.1 -- the IJG README" "${root}/third_party/libjpeg-turbo/README.ijg"
+emit "libspng 0.7.4 -- BSD 2-Clause License" "${root}/third_party/libspng/LICENSE"
+emit "miniz 3.1.2 -- MIT License" "${root}/third_party/miniz/LICENSE"
+emit "libwebp 1.6.0 -- BSD 3-Clause License" "${root}/third_party/libwebp/COPYING"
+emit "libwebp 1.6.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libwebp/PATENTS"
+emit "Noto Sans -- SIL Open Font License 1.1" "${root}/third_party/fonts/OFL.txt"
 
 if [ "$TTS" = 1 ]; then
   emit "The voice model -- Apache License 2.0" "${root}/ttskit/data/VOICE-LICENSE"
@@ -149,4 +199,19 @@ if [ "$TTS" = 1 ]; then
 fi
 if [ "$STT" = 1 ]; then
   emit "The recognizer -- MIT License" "${root}/sttkit/data/RECOGNIZER-LICENSE"
+fi
+if [ "$EXPORT" = 1 ]; then
+  emit "libavc 1.10.0 -- Apache License 2.0" "${root}/third_party/libavc/LICENSE"
+  emit "libavc 1.10.0 -- NOTICE" "${root}/third_party/libavc/NOTICE"
+  emit "LAME 3.100 -- GNU Library General Public License v2 or later" "${root}/third_party/lame/COPYING"
+  emit "libvpx 1.17.0 -- BSD 3-Clause License" "${root}/third_party/libvpx/LICENSE"
+  emit "libvpx 1.17.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libvpx/PATENTS"
+  # Opus once, whichever feature brought it.
+  [ "$TTS" = 1 ] || emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
+fi
+if [ "$CALLREC" = 1 ] && [ "$EXPORT" != 1 ]; then
+  # libvpx and Opus once, whichever feature brought them.
+  emit "libvpx 1.17.0 -- BSD 3-Clause License" "${root}/third_party/libvpx/LICENSE"
+  emit "libvpx 1.17.0 -- Additional IP Rights Grant (Patents)" "${root}/third_party/libvpx/PATENTS"
+  [ "$TTS" = 1 ] || emit "Opus 1.6.1 -- BSD 3-Clause License" "${root}/third_party/opus/COPYING"
 fi

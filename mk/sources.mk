@@ -6,10 +6,10 @@
 BIN := $(if $(ARCH_SUFFIX),build$(BUILD_SUFFIX)/openchimed,openchimed)
 
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c \
-              shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
+              shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c shared/scopes.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/webhooks_out.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c daemon/callrec.c daemon/callrec_render.c daemon/callrec_worker.c daemon/preview.c daemon/mcp.c daemon/oauth.c client/core/call/share.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -20,7 +20,9 @@ OBJ_DIR ?= build$(BUILD_SUFFIX)/obj
 # daemon built without Emscripten still links, and says it has no client.
 WEBAPP_RES := $(GEN_DIR)/webapp_res.c
 PWLIST_RES := $(GEN_DIR)/pw_common.c
-SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES) $(PWLIST_RES)
+# The font a call's recording names people in (CALLS.md §8): Noto Sans, SIL OFL.
+CALLREC_FONT_RES := $(GEN_DIR)/callrec_font.c
+SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES) $(PWLIST_RES) $(CALLREC_FONT_RES)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
 # --- Objects -------------------------------------------------------------------
@@ -68,25 +70,38 @@ SQLITE_O   := build$(BUILD_SUFFIX)/sqlite3.o
 # vendored (third_party/argon2, CC0 or Apache-2.0), one object of its own.
 ARGON2_DIR := third_party/argon2
 ARGON2_O   := build$(BUILD_SUFFIX)/argon2.o
+# Image previews (ARCH-137, docs/details/IMAGE-PREVIEWS.md): the hardened JPEG,
+# PNG and WebP decoders and encoders, committed and built pinned
+# (scripts/build/libjpeg-turbo.sh, libspng.sh with miniz as its zlib,
+# libwebp.sh). The daemon's alone; no client links them.
+LIBJPEG_DIR  := third_party/libjpeg-turbo-3.2.1$(ARCH_SUFFIX)
+LIBSPNG_DIR  := third_party/libspng-0.7.4$(ARCH_SUFFIX)
+LIBWEBP_DIR  := third_party/libwebp-1.6.0$(ARCH_SUFFIX)
+LIBJPEG_A    := $(LIBJPEG_DIR)/lib/libjpeg.a
+LIBSPNG_A    := $(LIBSPNG_DIR)/lib/libspng.a
+LIBWEBP_A    := $(LIBWEBP_DIR)/lib/libwebp.a
+PREVIEW_INC  := -I$(LIBJPEG_DIR)/include -I$(LIBSPNG_DIR)/include -I$(LIBWEBP_DIR)/include -DSPNG_STATIC
+PREVIEW_A    := $(LIBJPEG_A) $(LIBSPNG_A) $(LIBWEBP_A)
+PREVIEW_LIBS := $(LIBWEBP_A) $(LIBWEBP_DIR)/lib/libsharpyuv.a $(LIBSPNG_A) $(LIBJPEG_A)
 
 INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird_party/qrcodegen -I$(MBEDTLS_INC)
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
-APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES)
+APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES) $(CALLREC_FONT_RES)
 # e2e_client is a black-box tool of its own (its own main), not part of the
 # single in-process test binary.
 # The fuzzing tier's harnesses and decoder list (tests/fuzz/fuzz.h): in the test
 # binary, which replays their corpora, and in each libFuzzer binary
 # (mk/tests.mk, build/fuzz/%). tests/fuzz/main.c and seeds.c are the tools'.
 # This is the one list of them: the full suite runs each (scripts/test/full/
-# fuzz.sh, given the list and the dictionaries by make), and docs/TESTING.md
+# fuzz.sh, given the list and the dictionaries by make), and docs/details/TESTING.md
 # says what each fuzzes. FUZZ_DICT_<harness> is the dictionary a harness
 # takes (tests/fuzz/*.dict), none where unset. FUZZ_RUNS_<harness> is the
 # number of inputs the full suite runs it for, from a fixed seed: the same
 # work every run, sized from CI's measured speed so that all of them together
 # take well inside fuzz.sh's 20 seconds.
-FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken
+FUZZ_HARNESSES   := frame framebuf http ws proxy json cbor jwt webauthn idtoken image
 FUZZ_HARNESS_SRC := tests/fuzz/decoders.c $(patsubst %,tests/fuzz/%.c,$(FUZZ_HARNESSES))
 FUZZ_DICT_frame    := tests/fuzz/frame.dict
 FUZZ_DICT_framebuf := tests/fuzz/frame.dict
@@ -105,6 +120,7 @@ FUZZ_RUNS_cbor     := 35000
 FUZZ_RUNS_jwt      := 50000
 FUZZ_RUNS_webauthn := 33000
 FUZZ_RUNS_idtoken  := 20000
+FUZZ_RUNS_image    := 6000
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests
@@ -113,7 +129,7 @@ TEST_BIN := build/tests
 # The shared, frontend-agnostic core: the net thread + the two UI<->net queues +
 # the view-model/reducers + the oc_client facade. It has no main of its own -- the
 # headless test (make test) links and drives it against an in-process daemon, and
-# frontends (a TUI first, then native GUIs) link it too. See docs/CLIENT.md.
+# frontends (a TUI first, then native GUIs) link it too. See docs/details/CLIENT.md.
 # signin_web.c is the browser's signin.c (WEB.md): the web core takes it in
 # place of signin.c, the native build leaves it out.
 CORE_SRC := $(filter-out client/core/signin_web.c,$(wildcard client/core/*.c))
@@ -125,7 +141,10 @@ CORE_INC := -Iclient/core
 # or play video (the TUI) links no codec. libvpx and libopus are fetched and built
 # pinned (scripts/build/libvpx.sh, scripts/build/opus.sh), natively for `make
 # test` and cross-built for the Win32 client.
-MEDIA_SRC  := $(wildcard client/core/media/*.c)
+# The VP9 and Opus decoders are shared/ so the daemon's export links them too
+# (ARCH-135); every client build that has the media library has them.
+CODEC_DEC_SRC := shared/oc_vp9dec.c shared/oc_opusdec.c
+MEDIA_SRC  := $(wildcard client/core/media/*.c) $(CODEC_DEC_SRC)
 MEDIA_HDRS := $(wildcard client/core/media/*.h)
 LIBVPX_DIR := third_party/libvpx-1.17.0$(ARCH_SUFFIX)
 OPUS_DIR   := third_party/opus-1.6.1$(ARCH_SUFFIX)
@@ -136,6 +155,13 @@ OPUS_A     := $(OPUS_DIR)/lib/libopus.a
 # (scripts/build/speexdsp.sh) like the codecs.
 SPEEXDSP_DIR := third_party/speexdsp-1.2.1$(ARCH_SUFFIX)
 SPEEXDSP_A   := $(SPEEXDSP_DIR)/lib/libspeexdsp.a
+# The export of a video message (ARCH-135): libavc's H.264 encoder and LAME's MP3
+# encoder, committed and built pinned (scripts/build/libavc.sh,
+# scripts/build/lame.sh), natively, for a daemon built with EXPORT=1 alone.
+LIBAVC_DIR := third_party/libavc-1.10.0$(ARCH_SUFFIX)
+LAME_DIR   := third_party/lame-3.100$(ARCH_SUFFIX)
+LIBAVC_A   := $(LIBAVC_DIR)/lib/libavcenc.a
+LAME_A     := $(LAME_DIR)/lib/libmp3lame.a
 MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include -I$(SPEEXDSP_DIR)/include
 MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) -ldl -lm
 
@@ -147,7 +173,7 @@ VOICE_SRC  := $(wildcard client/core/voice/*.c)
 VOICE_HDRS := $(wildcard client/core/voice/*.h)
 VOICE_INC  := -Iclient/core/voice -Ithird_party/libfvad/include
 
-# --- Calls (ARCH-113, docs/CALLS.md) -----------------------------------------
+# --- Calls (ARCH-113, docs/details/CALLS.md) -----------------------------------------
 # The media engine behind the core's oc_call_media seam: the microphone through
 # the canceller and speexdsp's preprocessor, Opus, SFrame, the relay socket, the
 # jitter buffers and the mixer. Linked by the Win32 client and the tests; the
@@ -158,8 +184,8 @@ CALL_INC  := -Iclient/core/call
 
 # --- nnkit (the neural network kernels ttskit and sttkit share) ---------------
 # Plain C, no dependencies: the kernels read-aloud's voice model and voice
-# input's recognizer run on. Linked wherever either kit is. See docs/TTSKIT.md
-# §5b and docs/STTKIT.md.
+# input's recognizer run on. Linked wherever either kit is. See docs/details/TTSKIT.md
+# §5b and docs/details/STTKIT.md.
 NNKIT_SRC := $(wildcard nnkit/*.c)
 NNKIT_INC := -Innkit
 NNKIT_HDRS := $(wildcard nnkit/*.h)
@@ -173,7 +199,7 @@ KIT_CFLAGS := -ffp-contract=off
 # --- sttkit (voice input's recognizer, ARCH-112) ----------------------------
 # 16 kHz speech to text: the recognizer in plain C over nnkit, its model one
 # committed, memory-mapped file in sttkit/data. stt_check runs it against its
-# references and times it. See docs/STTKIT.md.
+# references and times it. See docs/details/STTKIT.md.
 STTKIT_SRC := $(filter-out sttkit/stt_check.c,$(wildcard sttkit/*.c))
 STTKIT_INC := -Isttkit $(NNKIT_INC)
 STTKIT_HDRS := $(wildcard sttkit/*.h)
@@ -182,7 +208,7 @@ STTKIT_HDRS := $(wildcard sttkit/*.h)
 # The summary model in plain C over nnkit, its data one memory-mapped file,
 # summary.bin, made by the daemon from Qwen's published files (--summary-pack,
 # daemon/summary_pack.c). sum_check runs it against its references, measures
-# its quantisation and times it. See docs/SUMKIT.md.
+# its quantisation and times it. See docs/details/SUMKIT.md.
 SUMKIT_SRC  := $(filter-out sumkit/sum_check.c,$(wildcard sumkit/*.c))
 SUMKIT_INC  := -Isumkit $(NNKIT_INC)
 SUMKIT_HDRS := $(wildcard sumkit/*.h)
@@ -192,7 +218,7 @@ SUMKIT_HDRS := $(wildcard sumkit/*.h)
 # trained guesser, both committed as memory-mapped data in ttskit/data. Pure C, no
 # dependencies; linked into the daemon and covered by `make test`. tts_pack
 # builds the data files (scripts/build/ttskit_data.sh) and says words with them.
-# See docs/TTSKIT.md.
+# See docs/details/TTSKIT.md.
 TTSKIT_SRC := $(filter-out ttskit/tts_pack.c,$(wildcard ttskit/*.c))
 TTSKIT_INC := -Ittskit $(NNKIT_INC)
 

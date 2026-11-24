@@ -1,5 +1,5 @@
 /* A call's video packet logic, a share's and a camera's — see oc_share.h and
- * docs/CALLS.md §6.4-§6.6, §7. */
+ * docs/details/CALLS.md §6.4-§6.6, §7. */
 #include "oc_share.h"
 
 #include <stdlib.h>

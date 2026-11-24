@@ -55,6 +55,7 @@ struct oc_relay {
     oc_idmap       by_token;         /* token key -> participant */
     oc_idmap       by_call;          /* call id -> first participant */
     oc_idmap       by_conn;          /* connection id -> participant */
+    oc_idmap       recorded;         /* call id -> the call is being recorded */
     size_t         n;
     uint64_t       received;         /* datagrams taken off the socket, relayed or not */
     participant    parts[OC_RELAY_MAX_PARTS];
@@ -116,8 +117,10 @@ oc_relay *oc_relay_open(int udp_fd, const oc_relay_hooks *hooks, void *ctx) {
     /* Twice the table, so neither index passes half full (idmap.h). */
     if (oc_idmap_init(&r->by_token, 2 * OC_RELAY_MAX_PARTS) != 0 ||
         oc_idmap_init(&r->by_call, 2 * OC_RELAY_MAX_PARTS) != 0 ||
-        oc_idmap_init(&r->by_conn, 2 * OC_RELAY_MAX_PARTS) != 0) {
-        oc_idmap_free(&r->by_token); oc_idmap_free(&r->by_call); oc_idmap_free(&r->by_conn); free(r);
+        oc_idmap_init(&r->by_conn, 2 * OC_RELAY_MAX_PARTS) != 0 ||
+        oc_idmap_init(&r->recorded, 2 * OC_RELAY_MAX_PARTS) != 0) {
+        oc_idmap_free(&r->by_token); oc_idmap_free(&r->by_call); oc_idmap_free(&r->by_conn);
+        oc_idmap_free(&r->recorded); free(r);
         return NULL;
     }
     r->fd = udp_fd;
@@ -149,6 +152,7 @@ void oc_relay_close(oc_relay *r) {
     oc_idmap_free(&r->by_token);
     oc_idmap_free(&r->by_call);
     oc_idmap_free(&r->by_conn);
+    oc_idmap_free(&r->recorded);
     free(r);
 }
 
@@ -263,10 +267,14 @@ static int wants_camera(const participant *e, uint64_t user) {
  * relay can hear it, and the others have no use for it. A camera's packet goes
  * only while that camera is on, and only to those who take it. */
 static void forward(oc_relay *r, participant *me, uint16_t seq, uint8_t stream,
-                    const uint8_t *payload, size_t plen) {
+                    const uint8_t *payload, size_t plen, int injected) {
     if (plen > OC_AUDIO_MAX_PACKET - OC_AUDIO_S2C_HDR || stream >= OC_CALL_STREAMS) return;
     int camera = stream == OC_CALL_STREAM_CAMERA;
     if (plen && camera && !me->camera) return;
+    /* The Recorder takes everything that is relayed in its call, every camera
+     * that is on included -- but not what it said itself. */
+    if (plen && !injected && r->hooks.record && oc_idmap_get(&r->recorded, me->call_id))
+        r->hooks.record(r->ctx, me->call_id, me->user_id, seq, stream, payload, plen);
     /* The forwarded datagram: sender_user_id + seq + stream + payload. */
     uint8_t out[OC_AUDIO_MAX_PACKET];
     wr_u64(out, me->user_id);
@@ -305,7 +313,26 @@ int oc_relay_from_tcp(oc_relay *r, uint64_t conn_id, uint16_t seq, uint8_t strea
     if (!me) return -1;
     me->tcp = 1;
     me->last_seen_ms = r->now_ms();
-    forward(r, me, seq, stream, ct, len);
+    forward(r, me, seq, stream, ct, len, 0);
+    return 0;
+}
+
+int oc_relay_set_recorded(oc_relay *r, uint64_t call_id, int on) {
+    if (!r || !call_id) return -1;
+    if (!on) { oc_idmap_del(&r->recorded, call_id); return 0; }
+    return oc_idmap_put(&r->recorded, call_id, (void *)r);
+}
+
+int oc_relay_inject(oc_relay *r, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                    const uint8_t *ct, size_t len) {
+    if (!r || !call_id || !len || !ct || stream >= OC_CALL_STREAMS || stream == OC_CALL_STREAM_CAMERA) return -1;
+    if (!oc_idmap_get(&r->by_call, call_id)) return -1;
+    /* A sender in no table: every participant of the call is someone else. */
+    participant me;
+    memset(&me, 0, sizeof me);
+    me.call_id = call_id;
+    me.user_id = sender;
+    forward(r, &me, seq, stream, ct, len, 1);
     return 0;
 }
 
@@ -376,7 +403,7 @@ static int relay_one(oc_relay *r) {
 
     me->tcp = 0;
     const uint8_t *seq = pkt + me->token_len;
-    forward(r, me, (uint16_t)((seq[0] << 8) | seq[1]), seq[2], seq + 3, (size_t)n - me->token_len - 3);
+    forward(r, me, (uint16_t)((seq[0] << 8) | seq[1]), seq[2], seq + 3, (size_t)n - me->token_len - 3, 0);
     return 1;
 }
 

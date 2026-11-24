@@ -1,4 +1,4 @@
-/* build/fuzz/seeds <dir>: the harnesses' seed corpora (docs/TESTING.md,
+/* build/fuzz/seeds <dir>: the harnesses' seed corpora (docs/details/TESTING.md,
  * "Fuzzing"). One frame per encoder, each over a zeroed message, so every
  * message type is in the corpus as the encoder writes it, into <dir>/frame/;
  * and into <dir>/framebuf/, streams of those frames under a few chunkings,
@@ -369,6 +369,14 @@ int main(int argc, char **argv) {
     { static oc_storage_status m; FRAME("storage_status", oc_encode_storage_status(&w, V, &m)); }
     { static oc_client_settings m; FRAME("client_settings", oc_encode_client_settings(&w, V, &m)); }
     { static oc_call_join m; FRAME("call_join", oc_encode_call_join(&w, V, &m)); }
+    { static oc_call_start m; FRAME("call_start", oc_encode_call_start(&w, V, &m)); }
+    { static oc_call_subject m; FRAME("call_subject", oc_encode_call_subject(&w, V, &m)); }
+    { static oc_call_history m; FRAME("call_history", oc_encode_call_history(&w, V, &m)); }
+    { static oc_call_history_page m; FRAME("call_history_page", oc_encode_call_history_page(&w, V, &m)); }
+    { static oc_call_detail m; FRAME("call_detail", oc_encode_call_detail(&w, V, &m)); }
+    { static oc_call_page m; FRAME("call_page", oc_encode_call_page(&w, V, &m)); }
+    { static oc_call_delete m; FRAME("call_delete", oc_encode_call_delete(&w, V, OC_MSG_CALL_DELETE, &m)); }
+    { static oc_call_record m; FRAME("call_record", oc_encode_call_record(&w, V, &m)); }
     { static oc_call_leave m; FRAME("call_leave", oc_encode_call_leave(&w, V, &m)); }
     { static oc_call_joined m; FRAME("call_joined", oc_encode_call_joined(&w, V, &m)); }
     { static oc_call_roster m; FRAME("call_roster", oc_encode_call_roster(&w, V, &m)); }
@@ -434,6 +442,26 @@ int main(int argc, char **argv) {
     { static oc_history_request m; FRAME("history_request", oc_encode_history_request(&w, V, &m)); }
     { static oc_history_around m; FRAME("history_around", oc_encode_history_around(&w, V, &m)); }
     { static oc_backfill_done m; FRAME("backfill_done", oc_encode_backfill_done(&w, V, &m)); }
+    { static oc_create_agent m; FRAME("create_agent", oc_encode_create_agent(&w, V, &m)); }
+    { static oc_agent_token m; FRAME("agent_token", oc_encode_agent_token(&w, V, &m)); }
+    { static oc_remove_agent m; FRAME("remove_agent", oc_encode_remove_agent(&w, V, &m)); }
+    { static oc_mint_agent_token m; FRAME("mint_agent_token", oc_encode_mint_agent_token(&w, V, &m)); }
+    { static oc_list_agent_tokens m; FRAME("list_agent_tokens", oc_encode_list_agent_tokens(&w, V, &m)); }
+    { static oc_agent_token_list m; FRAME("agent_token_list", oc_encode_agent_token_list(&w, V, &m)); }
+    { static oc_revoke_agent_token m; FRAME("revoke_agent_token", oc_encode_revoke_agent_token(&w, V, &m)); }
+    { static oc_connection_code m; FRAME("connection_code", oc_encode_connection_code(&w, V, &m)); }
+    { static oc_connection_request m; FRAME("connection_request", oc_encode_connection_request(&w, V, &m)); }
+    { static oc_connection_decide m; FRAME("connection_decide", oc_encode_connection_decide(&w, V, &m)); }
+    { static oc_connection_decided m; FRAME("connection_decided", oc_encode_connection_decided(&w, V, &m)); }
+    { static oc_list_connections m; FRAME("list_connections", oc_encode_list_connections(&w, V, &m)); }
+    { static oc_connection_list m; FRAME("connection_list", oc_encode_connection_list(&w, V, &m)); }
+    { static oc_revoke_connection m; FRAME("revoke_connection", oc_encode_revoke_connection(&w, V, &m)); }
+    { static oc_create_outgoing_webhook m; FRAME("create_outgoing_webhook", oc_encode_create_outgoing_webhook(&w, V, &m)); }
+    { static oc_outgoing_webhook_secret m; FRAME("outgoing_webhook_secret", oc_encode_outgoing_webhook_secret(&w, V, &m)); }
+    FRAME("list_outgoing_webhooks", oc_encode_list_outgoing_webhooks(&w, V));
+    { static oc_outgoing_webhook_list m; FRAME("outgoing_webhook_list", oc_encode_outgoing_webhook_list(&w, V, &m)); }
+    { static oc_set_outgoing_webhook m; FRAME("set_outgoing_webhook", oc_encode_set_outgoing_webhook(&w, V, &m)); }
+    { static oc_delete_outgoing_webhook m; FRAME("delete_outgoing_webhook", oc_encode_delete_outgoing_webhook(&w, V, &m)); }
     { static oc_error m; FRAME("error", oc_encode_error(&w, V, &m)); }
 
     static const uint16_t one[] = { 1 }, small[] = { 3, 7, 64 }, whole[] = { 16384 }, mixed[] = { 9, 4096, 2, 300 };

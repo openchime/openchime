@@ -8,7 +8,7 @@ the file's bytes and `const size_t NAME_len`. An empty PATH gives an empty
 resource (length 0). `NAME=gzip:PATH` holds the file gzipped instead -- the
 same bytes every build (no timestamp), which the daemon sends to a browser
 that takes gzip. The build runs it for the web client's page and loader,
-which the daemon serves from inside its own binary (docs/WEB.md); only the
+which the daemon serves from inside its own binary (docs/details/WEB.md); only the
 .wasm travels beside it, and a daemon built without the client (WEB=0) gets an
 empty loader and says so.
 """

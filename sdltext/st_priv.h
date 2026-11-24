@@ -45,7 +45,7 @@ int  st__clusters_build(const uint16_t *w16, int n, uint8_t **out_cb);
 int  st__cluster_prev(const uint8_t *cb, int n, int u);
 int  st__cluster_next(const uint8_t *cb, int n, int u);
 
-/* Line break opportunities (a working subset of UAX #14, docs/WEB.md):
+/* Line break opportunities (a working subset of UAX #14, docs/details/WEB.md):
  * brk[u] says whether a line may break BEFORE unit u: ST_BRK_NONE,
  * ST_BRK_ALLOWED, or ST_BRK_MANDATORY (after a newline). brk[0] is NONE. The
  * rules kept are the ones chat text meets: breaks after spaces and hyphens,

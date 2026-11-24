@@ -86,8 +86,20 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
       if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_alert_prefs"); }
     { oc_snooze sn; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_snooze(&p, &sn); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_snooze"); }
-    { oc_call_join cj; uint64_t inv[4]; oc_rbuf_init(&p, buf, len);
-      rc = oc_decode_call_join(&p, &cj, inv, 4); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_join"); }
+    oc_call_join cj; D(oc_decode_call_join(&p, &cj));
+    { oc_call_start cst; uint64_t inv[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_start(&p, &cst, inv, 4); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_start"); }
+    oc_call_subject csu; D(oc_decode_call_subject(&p, &csu));
+    oc_call_history chi; D(oc_decode_call_history(&p, &chi));
+    { oc_call_history_page chp; oc_call_hist_entry che[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_history_page(&p, &chp, che, 4); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_history_page"); }
+    oc_call_detail cdt; D(oc_decode_call_detail(&p, &cdt));
+    { static oc_call_stay a1[OC_CALL_PAGE_STAYS]; static oc_call_invitee a2[OC_CALL_PAGE_INVITEES];
+      static oc_call_event a3[OC_CALL_PAGE_EVENTS]; static oc_call_recording a4[OC_CALL_PAGE_RECORDINGS];
+      static oc_call_tline a5[OC_CALL_PAGE_LINES]; oc_call_page cpg; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_page(&p, &cpg, a1, a2, a3, a4, a5); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_page"); }
+    oc_call_delete cdl; D(oc_decode_call_delete(&p, &cdl));
+    oc_call_record crc; D(oc_decode_call_record(&p, &crc));
     oc_call_leave cle; D(oc_decode_call_leave(&p, &cle));
     { oc_call_joined jn; oc_call_part pr[4]; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_call_joined(&p, &jn, pr, 4); if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_call_joined"); }
@@ -127,6 +139,38 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_download_info di; D(oc_decode_download_info(&p, &di));
     oc_download_chunk dc; D(oc_decode_download_chunk(&p, &dc));
     oc_download_end den; D(oc_decode_download_end(&p, &den));
+    oc_preview_begin pvb; D(oc_decode_preview_begin(&p, &pvb));
+    oc_preview_info pvi; D(oc_decode_preview_info(&p, &pvi));
+    oc_preview_chunk pvc; D(oc_decode_preview_chunk(&p, &pvc));
+    oc_preview_end pve; D(oc_decode_preview_end(&p, &pve));
+    oc_create_agent cag; D(oc_decode_create_agent(&p, &cag));
+    oc_agent_token agt; D(oc_decode_agent_token(&p, &agt));
+    oc_remove_agent rag; D(oc_decode_remove_agent(&p, &rag));
+    oc_mint_agent_token mat; D(oc_decode_mint_agent_token(&p, &mat));
+    oc_list_agent_tokens lat; D(oc_decode_list_agent_tokens(&p, &lat));
+    oc_revoke_agent_token rat; D(oc_decode_revoke_agent_token(&p, &rat));
+    oc_create_outgoing_webhook cow; D(oc_decode_create_outgoing_webhook(&p, &cow));
+    oc_outgoing_webhook_secret ows; D(oc_decode_outgoing_webhook_secret(&p, &ows));
+    oc_set_outgoing_webhook sow; D(oc_decode_set_outgoing_webhook(&p, &sow));
+    oc_delete_outgoing_webhook dow; D(oc_decode_delete_outgoing_webhook(&p, &dow));
+    { oc_outgoing_webhook_entry we2[2]; uint16_t nc = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_outgoing_webhook_list(&p, we2, 2, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_outgoing_webhook_list"); }
+    { oc_agent_token_entry te[4]; uint16_t nc = 0; uint64_t aid = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_agent_token_list(&p, &aid, te, 4, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_agent_token_list"); }
+    oc_connection_code ccd; D(oc_decode_connection_code(&p, &ccd));
+    oc_connection_request crq; D(oc_decode_connection_request(&p, &crq));
+    oc_connection_decide cnd; D(oc_decode_connection_decide(&p, &cnd));
+    oc_connection_decided cnx; D(oc_decode_connection_decided(&p, &cnx));
+    oc_list_connections lcn; D(oc_decode_list_connections(&p, &lcn));
+    oc_revoke_connection rcn; D(oc_decode_revoke_connection(&p, &rcn));
+    { oc_connection_entry ce[4]; uint16_t nc = 0; uint8_t all = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_connection_list(&p, &all, ce, 4, &nc);
+      if (rc != OC_OK && rc != OC_E_MALFORMED) bad("oc_decode_connection_list"); }
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
     oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
     D(oc_decode_list_groups(&p));

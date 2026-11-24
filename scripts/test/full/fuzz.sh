@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test/full/fuzz.sh
 #
-# The coverage-guided fuzzing tier's short pass (docs/TESTING.md, "Fuzzing"):
+# The coverage-guided fuzzing tier's short pass (docs/details/TESTING.md, "Fuzzing"):
 # each harness under ASan and UBSan, from its checked-in corpus with the
 # dictionary, on a scratch copy of the corpus so nothing it grows lands in the
 # tree. A finding fails it, naming the harness and the crash file; the

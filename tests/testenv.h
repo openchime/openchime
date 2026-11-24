@@ -1,5 +1,5 @@
 /* What a test needs from its surroundings, so that it shares none of them
- * (docs/TESTING.md §2.3): a directory of its own, a port the kernel chose, and
+ * (docs/details/TESTING.md §2.3): a directory of its own, a port the kernel chose, and
  * the tree's files found from the test binary rather than the working
  * directory. Header-only; every function is static inline. */
 #ifndef OC_TEST_ENV_H

@@ -1,4 +1,4 @@
-/* OpenChime GUI -- the platform contract (ARCH-80, docs/CLIENT.md §1).
+/* OpenChime GUI -- the platform contract (ARCH-80, docs/details/CLIENT.md §1).
  *
  * The application layer (client/gui/app/) is one portable program: SDL3 for
  * the window, input, timers, clipboard text and cursors; oc_gfx for drawing;

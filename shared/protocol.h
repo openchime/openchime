@@ -2,9 +2,9 @@
  * OpenChime wire protocol v1 — frame codec.
  *
  * Pure encode/decode of the core-messaging-path frames defined in
- * docs/PROTOCOL.md. No sockets, no threads, no SQLite: this is the leaf the
+ * docs/details/PROTOCOL.md. No sockets, no threads, no SQLite: this is the leaf the
  * event loop and DB writer are built on top of, and it is the first thing to
- * be exhaustively unit-tested (docs/TESTING.md §2.2).
+ * be exhaustively unit-tested (docs/details/TESTING.md §2.2).
  *
  * Encoding is explicit and field-by-field (ARCH-7); nothing is memcpy'd over a
  * struct. All integers are big-endian on the wire, converted at the edges
@@ -258,8 +258,12 @@
  * 47: camera video in calls (REQ-160). CALL_MEDIA carries `stream` (u8) after
  * `seq` both ways, as the relay's datagrams now do; a participant's flags byte
  * gains OC_CALL_PART_CAMERA; CALL_CAMERA and CALL_VIDEO_SUB (0x00AC, 0x00AD) are
- * new. A field inserted in a fixed layout. */
-#define OC_PROTOCOL_VERSION 47u
+ * new. A field inserted in a fixed layout.
+ *
+ * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
+ * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
+ * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
+#define OC_PROTOCOL_VERSION 51u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -465,7 +469,7 @@ typedef enum {
     OC_MSG_STORAGE_STATUS      = 0x0098, /* S->C, usage + policy + what maintenance reclaimed */
     OC_MSG_AUDIT_QUERY         = 0x0099, /* C->S, owner/admin: page the audit log (REQ-251) */
     OC_MSG_AUDIT_PAGE          = 0x009A, /* S->C, a page of entries, newest first */
-    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, start or join a conversation's call (REQ-150/301) */
+    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a call this user is invited to (REQ-150/301) */
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
     OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: UDP endpoint/token, slot, epoch, roster */
     OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster and epoch changed */
@@ -479,9 +483,18 @@ typedef enum {
     OC_MSG_CALL_MEDIA       = 0x00AB, /* both ways: a media packet over the connection, when UDP cannot reach the relay */
     OC_MSG_CALL_CAMERA      = 0x00AC, /* C->S, turn this participant's camera on or off in the call (REQ-160) */
     OC_MSG_CALL_VIDEO_SUB   = 0x00AD, /* C->S, whose cameras the relay sends this participant (REQ-160) */
+    OC_MSG_CALL_START       = 0x00AE, /* C->S, start a call with a subject and invitees, and join it (CALLS.md §1) */
+    OC_MSG_CALL_SUBJECT     = 0x00AF, /* C->S, rename the call (CALLS.md §1) */
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
+    OC_MSG_CALL_HISTORY     = 0x00B4, /* C->S, a page of this user's calls, newest first (CALLS.md §1) */
+    OC_MSG_CALL_HISTORY_PAGE = 0x00B5, /* S->C, the page */
+    OC_MSG_CALL_DETAIL      = 0x00B6, /* C->S, one call's page, for its invitees */
+    OC_MSG_CALL_PAGE        = 0x00B7, /* S->C, the call's page: people, times, timeline, recordings, transcript */
+    OC_MSG_CALL_DELETE      = 0x00B8, /* C->S, delete a call's transcript (an admin) or a recording (its starter, an admin) */
+    OC_MSG_CALL_DELETED     = 0x00B9, /* S->C, it is gone */
+    OC_MSG_CALL_RECORD      = 0x00BA, /* C->S, start or stop recording the call (CALLS.md §8) */
     /* S->C, to the SENDER ONLY: names in the message that are people here but
      * are not in this channel, so the mention notified nobody (REQ-287). Not an
      * ERROR frame: nothing failed, the message was accepted and stored — it is a
@@ -560,7 +573,7 @@ typedef enum {
      * type, byte cap, bounds — and stores the rest as display facts. */
     OC_MSG_ATTACH_MEDIA_SET = 0x00DA, /* C->S, mark an upload as a video message */
     OC_MSG_ATTACH_MEDIA_OK  = 0x00DB, /* S->C, accepted */
-    /* Read-aloud (REQ-291-295, ARCH-111, docs/READ-ALOUD.md §6). TTS_INFO after
+    /* Read-aloud (REQ-291-295, ARCH-111, docs/details/READ-ALOUD.md §6). TTS_INFO after
      * authentication says whether this daemon speaks messages and in which
      * voices; a client that never receives it shows nothing of the feature.
      * AUDIO_* then fetch one message's speech, on the shape of the attachment
@@ -687,6 +700,50 @@ typedef enum {
     OC_MSG_CHANNEL_ADD_MANAGER    = 0x013B, /* C->S, a manager, admin or owner names a member of the channel its manager */
     OC_MSG_CHANNEL_REMOVE_MANAGER = 0x013C, /* C->S, and takes the role from any manager, the creator included */
     OC_MSG_RENAME_EMOJI         = 0x013D, /* C->S, a custom emoji's new name; the old one stays as an alias */
+    /* The export of a video message (ARCH-135): an H.264 + MP3 copy, made by the
+     * daemon when its operator turned it on, and downloaded as an attachment is. */
+    OC_MSG_EXPORT_GET           = 0x013E, /* C->S, the playable copy of a video message */
+    OC_MSG_EXPORT_INFO          = 0x013F, /* S->C, its duration and size */
+    OC_MSG_EXPORT_CHUNK         = 0x0140, /* S->C, a slice of the copy */
+    OC_MSG_EXPORT_END           = 0x0141, /* S->C, the whole copy is sent */
+    /* Image previews (ARCH-137): a smaller copy of an image attachment, made by
+     * the daemon at upload, at one of two rungs. Downloaded as an attachment is,
+     * on frames of their own so a preview and the original are never mistaken
+     * for each other. New frames, so no version bump. */
+    OC_MSG_PREVIEW_BEGIN        = 0x0142, /* C->S, a rung of an attachment's preview */
+    OC_MSG_PREVIEW_INFO         = 0x0143, /* S->C, its size, dimensions and type */
+    OC_MSG_PREVIEW_CHUNK        = 0x0144, /* S->C, a slice of the preview */
+    OC_MSG_PREVIEW_END          = 0x0145, /* S->C, the whole preview is sent */
+    /* Agents and their tokens (docs/details/MCP.md §3.1, §10):
+     * an owner's or admin's. A token is answered once, to the connection that
+     * minted it, and never listed. New frames, so no version bump. */
+    OC_MSG_CREATE_AGENT         = 0x0146, /* C->S, an agent, and its first token */
+    OC_MSG_AGENT_TOKEN          = 0x0147, /* S->C, a token minted: shown once */
+    OC_MSG_REMOVE_AGENT         = 0x0148, /* C->S, an agent, its tokens and its memberships */
+    OC_MSG_MINT_AGENT_TOKEN     = 0x0149, /* C->S, another token for an agent */
+    OC_MSG_LIST_AGENT_TOKENS    = 0x014A, /* C->S, an agent's tokens */
+    OC_MSG_AGENT_TOKEN_LIST     = 0x014B, /* S->C, the list: never a token */
+    OC_MSG_REVOKE_AGENT_TOKEN   = 0x014C, /* C->S, revoke one token */
+    /* A person's own AI clients (docs/details/AUTH.md §8.13): the code an
+     * authorize page shows, looked up and approved or declined in the app, and
+     * the connections it made, listed and revoked -- one's own, or everyone's
+     * for an owner or admin. Never a token. */
+    OC_MSG_CONNECTION_CODE      = 0x014D, /* C->S, the code a person typed: what is asking */
+    OC_MSG_CONNECTION_REQUEST   = 0x014E, /* S->C, the client and where it returns */
+    OC_MSG_CONNECTION_DECIDE    = 0x014F, /* C->S, approve (with a lifetime) or decline */
+    OC_MSG_CONNECTION_DECIDED   = 0x0150, /* S->C, done */
+    OC_MSG_LIST_CONNECTIONS     = 0x0151, /* C->S, one's own, or everyone's */
+    OC_MSG_CONNECTION_LIST      = 0x0152, /* S->C, the list */
+    OC_MSG_REVOKE_CONNECTION    = 0x0153, /* C->S, revoke one; answered with the list */
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): an owner's or admin's. The
+     * signing secret is answered once, to the connection that created the
+     * webhook, and never listed. New frames, so no version bump. */
+    OC_MSG_CREATE_OUTGOING_WEBHOOK = 0x0154, /* C->S, a webhook: URL, events, channels */
+    OC_MSG_OUTGOING_WEBHOOK_SECRET = 0x0155, /* S->C, its signing secret, shown once */
+    OC_MSG_LIST_OUTGOING_WEBHOOKS  = 0x0156, /* C->S, the workspace's webhooks */
+    OC_MSG_OUTGOING_WEBHOOK_LIST   = 0x0157, /* S->C, the list: never a secret */
+    OC_MSG_SET_OUTGOING_WEBHOOK    = 0x0158, /* C->S, enable or disable one */
+    OC_MSG_DELETE_OUTGOING_WEBHOOK = 0x0159, /* C->S, delete one */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -807,6 +864,20 @@ typedef enum {
     OC_ERR_INVALID_PROFILE_FIELD = 3071, /* a profile field without a label, past the cap, or a value too long or not a link */
     OC_ERR_INVALID_OUT_OF_OFFICE = 3072, /* an out-of-office ending before it starts, or its message too long */
     OC_ERR_EMOJI_ALIAS_LIMIT   = 3073, /* a rename past the old names an emoji, or the workspace, may keep */
+    OC_ERR_EXPORT_UNAVAILABLE  = 3074, /* no export here: not built in or turned off, or the person's or the daemon's queue is full (ARCH-135) */
+    OC_ERR_CALL_SUBJECT        = 3075, /* a call started, or renamed, without a subject, or with one too long (CALLS.md §1) */
+    OC_ERR_RECORDING_UNAVAILABLE = 3076, /* no recording here: not built in, turned off, a demo, or the recordings' space is used up (CALLS.md §8) */
+    OC_ERR_PREVIEW_MISSING     = 3077, /* the attachment has no preview at that rung: never made, or reclaimed; download the original (ARCH-137) */
+    OC_ERR_PREVIEW_RUNG        = 3078, /* PREVIEW_BEGIN named a rung that does not exist (ARCH-137) */
+    OC_ERR_UNKNOWN_SCOPE       = 3079, /* a token minted with a scope outside the catalog (docs/plans/APPS.md §4) */
+    OC_ERR_TOO_MANY_TOKENS     = 3080, /* the agent already holds the most tokens it may (docs/details/MCP.md §3.1) */
+    OC_ERR_UNKNOWN_CODE        = 3081, /* no AI client is waiting on that approval code: unknown, expired or already used (AUTH.md §8.13) */
+    OC_ERR_UNKNOWN_CONNECTION  = 3082, /* no such AI-client connection, or not the caller's to revoke (AUTH.md §8.13) */
+    OC_ERR_BAD_LIFETIME        = 3083, /* a connection's lifetime other than never, 30, 90 or 365 days (AUTH.md §8.13) */
+    OC_ERR_CONNECTIONS_OFF     = 3084, /* the workspace does not let people connect AI clients (OPENCHIME_MCP_CONNECTIONS) */
+    OC_ERR_WEBHOOK_URL         = 3085, /* an outgoing webhook's URL is not https (docs/details/WEBHOOKS.md) */
+    OC_ERR_WEBHOOK_EVENT       = 3086, /* an outgoing webhook named an event it may not select */
+    OC_ERR_WEBHOOK_UNVERIFIED  = 3087, /* the endpoint did not answer the url_verification challenge */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -928,6 +999,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_MAX_CALL_PARTICIPANTS 32u
 #define OC_CALL_DEVICE_KEY_LEN   32u   /* an X25519 public key (ARCH-113) */
 #define OC_CALL_SEALED_LEN       64u   /* HPKE enc(32) + a 16-byte key + its 16-byte tag */
+#define OC_CALL_SUBJECT_MAX     200u   /* a call's subject, in bytes of UTF-8 (CALLS.md §1) */
 #define OC_MAX_CALL_INVITES      OC_MAX_CALL_PARTICIPANTS
 
 /* What a message is (SCHEMA.md messages.kind): said by someone, or a call event
@@ -1189,13 +1261,19 @@ typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t messa
  * part, after `kind`. */
 /* `parent_id` is the thread a reply also posted to the channel belongs to
  * (REQ-062), 0 for a message that is not a reply; on the wire it follows
- * `broadcast_stored`, in the fixed part. */
+ * `broadcast_stored`, in the fixed part. `call_id` is the call a call message
+ * is about (kind OC_MSG_KIND_CALL, CALLS.md §1), 0 for any other message and
+ * for a missed-call line from before calls were kept; it follows `parent_id`.
+ * `via` names the AI client a person posted through (AUTH.md §8.13), empty for
+ * any other message; it follows `call_id`, ahead of the body (version 51). */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
                  uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name;   /* override name (webhooks); empty = use author_id */
                  uint8_t broadcast_stored;
-                 uint64_t parent_id; } oc_broadcast;
+                 uint64_t parent_id;
+                 uint64_t call_id;
+                 oc_slice via; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 /* A member's read cursor in a channel advanced (REQ-090 seen-by). */
 typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
@@ -1395,7 +1473,11 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t paren
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  uint8_t broadcast_stored;
-                 uint8_t also_channel; } oc_thread_reply;
+                 uint8_t also_channel;
+                 /* The AI client the reply was posted through (AUTH.md §8.13),
+                  * empty for none: after `also_channel`, ahead of the body
+                  * (version 51). */
+                 oc_slice via; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
@@ -1844,6 +1926,12 @@ typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVI
 /* ...and its camera is on (CALL_CAMERA): the others show its picture, and the
  * relay forwards its camera stream (REQ-160). */
 #define OC_CALL_PART_CAMERA 0x02u
+/* ...and it is the Recorder (CALLS.md §8): the daemon's, recording the call. It
+ * sends no audio or video, is not counted toward the cap, and is shown as
+ * "Recorder"; every device seals its key to it as to anyone in the call. */
+#define OC_CALL_PART_RECORDER 0x04u
+/* The Recorder's user id on a roster and in a sealed key's info: no account's. */
+#define OC_CALL_RECORDER_ID UINT64_C(0xFFFFFFFFFFFFFF00)
 /* The stream a call packet belongs to, in the clear in front of its ciphertext
  * and authenticated as the SFrame metadata (CALLS.md §5.4): the relay reads it
  * to decide who gets a camera's packets, and cannot change it unnoticed.
@@ -1855,34 +1943,48 @@ typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVI
 /* The video codecs a participant can decode, as bits (ARCH-87). VP9 is the one
  * every client has; a later codec is a new bit, chosen only when everyone has it. */
 #define OC_CALL_CODEC_VP9 0x01u
-/* Start or join. `invite` names who a start invites; joining a call already
- * there names nobody. `codecs` is what the joiner can decode. */
-typedef struct { uint64_t channel_id; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
-                 uint16_t n_invite; const uint64_t *invite; uint8_t codecs; } oc_call_join;
-typedef struct { uint64_t channel_id; } oc_call_leave;
-typedef struct { uint64_t channel_id; uint64_t call_id; uint16_t udp_port; oc_slice token;
+/* Start a call (CALLS.md §1): its subject, the people asked, and -- when it is
+ * started from a conversation -- that conversation, which gets one message
+ * about it and nothing else; 0 from Calls home. The starter joins it at once,
+ * with its device key and the codecs it can decode, as CALL_JOIN would. */
+typedef struct { uint64_t from_channel; oc_slice subject; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
+                 uint8_t codecs; uint16_t n_invite; const uint64_t *invite; } oc_call_start;
+/* Join a call this user is invited to, or rejoin it. */
+typedef struct { uint64_t call_id; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN]; uint8_t codecs; } oc_call_join;
+typedef struct { uint64_t call_id; } oc_call_leave;
+typedef struct { uint64_t call_id; uint16_t udp_port; oc_slice token;
                  uint8_t slot; uint32_t epoch; uint64_t starter; uint64_t started_at;
                  uint16_t count; const oc_call_part *parts; } oc_call_joined;
-typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch;
+typedef struct { uint64_t call_id; uint32_t epoch;
                  uint16_t count; const oc_call_part *parts; } oc_call_roster;
-typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *users; } oc_call_invite;
-typedef struct { uint64_t channel_id; } oc_call_decline;
-typedef struct { uint64_t channel_id; } oc_call_end;
-/* What the Calls section lists, sent on every change and at sign-in. `ended`
- * says the call is over: the last one about it. `sharer` is who is sharing a
- * screen, 0 for nobody (REQ-161). */
-typedef struct { uint64_t channel_id; uint64_t call_id; uint64_t starter; uint64_t started_at;
+typedef struct { uint64_t call_id; uint16_t count; const uint64_t *users; } oc_call_invite;
+typedef struct { uint64_t call_id; } oc_call_decline;
+typedef struct { uint64_t call_id; } oc_call_end;
+/* Rename the call: anyone in it may (CALLS.md §1). */
+typedef struct { uint64_t call_id; oc_slice subject; } oc_call_subject;
+/* A call as Calls home lists it, sent to its participants and invitees on
+ * every change and at sign-in. `from_channel` is the conversation it was
+ * started from, 0 for none; `chat_channel` is the call's own chat. `invited` is who is asked and has not yet joined
+ * or declined. `ended` says the call is over: the last one about it. `sharer`
+ * is who is sharing a screen, 0 for nobody (REQ-161). */
+typedef struct { uint64_t call_id; oc_slice subject; uint64_t starter; uint64_t started_at;
+                 uint64_t from_channel; uint64_t chat_channel; uint8_t flags;
                  uint8_t ended; uint16_t n_parts; const uint64_t *parts;
-                 uint16_t n_invited; const uint64_t *invited; uint64_t sharer; } oc_call_state;
+                 uint16_t n_invited; const uint64_t *invited; uint64_t sharer;
+                 uint64_t rec_by; } oc_call_state;   /* rec_by: who started the recording going on, 0 none */
+/* oc_call_state.flags: the call is being recorded (CALLS.md §8). */
+#define OC_CALL_STATE_RECORDING 0x01u
+/* Start (on = 1) or stop recording the call; anyone in it may (CALLS.md §8). */
+typedef struct { uint64_t call_id; uint8_t on; } oc_call_record;
 /* Start (on = 1) or stop sharing a screen. One sharer at a time: a start takes
  * over from whoever was sharing (REQ-161). */
-typedef struct { uint64_t channel_id; uint8_t on; } oc_call_share;
+typedef struct { uint64_t call_id; uint8_t on; } oc_call_share;
 /* Turn this participant's camera on (1) or off (0); the roster carries it as
  * OC_CALL_PART_CAMERA (REQ-160). */
-typedef struct { uint64_t channel_id; uint8_t on; } oc_call_camera;
+typedef struct { uint64_t call_id; uint8_t on; } oc_call_camera;
 /* Whose cameras the relay sends this participant: every one (`all` = 1, and
  * `users` empty), or the `count` named. A join starts at every one. */
-typedef struct { uint64_t channel_id; uint8_t all; uint16_t count; const uint64_t *users; } oc_call_video_sub;
+typedef struct { uint64_t call_id; uint8_t all; uint16_t count; const uint64_t *users; } oc_call_video_sub;
 /* CALL_MEDIA (PROTOCOL.md §5.17): the relay's UDP datagram, carried over the
  * connection instead. Client to server it is {seq, stream, ct} -- no token: the
  * connection is authenticated and in one call -- and server to client
@@ -1892,10 +1994,74 @@ typedef struct { uint64_t sender; uint16_t seq; oc_slice ct; uint8_t stream; } o
 /* A media key sealed to each recipient (HPKE enc ‖ ciphertext, opaque to the
  * daemon). */
 typedef struct { uint64_t recipient; oc_slice sealed; } oc_call_key_entry;
-typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch;
+typedef struct { uint64_t call_id; uint32_t epoch;
                  uint16_t count; const oc_call_key_entry *entries; } oc_call_key;
-typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch; uint64_t sender;
+typedef struct { uint64_t call_id; uint32_t epoch; uint64_t sender;
                  oc_slice sealed; } oc_call_key_for;
+/* How a call ended (CALLS.md §1), on the wire: 0 while it runs. */
+#define OC_CALL_RUNNING        0u
+#define OC_CALL_ENDED_LEFT     1u   /* the last person left */
+#define OC_CALL_ENDED_ALL      2u   /* ended for everyone */
+#define OC_CALL_ENDED_STOPPED  3u   /* the daemon stopped with it open */
+/* A call's timeline (SCHEMA.md call_events), on the wire. */
+enum { OC_CALL_EV_CAMERA_ON = 1, OC_CALL_EV_CAMERA_OFF = 2, OC_CALL_EV_SHARE_ON = 3,
+       OC_CALL_EV_SHARE_OFF = 4, OC_CALL_EV_RECORD_ON = 5, OC_CALL_EV_RECORD_OFF = 6,
+       OC_CALL_EV_SUBJECT = 7 };
+/* A recording's state (SCHEMA.md call_recordings). */
+#define OC_CALL_REC_RECORDING  1u
+#define OC_CALL_REC_PROCESSING 2u
+#define OC_CALL_REC_READY      3u
+#define OC_CALL_REC_FAILED     4u
+/* CALL_HISTORY: a page of the calls this user was asked to, newest first,
+ * those started before `before_ms` (0: from the newest), at most `limit`
+ * (1..OC_CALL_HISTORY_PAGE). */
+#define OC_CALL_HISTORY_PAGE 50u
+typedef struct { uint64_t before_ms; uint16_t limit; } oc_call_history;
+/* A call as the history lists it, as this user saw it: `flags` OC_CALL_HIST_*. */
+#define OC_CALL_HIST_JOINED     0x01u   /* this user took part */
+#define OC_CALL_HIST_MISSED     0x02u   /* asked, never joined nor declined, and it is over */
+#define OC_CALL_HIST_DECLINED   0x04u
+#define OC_CALL_HIST_PENDING    0x08u   /* running, and this user is asked and has not answered */
+#define OC_CALL_HIST_RECORDING  0x10u   /* it has a recording ready */
+#define OC_CALL_HIST_TRANSCRIPT 0x20u   /* it has a transcript */
+/* `faces`: up to OC_CALL_HIST_FACES of who took part, in the order they first
+ * joined, for a row's faces. */
+#define OC_CALL_HIST_FACES 3u
+typedef struct { uint64_t call_id; oc_slice subject; uint64_t starter; uint64_t started_at; uint64_t ended_at;
+                 uint8_t end_reason; uint64_t from_channel; uint64_t chat_channel; uint16_t n_people;
+                 uint8_t flags; uint8_t n_faces; uint64_t faces[OC_CALL_HIST_FACES]; } oc_call_hist_entry;
+typedef struct { uint16_t count; const oc_call_hist_entry *entries; uint8_t more; } oc_call_history_page;
+/* CALL_DETAIL: one call's page, its transcript's lines from `line_from`. */
+typedef struct { uint64_t call_id; uint32_t line_from; } oc_call_detail;
+#define OC_CALL_PAGE_STAYS      128u
+#define OC_CALL_PAGE_INVITEES   128u
+#define OC_CALL_PAGE_EVENTS     128u
+#define OC_CALL_PAGE_RECORDINGS 16u
+#define OC_CALL_PAGE_LINES      200u
+#define OC_CALL_PAGE_TEXT       24576u   /* bytes of transcript text in one page, at most */
+typedef struct { uint64_t user_id; uint64_t joined_at; uint64_t left_at; } oc_call_stay;
+typedef struct { uint64_t user_id; uint64_t invited_by; uint64_t invited_at; uint64_t declined_at; } oc_call_invitee;
+typedef struct { uint64_t at; uint64_t user_id; uint8_t kind; oc_slice detail; } oc_call_event;
+/* A recording: who started it and when, its state, and once ready its length,
+ * its size and the attachment it is played from (0 before). */
+typedef struct { uint64_t id; uint8_t state; uint64_t started_by; uint64_t started_at; uint64_t stopped_at;
+                 uint32_t duration_ms; uint64_t bytes; uint64_t attachment_id; } oc_call_recording;
+/* A line of a transcript: who said it, from and to (ms from the call's start). */
+typedef struct { uint64_t id; uint64_t speaker; uint32_t start_ms; uint32_t end_ms; oc_slice text; } oc_call_tline;
+typedef struct {
+    uint64_t call_id; oc_slice subject; uint64_t starter; uint64_t started_at; uint64_t ended_at;
+    uint8_t end_reason; uint64_t from_channel; uint64_t chat_channel;
+    uint16_t n_stays; const oc_call_stay *stays;
+    uint16_t n_invitees; const oc_call_invitee *invitees;
+    uint16_t n_events; const oc_call_event *events;
+    uint16_t n_recordings; const oc_call_recording *recordings;
+    uint8_t has_transcript; oc_slice transcript_lang; uint32_t n_lines_total; uint32_t line_from;
+    uint16_t n_lines; const oc_call_tline *lines;
+} oc_call_page;
+/* CALL_DELETE / CALL_DELETED: `what` OC_CALL_DEL_*; `id` the recording's. */
+#define OC_CALL_DEL_TRANSCRIPT 1u
+#define OC_CALL_DEL_RECORDING  2u
+typedef struct { uint64_t call_id; uint8_t what; uint64_t id; } oc_call_delete;
 /* Private DMs (PRIVATE-DM.md). The handshake and the ciphertext are opaque to the
  * daemon; it only routes them between the two devices bound to a private DM. */
 #define OC_PDM_MAX_HS     256u     /* one Noise XX message with a short payload */
@@ -1956,6 +2122,8 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_SUMMARIZE "summarize" /* summaries of a channel or DM (REQ-310) */
 #define OC_CAP_PDM "pdm" /* private DMs, end to end between two devices (PRIVATE-DM.md) */
 #define OC_CAP_POLLS "polls" /* post a poll and vote in one (REQ-225) */
+#define OC_CAP_H264_EXPORT "h264-export" /* an H.264 + MP3 copy of a video message (ARCH-135) */
+#define OC_CAP_CALL_RECORDING "call-recording" /* record a call (CALLS.md §8) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 /* The workspace's settings as clients are told them, read-only: each a key and
  * its effective value. They are the daemon's configuration (CONFIG.md, the
@@ -1976,6 +2144,72 @@ typedef struct { oc_slice voice_id; } oc_voice_preview_get;
 typedef struct { uint64_t message_id; uint32_t duration_ms; uint64_t total_size; } oc_audio_info;
 typedef struct { uint64_t message_id; uint32_t seq; oc_slice data; } oc_audio_chunk;
 typedef struct { uint64_t message_id; } oc_audio_end;
+
+/* The export of a video message (ARCH-135). EXPORT_GET asks for the H.264 + MP3
+ * copy of attachment `attachment_id`, which must be a video message the caller
+ * may read; it is answered as a download is, by EXPORT_INFO, EXPORT_CHUNKs and
+ * EXPORT_END, or by an ERROR naming the attachment. */
+typedef struct { uint64_t attachment_id; } oc_export_get;
+typedef struct { uint64_t attachment_id; uint32_t duration_ms; uint64_t total_size; } oc_export_info;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_export_chunk;
+typedef struct { uint64_t attachment_id; } oc_export_end;
+
+/* Image previews (ARCH-137). PREVIEW_BEGIN asks for rung `rung` of attachment
+ * `attachment_id` (OC_PREVIEW_RUNG_*), under the download's own gate; it is
+ * answered by PREVIEW_INFO, PREVIEW_CHUNKs and PREVIEW_END, or by an ERROR
+ * naming the attachment -- PREVIEW_MISSING when there is no such preview, and
+ * the client then downloads the original. `mime` is the preview's, always its
+ * original's format. */
+#define OC_PREVIEW_RUNG_INLINE_WIRE   1u
+#define OC_PREVIEW_RUNG_EXPANDED_WIRE 2u
+typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_begin;
+typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t width; uint32_t height; oc_slice mime;
+                 uint64_t total_size; } oc_preview_info;
+typedef struct { uint64_t attachment_id; uint8_t rung; uint32_t seq; oc_slice data; } oc_preview_chunk;
+typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_end;
+
+/* Agents and their tokens. `scopes` is scope names from the catalog
+ * (shared/scopes.h) separated by single spaces; `token` is
+ * OC_PRINCIPAL_TOKEN_PREFIX and 32 bytes in base64url. */
+#define OC_AGENT_TOKEN_LIST_MAX 16
+
+/* Outgoing webhooks. `events` is event names separated by single spaces;
+ * `channels` the conversations whose events it receives (none: only
+ * `user_change`). */
+#define OC_OUTWH_MAX_CHANNELS 32
+#define OC_OUTWH_LIST_MAX     32
+typedef struct { oc_slice url; oc_slice events; uint16_t n_channels; uint64_t channels[OC_OUTWH_MAX_CHANNELS]; }
+    oc_create_outgoing_webhook;
+typedef struct { uint64_t webhook_id; oc_slice secret; } oc_outgoing_webhook_secret;
+typedef struct { uint64_t webhook_id; oc_slice url; oc_slice events; uint8_t enabled; oc_slice disabled_reason;
+                 uint64_t created_by; uint64_t created_at_ms; uint16_t n_channels;
+                 uint64_t channels[OC_OUTWH_MAX_CHANNELS]; } oc_outgoing_webhook_entry;
+typedef struct { uint16_t count; const oc_outgoing_webhook_entry *entries; } oc_outgoing_webhook_list;
+typedef struct { uint64_t webhook_id; uint8_t enabled; } oc_set_outgoing_webhook;
+typedef struct { uint64_t webhook_id; } oc_delete_outgoing_webhook;
+typedef struct { oc_slice name; oc_slice token_name; oc_slice scopes; } oc_create_agent;
+typedef struct { uint64_t agent_id; uint64_t token_id; oc_slice token; oc_slice scopes; } oc_agent_token;
+typedef struct { uint64_t agent_id; } oc_remove_agent;
+typedef struct { uint64_t agent_id; oc_slice name; oc_slice scopes; } oc_mint_agent_token;
+typedef struct { uint64_t agent_id; } oc_list_agent_tokens;
+typedef struct { uint64_t token_id; oc_slice name; oc_slice scopes; uint64_t created_by; uint64_t created_at_ms;
+                 uint64_t last_used_at_ms; oc_slice last_used_from; } oc_agent_token_entry;
+typedef struct { uint64_t agent_id; uint16_t count; const oc_agent_token_entry *entries; } oc_agent_token_list;
+typedef struct { uint64_t agent_id; uint64_t token_id; } oc_revoke_agent_token;
+
+/* A person's AI clients (AUTH.md §8.13). `code` is the eight letters as typed
+ * (either case, a dash anywhere); `lifetime_days` 0 (never), 30, 90 or 365;
+ * `all` 1 asks for, or revokes from, everyone's (an owner or admin). */
+#define OC_CONNECTION_LIST_MAX 500
+typedef struct { oc_slice code; } oc_connection_code;
+typedef struct { oc_slice code; oc_slice client_name; oc_slice redirect_uri; } oc_connection_request;
+typedef struct { oc_slice code; uint8_t approve; uint32_t lifetime_days; } oc_connection_decide;
+typedef struct { uint8_t approved; oc_slice client_name; } oc_connection_decided;
+typedef struct { uint8_t all; } oc_list_connections;
+typedef struct { uint64_t connection_id; uint64_t user_id; oc_slice user_name; oc_slice client_name;
+                 uint64_t created_at_ms; uint64_t last_used_at_ms; uint64_t expires_at_ms; uint32_t lifetime_days; } oc_connection_entry;
+typedef struct { uint8_t all; uint16_t count; const oc_connection_entry *entries; } oc_connection_list;
+typedef struct { uint64_t connection_id; uint8_t all; } oc_revoke_connection;
 
 /* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
  * little-endian PCM, at most max_segment_ms long. */
@@ -2014,6 +2248,14 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                   * start <= now < end; the reader decides. */
                  uint64_t ooo_start, ooo_end; oc_slice ooo_message; } oc_user_list_entry;
 #define OC_USER_SYSTEM 0x01u
+/* An agent (docs/details/MCP.md §3.1, §7): not a person, but an account a
+ * token acts as; every surface that names it says so. A bit beside
+ * OC_USER_SYSTEM in the same byte, so the entry's layout is unchanged. */
+#define OC_USER_AGENT  0x02u
+/* An agent's token as it is shown once and presented: this prefix, then its
+ * 32 random bytes in base64url, so a secret scanner can recognise a leaked
+ * one (docs/details/MCP.md §10.1). */
+#define OC_PRINCIPAL_TOKEN_PREFIX "ocpt_"
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first
@@ -2092,8 +2334,11 @@ typedef struct {
  * text (REQ-058). */
 /* `rank` the row's relevance (bm25 × 1,000,000; 0 unless sorted by relevance),
  * which the next page's cursor carries. */
+/* A hit in a call's transcript (CALLS.md §1) has `call_id` and `line_id` set,
+ * `message_id` 0, `channel_id` the call's chat, `author_id` the speaker and
+ * `server_time` the moment it was said; a message's has both 0. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet;
-                 uint8_t action; int64_t rank; } oc_search_result_entry;
+                 uint8_t action; int64_t rank; uint64_t call_id; uint64_t line_id; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
@@ -2393,7 +2638,15 @@ oc_result oc_decode_usage(oc_rbuf *r, oc_usage *m, oc_usage_day *days, oc_usage_
                           oc_usage_channel *channels);
 
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
+oc_result oc_encode_call_start(oc_wbuf *w, uint16_t version, const oc_call_start *m);
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
+oc_result oc_encode_call_subject(oc_wbuf *w, uint16_t version, const oc_call_subject *m);
+oc_result oc_encode_call_history(oc_wbuf *w, uint16_t version, const oc_call_history *m);
+oc_result oc_encode_call_record(oc_wbuf *w, uint16_t version, const oc_call_record *m);
+oc_result oc_encode_call_history_page(oc_wbuf *w, uint16_t version, const oc_call_history_page *m);
+oc_result oc_encode_call_detail(oc_wbuf *w, uint16_t version, const oc_call_detail *m);
+oc_result oc_encode_call_page(oc_wbuf *w, uint16_t version, const oc_call_page *m);
+oc_result oc_encode_call_delete(oc_wbuf *w, uint16_t version, uint16_t type, const oc_call_delete *m);
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);
 oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m);
 oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m);
@@ -2427,6 +2680,34 @@ oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *
 oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info *m);
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
+oc_result oc_encode_export_get(oc_wbuf *w, uint16_t version, const oc_export_get *m);
+oc_result oc_encode_preview_begin(oc_wbuf *w, uint16_t version, const oc_preview_begin *m);
+oc_result oc_encode_preview_info(oc_wbuf *w, uint16_t version, const oc_preview_info *m);
+oc_result oc_encode_preview_chunk(oc_wbuf *w, uint16_t version, const oc_preview_chunk *m);
+oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_end *m);
+oc_result oc_encode_create_agent(oc_wbuf *w, uint16_t version, const oc_create_agent *m);
+oc_result oc_encode_agent_token(oc_wbuf *w, uint16_t version, const oc_agent_token *m);
+oc_result oc_encode_remove_agent(oc_wbuf *w, uint16_t version, const oc_remove_agent *m);
+oc_result oc_encode_mint_agent_token(oc_wbuf *w, uint16_t version, const oc_mint_agent_token *m);
+oc_result oc_encode_list_agent_tokens(oc_wbuf *w, uint16_t version, const oc_list_agent_tokens *m);
+oc_result oc_encode_agent_token_list(oc_wbuf *w, uint16_t version, const oc_agent_token_list *m);
+oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_revoke_agent_token *m);
+oc_result oc_encode_connection_code(oc_wbuf *w, uint16_t version, const oc_connection_code *m);
+oc_result oc_encode_connection_request(oc_wbuf *w, uint16_t version, const oc_connection_request *m);
+oc_result oc_encode_connection_decide(oc_wbuf *w, uint16_t version, const oc_connection_decide *m);
+oc_result oc_encode_connection_decided(oc_wbuf *w, uint16_t version, const oc_connection_decided *m);
+oc_result oc_encode_list_connections(oc_wbuf *w, uint16_t version, const oc_list_connections *m);
+oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_connection_list *m);
+oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m);
+oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m);
+oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m);
+oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m);
+oc_result oc_encode_set_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_set_outgoing_webhook *m);
+oc_result oc_encode_delete_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_delete_outgoing_webhook *m);
+oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m);
+oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m);
+oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m);
 oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
 oc_result oc_encode_workspace_settings(oc_wbuf *w, uint16_t version, const oc_workspace_settings *m);
 oc_result oc_encode_read_receipts(oc_wbuf *w, uint16_t version, const oc_read_receipts *m);
@@ -2625,7 +2906,17 @@ oc_result oc_decode_client_settings(oc_rbuf *p, oc_client_settings *m,
 /* The call frames decode their lists into caller buffers of `cap` entries; a
  * longer list is malformed rather than clamped, since a roster or a key list cut
  * short would be a wrong one. */
-oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap);
+oc_result oc_decode_call_start(oc_rbuf *p, oc_call_start *m, uint64_t *invite, uint16_t cap);
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m);
+oc_result oc_decode_call_subject(oc_rbuf *p, oc_call_subject *m);
+oc_result oc_decode_call_history(oc_rbuf *p, oc_call_history *m);
+oc_result oc_decode_call_record(oc_rbuf *p, oc_call_record *m);
+oc_result oc_decode_call_history_page(oc_rbuf *p, oc_call_history_page *m, oc_call_hist_entry *entries, uint16_t cap);
+oc_result oc_decode_call_detail(oc_rbuf *p, oc_call_detail *m);
+/* Each array OC_CALL_PAGE_* long; more is malformed. */
+oc_result oc_decode_call_page(oc_rbuf *p, oc_call_page *m, oc_call_stay *stays, oc_call_invitee *invitees,
+                              oc_call_event *events, oc_call_recording *recordings, oc_call_tline *lines);
+oc_result oc_decode_call_delete(oc_rbuf *p, oc_call_delete *m);
 oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m);
 oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *parts, uint16_t cap);
 oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *parts, uint16_t cap);
@@ -2659,6 +2950,40 @@ oc_result oc_decode_audio_get(oc_rbuf *p, oc_audio_get *m);
 oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
+oc_result oc_decode_export_get(oc_rbuf *p, oc_export_get *m);
+oc_result oc_decode_preview_begin(oc_rbuf *p, oc_preview_begin *m);
+oc_result oc_decode_preview_info(oc_rbuf *p, oc_preview_info *m);
+oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m);
+oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m);
+oc_result oc_decode_create_agent(oc_rbuf *p, oc_create_agent *m);
+oc_result oc_decode_agent_token(oc_rbuf *p, oc_agent_token *m);
+oc_result oc_decode_remove_agent(oc_rbuf *p, oc_remove_agent *m);
+oc_result oc_decode_mint_agent_token(oc_rbuf *p, oc_mint_agent_token *m);
+oc_result oc_decode_list_agent_tokens(oc_rbuf *p, oc_list_agent_tokens *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_token_entry *entries, uint16_t cap,
+                                     uint16_t *out_count);
+oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m);
+oc_result oc_decode_connection_code(oc_rbuf *p, oc_connection_code *m);
+oc_result oc_decode_connection_request(oc_rbuf *p, oc_connection_request *m);
+oc_result oc_decode_connection_decide(oc_rbuf *p, oc_connection_decide *m);
+oc_result oc_decode_connection_decided(oc_rbuf *p, oc_connection_decided *m);
+oc_result oc_decode_list_connections(oc_rbuf *p, oc_list_connections *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entry *entries, uint16_t cap,
+                                    uint16_t *out_count);
+oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
+/* More than OC_OUTWH_MAX_CHANNELS channels is MALFORMED. */
+oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m);
+oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m);
+/* Entries past `cap` are read and dropped; *out_count is the frame's count. */
+oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,
+                                          uint16_t *out_count);
+oc_result oc_decode_set_outgoing_webhook(oc_rbuf *p, oc_set_outgoing_webhook *m);
+oc_result oc_decode_delete_outgoing_webhook(oc_rbuf *p, oc_delete_outgoing_webhook *m);
+oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m);
+oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m);
+oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m);
 oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
 oc_result oc_decode_workspace_settings(oc_rbuf *p, oc_workspace_settings *m);
 oc_result oc_decode_read_receipts(oc_rbuf *p, oc_read_receipts *m);

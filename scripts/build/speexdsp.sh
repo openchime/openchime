@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Build the committed speexdsp (static) from third_party/speexdsp -- the
-# release tarball as Xiph published it, committed (docs/VENDORS.md §1) -- into
+# release tarball as Xiph published it, committed (docs/details/VENDORS.md §1) -- into
 # third_party/speexdsp-<version>[-arch|-win]. Nothing is downloaded.
 #
 #   scripts/build/speexdsp.sh            native (Linux; `make test` links it)
 #   scripts/build/speexdsp.sh windows    cross-built with mingw-w64 for the Win32 client
 #
 # Client-side only: its acoustic echo canceller keeps the client's own playback
-# out of the microphone for voice input (ARCH-112, docs/AUDIO.md §6). The daemon
+# out of the microphone for voice input (ARCH-112, docs/details/AUDIO.md §6). The daemon
 # never links it. scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

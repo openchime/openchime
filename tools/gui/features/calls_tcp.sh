@@ -33,11 +33,19 @@ gui_pair_up
 
 step "alice starts a call, bob joins"
 "$PAIR" a call start $CH >/dev/null || gui_abort "alice's client did not take 'call start'"
+# The call button opens New Call, its subject and people filled in; Start starts it.
+picker_up() { gui_snap a && grep -q '^callpick ' "$DA"; }
+waitfor 10 picker_up || gui_abort "alice's call button did not open New Call"
+"$PAIR" a call pick-go >/dev/null || gui_abort "alice's client did not take 'call pick-go'"
 "$PAIR" a call ns off >/dev/null || gui_abort "alice's client did not turn noise suppression off"
 "$PAIR" b call ns off >/dev/null || gui_abort "bob's client did not turn noise suppression off"
 a_in() { gui_snap a && [ "$(cfield a in)" = 1 ]; }
 waitfor 10 a_in || gui_abort "alice is not in the call she started"
 "$PAIR" b call join $CH >/dev/null || gui_abort "bob's client did not take 'call join'"
+# Every join goes through the pre-join screen: its Join.
+pj_up() { gui_snap b && grep -q '^prejoin open=1' "$DB"; }
+waitfor 10 pj_up || gui_abort "bob's pre-join screen did not open"
+"$PAIR" b call prejoin-join >/dev/null || gui_abort "bob's client did not take 'call prejoin-join'"
 a_tcp() { gui_snap a && [ "$(cfield a transport)" = tcp ]; }
 b_tcp() { gui_snap b && [ "$(cfield b transport)" = tcp ]; }
 check "alice finds UDP does not get through, and goes by the connection" waitfor 15 a_tcp

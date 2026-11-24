@@ -10,7 +10,7 @@ openchimed
 # (ARCH-20).
 dist/
 # Ignore what is built or fetched into third_party/ (scripts/build/*.sh), and
-# keep the sources committed there (docs/VENDORS.md §1). (Ignore the *contents*
+# keep the sources committed there (docs/details/VENDORS.md §1). (Ignore the *contents*
 # with /* rather than the directory, so re-inclusion below is possible.)
 /third_party/*
 !/third_party/jsmn/
@@ -23,6 +23,7 @@ dist/
 !/third_party/qrcodegen/
 !/third_party/miniaudio/
 !/third_party/stb/
+!/third_party/fonts/
 !/third_party/sqlite-3.53.4/
 !/third_party/libfvad/
 !/third_party/ca-roots/
@@ -31,6 +32,12 @@ dist/
 !/third_party/libvpx/
 !/third_party/mbedtls/
 !/third_party/SDL3/
+!/third_party/libavc/
+!/third_party/lame/
+!/third_party/libjpeg-turbo/
+!/third_party/libspng/
+!/third_party/libwebp/
+!/third_party/miniz/
 *.o
 *.db
 *.db-shm
@@ -45,3 +52,5 @@ package-lock.json
 
 # The container image's build context (packaging/image-context.sh).
 image/
+# ...which is not the image-preview harness's corpus.
+!/tests/fuzz/corpus/image/

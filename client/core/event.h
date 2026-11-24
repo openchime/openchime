@@ -24,6 +24,13 @@
 /* What an OC_EV_ERROR is about, beside its sentence: the stable kind a frontend
  * (or a test) acts on, since the words are for a person and may change. A
  * refusal from the daemon also carries its OC_ERR_* code. */
+/* What the client says when the daemon refuses an export (EXPORT_UNAVAILABLE,
+ * ARCH-135): the notice on OC_EV_XFER that ends an OC_CMD_EXPORT. */
+#define OC_EXPORT_UNAVAILABLE_TEXT "Export is not available right now"
+/* An export's transfer tag: its attachment id with the top bit set, so it is
+ * never taken for a download or fetch of the same video, whose tag is the id. */
+#define OC_EXPORT_TAG(attachment_id) ((uint64_t)(attachment_id) | (1ull << 63))
+
 typedef enum {
     OC_CERR_OTHER = 0,          /* anything not named below */
     OC_CERR_REFUSED,            /* the daemon refused a request (err_code says which) */
@@ -85,12 +92,17 @@ typedef struct {
     char     message[OC_MAX_ALERT_MESSAGE + 1];
 } oc_srvalert_view;
 
-/* A call as the model holds it (REQ-150, REQ-301-305): what CALL_STATE says of a
- * call in the Calls section, or -- on CALL_JOINED / CALL_ROSTER -- of the call
- * this client is in, with each participant's slot. Heap-owned by the event and
- * handed to the model, which keeps its own copy. */
+/* A call as the model holds it (REQ-150, REQ-301-305, CALLS.md §1): what
+ * CALL_STATE says of a call in Calls home, or -- on CALL_JOINED / CALL_ROSTER --
+ * of the call this client is in, with each participant's slot. `from_channel`
+ * is the conversation it was started from, 0 for none. Heap-owned by the event
+ * and handed to the model, which keeps its own copy. */
 typedef struct {
-    uint64_t channel_id, call_id, starter, started_at;
+    uint64_t from_channel, call_id, starter, started_at;
+    uint64_t chat_channel;   /* the call's own chat: a conversation in no list */
+    uint8_t  recording;      /* it is being recorded (CALLS.md §8) */
+    uint64_t rec_by;         /* ...started by this user; 0 when not recorded */
+    char     subject[OC_CALL_SUBJECT_MAX + 1];
     uint32_t epoch;
     uint8_t  ended;
     uint8_t  my_slot;
@@ -99,9 +111,50 @@ typedef struct {
     uint8_t  slots[OC_MAX_CALL_PARTICIPANTS];
     uint8_t  away[OC_MAX_CALL_PARTICIPANTS];   /* connection gone, seat held (OC_CALL_PART_AWAY) */
     uint8_t  camera[OC_MAX_CALL_PARTICIPANTS]; /* camera on (OC_CALL_PART_CAMERA, REQ-160) */
+    uint8_t  recorder[OC_MAX_CALL_PARTICIPANTS]; /* the Recorder (OC_CALL_PART_RECORDER, CALLS.md §8) */
     uint64_t invited[OC_MAX_CALL_INVITES];
     uint64_t sharer;      /* who is sharing a screen, 0 for nobody (REQ-161) */
 } oc_call_view;
+
+/* A call as the history lists it (CALLS.md §1), as this user saw it: one row
+ * of CALL_HISTORY_PAGE. `flags` OC_CALL_HIST_*; `end_reason` OC_CALL_ENDED_*. */
+typedef struct {
+    uint64_t call_id, starter, started_at, ended_at, from_channel, chat_channel;
+    uint8_t  end_reason, flags;
+    uint16_t n_people;
+    uint8_t  n_faces;                           /* who took part, first joined first */
+    uint64_t faces[OC_CALL_HIST_FACES];
+    char     subject[OC_CALL_SUBJECT_MAX + 1];
+} oc_call_hist_view;
+/* One page of the history: `before_ms` what was asked for (0 the newest). */
+typedef struct {
+    uint64_t          before_ms;
+    uint16_t          count;
+    uint8_t           more;
+    oc_call_hist_view rows[OC_CALL_HISTORY_PAGE];
+} oc_call_history_view;
+
+/* A call's page (CALLS.md §1): its people's stays, who was asked, the
+ * timeline, its recordings and its transcript's lines from `line_from`.
+ * Heap-owned with its lines (oc_call_page_view_free). */
+typedef struct { uint64_t at, user_id; uint8_t kind; char detail[OC_CALL_SUBJECT_MAX + 1]; } oc_call_event_view;
+typedef struct { uint64_t id, speaker; uint32_t start_ms, end_ms; char *text; } oc_call_line_view;
+typedef struct {
+    uint64_t           call_id, starter, started_at, ended_at, from_channel, chat_channel;
+    uint8_t            end_reason;
+    char               subject[OC_CALL_SUBJECT_MAX + 1];
+    uint16_t           n_stays, n_invitees, n_events, n_recordings;
+    oc_call_stay       stays[OC_CALL_PAGE_STAYS];
+    oc_call_invitee    invitees[OC_CALL_PAGE_INVITEES];
+    oc_call_event_view events[OC_CALL_PAGE_EVENTS];
+    oc_call_recording  recordings[OC_CALL_PAGE_RECORDINGS];
+    uint8_t            has_transcript;
+    char               transcript_lang[16];
+    uint32_t           n_lines_total, line_from;
+    uint32_t           n_lines;          /* held: the model's copy gathers pages of them */
+    oc_call_line_view *lines;
+} oc_call_page_view;
+void oc_call_page_view_free(oc_call_page_view *p);
 
 /* One user group (REQ-307), whole, as a GROUP_INFO says it. */
 typedef struct {
@@ -201,7 +254,7 @@ enum {
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
-    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
+    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string), op=the preview rung asked for (0: the original was) */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text
                             * (NULL on a bare progress tick), xfer_tag/xfer_done/xfer_total */
     OC_EV_MEDIA_POSTED,    /* a video message went out: xfer_tag, attach_id = the video, channel_id */
@@ -309,15 +362,15 @@ enum {
     /* A segment refused: count = segment id, op = mode, status = the reason
      * code (it does not fit a uint8_t, so it rides `size`). */
     OC_EV_STT_ERROR,
-    /* Calls (REQ-150, REQ-301-305). STATE: a call for the Calls section, in
-     * `call` (ended set when it is over). JOINED: this client is in the call in
-     * `call`. ROSTER: that call's participants changed. LEFT: this client is in
-     * no call any more (left, ended, moved to another device); channel_id says
-     * which. ERROR: a call request refused, the reason code in `size`,
-     * channel_id where known. REJOINING: put out of the call in channel_id by
-     * something other than its own act -- the connection, a sweep, a moved
-     * media path -- and getting back in; a JOINED ends it, or LOST, which says
-     * it could not be done (PROTOCOL.md §5.17). */
+    /* Calls (REQ-150, REQ-301-305, CALLS.md §1). STATE: a call for Calls
+     * home, in `call` (ended set when it is over). JOINED: this client is in
+     * the call in `call`. ROSTER: that call's participants changed. LEFT: this
+     * client is in no call any more (left, ended, moved to another device);
+     * call_id says which. ERROR: a call request refused, the reason code in
+     * `size`. REJOINING: put out of the call call_id by something other than
+     * its own act -- the connection, a sweep, a moved media path -- and getting
+     * back in; a JOINED ends it, or LOST, which says it could not be done
+     * (PROTOCOL.md §5.17). */
     OC_EV_CALL_STATE,
     OC_EV_CALL_JOINED,
     OC_EV_CALL_ROSTER,
@@ -325,6 +378,13 @@ enum {
     OC_EV_CALL_ERROR,
     OC_EV_CALL_REJOINING,
     OC_EV_CALL_LOST,
+    /* CALL_HISTORY: a page of this user's calls (`call_hist`), newest first.
+     * CALL_PAGE: one call's page (`call_page`). CALL_DELETED: an admin deleted
+     * call_id's transcript (op OC_CALL_DEL_TRANSCRIPT) or its recording
+     * `message_id` (op OC_CALL_DEL_RECORDING). CALLS.md §1, §8. */
+    OC_EV_CALL_HISTORY,
+    OC_EV_CALL_PAGE,
+    OC_EV_CALL_DELETED,
     /* CHANNEL_DESCRIPTION (REQ-034): channel_id + description in body ("" = none).
      * The answer to a fetch and the announcement of a change are one frame. */
     OC_EV_CHANNEL_DESCRIPTION,
@@ -370,7 +430,39 @@ enum {
     OC_EV_PDM,
     /* PROFILE_FIELDS: the workspace's own profile fields, `pfs[0..n_pfs)`
      * with `text` the label, in position order. */
-    OC_EV_PROFILE_FIELDS
+    OC_EV_PROFILE_FIELDS,
+    /* Agents and their tokens (docs/details/MCP.md §3.1). AGENT_TOKEN: a token
+     * minted, the only time it is sent -- `user_id` the agent, `message_id` the
+     * token's id, `body` the token, `topic` its scopes. AGENT_TOKENS_BEGIN:
+     * `user_id`'s list follows, replacing what was held. AGENT_TOKEN_ROW: one
+     * token of it, never the token -- `message_id` its id, `body` its name,
+     * `topic` its scopes, `author_id` who minted it, `created_at`, `server_time`
+     * its last use (0 never), `preview` where from. */
+    OC_EV_AGENT_TOKEN,
+    OC_EV_AGENT_TOKENS_BEGIN,
+    OC_EV_AGENT_TOKEN_ROW,
+    /* A person's AI clients (AUTH.md §8.13). CONNECTION_REQUEST: what a code
+     * names -- `preview` the code, `body` the client's name, `topic` where it
+     * returns. CONNECTION_DECIDED: `status` 1 approved, 0 declined, `body` the
+     * client's name. CONNECTIONS_BEGIN: a list follows, `status` 1 everyone's,
+     * replacing what was held. CONNECTION_ROW: one -- `message_id` its id,
+     * `user_id` whose, `topic` their name, `body` the client's, `created_at`,
+     * `server_time` its last use (0 never), `parent_id` its end (0 none),
+     * `count` its lifetime in days (0 never). */
+    OC_EV_CONNECTION_REQUEST,
+    OC_EV_CONNECTION_DECIDED,
+    OC_EV_CONNECTIONS_BEGIN,
+    OC_EV_CONNECTION_ROW,
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md). OUTWH_SECRET: a webhook
+     * saved, the only time its secret is sent -- `message_id` its id, `body`
+     * the secret. OUTWH_BEGIN: the list follows, replacing what was held.
+     * OUTWH_ROW: one webhook, never its secret -- `message_id` its id, `body`
+     * its address, `topic` its events, `preview` why it was turned off,
+     * `status` 1 on, `author_id` who made it, `created_at`, `ids` its
+     * channels. */
+    OC_EV_OUTWH_SECRET,
+    OC_EV_OUTWH_BEGIN,
+    OC_EV_OUTWH_ROW
 };
 
 /* A workspace profile field (OC_EV_PROFILE_FIELDS: `text` the label), or a
@@ -440,6 +532,7 @@ typedef struct {
     uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
+    char     via[104];     /* MESSAGE / THREAD_REPLY: the AI client it came through, "" for none */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
     char     ws_audience[132]; /* WORKSPACE_INFO: the workspace's audience id, "" when not enrolled */
     /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
@@ -495,6 +588,9 @@ typedef struct {
     uint64_t xfer_tag, xfer_done, xfer_total;
     uint8_t  xfer_file;   /* XFER: which file of a POST_FILES job is moving (0 otherwise) */
     oc_call_view *call;   /* heap; the CALL_* events */
+    oc_call_history_view *call_hist;   /* heap; OC_EV_CALL_HISTORY */
+    oc_call_page_view    *call_page;   /* heap; OC_EV_CALL_PAGE */
+    uint64_t call_id;     /* CALL_LEFT / CALL_REJOINING / CALL_LOST: which call */
     oc_group_view *group; /* heap; OC_EV_GROUP */
     oc_poll_view *poll;   /* heap; OC_EV_POLL */
     oc_todo_view *todo;   /* heap; OC_EV_TODO: one frame's range of a list */
@@ -506,6 +602,7 @@ typedef struct {
     uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
     size_t    n_ids;
     uint8_t  user_system; /* USER: the workspace's own sender (OC_USER_SYSTEM), not a person */
+    uint8_t  user_agent;  /* USER: an agent (OC_USER_AGENT), not a person */
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
     uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
     size_t    der_len;
@@ -674,12 +771,19 @@ enum {
      * 16 kHz mono PCM as little-endian 16-bit samples. Sent at once, beside and
      * never behind the transfer queue. */
     OC_CMD_STT_SEGMENT,
-    /* Calls (REQ-150, REQ-301-305), all on `channel_id`. JOIN starts or joins,
-     * inviting `uids` when it starts; INVITE asks `uids`; LEAVE, DECLINE and END
-     * (the starter's) carry nothing else; SHARE starts (op 1) or stops (op 0)
-     * sharing a screen (REQ-161); CAMERA turns the camera on (op 1) or off
-     * (op 0), and VIDEO_SUB says whose cameras to receive -- every one (op 1),
-     * or uids[0..n_uids) (REQ-160). */
+    /* Calls (REQ-150, REQ-301-305, CALLS.md §1), all on `call_id` but START.
+     * START begins a call with subject `body`, asking `uids`, from the
+     * conversation `channel_id` (0 for none); JOIN joins one; INVITE asks
+     * `uids`; LEAVE, DECLINE and END (the starter's) carry nothing else; SHARE
+     * starts (op 1) or stops (op 0) sharing a screen (REQ-161); CAMERA turns
+     * the camera on (op 1) or off (op 0), and VIDEO_SUB says whose cameras to
+     * receive -- every one (op 1), or uids[0..n_uids) (REQ-160); SUBJECT
+     * renames the call to `body`; RECORD starts (op 1) or stops (op 0)
+     * recording it (CALLS.md §8). HISTORY asks for a page of this user's calls
+     * started before `start_ms` (0 the newest); DETAIL for call_id's page, its
+     * transcript from line `req_id`; DELETE (an admin's) deletes its
+     * transcript (op OC_CALL_DEL_TRANSCRIPT) or its recording `message_id`
+     * (op OC_CALL_DEL_RECORDING). JOIN to DELETE are one range. */
     OC_CMD_CALL_JOIN,
     OC_CMD_CALL_INVITE,
     OC_CMD_CALL_LEAVE,
@@ -688,6 +792,12 @@ enum {
     OC_CMD_CALL_SHARE,
     OC_CMD_CALL_CAMERA,
     OC_CMD_CALL_VIDEO_SUB,
+    OC_CMD_CALL_START,
+    OC_CMD_CALL_SUBJECT,
+    OC_CMD_CALL_RECORD,
+    OC_CMD_CALL_HISTORY,
+    OC_CMD_CALL_DETAIL,
+    OC_CMD_CALL_DELETE,
     /* User groups (REQ-307-309). CREATE/UPDATE: body = handle, body2 = name,
      * body3 = description, message_id = the group (UPDATE); DELETE: message_id;
      * ADD/REMOVE_MEMBERS: message_id + uids; CHANNEL_ADD/REMOVE_GROUP:
@@ -732,6 +842,42 @@ enum {
     /* Out of office (REQ-122): start_ms/end_ms, body = the message; an end of
      * 0 clears it. */
     OC_CMD_SET_OUT_OF_OFFICE,
+    /* The playable copy of a video message (ARCH-135), saved to a file the
+     * person chose: message_id = the video's attachment id, body = dest path.
+     * A queued transfer, as OC_CMD_DOWNLOAD is. */
+    OC_CMD_EXPORT,
+    /* An image attachment's preview INTO MEMORY (ARCH-137): message_id = the
+     * attachment, op = the rung (OC_PREVIEW_RUNG_INLINE_WIRE or _EXPANDED_WIRE).
+     * Its bytes arrive as OC_EV_ATTACHMENT_DATA with op = that rung; where the
+     * daemon has no preview, the original's bytes do, with the same op. Queued
+     * as OC_CMD_FETCH is. */
+    OC_CMD_FETCH_PREVIEW,
+    /* Agents and their tokens: CREATE_AGENT body = the name, body2 = its first
+     * token's name, body3 = the scopes; MINT_AGENT_TOKEN message_id = the
+     * agent, body = the token's name, body3 = the scopes; REMOVE_AGENT and
+     * LIST_AGENT_TOKENS message_id = the agent; REVOKE_AGENT_TOKEN message_id =
+     * the agent, channel_id = the token's id. */
+    OC_CMD_CREATE_AGENT,
+    OC_CMD_MINT_AGENT_TOKEN,
+    OC_CMD_REMOVE_AGENT,
+    OC_CMD_LIST_AGENT_TOKENS,
+    OC_CMD_REVOKE_AGENT_TOKEN,
+    /* A person's AI clients: CONNECTION_CODE body = the code; CONNECTION_DECIDE
+     * body = the code, op = approve, message_id = the lifetime in days;
+     * LIST_CONNECTIONS op = everyone's; REVOKE_CONNECTION message_id = the
+     * connection, op = from everyone's. */
+    OC_CMD_CONNECTION_CODE,
+    OC_CMD_CONNECTION_DECIDE,
+    OC_CMD_LIST_CONNECTIONS,
+    OC_CMD_REVOKE_CONNECTION,
+    /* Outgoing webhooks: CREATE_OUTWH body = the address, body2 = the events,
+     * body3 = the channels' ids, in decimal, separated by spaces; LIST_OUTWH;
+     * SET_OUTWH message_id = the webhook, channel_id = 1 on, 0 off;
+     * DELETE_OUTWH message_id = the webhook. */
+    OC_CMD_CREATE_OUTWH,
+    OC_CMD_LIST_OUTWH,
+    OC_CMD_SET_OUTWH,
+    OC_CMD_DELETE_OUTWH,
     OC_CMD_QUIT
 };
 
@@ -779,7 +925,8 @@ typedef struct {
     uint8_t *mem[OC_MAX_ATTACH];
     size_t   mem_len[OC_MAX_ATTACH];
     uint8_t  n_paths;
-    /* CALL_JOIN / CALL_INVITE: the people asked. Inline, capped by the wire. */
+    /* CALL_START / CALL_INVITE: the people asked. Inline, capped by the wire. */
+    uint64_t call_id;     /* the CALL_* commands but START */
     uint64_t uids[OC_MAX_CALL_INVITES];
     uint16_t n_uids;
     /* SUMMARIZE: the request's id, and its span (OC_SUM_UNREAD...; start and

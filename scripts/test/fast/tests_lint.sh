@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hold the tests to the rule that makes them worth running (docs/TESTING.md
+# Hold the tests to the rule that makes them worth running (docs/details/TESTING.md
 # "Brittle tests"): a test's result changes only when behaviour a person,
 # an operator or an integrator could see changes, and it cannot stay green
 # while that behaviour regresses. What a C test cannot see of itself -- its
@@ -22,7 +22,7 @@
 #            in code: a verdict on how fast code runs or on real time passing,
 #            which a loaded machine fails with nothing wrong. A test asserts the
 #            mechanism, moves a clock it injects, or waits on the outcome
-#            (docs/TESTING.md "Speed and time").
+#            (docs/details/TESTING.md "Speed and time").
 # In .github/workflows/*.yml, and in the scripts under scripts/test/,
 # scripts/release/smoke/ and scripts/build/ that run under pipefail:
 #   pipe     `| grep -q` in a step that runs under pipefail: grep -q exits at
@@ -159,7 +159,7 @@ END {
         if (code ~ /"\/tmp\//)
             printf "%s:%d: tmp: a directory of its own (oc_test_mkdtemp, tests/testenv.h): %s\n", FILENAME, k, raw
         if (code ~ /(^|[^A-Za-z0-9_])(CHECK_SPEED|CHECK_TIMING|oc_test_let_time_pass|OC_TEST_TIMING)([^A-Za-z0-9_]|$)/)
-            printf "%s:%d: timing: assert the mechanism, move an injected clock or wait on the outcome (docs/TESTING.md \"Speed and time\"): %s\n", FILENAME, k, raw
+            printf "%s:%d: timing: assert the mechanism, move an injected clock or wait on the outcome (docs/details/TESTING.md \"Speed and time\"): %s\n", FILENAME, k, raw
     }
 }
 AWK
@@ -217,7 +217,7 @@ while IFS= read -r -d '' f; do
 done < <(list scripts/test '*.sh'; list scripts/release/smoke '*.sh'; list scripts/build '*.sh')
 
 if [ $found != 0 ]; then
-    echo "tests_lint: the tests wait on outcomes, judge no speed, compare markers rather than words, and share no paths (docs/TESTING.md \"Brittle tests\")" >&2
+    echo "tests_lint: the tests wait on outcomes, judge no speed, compare markers rather than words, and share no paths (docs/details/TESTING.md \"Brittle tests\")" >&2
     exit 1
 fi
 echo "tests_lint: tests and workflows clean"

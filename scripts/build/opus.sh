@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the committed libopus (static) from third_party/opus -- the release
-# tarball as Xiph published it, committed (docs/VENDORS.md §1) -- into
+# tarball as Xiph published it, committed (docs/details/VENDORS.md §1) -- into
 # third_party/opus-<version>[-arch|-win]. Nothing is downloaded.
 #
 #   scripts/build/opus.sh            native (Linux; `make test` links it)
@@ -10,7 +10,7 @@
 # (ARCH-73), and links libopus only for read-aloud (TTS=1, mk/daemon.mk).
 # scripts/build/media_wasm.sh builds the same sources for the web.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

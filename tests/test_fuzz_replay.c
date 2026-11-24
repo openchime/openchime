@@ -1,4 +1,4 @@
-/* The fuzzing tier's corpora and reproducers, replayed (docs/TESTING.md,
+/* The fuzzing tier's corpora and reproducers, replayed (docs/details/TESTING.md,
  * "Fuzzing"): every file under tests/fuzz/corpus/<harness>/ and
  * tests/fuzz/crashes/<harness>/ through its harness. A crash the fuzzer found is
  * checked in under crashes/, and fails here until it is fixed. A harness aborts
@@ -51,6 +51,7 @@ int run_fuzz_replay_tests(void) {
         { "jwt", oc_fuzz_jwt },
         { "webauthn", oc_fuzz_webauthn },
         { "idtoken", oc_fuzz_idtoken },
+        { "image", oc_fuzz_image },
     };
     int total = 0;
     for (size_t i = 0; i < sizeof H / sizeof H[0]; i++) {

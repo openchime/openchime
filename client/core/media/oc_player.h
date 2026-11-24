@@ -1,4 +1,4 @@
-/* Playing a video message (REQ-165, ARCH-110, docs/VIDEO-MESSAGES.md §8): an
+/* Playing a video message (REQ-165, ARCH-110, docs/details/VIDEO-MESSAGES.md §8): an
  * MP4 in memory in, BGRA frames for the UI and PCM to the speaker out.
  *
  * The audio clock is master: a video frame is presented once the samples the

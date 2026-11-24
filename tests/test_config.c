@@ -327,6 +327,20 @@ static void test_max_video_size(void) {
     refuses_removed("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", "167772160", "OPENCHIME_MAX_VIDEO_SIZE");
 }
 
+static void test_retention_days(void) {
+    /* Message retention (REQ-250): off (0) unless set, a number of days up
+     * to a hundred years, anything else refused. */
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    CHECK(oc_config_get()->retention_days == 0);
+    accepts("OPENCHIME_RETENTION_DAYS", "30");
+    CHECK(oc_config_get()->retention_days == 30);
+    accepts("OPENCHIME_RETENTION_DAYS", "36500");
+    CHECK(oc_config_get()->retention_days == 36500);
+    refuses("OPENCHIME_RETENTION_DAYS", "36501");
+    refuses("OPENCHIME_RETENTION_DAYS", "-1");
+    refuses("OPENCHIME_RETENTION_DAYS", "30d");
+}
+
 /* The workspace settings clients are told (CFG_VISIBLE): exactly the rows
  * marked so, by their key, with the effective value; never a secret. */
 static void test_visible(void) {
@@ -358,6 +372,22 @@ static void test_visible(void) {
         if (!strcmp(key, "custom_emoji_add")) saw = !strcmp(val, "admins");
     CHECK(saw);
     refuses("OPENCHIME_CUSTOM_EMOJI_ADD", "moderators");
+    /* Whether people may connect their own AI clients: on by default, told as on or off. */
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    accepts("OPENCHIME_WORKSPACE_NAME", "x");
+    CHECK(oc_config_get()->mcp.connections == 1);
+    saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "mcp_connections")) saw = !strcmp(val, "on");
+    CHECK(saw);
+    accepts("OPENCHIME_MCP_CONNECTIONS", "off");
+    CHECK(oc_config_get()->mcp.connections == 0);
+    saw = 0;
+    for (size_t i = 0; oc_config_visible(i, key, sizeof key, val, sizeof val); i++)
+        if (!strcmp(key, "mcp_connections")) saw = !strcmp(val, "off");
+    CHECK(saw);
+    refuses("OPENCHIME_MCP_CONNECTIONS", "admins");
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
 }
 
 /* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
@@ -502,9 +532,9 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 36);     /* OPENCHIME_MODE among them */
+    CHECK(operator_rows == 51);     /* OPENCHIME_MODE, the four OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
     CHECK(managed_rows == 7);
-    CHECK(dev_rows == 6 + 12);      /* the daemon's six, and the clients' */
+    CHECK(dev_rows == 6 + 13);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
     /* No row is also a removed name. */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++)
@@ -592,6 +622,7 @@ int run_config_tests(void) {
     test_constants();
     test_visible();
     test_max_video_size();
+    test_retention_days();
     test_mode();
     test_reload_and_registry();
     test_env_file();

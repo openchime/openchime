@@ -15,6 +15,7 @@
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
+#include "callrec_render.h"   /* a recording's size (CALLS.md §8) */
 #include "e2e_hpke.h"
 #include "pwpolicy.h"
 
@@ -27,6 +28,8 @@
 #include "authpool.h"
 #include "joinrules.h"
 #include "jwt.h"
+#include "scopes.h"
+#include "oauth.h"    /* the AI clients' tokens and codes (AUTH.md §8.13) */
 #include "localissuer.h"
 #include "ratelimit.h"
 #include "roles.h"
@@ -42,6 +45,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <mbedtls/sha256.h>
 #include <sys/eventfd.h>
 #include <time.h>
@@ -335,6 +339,15 @@ static void job_free(oc_job *j) {
     free(j->tts_text);
     free(j->tts_lang);
     free(j->tts_blob_key);
+    free(j->exp_version);
+    free(j->exp_blob_key);
+    for (int i = 0; i < 2; i++) { free(j->pv_keys[i]); free(j->pv_mime[i]); }
+    free(j->agent_name); free(j->token_name); free(j->token_scopes); free(j->token_from);
+    free(j->owh_url); free(j->owh_events); free(j->owh_reason);
+    free(j->mcp_query); free(j->mcp_from); free(j->mcp_action); free(j->mcp_target); free(j->mcp_detail);
+    free(j->oa_client_id); free(j->oa_name); free(j->oa_uris); free(j->oa_redirect); free(j->oa_challenge);
+    free(j->oa_state); free(j->oa_resource); free(j->oa_request); free(j->oa_code); free(j->oa_verifier);
+    free(j->oa_refresh); free(j->via);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -357,6 +370,11 @@ static void job_free(oc_job *j) {
     free(j->unf_descr);
     free(j->sum_version);
     free(j->call_uids);
+    free(j->call_subject);
+    free(j->call_spool);
+    free(j->tr_lang);
+    for (size_t i = 0; i < j->n_tr_lines; i++) free(j->tr_lines[i].text);
+    free(j->tr_lines);
     free(j->grp_handle); free(j->grp_name); free(j->grp_desc); free(j->grp_uids);
     free(j);
 }
@@ -850,6 +868,21 @@ static void append_todo(sqlite3 *db, oc_dbres *r, uint64_t mid) {
 }
 
 /* Lists for a replayed window. */
+/* The call a call message is about (CALLS.md §1): a call event's own column,
+ * read for those rows alone. */
+static void fill_replay_calls(sqlite3 *db, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    for (size_t i = 0; i < r->n_replay; i++) {
+        if (r->replay[i].kind != OC_MSG_KIND_CALL) continue;
+        if (!st && sqlite3_prepare_v2(db, "SELECT COALESCE(call_id,0) FROM messages WHERE id=?1;",
+                                      -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->replay[i].message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) r->replay[i].call_id = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+}
+
 static void fill_replay_todos(sqlite3 *db, oc_dbres *r) {
     for (size_t i = 0; i < r->n_replay; i++) append_todo(db, r, r->replay[i].message_id);
 }
@@ -880,10 +913,44 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->pfd); free(r->pfv);
     free(r->pf_ooo_message);
     free(r->tts_text); free(r->tts_blob_key);
+    free(r->exp_blob_key); free(r->exp_src_key);
+    free(r->pv_key); free(r->pv_mime); free(r->pv_drop[0]); free(r->pv_drop[1]);
+    for (size_t i = 0; i < r->n_ptokens; i++) {
+        free(r->ptokens[i].name); free(r->ptokens[i].scopes); free(r->ptokens[i].last_used_from);
+    }
+    free(r->ptokens);
+    free(r->tok_scopes);
+    free(r->oa_client_id); free(r->oa_name); free(r->oa_uris); free(r->oa_request); free(r->oa_code);
+    free(r->oa_redirect); free(r->oa_state); free(r->oa_error); free(r->oa_access); free(r->oa_refresh); free(r->via);
+    for (size_t i = 0; i < r->n_oa_conns; i++) { free(r->oa_conns[i].user_name); free(r->oa_conns[i].client_name); }
+    free(r->oa_conns);
+    free(r->owh_url); free(r->owh_events);
+    for (size_t i = 0; i < r->n_owh_rows; i++) {
+        free(r->owh_rows[i].url); free(r->owh_rows[i].events); free(r->owh_rows[i].disabled_reason);
+    }
+    free(r->owh_rows);
+    for (size_t i = 0; i < r->n_owh_due; i++) {
+        free(r->owh_due[i].url); free(r->owh_due[i].event_id); free(r->owh_due[i].payload);
+    }
+    free(r->owh_due);
+    for (size_t i = 0; i < r->n_mcp_chans; i++) free(r->mcp_chans[i].name);
+    free(r->mcp_chans);
+    for (size_t i = 0; i < r->n_mcp_rows; i++) {
+        oc_mcp_row *m = &r->mcp_rows[i];
+        free(m->author); free(m->handle); free(m->kind); free(m->text); free(m->channel);
+        for (size_t k = 0; k < m->n_files; k++) { free(m->file_names[k]); free(m->file_types[k]); }
+        free(m->file_names); free(m->file_types); free(m->file_sizes);
+    }
+    free(r->mcp_rows);
     free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
     free(r->call_uids);
+    free(r->call_subject);
+    for (size_t i = 0; i < r->n_recs; i++) free(r->rec_spools ? r->rec_spools[i] : NULL);
+    free(r->rec_ids); free(r->rec_spools);
+    free(r->rec_people);
+    free(r->frame);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
@@ -891,7 +958,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->member_participant);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
-    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
+    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free(r->replay[i].via); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
     free(r->replay);
     for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
     free(r->rreact);
@@ -950,9 +1017,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->react_adj_minus);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
-    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
+    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free(r->thread[i].via); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
     free(r->thread);
-    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free(r->search[i].author_name); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
+    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free(r->search[i].author_name); free(r->search[i].via); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
@@ -1030,6 +1097,9 @@ static size_t local_subject(char *buf, size_t cap, const char *username, size_t 
 }
 
 static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, int direct);
+static void owh_member(sqlite3 *db, uint64_t channel_id, uint64_t uid, int joined);
+static int owh_txn_begin(sqlite3 *db);
+static void owh_txn_end(sqlite3 *db, int own);
 static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out);
 
 /* The public, unarchived channels OPENCHIME_DEFAULT_CHANNELS names, by name:
@@ -1629,6 +1699,9 @@ static int user_disabled(sqlite3 *db, uint64_t uid) {
 /* Is this user a web visitor (SCHEMA.md §3bj)? A visitor reaches nothing but
  * its own conversation: it is no DM's participant, no channel's invitee and no
  * group's member, and every refusal reads as an unknown user's does. */
+static int user_not_person(sqlite3 *db, uint64_t uid);   /* an agent's, a bot's or a visitor's row */
+static int user_kind_is(sqlite3 *db, uint64_t uid, const char *kind);
+static int actor_manages(sqlite3 *db, uint64_t uid);
 static int user_is_visitor(sqlite3 *db, uint64_t uid) {
     sqlite3_stmt *st = NULL;
     int visitor = 0;
@@ -3031,7 +3104,7 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,''), is_system, "
-        "       ooo_start_ms, ooo_end_ms, ooo_message "
+        "       ooo_start_ms, ooo_end_ms, ooo_message, kind='agent' "
         "FROM users WHERE (?1 = 0 AND kind <> 'visitor') OR id = ?1 ORDER BY id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
@@ -3060,7 +3133,8 @@ static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
         arr[n].full_name    = strdup((const char *)sqlite3_column_text(st, 11));
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
-        arr[n].flags        = sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0;
+        arr[n].flags        = (uint8_t)((sqlite3_column_int(st, 14) ? OC_USER_SYSTEM : 0) |
+                                        (sqlite3_column_int(st, 18) ? OC_USER_AGENT : 0));
         arr[n].ooo_start    = (uint64_t)sqlite3_column_int64(st, 15);
         arr[n].ooo_end      = (uint64_t)sqlite3_column_int64(st, 16);
         arr[n].ooo_message  = strdup((const char *)sqlite3_column_text(st, 17));
@@ -3725,6 +3799,15 @@ static void deactivate_user(sqlite3 *db, uint64_t uid, uint64_t actor, const cha
      * promise cannot be kept and there is nobody left to tell. */
     sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    /* And the AI clients connected as them (AUTH.md §8.13): revoked, their
+     * tokens gone, so not one more request is answered as them. */
+    sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id IN"
+                           " (SELECT id FROM mcp_connections WHERE user_id=?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "UPDATE mcp_connections SET revoked_at_ms=?2, refresh_hash=NULL"
+                           " WHERE user_id=?1 AND revoked_at_ms=0;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid); sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     audit_actor(db, OC_AUDIT_ADMIN, action, actor, uid, NULL, 1, NULL);
@@ -3948,8 +4031,11 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
         sqlite3_bind_int(st, 4, want_direct);
+        int own = owh_txn_begin(db);
         sqlite3_step(st);
         sqlite3_finalize(st);
+        owh_member(db, channel_id, user_id, 1);   /* in the same transaction */
+        owh_txn_end(db, own);
         return 1;
     }
     if (want && cur_direct != want_direct) {
@@ -3963,6 +4049,7 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         return 0;
     }
     if (!want && exists) {
+        int own = owh_txn_begin(db);
         sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
@@ -3975,6 +4062,8 @@ static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, i
         sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
         sqlite3_step(st);
         sqlite3_finalize(st);
+        owh_member(db, channel_id, user_id, 0);
+        owh_txn_end(db, own);
         return -1;
     }
     return 0;
@@ -3995,6 +4084,771 @@ static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out)
     sqlite3_finalize(st);
     *n_out = n;
     return arr;
+}
+
+/* ---- Outgoing webhooks (docs/details/WEBHOOKS.md) -------------------------
+ * An owner or admin points the workspace at an https address and names the
+ * events it is sent and the channels they come from. Each event a webhook
+ * receives is queued here, as a row of webhook_deliveries, in the transaction
+ * that wrote the event; the delivery worker (daemon/webhooks_out.c) takes the
+ * rows due, signs and sends them, and says how each went. */
+
+/* The events a webhook can be sent, in the order a list shows them. */
+static const char *const OWH_EVENTS[] = {
+    "message", "reaction_added", "reaction_removed", "member_joined_channel",
+    "member_left_channel", "channel_rename", "channel_archive", "channel_unarchive",
+    "user_change",
+};
+#define OWH_N_EVENTS (sizeof OWH_EVENTS / sizeof OWH_EVENTS[0])
+
+/* A growing string; `bad` once an allocation failed, and then it stays empty. */
+typedef struct { char *p; size_t n, cap; int bad; } owh_sb;
+
+static void sb_add(owh_sb *b, const char *s, size_t n) {
+    if (b->bad) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->n + n + 1) cap *= 2;
+        char *g = realloc(b->p, cap);
+        if (!g) { b->bad = 1; return; }
+        b->p = g; b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+static void sb_str(owh_sb *b, const char *s) { sb_add(b, s, strlen(s)); }
+static void sb_fmt(owh_sb *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void sb_fmt(owh_sb *b, const char *fmt, ...) {
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof tmp) { b->bad = 1; return; }
+    sb_add(b, tmp, (size_t)n);
+}
+/* `s` as a JSON string, quoted. */
+static void sb_json(owh_sb *b, const char *s, size_t n) {
+    sb_add(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { char e[2] = { '\\', (char)c }; sb_add(b, e, 2); }
+        else if (c == '\n') sb_add(b, "\\n", 2);
+        else if (c == '\r') sb_add(b, "\\r", 2);
+        else if (c == '\t') sb_add(b, "\\t", 2);
+        else if (c < 0x20) sb_fmt(b, "\\u%04x", c);
+        else sb_add(b, (const char *)&c, 1);
+    }
+    sb_add(b, "\"", 1);
+}
+static void sb_jstr(owh_sb *b, const char *s) { sb_json(b, s ? s : "", s ? strlen(s) : 0); }
+
+/* Whether `url` is an address a webhook may have: https, a host, no space or
+ * control character. Any host: the address is the owner's or admin's choice. */
+static int owh_url_ok(const char *url) {
+    if (!url) return 0;
+    size_t n = strlen(url);
+    if (n <= 8 || n > 2048 || strncasecmp(url, "https://", 8) != 0) return 0;
+    if (url[8] == '/' || url[8] == '?' || url[8] == '#') return 0;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)url[i] <= 0x20 || url[i] == 0x7f) return 0;
+    return 1;
+}
+
+/* The event names in `in` (separated by spaces) into `out`, each once and in
+ * the catalog's order. 0, or -1 for an empty list or a name not allowed. */
+static int owh_events_canon(const char *in, char *out, size_t cap) {
+    int want[OWH_N_EVENTS] = { 0 };
+    int any = 0;
+    const char *p = in ? in : "";
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != ' ') e++;
+        size_t k = 0;
+        for (; k < OWH_N_EVENTS; k++)
+            if (strlen(OWH_EVENTS[k]) == (size_t)(e - p) && memcmp(OWH_EVENTS[k], p, (size_t)(e - p)) == 0) break;
+        if (k == OWH_N_EVENTS) return -1;
+        want[k] = 1; any = 1;
+        p = e;
+    }
+    if (!any) return -1;
+    size_t n = 0;
+    out[0] = '\0';
+    for (size_t k = 0; k < OWH_N_EVENTS; k++) {
+        if (!want[k]) continue;
+        int w = snprintf(out + n, cap - n, "%s%s", n ? " " : "", OWH_EVENTS[k]);
+        if (w < 0 || (size_t)w >= cap - n) return -1;
+        n += (size_t)w;
+    }
+    return 0;
+}
+
+/* The workspace's id in an envelope: `T` and its audience id's short form
+ * (the `ws_` dropped), or `T0` when it is not enrolled. */
+static void owh_team(sqlite3 *db, char *out, size_t cap) {
+    snprintf(out, cap, "T0");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT audience FROM ident.enrollment WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+        const char *a = (const char *)sqlite3_column_text(st, 0);
+        if (strncmp(a, "ws_", 3) == 0) a += 3;
+        if (*a) snprintf(out, cap, "T%s", a);
+    }
+    sqlite3_finalize(st);
+}
+
+/* A channel a webhook may watch: a named one, public or private, never a DM or
+ * group DM. 1, 0 for one of those, -1 for no channel at all. */
+static int owh_channel_named(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int ok = -1;
+    if (sqlite3_prepare_v2(db, "SELECT kind='channel' AND e2e=0 FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) ok = sqlite3_column_int(st, 0) ? 1 : 0;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* The enabled webhooks that receive `type` from channel `channel_id` (0: an
+ * event of no channel, user_change), into a heap array. */
+static uint64_t *owh_targets(sqlite3 *db, uint64_t channel_id, const char *type, size_t *n_out) {
+    *n_out = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id FROM outgoing_webhooks w WHERE enabled=1"
+            " AND (' ' || events || ' ') LIKE ('% ' || ?2 || ' %')"
+            " AND (?1 = 0 OR EXISTS(SELECT 1 FROM outgoing_webhook_channels c"
+            "                       WHERE c.webhook_id=w.id AND c.channel_id=?1))"
+            " ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return NULL;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
+    uint64_t *ids = NULL;
+    size_t n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t *g = realloc(ids, (n + 1) * sizeof *g);
+        if (!g) break;
+        ids = g;
+        ids[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    *n_out = n;
+    return ids;
+}
+
+/* Who is to receive an event of `type` in `channel_id`: the webhooks, or NULL
+ * when none -- then the event is not even built. A DM's and a group DM's
+ * events go nowhere. */
+static uint64_t *owh_wanted(sqlite3 *db, uint64_t channel_id, const char *type, size_t *n) {
+    *n = 0;
+    if (channel_id && owh_channel_named(db, channel_id) != 1) return NULL;
+    return owh_targets(db, channel_id, type, n);
+}
+
+/* Queue `event` (a JSON object) for each of `ids`, in its envelope. The
+ * caller holds the transaction that wrote the event. */
+static void owh_queue(sqlite3 *db, const uint64_t *ids, size_t n, const char *event) {
+    if (!n || !event) return;
+    char team[80];
+    owh_team(db, team, sizeof team);
+    uint64_t now = dbw_now_ms();
+    for (size_t i = 0; i < n; i++) {
+        uint8_t rnd[10];
+        if (oc_rand_bytes(rnd, sizeof rnd) != 0) continue;
+        char evid[3 + 2 * sizeof rnd];
+        memcpy(evid, "Ev", 2);
+        for (size_t k = 0; k < sizeof rnd; k++) snprintf(evid + 2 + 2 * k, 3, "%02x", rnd[k]);
+        owh_sb b = { 0 };
+        sb_str(&b, "{\"type\":\"event_callback\",\"team_id\":");
+        sb_jstr(&b, team);
+        sb_fmt(&b, ",\"api_app_id\":\"W%llu\",\"event_id\":\"%s\",\"event_time\":%llu,"
+                   "\"authorizations\":[],\"event\":",
+               (unsigned long long)ids[i], evid, (unsigned long long)(now / 1000u));
+        sb_str(&b, event);
+        sb_str(&b, "}");
+        sqlite3_stmt *st = NULL;
+        if (!b.bad && sqlite3_prepare_v2(db,
+                "INSERT INTO webhook_deliveries(webhook_id,event_id,payload,next_at_ms) VALUES(?1,?2,?3,?4);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)ids[i]);
+            sqlite3_bind_text(st, 2, evid, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, b.p, (int)b.n, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+        free(b.p);
+    }
+}
+
+/* A channel's type as the convention gives it in a message event. */
+static const char *owh_channel_type(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    int pub = 1;
+    if (sqlite3_prepare_v2(db, "SELECT is_public FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) pub = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return pub ? "channel" : "group";
+}
+
+/* A body's text as an app reads it: every mention of a person as `<@U42>`,
+ * whichever form its author typed, and @here, @channel and @everyone as the
+ * convention writes them. A name that names no member is left as written. */
+static void owh_text(sqlite3 *db, owh_sb *b, uint64_t channel_id, const char *body, size_t len) {
+    oc_mention m[OC_MENTION_MAX];
+    size_t found = oc_mention_scan(body, len, m, OC_MENTION_MAX);
+    if (found > OC_MENTION_MAX) found = OC_MENTION_MAX;
+    owh_sb t = { 0 };
+    size_t at = 0;
+    for (size_t i = 0; i < found; i++) {
+        if (m[i].start < at || m[i].start + m[i].len > len) continue;
+        char rep[48] = "";
+        if (m[i].kind == OC_MENTION_HERE) snprintf(rep, sizeof rep, "<!here>");
+        else if (m[i].kind == OC_MENTION_CHANNEL) snprintf(rep, sizeof rep, "<!channel>");
+        else if (m[i].kind == OC_MENTION_EVERYONE) snprintf(rep, sizeof rep, "<!everyone>");
+        else if (m[i].kind == OC_MENTION_USER) {
+            uint64_t uid = m[i].user_id;
+            if (!uid) {
+                sqlite3_stmt *q = NULL;
+                if (sqlite3_prepare_v2(db,
+                        "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
+                        "WHERE cm.channel_id = ?1 AND u.is_system = 0 AND lower(u.display_name) = lower(?2) "
+                        "ORDER BY u.id LIMIT 1;", -1, &q, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
+                    sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
+                    if (sqlite3_step(q) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(q, 0);
+                }
+                sqlite3_finalize(q);
+            }
+            if (uid) snprintf(rep, sizeof rep, "<@U%llu>", (unsigned long long)uid);
+        }
+        if (!rep[0]) continue;
+        sb_add(&t, body + at, m[i].start - at);
+        sb_str(&t, rep);
+        at = m[i].start + m[i].len;
+    }
+    sb_add(&t, body + at, len - at);
+    if (t.bad) { sb_json(b, body, len); free(t.p); return; }
+    sb_json(b, t.p ? t.p : "", t.n);
+    free(t.p);
+}
+
+enum { OWH_MSG_NEW, OWH_MSG_CHANGED, OWH_MSG_DELETED };
+
+/* Message `mid` posted, changed or deleted: a `message` event, with the
+ * subtype the convention gives it. */
+static void owh_message(sqlite3 *db, uint64_t mid, int what) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.channel_id, m.author_id, COALESCE(m.body,''), COALESCE(m.parent_id,0), m.kind,"
+            "       u.kind <> 'human', EXISTS(SELECT 1 FROM actions a WHERE a.message_id=m.id),"
+            "       COALESCE(m.deleted_by, 0)"
+            "  FROM messages m JOIN users u ON u.id = m.author_id WHERE m.id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 4) != (int)OC_MSG_KIND_MESSAGE) {
+        sqlite3_finalize(st);
+        return;
+    }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0), author = (uint64_t)sqlite3_column_int64(st, 1);
+    char *body = strdup((const char *)sqlite3_column_text(st, 2));
+    size_t blen = body ? strlen(body) : 0;
+    uint64_t parent = (uint64_t)sqlite3_column_int64(st, 3);
+    int bot = sqlite3_column_int(st, 5), action = sqlite3_column_int(st, 6);
+    uint64_t by = (uint64_t)sqlite3_column_int64(st, 7);
+    sqlite3_finalize(st);
+    size_t n = 0;
+    uint64_t *ids = body ? owh_wanted(db, cid, "message", &n) : NULL;
+    if (!n) { free(ids); free(body); return; }
+    const char *text = body;
+    size_t tlen = blen;
+    if (action && tlen >= 3 && strncmp(text, "/me", 3) == 0) {    /* the action's words, "/me" gone */
+        text += 3; tlen -= 3;
+        while (tlen && *text == ' ') { text++; tlen--; }
+    }
+    const char *ctype = owh_channel_type(db, cid);
+    unsigned long long c = (unsigned long long)cid, u = (unsigned long long)author, ts = (unsigned long long)mid;
+    owh_sb b = { 0 };
+    if (what == OWH_MSG_DELETED) {
+        sb_fmt(&b, "{\"type\":\"message\",\"subtype\":\"message_deleted\",\"hidden\":true,"
+                   "\"channel\":\"C%llu\",\"channel_type\":\"%s\",\"deleted_ts\":\"%llu\","
+                   "\"ts\":\"%llu\",\"event_ts\":\"%llu\"", c, ctype, ts, ts, ts);
+        if (by) sb_fmt(&b, ",\"user\":\"U%llu\"", (unsigned long long)by);
+        sb_str(&b, "}");
+    } else {
+        owh_sb m = { 0 };
+        sb_str(&m, "{\"type\":\"message\"");
+        if (what == OWH_MSG_NEW && bot) sb_str(&m, ",\"subtype\":\"bot_message\"");
+        else if (what == OWH_MSG_NEW && action) sb_str(&m, ",\"subtype\":\"me_message\"");
+        if (what == OWH_MSG_NEW) sb_fmt(&m, ",\"channel\":\"C%llu\",\"channel_type\":\"%s\"", c, ctype);
+        sb_fmt(&m, ",\"user\":\"U%llu\",\"text\":", u);
+        owh_text(db, &m, cid, text, tlen);
+        sb_fmt(&m, ",\"ts\":\"%llu\"", ts);
+        if (parent) sb_fmt(&m, ",\"thread_ts\":\"%llu\"", (unsigned long long)parent);
+        if (what == OWH_MSG_NEW) sb_fmt(&m, ",\"event_ts\":\"%llu\"}", ts);
+        else sb_fmt(&m, ",\"edited\":{\"user\":\"U%llu\",\"ts\":\"%llu\"}}", u, ts);
+        if (what == OWH_MSG_NEW) sb_add(&b, m.p ? m.p : "", m.n);
+        else {
+            sb_fmt(&b, "{\"type\":\"message\",\"subtype\":\"message_changed\",\"hidden\":true,"
+                       "\"channel\":\"C%llu\",\"channel_type\":\"%s\",\"message\":", c, ctype);
+            sb_add(&b, m.p ? m.p : "", m.n);
+            sb_fmt(&b, ",\"ts\":\"%llu\",\"event_ts\":\"%llu\"}", ts, ts);
+        }
+        if (m.bad) b.bad = 1;
+        free(m.p);
+    }
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+    free(body);
+}
+
+/* A reaction added to or taken from message `mid` by `uid`. */
+static void owh_reaction(sqlite3 *db, uint64_t channel_id, uint64_t mid, uint64_t uid, const char *emoji, int added) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, added ? "reaction_added" : "reaction_removed", &n);
+    if (!n) { free(ids); return; }
+    uint64_t author = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT author_id FROM messages WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        if (sqlite3_step(st) == SQLITE_ROW) author = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"%s\",\"user\":\"U%llu\",\"reaction\":", added ? "reaction_added" : "reaction_removed",
+           (unsigned long long)uid);
+    sb_jstr(&b, emoji);
+    sb_fmt(&b, ",\"item_user\":\"U%llu\",\"item\":{\"type\":\"message\",\"channel\":\"C%llu\",\"ts\":\"%llu\"},"
+               "\"event_ts\":\"%llu\"}", (unsigned long long)author, (unsigned long long)channel_id,
+           (unsigned long long)mid, (unsigned long long)mid);
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `uid` joined or left `channel_id`. */
+static void owh_member(sqlite3 *db, uint64_t channel_id, uint64_t uid, int joined) {
+    const char *type = joined ? "member_joined_channel" : "member_left_channel";
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, type, &n);
+    if (!n) { free(ids); return; }
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"%s\",\"user\":\"U%llu\",\"channel\":\"C%llu\",\"channel_type\":\"%s\"}", type,
+           (unsigned long long)uid, (unsigned long long)channel_id,
+           strcmp(owh_channel_type(db, channel_id), "channel") == 0 ? "C" : "G");
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `channel_id` renamed (`what` channel_rename), archived or unarchived, by `uid`. */
+static void owh_channel(sqlite3 *db, uint64_t channel_id, uint64_t uid, const char *what) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, channel_id, what, &n);
+    if (!n) { free(ids); return; }
+    owh_sb b = { 0 };
+    if (strcmp(what, "channel_rename") == 0) {
+        sqlite3_stmt *st = NULL;
+        char *name = NULL;
+        uint64_t created = 0;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(name,''), created_at_ms FROM channels WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                name = strdup((const char *)sqlite3_column_text(st, 0));
+                created = (uint64_t)sqlite3_column_int64(st, 1);
+            }
+        }
+        sqlite3_finalize(st);
+        sb_fmt(&b, "{\"type\":\"channel_rename\",\"channel\":{\"id\":\"C%llu\",\"name\":", (unsigned long long)channel_id);
+        sb_jstr(&b, name);
+        sb_fmt(&b, ",\"created\":%llu}}", (unsigned long long)(created / 1000u));
+        free(name);
+    } else {
+        sb_fmt(&b, "{\"type\":\"%s\",\"channel\":\"C%llu\",\"user\":\"U%llu\"}", what,
+               (unsigned long long)channel_id, (unsigned long long)uid);
+    }
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* `uid`'s profile changed: user_change, to every webhook that takes it,
+ * whatever its channels. */
+static void owh_user_change(sqlite3 *db, uint64_t uid) {
+    size_t n = 0;
+    uint64_t *ids = owh_wanted(db, 0, "user_change", &n);
+    if (!n) { free(ids); return; }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(display_name,''), COALESCE(full_name,''), COALESCE(title,''),"
+            "       COALESCE(pronouns,''), COALESCE(timezone,''), kind <> 'human'"
+            "  FROM users WHERE id=?1 AND is_system=0;", -1, &st, NULL) != SQLITE_OK ||
+        (sqlite3_bind_int64(st, 1, (sqlite3_int64)uid), sqlite3_step(st)) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        free(ids);
+        return;
+    }
+    owh_sb b = { 0 };
+    sb_fmt(&b, "{\"type\":\"user_change\",\"user\":{\"id\":\"U%llu\",\"name\":", (unsigned long long)uid);
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 0));
+    sb_str(&b, ",\"real_name\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 1));
+    sb_str(&b, ",\"tz\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 4));
+    sb_fmt(&b, ",\"is_bot\":%s,\"profile\":{\"display_name\":", sqlite3_column_int(st, 5) ? "true" : "false");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 0));
+    sb_str(&b, ",\"real_name\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 1));
+    sb_str(&b, ",\"title\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 2));
+    sb_str(&b, ",\"pronouns\":");
+    sb_jstr(&b, (const char *)sqlite3_column_text(st, 3));
+    sb_str(&b, "}},\"event_ts\":");
+    sb_fmt(&b, "\"%llu\"}", (unsigned long long)dbw_now_ms());
+    sqlite3_finalize(st);
+    if (!b.bad) owh_queue(db, ids, n, b.p);
+    free(b.p);
+    free(ids);
+}
+
+/* Begin a transaction unless the caller holds one; 1 when this began it. */
+static int owh_txn_begin(sqlite3 *db) {
+    int own = sqlite3_get_autocommit(db);
+    if (own) sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    return own;
+}
+static void owh_txn_end(sqlite3 *db, int own) {
+    if (own) sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+}
+
+static oc_dbres *owh_refuse(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_ERR;
+    r->err_code = code;
+    return r;
+}
+
+/* The webhooks into `r` as OC_RES_OUTWH_LIST, oldest first: never a secret. */
+static void owh_rows(sqlite3 *db, oc_dbres *r) {
+    r->type = OC_RES_OUTWH_LIST;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, url, events, enabled, disabled_reason, created_by, created_at_ms"
+            " FROM outgoing_webhooks ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_owh_rows < OC_OUTWH_LIST_MAX) {
+        oc_outwh_row *g = realloc(r->owh_rows, (r->n_owh_rows + 1) * sizeof *g);
+        if (!g) break;
+        r->owh_rows = g;
+        oc_outwh_row *o = &r->owh_rows[r->n_owh_rows++];
+        memset(o, 0, sizeof *o);
+        o->id = (uint64_t)sqlite3_column_int64(st, 0);
+        o->url = strdup((const char *)sqlite3_column_text(st, 1));
+        o->events = strdup((const char *)sqlite3_column_text(st, 2));
+        o->enabled = (uint8_t)sqlite3_column_int(st, 3);
+        o->disabled_reason = strdup((const char *)sqlite3_column_text(st, 4));
+        o->created_by = (uint64_t)sqlite3_column_int64(st, 5);
+        o->created_at_ms = (uint64_t)sqlite3_column_int64(st, 6);
+        sqlite3_stmt *c = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT channel_id FROM outgoing_webhook_channels WHERE webhook_id=?1"
+                                   " ORDER BY channel_id;", -1, &c, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(c, 1, (sqlite3_int64)o->id);
+            while (sqlite3_step(c) == SQLITE_ROW && o->n_channels < OC_OUTWH_MAX_CHANNELS)
+                o->channels[o->n_channels++] = (uint64_t)sqlite3_column_int64(c, 0);
+        }
+        sqlite3_finalize(c);
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_owh_create(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    if (!owh_url_ok(j->owh_url)) return owh_refuse(j, OC_ERR_WEBHOOK_URL);
+    char events[256];
+    if (owh_events_canon(j->owh_events, events, sizeof events) != 0) return owh_refuse(j, OC_ERR_WEBHOOK_EVENT);
+    if (j->owh_n_channels > OC_OUTWH_MAX_CHANNELS) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    for (uint16_t i = 0; i < j->owh_n_channels; i++) {
+        int named = owh_channel_named(db, j->owh_channels[i]);
+        if (named < 0) return owh_refuse(j, OC_ERR_UNKNOWN_CHANNEL);
+        if (!named) return owh_refuse(j, OC_ERR_FORBIDDEN);   /* a DM or group DM */
+    }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->owh_url = strdup(j->owh_url);
+    r->owh_events = strdup(events);
+    r->owh_n_channels = j->owh_n_channels;
+    memcpy(r->owh_channels, j->owh_channels, j->owh_n_channels * sizeof j->owh_channels[0]);
+    if (!j->owh_verified) {
+        /* Not saved yet: the endpoint is checked first, signed with this. */
+        if (oc_rand_bytes(r->owh_secret, sizeof r->owh_secret) != 0) { r->type = OC_RES_OUTWH_ERR; r->err_code = OC_ERR_INTERNAL; }
+        else r->type = OC_RES_OUTWH_CHECK;
+        return r;
+    }
+    if (!w->have_factor_key) { r->type = OC_RES_OUTWH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_exec(db, "SAVEPOINT owh_create;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    uint64_t id = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO outgoing_webhooks(url, events, secret_sealed, created_by, created_at_ms)"
+            " VALUES(?1, ?2, x'', ?3, ?4);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, j->owh_url, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 2, events, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+        if (sqlite3_step(st) == SQLITE_DONE) id = (uint64_t)sqlite3_last_insert_rowid(db);
+    }
+    sqlite3_finalize(st);
+    /* Sealed bound to its webhook: moved to another row, it does not open. */
+    uint8_t sealed[OC_TOTP_SEALED_LEN];
+    int ok = id && oc_factor_seal(w->factor_key, id, j->owh_secret, sealed) == 0;
+    if (ok) {
+        st = NULL;
+        ok = sqlite3_prepare_v2(db, "UPDATE outgoing_webhooks SET secret_sealed=?1 WHERE id=?2;", -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_blob (st, 1, sealed, (int)sizeof sealed, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+    }
+    for (uint16_t i = 0; ok && i < j->owh_n_channels; i++) {
+        st = NULL;
+        ok = sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO outgoing_webhook_channels(webhook_id, channel_id) VALUES(?1, ?2);",
+                                -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->owh_channels[i]);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!ok) {
+        sqlite3_exec(db, "ROLLBACK TO owh_create; RELEASE owh_create;", NULL, NULL, NULL);
+        r->type = OC_RES_OUTWH_ERR;
+        r->err_code = OC_ERR_INTERNAL;
+        return r;
+    }
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.outgoing.create", j->user_id, id, j->owh_url, 1, events);
+    sqlite3_exec(db, "RELEASE owh_create;", NULL, NULL, NULL);
+    r->type = OC_RES_OUTWH_SECRET;
+    r->message_id = id;
+    memcpy(r->owh_secret, j->owh_secret, sizeof r->owh_secret);
+    return r;
+}
+
+static oc_dbres *process_owh_list(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+/* Webhook `id`'s address, or NULL when there is no such webhook. Heap. */
+static char *owh_url_of(sqlite3 *db, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    char *url = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT url FROM outgoing_webhooks WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) url = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    return url;
+}
+
+/* Run `sql` with ?1 bound to `id`. */
+static void owh_exec_id(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_owh_set(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    char *url = owh_url_of(db, j->owh_id);
+    if (!url) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    /* Turned on, it starts afresh: no failing day carried over. */
+    owh_exec_id(db, j->owh_enabled
+        ? "UPDATE outgoing_webhooks SET enabled=1, disabled_reason='', failing_since_ms=0 WHERE id=?1;"
+        : "UPDATE outgoing_webhooks SET enabled=0, disabled_reason='' WHERE id=?1;", j->owh_id);
+    audit_actor(db, OC_AUDIT_ADMIN, j->owh_enabled ? "webhook.outgoing.enable" : "webhook.outgoing.disable",
+                j->user_id, j->owh_id, url, 1, NULL);
+    free(url);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+static oc_dbres *process_owh_delete(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    char *url = owh_url_of(db, j->owh_id);
+    if (!url) return owh_refuse(j, OC_ERR_FORBIDDEN);
+    int own = owh_txn_begin(db);
+    owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE webhook_id=?1;", j->owh_id);
+    owh_exec_id(db, "DELETE FROM outgoing_webhook_channels WHERE webhook_id=?1;", j->owh_id);
+    owh_exec_id(db, "DELETE FROM outgoing_webhooks WHERE id=?1;", j->owh_id);
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.outgoing.delete", j->user_id, j->owh_id, url, 1, NULL);
+    owh_txn_end(db, own);
+    free(url);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    owh_rows(db, r);
+    return r;
+}
+
+/* The deliveries due, for the worker, each held a while so the next take does
+ * not hand it out again; one never answered is taken again once its hold
+ * ends, after a restart too. */
+static oc_dbres *process_owh_take(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_DUE;
+    uint64_t now = dbw_now_ms();
+    unsigned limit = j->owh_limit && j->owh_limit < OC_OUTWH_TAKE_MAX ? j->owh_limit : OC_OUTWH_TAKE_MAX;
+    int own = owh_txn_begin(db);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT d.id, d.webhook_id, d.attempts, w.url, d.event_id, d.payload, w.secret_sealed, d.last_reason"
+            "  FROM webhook_deliveries d JOIN outgoing_webhooks w ON w.id = d.webhook_id"
+            " WHERE w.enabled = 1 AND d.next_at_ms <= ?1 ORDER BY d.next_at_ms, d.id LIMIT ?2;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        sqlite3_bind_int  (st, 2, (int)limit);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_outwh_due *g = realloc(r->owh_due, (r->n_owh_due + 1) * sizeof *g);
+            if (!g) break;
+            r->owh_due = g;
+            oc_outwh_due *d = &r->owh_due[r->n_owh_due++];
+            memset(d, 0, sizeof *d);
+            d->id = (uint64_t)sqlite3_column_int64(st, 0);
+            d->webhook_id = (uint64_t)sqlite3_column_int64(st, 1);
+            d->attempts = (uint32_t)sqlite3_column_int(st, 2);
+            d->url = strdup((const char *)sqlite3_column_text(st, 3));
+            d->event_id = strdup((const char *)sqlite3_column_text(st, 4));
+            d->payload = strdup((const char *)sqlite3_column_text(st, 5));
+            int sl = sqlite3_column_bytes(st, 6);
+            if (sl > 0 && (size_t)sl <= sizeof d->sealed) {
+                memcpy(d->sealed, sqlite3_column_blob(st, 6), (size_t)sl);
+                d->sealed_len = (size_t)sl;
+            }
+            snprintf(d->last_reason, sizeof d->last_reason, "%s", (const char *)sqlite3_column_text(st, 7));
+        }
+    }
+    sqlite3_finalize(st);
+    for (size_t i = 0; i < r->n_owh_due; i++) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE webhook_deliveries SET next_at_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)r->owh_due[i].id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(now + OC_OUTWH_LEASE_MS));
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    owh_txn_end(db, own);
+    return r;
+}
+
+/* A delivery's outcome. Success ends it and the webhook's failing; a failure
+ * is tried again after 1 s, doubling, up to OC_OUTWH_ATTEMPTS in all. A
+ * webhook failing for a day is turned off, every owner and admin is told, and
+ * the change is audited. */
+static oc_dbres *process_owh_done(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_OUTWH_DONE;
+    uint64_t now = dbw_now_ms();
+    uint64_t hook = 0, failing = 0;
+    uint32_t attempts = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT d.webhook_id, d.attempts, w.failing_since_ms FROM webhook_deliveries d"
+            "  JOIN outgoing_webhooks w ON w.id = d.webhook_id WHERE d.id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->owh_delivery);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            hook = (uint64_t)sqlite3_column_int64(st, 0);
+            attempts = (uint32_t)sqlite3_column_int(st, 1);
+            failing = (uint64_t)sqlite3_column_int64(st, 2);
+        }
+    }
+    sqlite3_finalize(st);
+    r->message_id = hook;
+    if (!hook) return r;                       /* its webhook went meanwhile */
+    int own = owh_txn_begin(db);
+    if (j->owh_ok) {
+        owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE id=?1;", j->owh_delivery);
+        owh_exec_id(db, "UPDATE outgoing_webhooks SET failing_since_ms=0 WHERE id=?1;", hook);
+        owh_txn_end(db, own);
+        return r;
+    }
+    attempts++;
+    if (attempts >= OC_OUTWH_ATTEMPTS) {
+        owh_exec_id(db, "DELETE FROM webhook_deliveries WHERE id=?1;", j->owh_delivery);
+    } else {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE webhook_deliveries SET attempts=?2, next_at_ms=?3, last_reason=?4 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->owh_delivery);
+            sqlite3_bind_int  (st, 2, (int)attempts);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)(now + ((uint64_t)OC_OUTWH_FIRST_RETRY_MS << (attempts - 1))));
+            sqlite3_bind_text (st, 4, j->owh_reason ? j->owh_reason : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    if (!failing) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE outgoing_webhooks SET failing_since_ms=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)hook);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    } else if (now - failing >= OC_OUTWH_DISABLE_MS) {
+        char *url = owh_url_of(db, hook);
+        owh_exec_id(db, "UPDATE outgoing_webhooks SET enabled=0,"
+                        " disabled_reason='its address failed every delivery for a day' WHERE id=?1;", hook);
+        audit_log(db, OC_AUDIT_ADMIN, "webhook.outgoing.disable", 0, NULL, hook, url, 1,
+                  "failed every delivery for a day");
+        size_t n = 0;
+        uint64_t *who = ids_of(db, "SELECT id FROM users WHERE role IN ('owner','admin') AND disabled=0"
+                                   " AND kind='human' AND is_system=0 AND ?1=?1;", 0, &n);
+        for (size_t i = 0; i < n; i++)
+            notice_person(db, who[i], "The outgoing webhook to %s was turned off: every delivery to it failed "
+                          "for a day. Turn it on again in Admin, Webhooks, once its address answers.",
+                          url ? url : "its address");
+        free(who);
+        free(url);
+        r->owh_disabled = 1;
+    }
+    owh_txn_end(db, own);
+    return r;
 }
 
 /* A channel's groups, in the order they were added. */
@@ -4298,7 +5152,7 @@ static oc_dbres *process_group_members(sqlite3 *db, const oc_job *j, int add) {
         if (add) {
             /* A removed member, or a visitor, who would gain channels through
              * the group (SCHEMA.md §3bj), is not added. */
-            if (user_disabled(db, uid) || user_is_visitor(db, uid)) continue;
+            if (user_disabled(db, uid) || user_not_person(db, uid)) continue;
             uint8_t role;
             if (!user_role(db, uid, &role)) continue;          /* no such person: nothing to add */
             sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_group_members(group_id,user_id,added_at_ms) "
@@ -5039,6 +5893,22 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
     sqlite3_finalize(st);
 }
 
+/* The AI client a message was posted through (messages.via, AUTH.md §8.13):
+ * heap, or NULL for a message that came through none. */
+static char *message_via(sqlite3 *db, uint64_t message_id) {
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT via FROM messages WHERE id=?1 AND via<>'';", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *v = (const char *)sqlite3_column_text(st, 0);
+            if (v) out = strdup(v);
+        }
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -5073,6 +5943,8 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     /* An encrypted DM carries text only: no files, no forwards (PRIVATE-DM.md). */
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    /* An AI client never posts into an encrypted DM: it would be plain text there. */
+    if (r->ch_e2e && j->via && j->via[0]) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     /* A poll (REQ-225): its options are checked here, where it is stored. */
@@ -5088,12 +5960,13 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
 
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms) "
-        "VALUES(?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, via) "
+        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    sqlite3_bind_text(st, 5, j->via ? j->via : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -5138,6 +6011,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
      * client that dies between the send and its own cleanup would otherwise
      * leave the sent text sitting in the composer of every other device. */
     drop_draft(db, j->user_id, j->channel_id, 0);
+    owh_message(db, mid, OWH_MSG_NEW);   /* queued with the message it carries */
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -5146,6 +6020,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->message_id = mid;
     r->server_time = ts;
     r->author_name = lookup_display_name(db, j->user_id);   /* name for the live BROADCAST */
+    if (j->via && j->via[0]) r->via = strdup(j->via);
     /* Read the reference back rather than echoing what was asked for: what the
      * channel is told is what actually landed in the table, or nothing. */
     append_forward(db, r, mid, j->channel_id);
@@ -5263,6 +6138,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     /* An edit can make an action or unmake one (REQ-058). */
     store_action(db, j->message_id);
+    owh_message(db, j->message_id, OWH_MSG_CHANGED);
     sum_purge_msg(db, j->message_id);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -5510,6 +6386,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     holds_purge(db, ts, w->restore_window_ms);
     hold_deleted(db, j->message_id, j->user_id, ts);   /* before anything below gives it up */
     sqlite3_stmt *st = NULL;
+    int own = owh_txn_begin(db);   /* the tombstone and its webhooks' event together */
     sqlite3_prepare_v2(db,
         "UPDATE messages SET body=NULL, deleted_at_ms=?, deleted_by=? WHERE id=?;",
         -1, &st, NULL);
@@ -5519,6 +6396,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
+        if (own) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     sum_purge_msg(db, j->message_id);
@@ -5564,6 +6442,8 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     /* Nor a question to vote on: the poll goes with it (REQ-225). A restore
      * brings back the question as a message, not the poll -- as with pins. */
     drop_poll(db, j->message_id);
+    owh_message(db, j->message_id, OWH_MSG_DELETED);
+    owh_txn_end(db, own);
 
     /* Only a MODERATOR delete is auditable governance; a user removing their
      * own message is ordinary use and would drown the log (REQ-032 already
@@ -5838,10 +6718,13 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         sqlite3_finalize(st);
         if (taken) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r; }
 
+        int own = owh_txn_begin(db);
         sqlite3_prepare_v2(db, "UPDATE channels SET name=? WHERE id=?;", -1, &st, NULL);
         sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
+        owh_channel(db, j->channel_id, j->user_id, "channel_rename");
+        owh_txn_end(db, own);
         /* The id is untouched, so membership, history and cursors all follow the
          * rename for free — nothing durable was ever keyed on the name. */
         audit_actor_in(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, j->channel_id, 0, j->ch_name, 1, NULL);
@@ -5890,7 +6773,10 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         if (on) sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
         else    sqlite3_bind_null(st, 1);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        int own = owh_txn_begin(db);
         sqlite3_step(st); sqlite3_finalize(st);
+        owh_channel(db, j->channel_id, j->user_id, on ? "channel_archive" : "channel_unarchive");
+        owh_txn_end(db, own);
         audit_actor_in(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
                        j->user_id, j->channel_id, 0, NULL, 1, NULL);
         channel_change_notice(db, j, on ? "archived this channel." : "unarchived this channel.");
@@ -6041,7 +6927,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "     WHERE x.channel_id=c.id AND (x.parent_id IS NULL OR x.also_channel=1) AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0), "
         "  c.e2e "
-        "FROM channels c WHERE "
+        /* A call's chat is the call's, reached from the call, and in no list
+         * of conversations (CALLS.md §1). */
+        "FROM channels c WHERE c.call_id IS NULL AND ( "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
         /* An archived channel is hidden from the default list unless you are a
@@ -6049,7 +6937,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * back in, and its history stays searchable for everyone who could read
          * it before. */
         "  AND (c.archived_at_ms IS NULL "
-        "       OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
+        "       OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) ) "
         "ORDER BY c.id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     /* ?2 is the preview length. An unbound parameter is NULL, and
@@ -6187,10 +7075,21 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
          * §3bj): no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    /* An agent (docs/details/MCP.md §6) is put in a channel by an owner or an
+     * admin alone, who must be in it -- adding one shows the channel's history
+     * to whoever holds its token -- and is never put anywhere by itself. A
+     * bot, until apps install it, is put nowhere. */
+    int agent = user_kind_is(db, j->target_user_id, "agent");
+    if ((agent && !actor_manages(db, j->user_id)) || user_kind_is(db, j->target_user_id, "bot") ||
+        !user_kind_is(db, j->user_id, "human")) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     int was_in = is_member(db, j->channel_id, j->target_user_id);
     add_membership(db, j->channel_id, j->target_user_id);
-    /* Told, always: someone put them somewhere. */
-    if (!was_in && j->target_user_id != j->user_id) {
+    if (agent && !was_in)
+        audit_actor_in(db, OC_AUDIT_ADMIN, "agent.channel.add", j->user_id, j->channel_id, j->target_user_id, NULL, 1, NULL);
+    /* Told, always: someone put them somewhere. An agent has no notices. */
+    if (!was_in && !agent && j->target_user_id != j->user_id) {
         char *who = audit_name_of(db, j->user_id), *ch = NULL;
         sqlite3_stmt *nq = NULL;
         sqlite3_prepare_v2(db, "SELECT name FROM channels WHERE id=?1;", -1, &nq, NULL);
@@ -6225,6 +7124,20 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
      * Added directly as well, the remove clears the direct half. */
     if (member_only_via_group(db, j->channel_id, j->target_user_id)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_MEMBER_VIA_GROUP; return r;
+    }
+    /* An agent is taken out by an owner or an admin alone (docs/details/MCP.md
+     * §6), and that is an administrative act, audited as one. */
+    if (user_kind_is(db, j->target_user_id, "agent")) {
+        if (!actor_manages(db, j->user_id)) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+        if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
+            audit_actor_in(db, OC_AUDIT_ADMIN, "agent.channel.remove", j->user_id, j->channel_id,
+                           j->target_user_id, NULL, 1, NULL);
+            note_change(db, r, j->channel_id, j->target_user_id, 0);
+        }
+        r->type = OC_RES_CHANNEL_INFO;
+        load_channel_info(db, j->channel_id, j->user_id, r);
+        fill_briefs(db, r);
+        return r;
     }
     if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
         /* REQ-251's moderation family names this explicitly: removing a member
@@ -6415,7 +7328,7 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     }
     /* A visitor is nobody's DM, and opens none (SCHEMA.md §3bj): answered as an
      * unknown target is, so nothing says a visitor is there. */
-    if (user_is_visitor(db, self) || user_is_visitor(db, other)) {
+    if (user_not_person(db, self) || user_not_person(db, other)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     /* Blocked by them: no conversation, new or old, is opened, and the answer
@@ -6502,7 +7415,7 @@ static oc_dbres *process_open_e2e_dm(sqlite3 *db, const oc_job *j) {
     uint64_t self = j->user_id, other = j->target_user_id;
     uint8_t trole = OC_ROLE_MEMBER;
     if (!other || other == self || !user_role(db, other, &trole) || user_disabled(db, other) ||
-        user_is_visitor(db, self) || user_is_visitor(db, other)) return r;
+        user_not_person(db, self) || user_not_person(db, other)) return r;
     /* Always a new conversation: refused, as plainly as any other, to someone
      * the peer blocks or when the peer takes no new ones. */
     if (is_blocked(db, other, self) || dm_closed(db, other)) return r;
@@ -6908,7 +7821,7 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
         uint8_t role = OC_ROLE_MEMBER;
         /* An unknown or disabled user, or a visitor, is refused without saying
          * which — the same no-disclosure rule OPEN_DM follows. */
-        if (!user_role(db, u, &role) || user_disabled(db, u) || user_is_visitor(db, u)) {
+        if (!user_role(db, u, &role) || user_disabled(db, u) || user_not_person(db, u)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
         }
         /* Anyone named who blocks the caller: refused, as a 1:1 is. */
@@ -7125,6 +8038,9 @@ static oc_dbres *process_list_file_channels(sqlite3 *db, const oc_job *j) {
         "SELECT a.channel_id, COUNT(*) FROM attachments a "
         " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
         "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+        /* A call's chat keeps its files, reached from the call: it is in no
+         * list of conversations (CALLS.md §1). */
+        "   AND a.channel_id NOT IN (SELECT id FROM channels WHERE call_id IS NOT NULL) "
         " GROUP BY a.channel_id ORDER BY COUNT(*) DESC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_FILE_CHANNELS);
@@ -7925,8 +8841,15 @@ static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
         sqlite3_bind_text(st, 3, j->emoji, (int)elen, SQLITE_STATIC);
     }
+    int own = owh_txn_begin(db);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    if (sqlite3_changes(db) > 0) {   /* a reaction already there, or already gone, is no event */
+        char *em = strndup(j->emoji, elen);
+        owh_reaction(db, j->channel_id, j->message_id, j->user_id, em, j->react_op == OC_REACT_ADD);
+        free(em);
+    }
+    owh_txn_end(db, own);
 
     uint64_t count = 0;
     sqlite3_prepare_v2(db,
@@ -8294,6 +9217,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     if (acc == CH_ARCHIVED){ r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
     r->ch_e2e = (uint8_t)channel_is_e2e(db, j->channel_id);
     if (r->ch_e2e && (j->n_attach || j->src_message || j->n_poll_opts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (r->ch_e2e && j->via && j->via[0]) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
 
     uint64_t ts = dbw_now_ms();
     if (j->n_poll_opts && !poll_valid(j, ts)) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INVALID_POLL; return r; }
@@ -8307,14 +9231,15 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     /* Also to the channel (REQ-062): one row, flagged, never a copy -- the main
      * scroll's queries take a flagged reply as they take a top-level message. */
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel) "
-        "VALUES(?, ?, ?, ?, ?, ?);", -1, &st, NULL);
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id, also_channel, via) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root);
     sqlite3_bind_int(st, 6, j->also_channel ? 1 : 0);
+    sqlite3_bind_text(st, 7, j->via ? j->via : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
@@ -8360,6 +9285,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     store_action(db, mid);   /* a reply can be an action too (REQ-058) */
     if (j->n_poll_opts) store_poll(db, mid, j->channel_id, j, ts);   /* and a poll (REQ-225) */
     if (is_todo) store_todo(db, mid, j->channel_id, j->user_id, j->body, &tp, ts);
+    owh_message(db, mid, OWH_MSG_NEW);
 
     sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -8373,6 +9299,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->parent_id = root;
     r->reply_count = count;
     r->also_channel = j->also_channel ? 1 : 0;
+    if (j->via && j->via[0]) r->via = strdup(j->via);
     append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->n_poll_opts) append_poll(db, r, mid, j->channel_id, 0);
     if (is_todo) append_todo(db, r, mid);
@@ -8539,6 +9466,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
         int blen = sqlite3_column_bytes(st, 3);
         if (b && blen > 0) { m->body = malloc((size_t)blen); if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; } }
         m->broadcast_stored = broadcast_stored(db, m->message_id);
+        m->via = message_via(db, m->message_id);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);  /* REQ-140 */
         n++;
     }
@@ -8805,10 +9733,44 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         }
         sqlite3_finalize(st);
     }
+    /* A call's transcript (CALLS.md §1): its lines are found by the call's
+     * people, joining the first page of a plain text search as snippets do,
+     * newest call first. A hit names the call and the line, which its page
+     * opens at. */
+    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+        sqlite3_prepare_v2(db,
+            "SELECT l.id, t.call_id, COALESCE((SELECT ch.id FROM channels ch WHERE ch.call_id=t.call_id),0),"
+            "       COALESCE(l.speaker,0), c.started_at_ms + l.start_ms,"
+            "       snippet(call_transcripts_fts, 0, '', '', ' ... ', 12)"
+            "  FROM call_transcripts_fts f JOIN call_transcript_lines l ON l.id = f.rowid"
+            "  JOIN call_transcripts t ON t.id = l.transcript_id"
+            "  JOIN calls c ON c.id = t.call_id"
+            " WHERE call_transcripts_fts MATCH ?1"
+            "   AND EXISTS(SELECT 1 FROM call_invitees i WHERE i.call_id=t.call_id AND i.user_id=?2)"
+            " ORDER BY c.started_at_ms DESC, l.start_ms LIMIT ?3;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+        while (n < lim && sqlite3_step(st) == SQLITE_ROW) {
+            if (n == cap) { cap *= 2; oc_replay_msg *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+            oc_replay_msg *m = &arr[n];
+            memset(m, 0, sizeof *m);
+            m->call_line   = (uint64_t)sqlite3_column_int64(st, 0);
+            m->call_id     = (uint64_t)sqlite3_column_int64(st, 1);
+            m->channel_id  = (uint64_t)sqlite3_column_int64(st, 2);
+            m->author_id   = (uint64_t)sqlite3_column_int64(st, 3);
+            m->server_time = (uint64_t)sqlite3_column_int64(st, 4);
+            const void *sn = sqlite3_column_text(st, 5);
+            int sl = sqlite3_column_bytes(st, 5);
+            if (sn && sl > 0 && (m->body = malloc((size_t)sl)) != NULL) { memcpy(m->body, sn, (size_t)sl); m->body_len = (size_t)sl; }
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
     r->search = arr;
     r->n_search = n;
     r->truncated = (n >= lim);   /* filled the requested limit -> maybe more */
-    for (size_t i = 0; i < n; i++) append_todo(db, r, arr[i].message_id);   /* each list as it stands */
+    for (size_t i = 0; i < n; i++) if (arr[i].message_id) append_todo(db, r, arr[i].message_id);   /* each list as it stands */
     return r;
 }
 
@@ -9163,6 +10125,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
             m->saved     = m->saved_at != 0;
             m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+            m->via       = message_via(db, m->message_id);
             m->broadcast_stored = broadcast_stored(db, m->message_id);
             m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
             m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
@@ -9188,6 +10151,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
     fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
     fill_replay_todos(db, r);
+    fill_replay_calls(db, r);
     return r;
 }
 
@@ -9365,6 +10329,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
         m->saved     = m->saved_at != 0;
         m->kind      = (uint8_t)sqlite3_column_int(st, 10);
+        m->via       = message_via(db, m->message_id);
         m->broadcast_stored = broadcast_stored(db, m->message_id);
         m->collapsed = (uint8_t)sqlite3_column_int(st, 11);
         m->parent_id = (uint64_t)sqlite3_column_int64(st, 12);
@@ -9399,6 +10364,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     fill_replay_polls(db, r, j->user_id);   /* REQ-225 */
     fill_replay_reminders(db, r, j->user_id);   /* REQ-283 */
     fill_replay_todos(db, r);
+    fill_replay_calls(db, r);
     return r;
 }
 
@@ -9457,72 +10423,963 @@ static int user_is_active(sqlite3 *db, uint64_t user_id) {
     return ok;
 }
 
-/* A call's access question (REQ-150, REQ-301/302): may the actor read the
- * conversation -- the ordinary channel-read gate, since anyone who may read it
- * may join its call -- which of the users named may read it too (only they can
- * be invited), and who its members are, the audience the net thread tells about
- * the call. The net thread owns the call itself. Read (query connection). */
+/* Who of the people named may be invited to a call (CALLS.md §1): an account
+ * that is on and is not a visitor. Whether the asker is in the call, and the
+ * cap, are the net thread's, which holds the call. Read (query connection). */
 static oc_dbres *process_call_auth(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
-    r->channel_id = j->channel_id;
     r->user_id = j->user_id;
     r->call_op = j->call_op;
-    memcpy(r->call_key, j->call_key, sizeof r->call_key);
-    r->call_codecs = j->call_codecs;
-    if (!channel_read_access(db, j->channel_id, j->user_id)) {
-        r->type = OC_RES_CALL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
-        return r;
-    }
+    r->call_id = j->call_id;
     r->type = OC_RES_CALL_AUTH;
-    load_members(db, j->channel_id, r);
     if (j->n_call_uids) {
         r->call_uids = malloc(j->n_call_uids * sizeof *r->call_uids);
         for (uint16_t i = 0; r->call_uids && i < j->n_call_uids; i++) {
             uint64_t u = j->call_uids[i];
-            if (u && u != j->user_id && user_is_active(db, u) &&
-                channel_read_access(db, j->channel_id, u))
+            if (u && u != j->user_id && user_is_active(db, u) && !user_is_visitor(db, u))
                 r->call_uids[r->n_call_uids++] = u;
         }
     }
     return r;
 }
 
-/* Write a call event (REQ-304): a message of kind OC_MSG_KIND_CALL in the
- * conversation, authored by the call's starter, carrying a readable body. It is
- * an ordinary row in every other respect -- unread, backfill, history -- so the
- * one thing that marks it is the kind. Write. */
-static oc_dbres *process_call_event(sqlite3 *db, const oc_job *j) {
+/* --- A call's record (CALLS.md §1, SCHEMA.md `calls`) --------------------- */
+
+/* One statement with up to four integer binds and an optional text one, run
+ * to its end; 0 when it did. */
+static int call_exec(sqlite3 *db, const char *sql, int n, const sqlite3_int64 *v,
+                     int text_at, const char *text) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return -1; }
+    for (int i = 0; i < n; i++) sqlite3_bind_int64(st, i + 1, v[i]);
+    if (text_at) sqlite3_bind_text(st, text_at, text ? text : "", -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* What a call's message in its conversation says (CALLS.md §1), so it reads
+ * sensibly anywhere -- in a client that draws it as the call, and in one that
+ * shows only the body: "alice started a call: Q3 pricing review", and once it
+ * is over, how long it lasted. Heap, or NULL. */
+static char *call_message_text(sqlite3 *db, uint64_t call) {
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.subject, c.started_at_ms, c.ended_at_ms, COALESCE(NULLIF(u.display_name,''), 'Someone')"
+            "  FROM calls c LEFT JOIN users u ON u.id = c.starter WHERE c.id = ?1;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return NULL;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *subject = (const char *)sqlite3_column_text(st, 0);
+        const char *who = (const char *)sqlite3_column_text(st, 3);
+        char len[48] = "";
+        if (sqlite3_column_type(st, 2) != SQLITE_NULL) {
+            uint64_t ms = (uint64_t)(sqlite3_column_int64(st, 2) - sqlite3_column_int64(st, 1));
+            uint64_t min = ms / 60000;
+            if (min == 0)      snprintf(len, sizeof len, " (ended after less than a minute)");
+            else if (min == 1) snprintf(len, sizeof len, " (ended after 1 minute)");
+            else               snprintf(len, sizeof len, " (ended after %llu minutes)", (unsigned long long)min);
+        }
+        size_t n = strlen(who ? who : "") + strlen(subject ? subject : "") + strlen(len) + 32;
+        if ((out = malloc(n)) != NULL)
+            snprintf(out, n, "%s started a call: %s%s", who ? who : "", subject ? subject : "", len);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* The call's message, brought up to date with the call (a rename, the end):
+ * its body rewritten in place -- it is the daemon's, so this is not an edit
+ * anyone made -- and answered as OC_RES_CALL_EVENT for the conversation's
+ * members, or NULL when the call left no message. */
+static oc_dbres *call_message_refresh(sqlite3 *db, uint64_t call) {
+    sqlite3_stmt *st = NULL;
+    uint64_t mid = 0, ch = 0, author = 0, at = 0;
+    if (sqlite3_prepare_v2(db, "SELECT id, channel_id, author_id, created_at_ms FROM messages "
+                               "WHERE call_id = ?1 AND kind = 1 AND deleted_at_ms IS NULL LIMIT 1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            mid = (uint64_t)sqlite3_column_int64(st, 0);
+            ch = (uint64_t)sqlite3_column_int64(st, 1);
+            author = (uint64_t)sqlite3_column_int64(st, 2);
+            at = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!mid) return NULL;
+    char *text = call_message_text(db, call);
+    if (!text) return NULL;
+    sqlite3_int64 v[1] = { (sqlite3_int64)mid };
+    if (call_exec(db, "UPDATE messages SET body = ?2 WHERE id = ?1;", 1, v, 2, text) != 0) { free(text); return NULL; }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) { free(text); return NULL; }
+    r->type = OC_RES_CALL_EVENT;
+    r->message_id = mid;
+    r->channel_id = ch;
+    r->author_id = author;
+    r->server_time = at;
+    r->call_id = call;
+    r->body = (uint8_t *)text;
+    r->body_len = strlen(text);
+    /* Not an action, said as every live message frame says it (ARCH-115). */
+    append_action(db, r, mid, ch, 1);
+    load_members(db, ch, r);
+    return r;
+}
+
+/* Invite `uid` to `call`, asked by `by`, unless already asked. */
+static void call_row_invite(sqlite3 *db, uint64_t call, uint64_t uid, uint64_t by, uint64_t ts) {
+    sqlite3_int64 v[4] = { (sqlite3_int64)call, (sqlite3_int64)uid, (sqlite3_int64)by, (sqlite3_int64)ts };
+    call_exec(db, "INSERT OR IGNORE INTO call_invitees(call_id, user_id, invited_by, invited_at_ms) "
+                  "VALUES(?1, ?2, ?3, ?4);", 4, v, 0, NULL);
+}
+
+/* A call begins (CALLS.md §1): its row, and its invitees -- the starter first,
+ * then each person named who has an account that is on, is not a visitor and
+ * is not the starter. A call started from a conversation needs the starter to
+ * be able to read it; who else is in it does not matter, since the call is not
+ * the conversation's. The subject is checked by the net thread as it is here:
+ * one that is blank or too long is refused. Write. */
+static oc_dbres *process_call_start(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->channel_id = j->channel_id;
+    r->gen = j->gen;
+    memcpy(r->call_key, j->call_key, sizeof r->call_key);
+    r->call_codecs = j->call_codecs;
+    r->type = OC_RES_CALL_ERR;
+    size_t sl = j->call_subject ? strlen(j->call_subject) : 0;
+    int blank = 1;
+    for (size_t i = 0; i < sl; i++) if (!isspace((unsigned char)j->call_subject[i])) blank = 0;
+    if (blank || sl > OC_CALL_SUBJECT_MAX) { r->err_code = OC_ERR_CALL_SUBJECT; return r; }
+    if (j->channel_id && !channel_read_access(db, j->channel_id, j->user_id)) {
+        r->err_code = OC_ERR_NOT_A_MEMBER;
+        return r;
+    }
+    r->err_code = OC_ERR_INTERNAL;
+    uint64_t ts = dbw_now_ms();
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) return r;
+    sqlite3_stmt *st = NULL;
+    int ok = sqlite3_prepare_v2(db,
+        "INSERT INTO calls(subject, starter, from_channel, started_at_ms) VALUES(?1, ?2, ?3, ?4);",
+        -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text (st, 1, j->call_subject, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        if (j->channel_id) sqlite3_bind_int64(st, 3, (sqlite3_int64)j->channel_id);
+        else               sqlite3_bind_null (st, 3);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    uint64_t call = ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    /* The call's chat: a conversation of its own, a DM in kind, marked with
+     * its call, whose members are the call's invitees (SCHEMA.md §3bz). */
+    uint64_t chat = 0;
+    if (ok) {
+        sqlite3_stmt *cs = NULL;
+        ok = sqlite3_prepare_v2(db, "INSERT INTO channels(kind, is_public, created_at_ms, call_id) VALUES('dm', 0, ?1, ?2);",
+                                -1, &cs, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int64(cs, 1, (sqlite3_int64)ts);
+            sqlite3_bind_int64(cs, 2, (sqlite3_int64)call);
+            ok = sqlite3_step(cs) == SQLITE_DONE;
+        }
+        sqlite3_finalize(cs);
+        if (ok) chat = (uint64_t)sqlite3_last_insert_rowid(db);
+    }
+    if (ok) {
+        call_row_invite(db, call, j->user_id, j->user_id, ts);
+        membership_sync(db, chat, j->user_id, 1);
+        if (j->n_call_uids) r->call_uids = malloc(j->n_call_uids * sizeof *r->call_uids);
+        for (uint16_t i = 0; r->call_uids && i < j->n_call_uids; i++) {
+            uint64_t u = j->call_uids[i];
+            int dup = 0;
+            for (size_t k = 0; k < r->n_call_uids; k++) if (r->call_uids[k] == u) dup = 1;
+            if (dup || !u || u == j->user_id || !user_is_active(db, u) || user_is_visitor(db, u)) continue;
+            call_row_invite(db, call, u, j->user_id, ts);
+            membership_sync(db, chat, u, 1);
+            r->call_uids[r->n_call_uids++] = u;
+        }
+    }
+    /* Started from a conversation: one message there about it, which is all
+     * the conversation gets. It notifies nobody -- the invitation does that,
+     * and only for those asked. */
+    char *text = ok && j->channel_id ? call_message_text(db, call) : NULL;
+    if (ok && j->channel_id) {
+        st = NULL;
+        ok = text && sqlite3_prepare_v2(db,
+            "INSERT INTO messages(channel_id, author_id, body, created_at_ms, kind, call_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6);",
+            -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+            sqlite3_bind_text (st, 3, text, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+            sqlite3_bind_int  (st, 5, (int)OC_MSG_KIND_CALL);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)call);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+        if (ok) r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
+    }
+    if (!ok || sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        free(r->call_uids); r->call_uids = NULL; r->n_call_uids = 0;
+        free(text);
+        r->message_id = 0;
+        return r;
+    }
+    r->type = OC_RES_CALL_STARTED;
+    r->err_code = 0;
+    r->call_id = call;
+    r->call_chat = chat;
+    r->call_subject = strdup(j->call_subject);
+    r->server_time = ts;
+    if (r->message_id) {
+        r->author_id = j->user_id;
+        r->body = (uint8_t *)text;
+        r->body_len = strlen(text);
+        text = NULL;
+        /* A call message is never an action, and says so like every live
+         * message frame does (ARCH-115). */
+        append_action(db, r, r->message_id, j->channel_id, 1);
+        load_members(db, j->channel_id, r);
+    }
+    free(text);
+    return r;
+}
+
+static const char *const CALL_EVENT_KINDS[] = {
+    NULL, "camera_on", "camera_off", "share_on", "share_off", "record_on", "record_off", "subject"
+};
+
+/* One change to a call's record, as the net thread makes it: a stay opened
+ * or closed, people asked, an invitation declined, an event on the timeline,
+ * a new subject, the end. Write, fire and forget -- except that a new subject
+ * or the end changes the message the call left in its conversation, which is
+ * answered for its members (OC_RES_CALL_EVENT). */
+static oc_dbres *process_call_log(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = 0;
-    r->type = OC_RES_CALL_EVENT;
-    r->err_code = OC_ERR_INTERNAL;
+    r->type = OC_RES_OK;
     uint64_t ts = dbw_now_ms();
+    sqlite3_int64 v[4] = { (sqlite3_int64)j->call_id, (sqlite3_int64)j->user_id, (sqlite3_int64)ts, 0 };
+    switch (j->call_log) {
+    case OC_CALL_LOG_JOIN:
+        call_exec(db, "INSERT INTO call_participants(call_id, user_id, joined_at_ms) VALUES(?1, ?2, ?3);",
+                  3, v, 0, NULL);
+        break;
+    case OC_CALL_LOG_LEAVE:
+        call_exec(db, "UPDATE call_participants SET left_at_ms=?3 "
+                      "WHERE call_id=?1 AND user_id=?2 AND left_at_ms IS NULL;", 3, v, 0, NULL);
+        break;
+    case OC_CALL_LOG_INVITE: {
+        /* Asked to the call, and so a member of its chat. */
+        uint64_t chat = 0;
+        sqlite3_stmt *cs = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE call_id=?1;", -1, &cs, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(cs, 1, (sqlite3_int64)j->call_id);
+            if (sqlite3_step(cs) == SQLITE_ROW) chat = (uint64_t)sqlite3_column_int64(cs, 0);
+        }
+        sqlite3_finalize(cs);
+        for (uint16_t i = 0; i < j->n_call_uids; i++) {
+            call_row_invite(db, j->call_id, j->call_uids[i], j->user_id, ts);
+            if (chat) membership_sync(db, chat, j->call_uids[i], 1);
+        }
+        break;
+    }
+    case OC_CALL_LOG_DECLINE:
+        call_exec(db, "UPDATE call_invitees SET declined_at_ms=?3 "
+                      "WHERE call_id=?1 AND user_id=?2 AND declined_at_ms IS NULL;", 3, v, 0, NULL);
+        break;
+    case OC_CALL_LOG_SUBJECT: {
+        call_exec(db, "UPDATE calls SET subject=?4 WHERE id=?1;", 1, v, 4, j->call_subject);
+        call_exec(db, "INSERT INTO call_events(call_id, at_ms, user_id, kind, detail) "
+                      "VALUES(?1, ?3, ?2, 'subject', ?4);", 3, v, 4, j->call_subject);
+        oc_dbres *m = call_message_refresh(db, j->call_id);
+        if (m) { free(r); return m; }
+        break;
+    }
+    case OC_CALL_LOG_EVENT:
+        if (j->call_event >= 1 && j->call_event < sizeof CALL_EVENT_KINDS / sizeof CALL_EVENT_KINDS[0])
+            call_exec(db, "INSERT INTO call_events(call_id, at_ms, user_id, kind) VALUES(?1, ?3, ?2, ?4);",
+                      3, v, 4, CALL_EVENT_KINDS[j->call_event]);
+        break;
+    case OC_CALL_LOG_END: {
+        static const char *const why[] = { "left", "ended", "stopped" };
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        call_exec(db, "UPDATE call_participants SET left_at_ms=?3 WHERE call_id=?1 AND left_at_ms IS NULL;",
+                  3, v, 0, NULL);
+        call_exec(db, "UPDATE calls SET ended_at_ms=?3, end_reason=?4 WHERE id=?1 AND ended_at_ms IS NULL;",
+                  3, v, 4, why[j->call_reason <= OC_CALL_END_STOPPED ? j->call_reason : 0]);
+        if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        oc_dbres *m = call_message_refresh(db, j->call_id);
+        if (m) { free(r); return m; }
+        break;
+    }
+    default: break;
+    }
+    return r;
+}
+
+static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
+                       uint64_t aid, const char *key, uint64_t now, int reason);
+
+/* Whether `uid` was asked to `call` -- the starter included -- the one test of
+ * who may see a call, its page, chat, recording and transcript (CALLS.md §1). */
+static int call_invitee(sqlite3 *db, uint64_t call, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM call_invitees WHERE call_id=?1 AND user_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+static uint8_t call_end_wire(const unsigned char *why) {
+    if (!why) return OC_CALL_RUNNING;
+    if (!strcmp((const char *)why, "ended"))   return OC_CALL_ENDED_ALL;
+    if (!strcmp((const char *)why, "stopped")) return OC_CALL_ENDED_STOPPED;
+    return OC_CALL_ENDED_LEFT;
+}
+
+static uint8_t call_event_wire(const unsigned char *kind) {
+    for (uint8_t k = 1; kind && k < sizeof CALL_EVENT_KINDS / sizeof CALL_EVENT_KINDS[0]; k++)
+        if (!strcmp((const char *)kind, CALL_EVENT_KINDS[k])) return k;
+    return 0;
+}
+
+/* Strings a page is built from, kept until it is encoded. */
+typedef struct { char **v; size_t n, cap; } str_arena;
+static oc_slice arena_keep(str_arena *a, const unsigned char *t) {
+    char *d = strdup(t ? (const char *)t : "");
+    if (d && a->n == a->cap) {
+        size_t cap = a->cap ? a->cap * 2 : 64;
+        char **g = realloc(a->v, cap * sizeof *g);
+        if (!g) { free(d); d = NULL; } else { a->v = g; a->cap = cap; }
+    }
+    if (!d) return oc_slice_str("");
+    a->v[a->n++] = d;
+    return oc_slice_str(d);
+}
+
+/* The answer, encoded here whole, into r->frame. */
+static void call_frame_take(oc_dbres *r, const uint8_t *buf, size_t len) {
+    if ((r->frame = malloc(len)) != NULL) { memcpy(r->frame, buf, len); r->frame_len = len; }
+}
+
+/* Calls home's history (CALLS.md §1): the calls this user was asked to, newest
+ * first, as they saw them -- running and asked, taken part in, missed,
+ * declined. Read. */
+static oc_dbres *process_call_history(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_CALL_FRAME;
+    unsigned lim = j->call_limit && j->call_limit <= OC_CALL_HISTORY_PAGE ? j->call_limit : OC_CALL_HISTORY_PAGE;
+    sqlite3_stmt *st = NULL;
+    oc_call_hist_entry ents[OC_CALL_HISTORY_PAGE];
+    char *subj[OC_CALL_HISTORY_PAGE];
+    uint16_t n = 0;
+    uint8_t more = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.subject, c.starter, c.started_at_ms, COALESCE(c.ended_at_ms,0), c.end_reason,"
+            "       COALESCE(c.from_channel,0), COALESCE((SELECT ch.id FROM channels ch WHERE ch.call_id=c.id),0),"
+            "       (SELECT COUNT(DISTINCT p.user_id) FROM call_participants p WHERE p.call_id=c.id),"
+            "       EXISTS(SELECT 1 FROM call_participants p WHERE p.call_id=c.id AND p.user_id=?1),"
+            "       i.declined_at_ms IS NOT NULL,"
+            "       EXISTS(SELECT 1 FROM call_recordings cr WHERE cr.call_id=c.id AND cr.state='ready'),"
+            "       EXISTS(SELECT 1 FROM call_transcripts t WHERE t.call_id=c.id)"
+            "  FROM call_invitees i JOIN calls c ON c.id = i.call_id"
+            " WHERE i.user_id=?1 AND (?2 = 0 OR c.started_at_ms < ?2)"
+            " ORDER BY c.started_at_ms DESC, c.id DESC LIMIT ?3;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->call_before_ms);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)lim + 1);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (n == lim) { more = 1; break; }
+            oc_call_hist_entry *e = &ents[n];
+            memset(e, 0, sizeof *e);
+            e->call_id = (uint64_t)sqlite3_column_int64(st, 0);
+            const char *t = (const char *)sqlite3_column_text(st, 1);
+            subj[n] = strdup(t ? t : "");
+            e->subject = oc_slice_str(subj[n] ? subj[n] : "");
+            e->starter = (uint64_t)sqlite3_column_int64(st, 2);
+            e->started_at = (uint64_t)sqlite3_column_int64(st, 3);
+            e->ended_at = (uint64_t)sqlite3_column_int64(st, 4);
+            e->end_reason = sqlite3_column_type(st, 5) == SQLITE_NULL ? OC_CALL_RUNNING
+                                                                       : call_end_wire(sqlite3_column_text(st, 5));
+            e->from_channel = (uint64_t)sqlite3_column_int64(st, 6);
+            e->chat_channel = (uint64_t)sqlite3_column_int64(st, 7);
+            e->n_people = (uint16_t)sqlite3_column_int(st, 8);
+            int joined = sqlite3_column_int(st, 9), declined = sqlite3_column_int(st, 10);
+            int mine = e->starter == j->user_id, over = e->ended_at != 0;
+            e->flags = (uint8_t)((joined ? OC_CALL_HIST_JOINED : 0) |
+                                 (declined ? OC_CALL_HIST_DECLINED : 0) |
+                                 (!joined && !declined && !mine && over ? OC_CALL_HIST_MISSED : 0) |
+                                 (!joined && !declined && !mine && !over ? OC_CALL_HIST_PENDING : 0) |
+                                 (sqlite3_column_int(st, 11) ? OC_CALL_HIST_RECORDING : 0) |
+                                 (sqlite3_column_int(st, 12) ? OC_CALL_HIST_TRANSCRIPT : 0));
+            n++;
+        }
+    }
+    sqlite3_finalize(st);
+    /* Each row's faces: who took part, in the order they first joined. */
+    st = NULL;
+    if (n && sqlite3_prepare_v2(db, "SELECT user_id FROM call_participants WHERE call_id=?1 GROUP BY user_id"
+                                    " ORDER BY MIN(joined_at_ms), user_id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        for (uint16_t i = 0; i < n; i++) {
+            sqlite3_reset(st);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)ents[i].call_id);
+            sqlite3_bind_int(st, 2, (int)OC_CALL_HIST_FACES);
+            while (ents[i].n_faces < OC_CALL_HIST_FACES && sqlite3_step(st) == SQLITE_ROW)
+                ents[i].faces[ents[i].n_faces++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
+    if (buf) {
+        oc_wbuf w; oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+        oc_call_history_page pg = { n, ents, more };
+        if (oc_encode_call_history_page(&w, OC_PROTOCOL_VERSION, &pg) == OC_OK) call_frame_take(r, buf, w.len);
+        free(buf);
+    }
+    for (uint16_t i = 0; i < n; i++) free(subj[i]);
+    return r;
+}
+
+/* One call's page (CALLS.md §1), for its invitees and nobody else: when and
+ * how long, who came and went and who was asked, the timeline, the
+ * recordings, and the transcript's lines from `call_line_from`, as many as fit
+ * one frame. Read. */
+static oc_dbres *process_call_detail(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->call_id = j->call_id;
+    if (!call_invitee(db, j->call_id, j->user_id)) {
+        r->type = OC_RES_CALL_ERR;
+        r->err_code = OC_ERR_NOT_A_MEMBER;
+        return r;
+    }
+    r->type = OC_RES_CALL_FRAME;
+    /* The strings live in an arena freed at the end: the frame is encoded here. */
+    str_arena ar = { NULL, 0, 0 };
+    #define KEEP(t) arena_keep(&ar, (t))
+    oc_call_page pg;
+    memset(&pg, 0, sizeof pg);
+    static __thread oc_call_stay stays[OC_CALL_PAGE_STAYS];
+    static __thread oc_call_invitee invs[OC_CALL_PAGE_INVITEES];
+    static __thread oc_call_event evs[OC_CALL_PAGE_EVENTS];
+    static __thread oc_call_recording recs[OC_CALL_PAGE_RECORDINGS];
+    static __thread oc_call_tline lines[OC_CALL_PAGE_LINES];
+    pg.stays = stays; pg.invitees = invs; pg.events = evs; pg.recordings = recs; pg.lines = lines;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "INSERT INTO messages(channel_id, author_id, body, created_at_ms, kind) VALUES(?, ?, ?, ?, ?);",
-            -1, &st, NULL) != SQLITE_OK) return r;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
-    sqlite3_bind_blob (st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
-    sqlite3_bind_int  (st, 5, (int)OC_MSG_KIND_CALL);
-    int rc = sqlite3_step(st);
+            "SELECT subject, starter, started_at_ms, COALESCE(ended_at_ms,0), end_reason, COALESCE(from_channel,0),"
+            "       COALESCE((SELECT id FROM channels WHERE call_id=calls.id),0) FROM calls WHERE id=?1;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            pg.call_id = j->call_id;
+            pg.subject = KEEP(sqlite3_column_text(st, 0));
+            pg.starter = (uint64_t)sqlite3_column_int64(st, 1);
+            pg.started_at = (uint64_t)sqlite3_column_int64(st, 2);
+            pg.ended_at = (uint64_t)sqlite3_column_int64(st, 3);
+            pg.end_reason = sqlite3_column_type(st, 4) == SQLITE_NULL ? OC_CALL_RUNNING : call_end_wire(sqlite3_column_text(st, 4));
+            pg.from_channel = (uint64_t)sqlite3_column_int64(st, 5);
+            pg.chat_channel = (uint64_t)sqlite3_column_int64(st, 6);
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    oc_call_stay *sp = stays; oc_call_invitee *ip = invs; oc_call_event *ep = evs;
+    oc_call_recording *rp = recs; oc_call_tline *lp = lines;
+    if (sqlite3_prepare_v2(db, "SELECT user_id, joined_at_ms, COALESCE(left_at_ms,0) FROM call_participants "
+                               "WHERE call_id=?1 ORDER BY joined_at_ms, id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        sqlite3_bind_int(st, 2, (int)OC_CALL_PAGE_STAYS);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            sp[pg.n_stays].user_id = (uint64_t)sqlite3_column_int64(st, 0);
+            sp[pg.n_stays].joined_at = (uint64_t)sqlite3_column_int64(st, 1);
+            sp[pg.n_stays].left_at = (uint64_t)sqlite3_column_int64(st, 2);
+            pg.n_stays++;
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT user_id, invited_by, invited_at_ms, COALESCE(declined_at_ms,0) FROM call_invitees "
+                               "WHERE call_id=?1 ORDER BY invited_at_ms, user_id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        sqlite3_bind_int(st, 2, (int)OC_CALL_PAGE_INVITEES);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            ip[pg.n_invitees].user_id = (uint64_t)sqlite3_column_int64(st, 0);
+            ip[pg.n_invitees].invited_by = (uint64_t)sqlite3_column_int64(st, 1);
+            ip[pg.n_invitees].invited_at = (uint64_t)sqlite3_column_int64(st, 2);
+            ip[pg.n_invitees].declined_at = (uint64_t)sqlite3_column_int64(st, 3);
+            pg.n_invitees++;
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT at_ms, user_id, kind, COALESCE(detail,'') FROM call_events "
+                               "WHERE call_id=?1 ORDER BY at_ms, id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        sqlite3_bind_int(st, 2, (int)OC_CALL_PAGE_EVENTS);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            ep[pg.n_events].at = (uint64_t)sqlite3_column_int64(st, 0);
+            ep[pg.n_events].user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            ep[pg.n_events].kind = call_event_wire(sqlite3_column_text(st, 2));
+            ep[pg.n_events].detail = KEEP(sqlite3_column_text(st, 3));
+            pg.n_events++;
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, state, started_by, started_at_ms, COALESCE(stopped_at_ms,0),"
+                               "       COALESCE(duration_ms,0), COALESCE(bytes,0), COALESCE(attachment_id,0)"
+                               "  FROM call_recordings WHERE call_id=?1 ORDER BY id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        sqlite3_bind_int(st, 2, (int)OC_CALL_PAGE_RECORDINGS);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_call_recording *rc = &rp[pg.n_recordings];
+            const char *state = (const char *)sqlite3_column_text(st, 1);
+            rc->id = (uint64_t)sqlite3_column_int64(st, 0);
+            rc->state = !state ? 0 : !strcmp(state, "recording") ? OC_CALL_REC_RECORDING
+                      : !strcmp(state, "processing") ? OC_CALL_REC_PROCESSING
+                      : !strcmp(state, "ready") ? OC_CALL_REC_READY : OC_CALL_REC_FAILED;
+            rc->started_by = (uint64_t)sqlite3_column_int64(st, 2);
+            rc->started_at = (uint64_t)sqlite3_column_int64(st, 3);
+            rc->stopped_at = (uint64_t)sqlite3_column_int64(st, 4);
+            rc->duration_ms = (uint32_t)sqlite3_column_int64(st, 5);
+            rc->bytes = (uint64_t)sqlite3_column_int64(st, 6);
+            rc->attachment_id = rc->state == OC_CALL_REC_READY ? (uint64_t)sqlite3_column_int64(st, 7) : 0;
+            pg.n_recordings++;
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    uint64_t tid = 0;
+    if (sqlite3_prepare_v2(db, "SELECT id, COALESCE(language,''), (SELECT COUNT(*) FROM call_transcript_lines l "
+                               "WHERE l.transcript_id=t.id) FROM call_transcripts t WHERE call_id=?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            tid = (uint64_t)sqlite3_column_int64(st, 0);
+            pg.has_transcript = 1;
+            pg.transcript_lang = KEEP(sqlite3_column_text(st, 1));
+            pg.n_lines_total = (uint32_t)sqlite3_column_int64(st, 2);
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    pg.line_from = j->call_line_from;
+    if (tid && sqlite3_prepare_v2(db, "SELECT id, COALESCE(speaker,0), start_ms, end_ms, text FROM call_transcript_lines "
+                                      "WHERE transcript_id=?1 ORDER BY start_ms, id LIMIT ?2 OFFSET ?3;",
+                                  -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)tid);
+        sqlite3_bind_int(st, 2, (int)OC_CALL_PAGE_LINES);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->call_line_from);
+        size_t text = 0;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            size_t tl = (size_t)sqlite3_column_bytes(st, 4);
+            if (pg.n_lines && text + tl > OC_CALL_PAGE_TEXT) break;   /* the rest on the next page */
+            text += tl;
+            lp[pg.n_lines].id = (uint64_t)sqlite3_column_int64(st, 0);
+            lp[pg.n_lines].speaker = (uint64_t)sqlite3_column_int64(st, 1);
+            lp[pg.n_lines].start_ms = (uint32_t)sqlite3_column_int64(st, 2);
+            lp[pg.n_lines].end_ms = (uint32_t)sqlite3_column_int64(st, 3);
+            lp[pg.n_lines].text = KEEP(sqlite3_column_text(st, 4));
+            pg.n_lines++;
+        }
+    }
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) return r;
-    r->err_code = 0;
-    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
-    r->channel_id = j->channel_id;
-    r->author_id = j->user_id;
-    r->server_time = ts;
-    if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
-    /* A call event is never an action, and says so like every live message
-     * frame does: the client pairs each with the ACTION behind it (ARCH-115). */
-    append_action(db, r, r->message_id, j->channel_id, 1);
-    load_members(db, j->channel_id, r);
+    #undef KEEP
+    uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
+    if (buf && pg.call_id) {
+        oc_wbuf w; oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+        if (oc_encode_call_page(&w, OC_PROTOCOL_VERSION, &pg) == OC_OK) call_frame_take(r, buf, w.len);
+    }
+    free(buf);
+    for (size_t i = 0; i < ar.n; i++) free(ar.v[i]);
+    free(ar.v);
+    if (!r->frame) { r->type = OC_RES_CALL_ERR; r->err_code = OC_ERR_INTERNAL; }
     return r;
+}
+
+/* Delete a call's transcript -- an admin's to do -- or one of its recordings
+ * -- the person who started it, or an admin (CALLS.md §1). The call's invitees
+ * are told; a recording's bytes go. Write. */
+static oc_dbres *process_call_delete(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->call_id = j->call_id;
+    r->call_del_what = j->call_del_what;
+    r->call_del_id = j->call_del_id;
+    r->type = OC_RES_CALL_ERR;
+    uint8_t role = OC_ROLE_MEMBER;
+    int admin = user_role(db, j->user_id, &role) && (role == OC_ROLE_ADMIN || role == OC_ROLE_OWNER);
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 v[2] = { (sqlite3_int64)j->call_id, (sqlite3_int64)j->call_del_id };
+    if (j->call_del_what == OC_CALL_DEL_TRANSCRIPT) {
+        if (!admin) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+        uint64_t tid = 0;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM call_transcripts WHERE call_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, v[0]);
+            if (sqlite3_step(st) == SQLITE_ROW) tid = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        if (!tid) { r->err_code = OC_ERR_NOT_IN_CALL; return r; }
+        sqlite3_int64 t[1] = { (sqlite3_int64)tid };
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        call_exec(db, "DELETE FROM call_transcript_lines WHERE transcript_id=?1;", 1, t, 0, NULL);
+        call_exec(db, "DELETE FROM call_transcripts WHERE id=?1;", 1, t, 0, NULL);
+        if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            r->err_code = OC_ERR_INTERNAL;
+            return r;
+        }
+        audit_actor(db, OC_AUDIT_ADMIN, "call.transcript.delete", j->user_id, j->call_id, "call", 1, NULL);
+    } else if (j->call_del_what == OC_CALL_DEL_RECORDING) {
+        uint64_t by = 0, aid = 0;
+        int found = 0;
+        if (sqlite3_prepare_v2(db, "SELECT started_by, COALESCE(attachment_id,0) FROM call_recordings "
+                                   "WHERE id=?2 AND call_id=?1 AND state IN ('ready','failed');", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, v[0]);
+            sqlite3_bind_int64(st, 2, v[1]);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                found = 1;
+                by = (uint64_t)sqlite3_column_int64(st, 0);
+                aid = (uint64_t)sqlite3_column_int64(st, 1);
+            }
+        }
+        sqlite3_finalize(st);
+        if (!found) { r->err_code = OC_ERR_NOT_IN_CALL; return r; }
+        if (by != j->user_id && !admin) { r->err_code = OC_ERR_FORBIDDEN; return r; }
+        char *key = NULL;
+        if (aid && sqlite3_prepare_v2(db, "SELECT storage_key FROM attachments WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)aid);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) key = strdup((const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+        call_exec(db, "DELETE FROM call_recordings WHERE id=?2 AND call_id=?1;", 2, v, 0, NULL);
+        if (key) {
+            r->reclaim = calloc(1, sizeof *r->reclaim);
+            if (r->reclaim) reclaim_add(db, r, 1, aid, key, dbw_now_ms(), OC_RECLAIM_DELETED);
+            free(key);
+        }
+        if (by != j->user_id)
+            audit_actor(db, OC_AUDIT_ADMIN, "call.recording.delete", j->user_id, j->call_id, "call", 1, NULL);
+    } else {
+        r->err_code = OC_ERR_NOT_IN_CALL;
+        return r;
+    }
+    r->type = OC_RES_CALL_DELETED;
+    r->err_code = 0;
+    /* Who is told: the call's invitees, the deleter besides. */
+    if (sqlite3_prepare_v2(db, "SELECT user_id FROM call_invitees WHERE call_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, v[0]);
+        size_t cap = 16;
+        r->members = malloc(cap * sizeof *r->members);
+        while (r->members && sqlite3_step(st) == SQLITE_ROW) {
+            if (r->n_members == cap) {
+                uint64_t *g = realloc(r->members, cap * 2 * sizeof *g);
+                if (!g) break;
+                r->members = g; cap *= 2;
+            }
+            r->members[r->n_members++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* A transcript stored (the daemon's transcript function), replacing the one
+ * the call had: its lines indexed for search. Write, fire and forget. */
+static oc_dbres *process_call_transcript(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_int64 v[2] = { (sqlite3_int64)j->call_id, (sqlite3_int64)dbw_now_ms() };
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) return r;
+    call_exec(db, "DELETE FROM call_transcript_lines WHERE transcript_id IN "
+                  "(SELECT id FROM call_transcripts WHERE call_id=?1);", 1, v, 0, NULL);
+    call_exec(db, "DELETE FROM call_transcripts WHERE call_id=?1;", 1, v, 0, NULL);
+    int ok = call_exec(db, "INSERT INTO call_transcripts(call_id, created_at_ms, language) "
+                           "SELECT ?1, ?2, NULLIF(?3,'') FROM calls WHERE id=?1;", 2, v, 3, j->tr_lang) == 0 &&
+             sqlite3_changes(db) == 1;
+    uint64_t tid = ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    sqlite3_stmt *st = NULL;
+    if (ok && sqlite3_prepare_v2(db, "INSERT INTO call_transcript_lines(transcript_id, speaker, start_ms, end_ms, text) "
+                                     "VALUES(?1, NULLIF(?2,0), ?3, ?4, ?5);", -1, &st, NULL) == SQLITE_OK) {
+        for (size_t i = 0; ok && i < j->n_tr_lines; i++) {
+            sqlite3_reset(st);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)tid);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->tr_lines[i].speaker);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)j->tr_lines[i].start_ms);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)j->tr_lines[i].end_ms);
+            sqlite3_bind_text(st, 5, j->tr_lines[i].text ? j->tr_lines[i].text : "", -1, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+    }
+    sqlite3_finalize(st);
+    if (!ok || sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    return r;
+}
+
+/* A recording begins (CALLS.md §8): its row, unless the recordings already
+ * take the space they may. Write. */
+static oc_dbres *process_recording_start(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->call_id = j->call_id;
+    r->user_id = j->user_id;
+    r->type = OC_RES_CALL_ERR;
+    r->err_code = OC_ERR_RECORDING_UNAVAILABLE;
+    sqlite3_stmt *st = NULL;
+    if (j->call_cap_bytes) {
+        uint64_t used = 0;
+        if (sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(bytes),0) FROM call_recordings;", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW) used = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); st = NULL;
+        if (used >= j->call_cap_bytes) return r;
+    }
+    if (sqlite3_prepare_v2(db, "INSERT INTO call_recordings(call_id, started_by, started_at_ms, state, spool) "
+                               "VALUES(?1, ?2, ?3, 'recording', ?4);", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        r->err_code = OC_ERR_INTERNAL;
+        return r;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_text(st, 4, j->call_spool ? j->call_spool : "", -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (!ok) { r->err_code = OC_ERR_INTERNAL; return r; }
+    r->rec_id = (uint64_t)sqlite3_last_insert_rowid(db);
+    /* Its spool is a directory of its own under the one named: <dir>/<id>. */
+    sqlite3_int64 v[1] = { (sqlite3_int64)r->rec_id };
+    call_exec(db, "UPDATE call_recordings SET spool = spool || '/' || id WHERE id=?1;", 1, v, 0, NULL);
+    r->type = OC_RES_RECORDING_STARTED;
+    r->err_code = 0;
+    return r;
+}
+
+/* A recording stopped: processing makes it from its spool. Write, fire and
+ * forget. */
+static oc_dbres *process_recording_stop(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_OK;
+    sqlite3_int64 v[2] = { (sqlite3_int64)j->rec_id, (sqlite3_int64)dbw_now_ms() };
+    call_exec(db, "UPDATE call_recordings SET stopped_at_ms=?2, state='processing' "
+                  "WHERE id=?1 AND state='recording';", 2, v, 0, NULL);
+    return r;
+}
+
+/* Who people in a recording are: each one's name (its display name) and the
+ * store key of their avatar, while its bytes are there. Read. */
+static oc_dbres *process_rec_people(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_REC_PEOPLE;
+    r->call_id = j->call_id;
+    if (!j->n_call_uids || !(r->rec_people = calloc(j->n_call_uids, sizeof *r->rec_people))) return r;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(u.display_name, ''),"
+            "       COALESCE((SELECT a.storage_key FROM attachments a WHERE a.id = u.avatar_attachment_id"
+            "                 AND a.reclaimed_at_ms = 0), '')"
+            "  FROM users u WHERE u.id = ?1;", -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return r; }
+    for (uint16_t i = 0; i < j->n_call_uids; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->call_uids[i]);
+        if (sqlite3_step(st) != SQLITE_ROW) continue;
+        oc_rec_person *p = &r->rec_people[r->n_rec_people++];
+        p->user = j->call_uids[i];
+        snprintf(p->name, sizeof p->name, "%s", (const char *)sqlite3_column_text(st, 0));
+        snprintf(p->avatar_key, sizeof p->avatar_key, "%s", (const char *)sqlite3_column_text(st, 1));
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* The recordings stopped and not yet made, oldest first, with their spools:
+ * what the worker is given as the daemon starts. Read. */
+static oc_dbres *process_recordings_pending(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_RECORDINGS_PENDING;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, spool FROM call_recordings WHERE state='processing' AND spool IS NOT NULL "
+                               "ORDER BY id LIMIT 64;", -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return r; }
+    r->rec_ids = calloc(64, sizeof *r->rec_ids);
+    r->rec_spools = calloc(64, sizeof *r->rec_spools);
+    while (r->rec_ids && r->rec_spools && sqlite3_step(st) == SQLITE_ROW) {
+        const char *sp = (const char *)sqlite3_column_text(st, 1);
+        if (!(r->rec_spools[r->n_recs] = strdup(sp ? sp : ""))) break;
+        r->rec_ids[r->n_recs++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* A recording made (CALLS.md §8): an attachment of the call's chat -- a video,
+ * as a video message is -- carried by a message there from who started it,
+ * and the recording ready with it. Or not made: failed, with why. Write. */
+static oc_dbres *process_recording_done(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_OK;
+    sqlite3_int64 v[1] = { (sqlite3_int64)j->rec_id };
+    if (j->rec_failed) {
+        char why[200];
+        snprintf(why, sizeof why, "%.*s", (int)(j->body_len < 190 ? j->body_len : 190), j->body ? (const char *)j->body : "");
+        call_exec(db, "UPDATE call_recordings SET state='failed', spool=NULL, error=?2 WHERE id=?1;", 1, v, 2, why);
+        return r;
+    }
+    uint64_t call = 0, by = 0, chat = 0;
+    char subject[OC_CALL_SUBJECT_MAX + 1] = "";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT r.call_id, r.started_by, c.subject, (SELECT id FROM channels WHERE call_id=c.id) "
+                               "FROM call_recordings r JOIN calls c ON c.id=r.call_id WHERE r.id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, v[0]);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            call = (uint64_t)sqlite3_column_int64(st, 0);
+            by = (uint64_t)sqlite3_column_int64(st, 1);
+            snprintf(subject, sizeof subject, "%s", sqlite3_column_text(st, 2) ? (const char *)sqlite3_column_text(st, 2) : "");
+            chat = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (!call || !chat) return r;
+    uint64_t ts = dbw_now_ms();
+    char fname[OC_CALL_SUBJECT_MAX + 32], body[OC_CALL_SUBJECT_MAX + 32];
+    snprintf(fname, sizeof fname, "Recording of %s.mp4", subject);
+    snprintf(body, sizeof body, "Recording of %s", subject);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) return r;
+    int ok = sqlite3_prepare_v2(db, "INSERT INTO messages(channel_id, author_id, body, created_at_ms) VALUES(?1, ?2, ?3, ?4);",
+                                -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)chat);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)by);
+        sqlite3_bind_blob (st, 3, body, (int)strlen(body), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st); st = NULL;
+    uint64_t mid = ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0, aid = 0;
+    if (ok) {
+        ok = sqlite3_prepare_v2(db, "INSERT INTO attachments(channel_id, message_id, uploader_id, storage_key, filename, mime, "
+                                    "size, created_at_ms, sha256) VALUES(?1, ?2, ?3, ?4, ?5, 'video/mp4', ?6, ?7, ?8);",
+                                -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)chat);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)mid);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)by);
+            sqlite3_bind_text (st, 4, j->call_spool ? j->call_spool : "", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text (st, 5, fname, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)j->exp_bytes);
+            sqlite3_bind_int64(st, 7, (sqlite3_int64)ts);
+            sqlite3_bind_blob (st, 8, j->att_sha256, (int)sizeof j->att_sha256, SQLITE_TRANSIENT);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st); st = NULL;
+        aid = ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    }
+    if (ok) {
+        sqlite3_int64 m[6] = { (sqlite3_int64)aid, (sqlite3_int64)j->exp_duration_ms, OC_CALLREC_WIDTH, OC_CALLREC_HEIGHT,
+                               (sqlite3_int64)ts, OC_MEDIA_VIDEO_MESSAGE };
+        /* A video, played as a video message is. */
+        ok = call_exec(db, "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, created_at_ms) "
+                           "VALUES(?1, ?6, ?2, ?3, ?4, NULL, ?5);", 6, m, 0, NULL) == 0;
+    }
+    if (ok) {
+        sqlite3_int64 u[4] = { (sqlite3_int64)j->rec_id, (sqlite3_int64)aid, (sqlite3_int64)j->exp_bytes,
+                               (sqlite3_int64)j->exp_duration_ms };
+        ok = call_exec(db, "UPDATE call_recordings SET state='ready', spool=NULL, attachment_id=?2, bytes=?3, "
+                           "duration_ms=?4 WHERE id=?1;", 4, u, 0, NULL) == 0;
+    }
+    if (!ok || sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        call_exec(db, "UPDATE call_recordings SET state='failed', spool=NULL, error='its row could not be written' "
+                      "WHERE id=?1;", 1, v, 0, NULL);
+        return r;
+    }
+    /* The message, to the call's people, as a message with its file is sent. */
+    r->type = OC_RES_RECORDING_DONE;
+    r->message_id = mid;
+    r->channel_id = chat;
+    r->author_id = by;
+    r->server_time = ts;
+    r->call_id = call;
+    r->body = malloc(strlen(body));
+    if (r->body) { memcpy(r->body, body, strlen(body)); r->body_len = strlen(body); }
+    load_message_attachments(db, mid, r->attach, &r->n_attach);
+    append_action(db, r, mid, chat, 1);
+    load_members(db, chat, r);
+    return r;
+}
+
+int oc_dbwriter_call_transcript(oc_dbwriter *w, uint64_t call_id, const char *language,
+                                const oc_transcript_line *lines, size_t n) {
+    oc_job *j = oc_job_new(OC_JOB_CALL_TRANSCRIPT, 0);
+    if (!j) return -1;
+    j->call_id = call_id;
+    j->tr_lang = strdup(language ? language : "");
+    j->tr_lines = n ? calloc(n, sizeof *j->tr_lines) : NULL;
+    if (!j->tr_lang || (n && !j->tr_lines)) { oc_job_free(j); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        j->tr_lines[i] = lines[i];
+        j->tr_lines[i].text = strdup(lines[i].text ? lines[i].text : "");
+        j->n_tr_lines = i + 1;
+        if (!j->tr_lines[i].text) { oc_job_free(j); return -1; }
+    }
+    oc_dbwriter_submit(w, j);
+    return 0;
+}
+
+/* The daemon stopped with calls open: each ended then, by a stop, with every
+ * stay in it closed. When is not known, so it is the last thing the call
+ * recorded -- its latest join, leave or event, else its start. Run once, as
+ * the writer starts, before any call can begin. */
+static void calls_close_stopped(sqlite3 *db) {
+    /* Which they are, first: their messages say they ended, below. */
+    uint64_t ids[256];
+    int n = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id FROM calls WHERE ended_at_ms IS NULL;", -1, &st, NULL) == SQLITE_OK)
+        while (n < 256 && sqlite3_step(st) == SQLITE_ROW) ids[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_exec(db,
+        "BEGIN IMMEDIATE;"
+        "UPDATE calls SET end_reason='stopped', ended_at_ms=MAX(started_at_ms,"
+        "  COALESCE((SELECT MAX(MAX(joined_at_ms, COALESCE(left_at_ms, 0))) FROM call_participants p"
+        "            WHERE p.call_id=calls.id), 0),"
+        "  COALESCE((SELECT MAX(at_ms) FROM call_events e WHERE e.call_id=calls.id), 0))"
+        " WHERE ended_at_ms IS NULL;"
+        "UPDATE call_participants SET left_at_ms=(SELECT ended_at_ms FROM calls c WHERE c.id=call_participants.call_id)"
+        " WHERE left_at_ms IS NULL;"
+        "COMMIT;", NULL, NULL, NULL);
+    /* A recording the daemon stopped in the middle of: what its spool holds is
+     * processed as for any stopped recording (CALLS.md §8). */
+    sqlite3_exec(db, "UPDATE call_recordings SET state='processing', stopped_at_ms=COALESCE(stopped_at_ms,"
+                     " (SELECT ended_at_ms FROM calls c WHERE c.id=call_recordings.call_id)) WHERE state='recording';",
+                 NULL, NULL, NULL);
+    /* Nobody is connected yet to be told; whoever reads them sees they ended. */
+    for (int i = 0; i < n; i++) oc_dbres_free(call_message_refresh(db, ids[i]));
 }
 
 /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row (message_id
@@ -9629,12 +11486,20 @@ static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT size, uploader_id, sha256 FROM attachments WHERE id=?;", -1, &st, NULL);
+        "SELECT size, uploader_id, sha256, storage_key, mime FROM attachments WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
     int found = sqlite3_step(st) == SQLITE_ROW;
     uint64_t declared = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
     uint64_t owner    = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
     int already       = found && sqlite3_column_type(st, 2) != SQLITE_NULL;
+    /* The key and type ride back so the net loop can have the image previewed
+     * (ARCH-137) without asking again. */
+    if (found) {
+        const char *k = (const char *)sqlite3_column_text(st, 3);
+        const char *m = (const char *)sqlite3_column_text(st, 4);
+        r->storage_key = strdup(k ? k : "");
+        r->mime = strdup(m ? m : "");
+    }
     sqlite3_finalize(st);
 
     if (!found || owner != j->user_id || already) {
@@ -9889,6 +11754,1284 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
     r->att_size = sz;
     if (dg && dglen == 32) memcpy(r->att_sha256, dg, 32);
     sqlite3_finalize(st);
+    return r;
+}
+
+/* Image previews (ARCH-137). STORE records what a transfer worker made of an
+ * upload: its dimensions on `attachments`, and a row per rung. The rows are
+ * written only while the attachment is still there and not reclaimed; if it
+ * went while its previews were being made, the rungs' keys come back in
+ * pv_drop for the net loop to delete, so no preview outlives its original.
+ * Write. */
+static oc_dbres *process_preview_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->attachment_id = j->attachment_id;
+    r->type = OC_RES_PREVIEW_STORED;
+    sqlite3_stmt *st = NULL;
+    int live = 0;
+    if (sqlite3_prepare_v2(db, "SELECT reclaimed_at_ms FROM attachments WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        live = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int64(st, 0) == 0;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (live && j->pv_width && j->pv_height &&
+        sqlite3_prepare_v2(db, "UPDATE attachments SET width=?2, height=?3 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->pv_width);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->pv_height);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    uint64_t now = dbw_now_ms();
+    for (int i = 0; i < j->pv_count && i < 2; i++) {
+        int stored = 0;
+        st = NULL;
+        if (live && j->pv_keys[i] &&
+            sqlite3_prepare_v2(db,
+                "INSERT OR REPLACE INTO attachment_previews"
+                "  (attachment_id, rung, storage_key, width, height, size, mime, created_at_ms, last_used_ms)"
+                " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+            sqlite3_bind_int  (st, 2, i + 1);
+            sqlite3_bind_text (st, 3, j->pv_keys[i], -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)j->pv_w[i]);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)j->pv_h[i]);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)j->pv_size[i]);
+            sqlite3_bind_text (st, 7, j->pv_mime[i] ? j->pv_mime[i] : "", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 8, (sqlite3_int64)now);
+            stored = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+        if (!stored && j->pv_keys[i]) r->pv_drop[i] = strdup(j->pv_keys[i]);
+    }
+    return r;
+}
+
+/* PREVIEW_LOOKUP: the download's own gate (process_attach_lookup: the
+ * channel's read check, or an avatar's everyone), then the rung asked for. A
+ * rung that was never made, or was reclaimed, is PREVIEW_MISSING, which a
+ * client answers by downloading the original. Read (query connection). */
+static oc_dbres *process_preview_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = process_attach_lookup(db, j);
+    if (!r) return NULL;
+    if (r->type != OC_RES_ATTACH_META) {
+        r->type = OC_RES_PREVIEW_ERR;
+        return r;
+    }
+    r->pv_rung = j->pv_rung;
+    sqlite3_stmt *st = NULL;
+    r->type = OC_RES_PREVIEW_ERR;
+    r->err_code = OC_ERR_PREVIEW_MISSING;
+    if (sqlite3_prepare_v2(db,
+            "SELECT storage_key, width, height, size, mime FROM attachment_previews"
+            " WHERE attachment_id=?1 AND rung=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, j->pv_rung);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *k = (const char *)sqlite3_column_text(st, 0);
+            const char *m = (const char *)sqlite3_column_text(st, 4);
+            r->pv_key = strdup(k ? k : "");
+            r->pv_w = (uint32_t)sqlite3_column_int64(st, 1);
+            r->pv_h = (uint32_t)sqlite3_column_int64(st, 2);
+            r->pv_size = (uint64_t)sqlite3_column_int64(st, 3);
+            r->pv_mime = strdup(m ? m : "");
+            if (r->pv_key && r->pv_mime) { r->type = OC_RES_PREVIEW_META; r->err_code = 0; }
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* PREVIEW_TOUCH: a rung served, so it is the last of its kind reclaimed. Write,
+ * fire and forget. */
+static oc_dbres *process_preview_touch(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE attachment_previews SET last_used_ms=?3 WHERE attachment_id=?1 AND rung=?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_int  (st, 2, j->pv_rung);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) { r->type = OC_RES_OK; r->conn_id = j->conn_id; }
+    return r;
+}
+
+/* --- The MCP surface's reads (docs/details/MCP.md §4) ----------------------------
+ * An agent reads the channels it is a member of and nothing else: no DM, no
+ * group DM, no end-to-end channel (the daemon holds only ciphertext), no
+ * public channel it has not been put in. Every read checks that
+ * here, at the moment it is made. Deleted messages are not returned. */
+
+static char *mcp_dup(sqlite3_stmt *st, int i) {
+    const char *t = (const char *)sqlite3_column_text(st, i);
+    return strdup(t ? t : "");
+}
+
+/* An agent reads its channels; a person through an AI client (`person`) also
+ * their DMs and group DMs. Never an encrypted one. */
+static int agent_reads(sqlite3 *db, uint64_t channel, uint64_t agent, int person) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
+            " WHERE c.id=?1 AND cm.user_id=?2 AND (c.kind='channel' OR ?3=1) AND c.e2e=0;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)agent);
+        sqlite3_bind_int(st, 3, person ? 1 : 0);
+        ok = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static oc_dbres *process_mcp_channels(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_CHANNELS;
+    sqlite3_stmt *st = NULL;
+    /* A DM or group DM is named by the others in it, by handle, in order:
+     * "alice", "alice,@bob" -- shown as "@alice", "@alice,@bob". */
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, CASE WHEN c.kind='dm' THEN"
+            "   (SELECT group_concat(h, ',@') FROM (SELECT CASE WHEN substr(u.subject,1,6)='local:' THEN substr(u.subject,7)"
+            "      ELSE COALESCE(NULLIF(u.display_name,''), 'user'||u.id) END AS h"
+            "     FROM channel_members o JOIN users u ON u.id=o.user_id WHERE o.channel_id=c.id AND o.user_id<>?1 ORDER BY h))"
+            "   ELSE c.name END, c.is_public, c.kind='dm'"
+            " FROM channels c JOIN channel_members cm ON cm.channel_id=c.id"
+            " WHERE cm.user_id=?1 AND (c.kind='channel' OR ?2=1) AND c.e2e=0 ORDER BY c.kind='dm', 2, c.id;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int(st, 2, j->mcp_person ? 1 : 0);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_mcp_chan *g = realloc(r->mcp_chans, (r->n_mcp_chans + 1) * sizeof *g);
+            if (!g) break;
+            r->mcp_chans = g;
+            oc_mcp_chan *c = &r->mcp_chans[r->n_mcp_chans++];
+            c->id = (uint64_t)sqlite3_column_int64(st, 0);
+            c->name = mcp_dup(st, 1);
+            c->is_public = (uint8_t)sqlite3_column_int(st, 2);
+            c->is_dm = (uint8_t)sqlite3_column_int(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* The columns every MCP read takes, in this order (mcp_row_fill). */
+#define MCP_COLS \
+    "m.id, m.channel_id, m.created_at_ms, m.body, (m.edited_at_ms IS NOT NULL)," \
+    " (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id AND c.deleted_at_ms IS NULL)," \
+    " COALESCE(NULLIF(m.author_name,''), u.display_name, '')," \
+    " CASE WHEN COALESCE(m.author_name,'') <> '' THEN 'webhook' WHEN u.kind='agent' THEN 'agent' ELSE 'person' END," \
+    " CASE WHEN substr(u.subject, 1, 6)='local:' THEN substr(u.subject, 7) ELSE '' END," \
+    " ch.name"
+
+static void mcp_row_fill(sqlite3 *db, sqlite3_stmt *st, oc_mcp_row *m) {
+    memset(m, 0, sizeof *m);
+    m->id = (uint64_t)sqlite3_column_int64(st, 0);
+    m->channel_id = (uint64_t)sqlite3_column_int64(st, 1);
+    m->at_ms = (uint64_t)sqlite3_column_int64(st, 2);
+    const void *b = sqlite3_column_blob(st, 3);
+    int bl = sqlite3_column_bytes(st, 3);
+    m->text = malloc((size_t)(bl > 0 ? bl : 0) + 1);
+    if (m->text) { if (bl > 0) memcpy(m->text, b, (size_t)bl); m->text[bl > 0 ? bl : 0] = '\0'; m->text_len = (size_t)(bl > 0 ? bl : 0); }
+    m->edited = (uint8_t)sqlite3_column_int(st, 4);
+    m->replies = (uint32_t)sqlite3_column_int64(st, 5);
+    m->author = mcp_dup(st, 6);
+    m->kind = mcp_dup(st, 7);
+    m->handle = mcp_dup(st, 8);
+    m->channel = mcp_dup(st, 9);
+    sqlite3_stmt *fs = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT filename, mime, size FROM attachments WHERE message_id=?1 AND reclaimed_at_ms=0 ORDER BY id;",
+            -1, &fs, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(fs, 1, (sqlite3_int64)m->id);
+        while (sqlite3_step(fs) == SQLITE_ROW) {
+            size_t k = m->n_files;
+            char **gn = realloc(m->file_names, (k + 1) * sizeof *gn);
+            if (gn) m->file_names = gn;
+            char **gt = realloc(m->file_types, (k + 1) * sizeof *gt);
+            if (gt) m->file_types = gt;
+            uint64_t *gs = realloc(m->file_sizes, (k + 1) * sizeof *gs);
+            if (gs) m->file_sizes = gs;
+            if (!gn || !gt || !gs) break;
+            m->file_names[k] = mcp_dup(fs, 0);
+            m->file_types[k] = mcp_dup(fs, 1);
+            m->file_sizes[k] = (uint64_t)sqlite3_column_int64(fs, 2);
+            m->n_files++;
+        }
+    }
+    sqlite3_finalize(fs);
+}
+
+static int mcp_row_add(oc_dbres *r) {
+    oc_mcp_row *g = realloc(r->mcp_rows, (r->n_mcp_rows + 1) * sizeof *g);
+    if (!g) return -1;
+    r->mcp_rows = g;
+    r->n_mcp_rows++;
+    return 0;
+}
+
+static int mcp_exists(sqlite3 *db, const char *sql, uint64_t a, uint64_t b, uint64_t c) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)a);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)b);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)c);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* MCP_READ: a conversation's top-level messages, or one thread's replies,
+ * newest first by page unless after or since asks for the other way. */
+static oc_dbres *process_mcp_read(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_MESSAGES;
+    r->channel_id = j->channel_id;
+    if (!agent_reads(db, j->channel_id, j->user_id, j->mcp_person)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (j->mcp_thread &&
+        !mcp_exists(db, "SELECT 1 FROM messages WHERE id=?1 AND channel_id=?2 AND parent_id IS NULL AND ?3=?3;",
+                    j->mcp_thread, j->channel_id, 0)) {
+        r->err_code = OC_ERR_UNKNOWN_MESSAGE;
+        return r;
+    }
+    int forward = j->mcp_has_after || (j->mcp_has_since && !j->mcp_has_before);
+    uint16_t lim = j->mcp_limit ? j->mcp_limit : 50;
+    char sql[1600];
+    snprintf(sql, sizeof sql,
+             "SELECT " MCP_COLS " FROM messages m LEFT JOIN users u ON u.id=m.author_id JOIN channels ch ON ch.id=m.channel_id"
+             " WHERE m.channel_id=?1 AND m.deleted_at_ms IS NULL AND m.body IS NOT NULL"
+             " AND %s"
+             " AND NOT EXISTS(SELECT 1 FROM withheld_messages wm WHERE wm.user_id=?6 AND wm.message_id=m.id)"
+             " AND (?2=0 OR m.id < ?2) AND (?3=0 OR m.id > ?3) AND (?4=0 OR m.created_at_ms >= ?4)"
+             " ORDER BY m.id %s LIMIT ?5;",
+             j->mcp_thread ? "m.parent_id=?7" : "(m.parent_id IS NULL OR m.also_channel=1) AND ?7=?7",
+             forward ? "ASC" : "DESC");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(j->mcp_has_before ? j->mcp_before : 0));
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)(j->mcp_has_after ? j->mcp_after : 0));
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)(j->mcp_has_since ? j->mcp_since : 0));
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)lim + 1);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)j->mcp_thread);
+    size_t got = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (got++ == lim) { if (forward) r->mcp_more_newer = 1; else r->mcp_more_older = 1; break; }
+        if (mcp_row_add(r) != 0) break;
+        mcp_row_fill(db, st, &r->mcp_rows[r->n_mcp_rows - 1]);
+    }
+    sqlite3_finalize(st);
+    /* In id order, whichever way it was read. */
+    if (!forward)
+        for (size_t a = 0, b = r->n_mcp_rows; a + 1 < b; a++, b--) {
+            oc_mcp_row t = r->mcp_rows[a]; r->mcp_rows[a] = r->mcp_rows[b - 1]; r->mcp_rows[b - 1] = t;
+        }
+    r->mcp_newest_kept = (uint8_t)!forward;
+    /* What lies beyond the page's other end: before it when read forwards, after
+     * it when read backwards from a cursor. */
+    if (r->n_mcp_rows) {
+        const char *older = j->mcp_thread
+            ? "SELECT 1 FROM messages WHERE channel_id=?1 AND parent_id=?3 AND deleted_at_ms IS NULL AND id < ?2;"
+            : "SELECT 1 FROM messages WHERE channel_id=?1 AND (parent_id IS NULL OR also_channel=1) AND deleted_at_ms IS NULL AND id < ?2 AND ?3=?3;";
+        const char *newer = j->mcp_thread
+            ? "SELECT 1 FROM messages WHERE channel_id=?1 AND parent_id=?3 AND deleted_at_ms IS NULL AND id > ?2;"
+            : "SELECT 1 FROM messages WHERE channel_id=?1 AND (parent_id IS NULL OR also_channel=1) AND deleted_at_ms IS NULL AND id > ?2 AND ?3=?3;";
+        if (forward) r->mcp_more_older = (uint8_t)mcp_exists(db, older, j->channel_id, r->mcp_rows[0].id, j->mcp_thread);
+        else r->mcp_more_newer = (uint8_t)mcp_exists(db, newer, j->channel_id, r->mcp_rows[r->n_mcp_rows - 1].id, j->mcp_thread);
+    }
+    return r;
+}
+
+/* The words of a query as an FTS5 expression: each a quoted phrase, all
+ * required, so nothing the caller types is taken as an operator. */
+static int mcp_fts_query(const char *q, char *out, size_t cap) {
+    size_t o = 0;
+    int words = 0;
+    while (*q) {
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (!*q) break;
+        if (o + 3 >= cap) return -1;
+        if (words++) out[o++] = ' ';
+        out[o++] = '"';
+        while (*q && *q != ' ' && *q != '\t' && *q != '\n') {
+            if (o + 3 >= cap) return -1;
+            if (*q == '"') out[o++] = '"';
+            out[o++] = *q++;
+        }
+        out[o++] = '"';
+    }
+    out[o] = '\0';
+    return words ? 0 : -1;
+}
+
+static oc_dbres *process_mcp_search(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_MCP_MESSAGES;
+    if (j->channel_id && !agent_reads(db, j->channel_id, j->user_id, j->mcp_person)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    char fq[1200];
+    if (!j->mcp_query || mcp_fts_query(j->mcp_query, fq, sizeof fq) != 0) return r;
+    uint64_t from_uid = 0;
+    if (j->mcp_from && j->mcp_from[0]) {
+        const char *h = j->mcp_from[0] == '@' ? j->mcp_from + 1 : j->mcp_from;
+        sqlite3_stmt *u = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject='local:'||?1 OR display_name=?1 ORDER BY id LIMIT 1;",
+                               -1, &u, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(u, 1, h, -1, SQLITE_STATIC);
+            if (sqlite3_step(u) == SQLITE_ROW) from_uid = (uint64_t)sqlite3_column_int64(u, 0);
+        }
+        sqlite3_finalize(u);
+        if (!from_uid) return r;                       /* nobody by that name wrote anything */
+    }
+    uint16_t lim = j->mcp_limit ? j->mcp_limit : 20;
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "SELECT * FROM (SELECT " MCP_COLS ", bm25(messages_fts) AS rank"
+        "  FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid"
+        "  JOIN channels ch ON ch.id=m.channel_id AND (ch.kind='channel' OR ?13=1) AND ch.e2e=0"
+        "  JOIN channel_members cm ON cm.channel_id=m.channel_id AND cm.user_id=?2"
+        "  LEFT JOIN users u ON u.id=m.author_id"
+        " WHERE messages_fts MATCH ?1 AND m.deleted_at_ms IS NULL AND m.body IS NOT NULL"
+        "   AND ((ch.is_public=1 AND ?3=1) OR (ch.is_public=0 AND ?4=1))"
+        "   AND (?5=0 OR m.channel_id=?5) AND (?6=0 OR m.author_id=?6)"
+        "   AND (?7=0 OR m.created_at_ms >= ?7) AND (?8=0 OR m.created_at_ms < ?8))"
+        " WHERE (?9=0 OR rank > ?10 OR (rank = ?10 AND id > ?11))"
+        " ORDER BY rank, id LIMIT ?12;";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_bind_text (st, 1, fq, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int  (st, 3, j->mcp_pub);
+    sqlite3_bind_int  (st, 4, j->mcp_priv);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)from_uid);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)(j->mcp_has_since ? j->mcp_since : 0));
+    sqlite3_bind_int64(st, 8, (sqlite3_int64)(j->mcp_has_until ? j->mcp_until : 0));
+    sqlite3_bind_int  (st, 9, j->mcp_has_cursor);
+    sqlite3_bind_double(st, 10, j->mcp_rank);
+    sqlite3_bind_int64(st, 11, (sqlite3_int64)j->mcp_after);
+    sqlite3_bind_int64(st, 12, (sqlite3_int64)lim + 1);
+    sqlite3_bind_int  (st, 13, j->mcp_person ? 1 : 0);
+    size_t got = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (got++ == lim) { r->mcp_more_newer = 1; break; }   /* another page follows */
+        if (mcp_row_add(r) != 0) break;
+        oc_mcp_row *m = &r->mcp_rows[r->n_mcp_rows - 1];
+        mcp_row_fill(db, st, m);
+        m->rank = sqlite3_column_double(st, 10);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* MCP_AUDIT: the row, its detail led by the token's name (token_id), so an
+ * owner sees which of an agent's tokens did it; never the token itself. */
+static oc_dbres *process_mcp_audit(sqlite3 *db, const oc_job *j) {
+    char *nm = j->user_id ? audit_name_of(db, j->user_id) : NULL;
+    char tok[128] = "", detail[512];
+    if (j->token_id) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM principal_tokens WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                snprintf(tok, sizeof tok, "%s", (const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+    }
+    if (tok[0]) snprintf(detail, sizeof detail, "token=%s%s%s", tok, j->mcp_detail ? " " : "", j->mcp_detail ? j->mcp_detail : "");
+    else snprintf(detail, sizeof detail, "%s", j->mcp_detail ? j->mcp_detail : "");
+    audit_log(db, j->mcp_family ? j->mcp_family : OC_AUDIT_MCP, j->mcp_action ? j->mcp_action : "mcp",
+              j->user_id, nm, j->target_user_id, j->mcp_target, j->mcp_outcome, detail[0] ? detail : NULL);
+    free(nm);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) { r->type = OC_RES_OK; r->conn_id = 0; }
+    return r;
+}
+
+/* --- Agents and their tokens (docs/details/MCP.md §3.1, §6, §7) ---------------
+ * An agent is a `users` row of kind 'agent' with a name and nothing of a
+ * person's: no password, no identity-provider subject, no session, no device.
+ * It acts only through a token: 32 random bytes, shown once as
+ * OC_PRINCIPAL_TOKEN_PREFIX and the bytes in base64url, stored as their
+ * SHA-256 in `principal_tokens` (migration 0090), which holds the tokens of
+ * kind 'agent' and, later, 'bot' rows alone. Everything here is an owner's or
+ * an admin's, and audited in the administrative family, never with a token. */
+
+static int user_kind_is(sqlite3 *db, uint64_t uid, const char *kind) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT kind=?2 FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
+        yes = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) != 0;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Not a person: a visitor, an agent or a bot. None of them is in a DM, a
+ * group DM or a user group. */
+static int user_not_person(sqlite3 *db, uint64_t uid) { return !user_kind_is(db, uid, "human"); }
+
+static int actor_manages(sqlite3 *db, uint64_t uid) {
+    uint8_t role = OC_ROLE_MEMBER;
+    return user_role(db, uid, &role) && !user_disabled(db, uid) && user_kind_is(db, uid, "human") &&
+           (role == OC_ROLE_OWNER || role == OC_ROLE_ADMIN);
+}
+
+/* A live agent: of kind 'agent' and not removed. */
+static int agent_live(sqlite3 *db, uint64_t uid) {
+    return uid && user_kind_is(db, uid, "agent") && !user_disabled(db, uid);
+}
+
+static oc_dbres *agent_refuse(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_AGENT_ERR;
+    r->err_code = code;
+    return r;
+}
+
+/* Mint a token for `agent` into `r` (OC_RES_AGENT_TOKEN): the checks a mint
+ * makes -- the scopes in the catalog, at most OC_AGENT_MAX_TOKENS -- and the
+ * row. 0, or the error code. The store takes rows of kind 'agent' and 'bot'
+ * alone. */
+static uint16_t mint_token(sqlite3 *db, uint64_t agent, uint64_t actor, const char *name, const char *scopes,
+                           oc_dbres *r) {
+    if (!user_kind_is(db, agent, "agent") && !user_kind_is(db, agent, "bot")) return OC_ERR_FORBIDDEN;
+    char canon[512];
+    if (oc_scopes_normalize(scopes ? scopes : "", scopes ? strlen(scopes) : 0, canon, sizeof canon) != 0)
+        return OC_ERR_UNKNOWN_SCOPE;
+    if (!name || !name[0] || strlen(name) > OC_MAX_CHANNEL_NAME) return OC_ERR_INVALID_CHANNEL;
+    sqlite3_stmt *st = NULL;
+    int64_t held = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)agent);
+        if (sqlite3_step(st) == SQLITE_ROW) held = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (held >= OC_AGENT_MAX_TOKENS) return OC_ERR_TOO_MANY_TOKENS;
+    uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) return OC_ERR_INTERNAL;
+    st = NULL;
+    int rc = SQLITE_ERROR;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO principal_tokens(token_hash, user_id, name, scopes, created_by, created_at_ms)"
+            " VALUES(?1, ?2, ?3, ?4, ?5, ?6);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob (st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)agent);
+        sqlite3_bind_text (st, 3, name, -1, SQLITE_STATIC);
+        sqlite3_bind_text (st, 4, canon, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)actor);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return OC_ERR_INTERNAL;
+    r->type = OC_RES_AGENT_TOKEN;
+    r->user_id = agent;
+    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);   /* before the audit row's insert */
+    r->tok_scopes = strdup(canon);
+    memcpy(r->session_token, token, sizeof token);               /* the token, shown once */
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.token.mint", actor, agent, name, 1, NULL);
+    return 0;
+}
+
+static oc_dbres *process_agent_create(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!j->agent_name || !j->agent_name[0] || strlen(j->agent_name) > OC_MAX_CHANNEL_NAME)
+        return agent_refuse(j, OC_ERR_INVALID_CHANNEL);
+    char canon[512];
+    if (oc_scopes_normalize(j->token_scopes ? j->token_scopes : "", j->token_scopes ? strlen(j->token_scopes) : 0,
+                            canon, sizeof canon) != 0)
+        return agent_refuse(j, OC_ERR_UNKNOWN_SCOPE);
+    uint8_t rnd[16];
+    if (oc_rand_bytes(rnd, sizeof rnd) != 0) return agent_refuse(j, OC_ERR_INTERNAL);
+    char subject[6 + 2 * sizeof rnd + 1];
+    memcpy(subject, "agent:", 6);
+    for (size_t i = 0; i < sizeof rnd; i++) snprintf(subject + 6 + 2 * i, 3, "%02x", rnd[i]);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_exec(db, "SAVEPOINT agent_create;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    int rc = SQLITE_ERROR;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO users(subject, display_name, role, kind, created_at_ms) VALUES(?1, ?2, 'member', 'agent', ?3);",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, subject, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (st, 2, j->agent_name, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    uint64_t agent = rc == SQLITE_DONE ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    uint16_t err = agent ? 0 : OC_ERR_INTERNAL;
+    if (!err) {
+        audit_actor(db, OC_AUDIT_ADMIN, "agent.create", j->user_id, agent, j->agent_name, 1, NULL);
+        err = mint_token(db, agent, j->user_id, j->token_name && j->token_name[0] ? j->token_name : "first",
+                         canon, r);
+    }
+    if (err) {
+        sqlite3_exec(db, "ROLLBACK TO agent_create; RELEASE agent_create;", NULL, NULL, NULL);
+        r->type = OC_RES_AGENT_ERR;
+        r->err_code = err;
+        return r;
+    }
+    sqlite3_exec(db, "RELEASE agent_create;", NULL, NULL, NULL);
+    user_rows(db, agent, r);             /* the new row, for every roster */
+    return r;
+}
+
+static oc_dbres *process_token_mint(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    /* The store's own rule decides the kind (mint_token): an agent's row or a
+     * bot's, and no other. A removed one holds none. */
+    if (!j->target_user_id || user_disabled(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint16_t err = mint_token(db, j->target_user_id, j->user_id, j->token_name, j->token_scopes, r);
+    if (err) { r->type = OC_RES_AGENT_ERR; r->err_code = err; }
+    return r;
+}
+
+/* An agent's tokens into `r` as OC_RES_TOKEN_LIST: never a token or its hash. */
+static void token_rows(sqlite3 *db, uint64_t agent, oc_dbres *r) {
+    r->type = OC_RES_TOKEN_LIST;
+    r->user_id = agent;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, name, scopes, created_by, created_at_ms, last_used_at_ms, last_used_from"
+            " FROM principal_tokens WHERE user_id=?1 ORDER BY id;", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)agent);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        oc_token_row *g = realloc(r->ptokens, (r->n_ptokens + 1) * sizeof *g);
+        if (!g) break;
+        r->ptokens = g;
+        oc_token_row *t = &r->ptokens[r->n_ptokens++];
+        t->id = (uint64_t)sqlite3_column_int64(st, 0);
+        t->name = strdup((const char *)sqlite3_column_text(st, 1));
+        t->scopes = strdup((const char *)sqlite3_column_text(st, 2));
+        t->created_by = (uint64_t)sqlite3_column_int64(st, 3);
+        t->created_at_ms = (uint64_t)sqlite3_column_int64(st, 4);
+        t->last_used_at_ms = (uint64_t)sqlite3_column_int64(st, 5);
+        t->last_used_from = strdup((const char *)sqlite3_column_text(st, 6));
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_token_list(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    token_rows(db, j->target_user_id, r);
+    return r;
+}
+
+static oc_dbres *process_token_revoke(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    char *name = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT name FROM principal_tokens WHERE id=?1 AND user_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) name = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    if (!name) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM principal_tokens WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->token_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.token.revoke", j->user_id, j->target_user_id, name, 1, NULL);
+    free(name);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    token_rows(db, j->target_user_id, r);
+    return r;
+}
+
+/* Removing an agent: its tokens and its channel memberships in one
+ * transaction, its row marked removed; its messages stay under its name. The
+ * channels it left are told as for a member leaving. */
+static oc_dbres *process_agent_remove(sqlite3 *db, const oc_job *j) {
+    if (!actor_manages(db, j->user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    if (!agent_live(db, j->target_user_id)) return agent_refuse(j, OC_ERR_FORBIDDEN);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_exec(db, "SAVEPOINT agent_remove;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM principal_tokens WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    uint64_t chans[512];
+    size_t nch = 0;
+    if (sqlite3_prepare_v2(db, "SELECT channel_id FROM channel_members WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        while (nch < sizeof chans / sizeof chans[0] && sqlite3_step(st) == SQLITE_ROW)
+            chans[nch++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE user_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    for (size_t i = 0; i < nch; i++) note_change(db, r, chans[i], j->target_user_id, 0);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, "agent.remove", j->user_id, j->target_user_id, NULL, 1, NULL);
+    sqlite3_exec(db, "RELEASE agent_remove;", NULL, NULL, NULL);
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->target_user_id;
+    r->role = OC_ROLE_MEMBER;
+    r->disabled = 1;
+    return r;
+}
+
+/* The lookup a request authenticates with: the presented token's agent and
+ * scopes, in one indexed probe, never cached, so a revoked token or one whose
+ * agent is gone is refused at once. Its last use is written at most once a
+ * minute, on this writer's clock. */
+#define TOKEN_USE_EVERY_MS 60000u
+static oc_dbres *process_token_lookup(sqlite3 *db, const oc_job *j) {
+    size_t plen = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    uint8_t raw[OC_SESSION_TOKEN_LEN + 4], hash[OC_SHA256_LEN];
+    if (!j->token || j->token_len <= plen || memcmp(j->token, OC_PRINCIPAL_TOKEN_PREFIX, plen) != 0 ||
+        oc_base64url_decode(j->token + plen, j->token_len - plen, raw, sizeof raw) != OC_SESSION_TOKEN_LEN ||
+        oc_sha256(raw, OC_SESSION_TOKEN_LEN, hash) != 0)
+        return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    sqlite3_stmt *st = NULL;
+    oc_dbres *r = NULL;
+    uint64_t last = 0, id = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT t.id, t.user_id, t.scopes, t.last_used_at_ms FROM principal_tokens t JOIN users u ON u.id=t.user_id"
+            " WHERE t.token_hash=?1 AND u.disabled=0 AND u.kind IN ('agent','bot');", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW && (r = calloc(1, sizeof *r))) {
+            r->conn_id = j->conn_id;
+            r->type = OC_RES_TOKEN_PRINCIPAL;
+            id = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = id;
+            r->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->tok_scopes = strdup((const char *)sqlite3_column_text(st, 2));
+            last = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!r) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    uint64_t now = dbw_now_ms();
+    if (now >= last + TOKEN_USE_EVERY_MS) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE principal_tokens SET last_used_at_ms=?2, last_used_from=?3 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_bind_text (st, 3, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
+/* --- A person's AI clients (docs/details/AUTH.md §8.13; SCHEMA.md 0091) -------
+ * The daemon as the MCP endpoint's authorization server. A client identifies
+ * itself (registered, or by its metadata document); an authorize request waits
+ * as an approval with an eight-letter code until the person enters that code
+ * in their signed-in app and approves or declines; the page collects the
+ * outcome and hands the client a one-minute authorization code; the token
+ * endpoint exchanges it, with PKCE, for an hour's access token and a refresh
+ * token for the connection's lifetime. Every secret is kept as its SHA-256. */
+
+static oc_dbres *oa_res(const oc_job *j, int type) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = type;
+    return r;
+}
+
+/* A refusal: `oauth` the OAuth error code (the token endpoint's) or the page's
+ * sentence; `code` the reason a person's app is told. */
+static oc_dbres *oa_refuse(const oc_job *j, const char *oauth, uint16_t code) {
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_ERR);
+    if (!r) return NULL;
+    r->oa_error = strdup(oauth ? oauth : "");
+    r->err_code = code;
+    return r;
+}
+
+static void oa_bind_hash(sqlite3_stmt *st, int i, const char *secret) {
+    uint8_t h[32];
+    if (!secret || oc_oauth_hash(secret, strlen(secret), h) != 0) memset(h, 0, sizeof h);
+    sqlite3_bind_blob(st, i, h, sizeof h, SQLITE_TRANSIENT);
+}
+
+static char *oa_col(sqlite3_stmt *st, int i) {
+    const char *t = (const char *)sqlite3_column_text(st, i);
+    return strdup(t ? t : "");
+}
+
+/* Whether `uid` may connect an AI client as themself: a person (not a
+ * visitor, an agent or the workspace), not removed. */
+static int oa_person(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE id=?1 AND kind='human' AND disabled=0 AND is_system=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        ok = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static oc_dbres *process_oauth_register(sqlite3 *db, const oc_job *j) {
+    char id[OC_OAUTH_TOKEN_MAX];
+    if (!j->oa_name || !j->oa_uris || oc_oauth_mint(OC_OAUTH_CLIENT_PREFIX, id, sizeof id) != 0)
+        return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO oauth_clients(client_id, kind, name, redirect_uris, created_at_ms, created_from)"
+            " VALUES(?1, 'registered', ?2, ?3, ?4, ?5);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, j->oa_name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, j->oa_uris, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text(st, 5, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_CLIENT);
+    if (r) { r->oa_client_id = strdup(id); r->oa_name = strdup(j->oa_name); r->oa_uris = strdup(j->oa_uris); }
+    return r;
+}
+
+static oc_dbres *process_oauth_doc_store(sqlite3 *db, const oc_job *j) {
+    /* A fetch that failed comes here too, its sentence in oa_state, so the
+     * request waiting on it is answered in order. */
+    if (!j->oa_client_id || !j->oa_name || !j->oa_uris)
+        return oa_refuse(j, j->oa_state ? j->oa_state : "The client's metadata document could not be read.", OC_ERR_INTERNAL);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO oauth_clients(client_id, kind, name, redirect_uris, created_at_ms, fetched_at_ms)"
+            " VALUES(?1, 'document', ?2, ?3, ?4, ?4)"
+            " ON CONFLICT(client_id) DO UPDATE SET name=excluded.name, redirect_uris=excluded.redirect_uris,"
+            "   fetched_at_ms=excluded.fetched_at_ms WHERE kind='document';", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, j->oa_client_id, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, j->oa_name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, j->oa_uris, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return oa_refuse(j, "server_error", OC_ERR_INTERNAL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_CLIENT);
+    if (r) { r->oa_client_id = strdup(j->oa_client_id); r->oa_name = strdup(j->oa_name); r->oa_uris = strdup(j->oa_uris); }
+    return r;
+}
+
+/* An authorize request, checked by the loop, against its client: a document
+ * not yet fetched or a day old is fetched first; a redirect URI the client
+ * did not declare is refused. Then a pending approval with a new handle and
+ * code, ten minutes long. */
+static oc_dbres *process_oauth_begin(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_client_id || !j->oa_redirect || !j->oa_challenge || !j->oa_state || !j->oa_resource)
+        return oa_refuse(j, "The request is incomplete.", OC_ERR_INTERNAL);
+    uint64_t now = dbw_now_ms();
+    /* Approvals an hour past their end are of no more use to anyone. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM oauth_approvals WHERE expires_at_ms < ?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(now > 3600000u ? now - 3600000u : 0));
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    char *name = NULL, *uris = NULL, *kind = NULL;
+    uint64_t fetched = 0;
+    if (sqlite3_prepare_v2(db, "SELECT name, redirect_uris, kind, fetched_at_ms FROM oauth_clients WHERE client_id=?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, j->oa_client_id, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            name = oa_col(st, 0); uris = oa_col(st, 1); kind = oa_col(st, 2);
+            fetched = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    int is_doc = oc_oauth_client_id_is_url(j->oa_client_id, 1);
+    if (is_doc && (!name || (kind && strcmp(kind, "document") == 0 && now >= fetched + OC_OAUTH_DOC_TTL_MS))) {
+        free(name); free(uris); free(kind);
+        return oa_res(j, OC_RES_OAUTH_NEED_FETCH);
+    }
+    free(kind);
+    if (!name || !uris) {
+        free(name); free(uris);
+        return oa_refuse(j, "This workspace does not know the client that sent you here.", OC_ERR_INTERNAL);
+    }
+    if (!oc_oauth_uris_has(uris, j->oa_redirect)) {
+        free(name); free(uris);
+        return oa_refuse(j, "The client asked to return somewhere it did not declare.", OC_ERR_INTERNAL);
+    }
+    free(uris);
+    char request[OC_OAUTH_TOKEN_MAX], code[OC_OAUTH_CODE_LEN + 1];
+    int ok = 0;
+    for (int tries = 0; tries < 4 && !ok; tries++) {
+        if (oc_oauth_mint(OC_OAUTH_REQUEST_PREFIX, request, sizeof request) != 0 || oc_oauth_approval_code(code) != 0) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO oauth_approvals(request_hash, code_hash, client_id, client_name, redirect_uri, code_challenge,"
+                " state, resource, created_at_ms, expires_at_ms, created_from)"
+                " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);", -1, &st, NULL) == SQLITE_OK) {
+            oa_bind_hash(st, 1, request);
+            oa_bind_hash(st, 2, code);
+            sqlite3_bind_text(st, 3, j->oa_client_id, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 5, j->oa_redirect, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 6, j->oa_challenge, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 7, j->oa_state, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 8, j->oa_resource, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 9, (sqlite3_int64)now);
+            sqlite3_bind_int64(st, 10, (sqlite3_int64)(now + OC_OAUTH_PENDING_TTL_MS));
+            sqlite3_bind_text(st, 11, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;   /* a code taken already: another try */
+        }
+        sqlite3_finalize(st);
+    }
+    if (!ok) { free(name); return oa_refuse(j, "The workspace could not take the request just now.", OC_ERR_INTERNAL); }
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_PAGE);
+    if (!r) { free(name); return NULL; }
+    r->oa_page = OC_OAUTH_PAGE_PENDING;
+    r->oa_name = name;
+    r->oa_request = strdup(request);
+    r->oa_code = strdup(code);
+    return r;
+}
+
+/* The page reloading itself, by its handle: still pending (the client's name;
+ * the code, kept hashed only, is the page's to carry in its reload), expired,
+ * or acted on -- collected once, as a redirect with an authorization code or
+ * access_denied. */
+static oc_dbres *process_oauth_poll(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    oc_dbres *r = NULL;
+    if (!j->oa_request) return oa_refuse(j, "This request is not one this workspace made.", OC_ERR_INTERNAL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, status, expires_at_ms, client_name, redirect_uri, state FROM oauth_approvals WHERE request_hash=?1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return oa_refuse(j, "The workspace could not look the request up.", OC_ERR_INTERNAL);
+    }
+    oa_bind_hash(st, 1, j->oa_request);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return oa_refuse(j, "This request is not one this workspace made, or it is over.", OC_ERR_INTERNAL);
+    }
+    uint64_t id = (uint64_t)sqlite3_column_int64(st, 0);
+    int status = sqlite3_column_int(st, 1);
+    uint64_t expires = (uint64_t)sqlite3_column_int64(st, 2);
+    char *name = oa_col(st, 3), *redirect = oa_col(st, 4), *state = oa_col(st, 5);
+    sqlite3_finalize(st);
+    if (status == 0 && now < expires) {
+        r = oa_res(j, OC_RES_OAUTH_PAGE);
+        if (r) { r->oa_page = OC_OAUTH_PAGE_PENDING; r->oa_name = name; name = NULL; }
+    } else if (status == 1 || status == 2) {
+        /* Collected once: the next reload finds it over. */
+        char code[OC_OAUTH_TOKEN_MAX] = "";
+        int ok = status == 2 || oc_oauth_mint(OC_OAUTH_CODE_PREFIX, code, sizeof code) == 0;
+        st = NULL;
+        if (ok && sqlite3_prepare_v2(db,
+                "UPDATE oauth_approvals SET status=3, auth_code_hash=?2, auth_code_until=?3 WHERE id=?1 AND status IN (1,2);",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+            if (status == 1) oa_bind_hash(st, 2, code);
+            else sqlite3_bind_null(st, 2);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)(status == 1 ? now + OC_OAUTH_CODE_TTL_MS : 0));
+            ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        } else ok = 0;
+        sqlite3_finalize(st);
+        if (!ok) r = oa_refuse(j, "The workspace could not finish the request.", OC_ERR_INTERNAL);
+        else if ((r = oa_res(j, OC_RES_OAUTH_REDIRECT))) {
+            r->oa_redirect = redirect; redirect = NULL;
+            r->oa_state = state; state = NULL;
+            if (status == 1) r->oa_code = strdup(code);
+            else r->oa_error = strdup("access_denied");
+        }
+    } else if (status == 0) {
+        r = oa_res(j, OC_RES_OAUTH_PAGE);
+        if (r) r->oa_page = OC_OAUTH_PAGE_EXPIRED;
+    } else {
+        r = oa_refuse(j, "This request is over: start again from the AI client.", OC_ERR_INTERNAL);
+    }
+    free(name); free(redirect); free(state);
+    return r;
+}
+
+/* The approval a person's code names, pending and in time: its id, the
+ * client's name and where it returns. 0, or -1. */
+static int oa_pending(sqlite3 *db, const char *typed, uint64_t *id, char **name, char **redirect) {
+    char code[OC_OAUTH_CODE_LEN + 1];
+    if (!typed || oc_oauth_code_normalize(typed, code) != 0) return -1;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, client_name, redirect_uri FROM oauth_approvals WHERE code_hash=?1 AND status=0 AND expires_at_ms > ?2;",
+            -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, code);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            *id = (uint64_t)sqlite3_column_int64(st, 0);
+            if (name) *name = oa_col(st, 1);
+            if (redirect) *redirect = oa_col(st, 2);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found ? 0 : -1;
+}
+
+static oc_dbres *process_oauth_code_find(sqlite3 *db, const oc_job *j) {
+    if (!oa_person(db, j->user_id)) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    uint64_t id = 0;
+    char *name = NULL, *redirect = NULL;
+    if (oa_pending(db, j->oa_code, &id, &name, &redirect) != 0) return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_APPROVAL);
+    if (!r) { free(name); free(redirect); return NULL; }
+    r->oa_name = name;
+    r->oa_redirect = redirect;
+    r->oa_code = strdup(j->oa_code);
+    return r;
+}
+
+static oc_dbres *process_oauth_decide(sqlite3 *db, const oc_job *j) {
+    if (!oa_person(db, j->user_id)) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    if (j->oa_approve && !oc_oauth_lifetime_ok(j->oa_lifetime)) return oa_refuse(j, NULL, OC_ERR_BAD_LIFETIME);
+    uint64_t id = 0;
+    char *name = NULL;
+    if (oa_pending(db, j->oa_code, &id, &name, NULL) != 0) return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE);
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "UPDATE oauth_approvals SET status=?2, approved_by=?3, lifetime_days=?4 WHERE id=?1 AND status=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_bind_int(st, 2, j->oa_approve ? 1 : 2);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)(j->oa_approve ? j->oa_lifetime : 0));
+        ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    if (!ok) { free(name); return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CODE); }
+    char detail[64];
+    if (j->oa_lifetime) snprintf(detail, sizeof detail, "lifetime=%u days", j->oa_lifetime);
+    else snprintf(detail, sizeof detail, "lifetime=never");
+    audit_actor(db, OC_AUDIT_ACCOUNT, j->oa_approve ? "mcp.connection_approve" : "mcp.connection_decline",
+                j->user_id, 0, name, 1, j->oa_approve ? detail : NULL);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_DECIDED);
+    if (r) { r->oa_name = name; name = NULL; r->oa_approve_echo = j->oa_approve; }
+    free(name);
+    return r;
+}
+
+/* A new access token for connection `conn`, its refresh token rotated: both
+ * into `r` (shown once), only their hashes kept. 0, or -1. */
+static int oa_issue(sqlite3 *db, uint64_t conn, oc_dbres *r) {
+    char access[OC_OAUTH_TOKEN_MAX], refresh[OC_OAUTH_TOKEN_MAX];
+    if (oc_oauth_mint(OC_OAUTH_ACCESS_PREFIX, access, sizeof access) != 0 ||
+        oc_oauth_mint(OC_OAUTH_REFRESH_PREFIX, refresh, sizeof refresh) != 0)
+        return -1;
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id=?1 AND expires_at_ms <= ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT INTO mcp_access_tokens(token_hash, connection_id, expires_at_ms) VALUES(?1, ?2, ?3);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, access);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)conn);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)(now + OC_OAUTH_ACCESS_TTL_MS));
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (ok && sqlite3_prepare_v2(db, "UPDATE mcp_connections SET refresh_hash=?2 WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+        oa_bind_hash(st, 2, refresh);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+    } else ok = 0;
+    sqlite3_finalize(st);
+    if (!ok) return -1;
+    r->oa_access = strdup(access);
+    r->oa_refresh = strdup(refresh);
+    return r->oa_access && r->oa_refresh ? 0 : -1;
+}
+
+static oc_dbres *process_oauth_exchange(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_code || !j->oa_verifier || !j->oa_redirect || !j->oa_client_id) return oa_refuse(j, "invalid_request", 0);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    uint64_t id = 0, user = 0, until = 0;
+    uint32_t days = 0;
+    char *client = NULL, *name = NULL, *redirect = NULL, *challenge = NULL, *resource = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, approved_by, lifetime_days, auth_code_until, client_id, client_name, redirect_uri, code_challenge, resource"
+            " FROM oauth_approvals WHERE auth_code_hash=?1 AND status=3;", -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, j->oa_code);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            id = (uint64_t)sqlite3_column_int64(st, 0);
+            user = (uint64_t)sqlite3_column_int64(st, 1);
+            days = (uint32_t)sqlite3_column_int64(st, 2);
+            until = (uint64_t)sqlite3_column_int64(st, 3);
+            client = oa_col(st, 4); name = oa_col(st, 5); redirect = oa_col(st, 6);
+            challenge = oa_col(st, 7); resource = oa_col(st, 8);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!id) return oa_refuse(j, "invalid_grant", 0);
+    /* Single use: whatever happens next, this code is spent. */
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE oauth_approvals SET auth_code_hash=NULL WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = NULL;
+    if (now > until || strcmp(client, j->oa_client_id) != 0 || strcmp(redirect, j->oa_redirect) != 0 ||
+        (j->oa_resource && j->oa_resource[0] && strcmp(j->oa_resource, resource) != 0) ||
+        !oc_oauth_pkce_ok(j->oa_verifier, challenge) || !oa_person(db, user)) {
+        r = oa_refuse(j, "invalid_grant", 0);
+    } else {
+        sqlite3_exec(db, "SAVEPOINT oauth_exchange;", NULL, NULL, NULL);
+        st = NULL;
+        uint64_t conn = 0;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO mcp_connections(user_id, client_id, client_name, resource, lifetime_days, expires_at_ms, created_at_ms)"
+                " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)user);
+            sqlite3_bind_text(st, 2, client, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, resource, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)days);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)(days ? now + (uint64_t)days * 86400000u : 0));
+            sqlite3_bind_int64(st, 7, (sqlite3_int64)now);
+            if (sqlite3_step(st) == SQLITE_DONE) conn = (uint64_t)sqlite3_last_insert_rowid(db);
+        }
+        sqlite3_finalize(st);
+        r = oa_res(j, OC_RES_OAUTH_TOKENS);
+        if (r && (!conn || oa_issue(db, conn, r) != 0)) {
+            sqlite3_exec(db, "ROLLBACK TO oauth_exchange;", NULL, NULL, NULL);
+            oc_dbres_free(r);
+            r = oa_refuse(j, "server_error", 0);
+        }
+        sqlite3_exec(db, "RELEASE oauth_exchange;", NULL, NULL, NULL);
+    }
+    free(client); free(name); free(redirect); free(challenge); free(resource);
+    return r;
+}
+
+static oc_dbres *process_oauth_refresh(sqlite3 *db, const oc_job *j) {
+    if (!j->oa_refresh || !j->oa_client_id) return oa_refuse(j, "invalid_request", 0);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms();
+    uint64_t conn = 0, user = 0, expires = 0, revoked = 0;
+    char *client = NULL, *resource = NULL, *name = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, user_id, expires_at_ms, revoked_at_ms, client_id, resource, client_name FROM mcp_connections"
+            " WHERE refresh_hash=?1;", -1, &st, NULL) == SQLITE_OK) {
+        oa_bind_hash(st, 1, j->oa_refresh);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            conn = (uint64_t)sqlite3_column_int64(st, 0);
+            user = (uint64_t)sqlite3_column_int64(st, 1);
+            expires = (uint64_t)sqlite3_column_int64(st, 2);
+            revoked = (uint64_t)sqlite3_column_int64(st, 3);
+            client = oa_col(st, 4); resource = oa_col(st, 5); name = oa_col(st, 6);
+        }
+    }
+    sqlite3_finalize(st);
+    const char *why = !conn ? "unknown" : revoked ? "revoked" : (expires && now >= expires) ? "expired"
+                    : strcmp(client, j->oa_client_id) != 0 ? "another client"
+                    : (j->oa_resource && j->oa_resource[0] && strcmp(j->oa_resource, resource) != 0) ? "another resource"
+                    : !oa_person(db, user) ? "removed" : NULL;
+    oc_dbres *r = NULL;
+    if (why) {
+        /* Refused: audited, the person as actor when the token was theirs. */
+        char detail[96];
+        snprintf(detail, sizeof detail, "refresh refused: %s", why);
+        if (user) audit_actor(db, OC_AUDIT_SECURITY, "mcp.refresh_refused", user, 0, name, 0, detail);
+        else audit_log(db, OC_AUDIT_SECURITY, "mcp.refresh_refused", 0, NULL, 0, NULL, 0, detail);
+        r = oa_refuse(j, "invalid_grant", 0);
+    } else {
+        r = oa_res(j, OC_RES_OAUTH_TOKENS);
+        if (r && oa_issue(db, conn, r) != 0) { oc_dbres_free(r); r = oa_refuse(j, "server_error", 0); }
+    }
+    free(client); free(resource); free(name);
+    return r;
+}
+
+/* The lookup a person's access token authenticates with at /mcp: the token in
+ * time, its connection neither revoked nor past its lifetime, its person a
+ * person still. Never cached. The connection's last use is written at most
+ * once a minute. */
+static oc_dbres *process_oauth_lookup(sqlite3 *db, const oc_job *j) {
+    if (!j->token || oc_oauth_token_of(j->token, j->token_len) != OC_OAUTH_TOKEN_PERSON) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    sqlite3_stmt *st = NULL;
+    uint64_t now = dbw_now_ms(), conn = 0, last = 0;
+    oc_dbres *r = NULL;
+    uint8_t h[32];
+    if (oc_oauth_hash(j->token, j->token_len, h) != 0) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.user_id, c.client_name, c.last_used_at_ms FROM mcp_access_tokens t"
+            " JOIN mcp_connections c ON c.id=t.connection_id JOIN users u ON u.id=c.user_id"
+            " WHERE t.token_hash=?1 AND t.expires_at_ms > ?2 AND c.revoked_at_ms=0"
+            "   AND (c.expires_at_ms=0 OR c.expires_at_ms > ?2) AND u.kind='human' AND u.disabled=0;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, h, sizeof h, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        if (sqlite3_step(st) == SQLITE_ROW && (r = oa_res(j, OC_RES_TOKEN_PRINCIPAL))) {
+            conn = (uint64_t)sqlite3_column_int64(st, 0);
+            r->message_id = conn;
+            r->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            r->oa_name = oa_col(st, 2);
+            r->oa_person = 1;
+            last = (uint64_t)sqlite3_column_int64(st, 3);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!r) return agent_refuse(j, OC_ERR_AUTH_INVALID_TOKEN);
+    if (now >= last + TOKEN_USE_EVERY_MS) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE mcp_connections SET last_used_at_ms=?2, last_used_from=?3 WHERE id=?1;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)conn);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+            sqlite3_bind_text (st, 3, j->token_from ? j->token_from : "", -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
+/* The connections still in force: the caller's own, or with `all` (an owner
+ * or admin) everyone's. */
+static void oa_list_into(sqlite3 *db, oc_dbres *r, uint64_t uid, int all) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT c.id, c.user_id, COALESCE(u.display_name, u.subject), c.client_name, c.created_at_ms, c.last_used_at_ms,"
+            " c.expires_at_ms, c.lifetime_days FROM mcp_connections c JOIN users u ON u.id=c.user_id"
+            " WHERE c.revoked_at_ms=0 AND (c.expires_at_ms=0 OR c.expires_at_ms > ?2) AND (?3=1 OR c.user_id=?1)"
+            " ORDER BY c.created_at_ms DESC, c.id DESC LIMIT 500;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_int(st, 3, all ? 1 : 0);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            oc_conn_row *g = realloc(r->oa_conns, (r->n_oa_conns + 1) * sizeof *g);
+            if (!g) break;
+            r->oa_conns = g;
+            oc_conn_row *c = &r->oa_conns[r->n_oa_conns++];
+            c->id = (uint64_t)sqlite3_column_int64(st, 0);
+            c->user_id = (uint64_t)sqlite3_column_int64(st, 1);
+            c->user_name = oa_col(st, 2);
+            c->client_name = oa_col(st, 3);
+            c->created_ms = (uint64_t)sqlite3_column_int64(st, 4);
+            c->last_used_ms = (uint64_t)sqlite3_column_int64(st, 5);
+            c->expires_ms = (uint64_t)sqlite3_column_int64(st, 6);
+            c->lifetime_days = (uint32_t)sqlite3_column_int64(st, 7);
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_oauth_list(sqlite3 *db, const oc_job *j) {
+    if (j->oa_all && get_role(db, j->user_id) < OC_ROLE_ADMIN) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_LIST);
+    if (!r) return NULL;
+    r->oa_approve_echo = j->oa_all;
+    oa_list_into(db, r, j->user_id, j->oa_all);
+    return r;
+}
+
+/* Revoking: one's own, or anyone's as an owner or admin. Audited in the
+ * account family for one's own, the administrative for another's. */
+static oc_dbres *process_oauth_revoke(sqlite3 *db, const oc_job *j) {
+    int admin = get_role(db, j->user_id) >= OC_ROLE_ADMIN;
+    if (j->oa_all && !admin) return oa_refuse(j, NULL, OC_ERR_FORBIDDEN);
+    sqlite3_stmt *st = NULL;
+    uint64_t owner = 0;
+    char *name = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT user_id, client_name FROM mcp_connections WHERE id=?1 AND revoked_at_ms=0;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        if (sqlite3_step(st) == SQLITE_ROW) { owner = (uint64_t)sqlite3_column_int64(st, 0); name = oa_col(st, 1); }
+    }
+    sqlite3_finalize(st);
+    if (!owner || (owner != j->user_id && !admin)) { free(name); return oa_refuse(j, NULL, OC_ERR_UNKNOWN_CONNECTION); }
+    sqlite3_exec(db, "SAVEPOINT oauth_revoke;", NULL, NULL, NULL);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE mcp_connections SET revoked_at_ms=?2, refresh_hash=NULL WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM mcp_access_tokens WHERE connection_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->oa_conn_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "RELEASE oauth_revoke;", NULL, NULL, NULL);
+    char detail[48];
+    snprintf(detail, sizeof detail, "connection=%llu", (unsigned long long)j->oa_conn_id);
+    audit_actor(db, owner == j->user_id ? OC_AUDIT_ACCOUNT : OC_AUDIT_ADMIN, "mcp.connection_revoke", j->user_id,
+                owner, name, 1, detail);
+    free(name);
+    oc_dbres *r = oa_res(j, OC_RES_OAUTH_LIST);
+    if (!r) return NULL;
+    r->oa_approve_echo = j->oa_all;
+    oa_list_into(db, r, j->user_id, j->oa_all);
     return r;
 }
 
@@ -10452,8 +13595,11 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_text (st, 5, j->pf_timezone  ? j->pf_timezone  : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
     sqlite3_bind_text (st, 7, j->pf_voice_id  ? j->pf_voice_id  : "", -1, SQLITE_TRANSIENT);
+    int own = owh_txn_begin(db);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    owh_user_change(db, j->user_id);
+    owh_txn_end(db, own);
     build_profile(db, j->user_id, r);
     r->pf_fanout = 1;
     return r;
@@ -12271,6 +15417,125 @@ static oc_dbres *process_tts_touch(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* A message's speech was looked up under a handle (REQ-250): recorded, so the
+ * rendering goes when the message ages out. Fire and forget, as a touch is. */
+static oc_dbres *process_tts_use(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO rendered_audio_uses(message_id, handle)"
+            " SELECT id, ?2 FROM messages WHERE id = ?1;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_blob (st, 2, j->tts_handle, 32, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* The export of a video message (ARCH-135). The gate is the download's: the
+ * copy is the video, so whoever may read the video may have it. Then it must be
+ * a video message -- an attachment with a media row of kind 1 -- whose bytes are
+ * still here and are not an encrypted DM's ciphertext. The answer names the
+ * copy already made for these codecs, or the source to make it from. */
+static oc_dbres *process_export_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->exp_attachment_id = j->attachment_id;
+    r->type = OC_RES_EXPORT_ERR;
+    r->err_code = OC_ERR_UNKNOWN_ATTACHMENT;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT a.channel_id, a.storage_key, a.size, a.reclaimed_at_ms, m.kind"
+            "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id"
+            " WHERE a.id = ?1 AND a.sha256 IS NOT NULL AND a.message_id IS NOT NULL;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return r; }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0);
+    const char *key = (const char *)sqlite3_column_text(st, 1);
+    char *src_key = strdup(key ? key : "");
+    uint64_t size = (uint64_t)sqlite3_column_int64(st, 2);
+    int gone = sqlite3_column_int64(st, 3) != 0;
+    int video = sqlite3_column_type(st, 4) != SQLITE_NULL && sqlite3_column_int(st, 4) == 1;
+    sqlite3_finalize(st);
+    if (!src_key) { r->err_code = OC_ERR_INTERNAL; return r; }
+    if (!channel_read_access(db, cid, j->user_id)) { free(src_key); r->err_code = OC_ERR_FORBIDDEN; return r; }
+    if (gone) { free(src_key); r->err_code = OC_ERR_ATTACHMENT_GONE; return r; }
+    if (!video || channel_is_e2e(db, cid)) { free(src_key); r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+
+    r->type = OC_RES_EXPORT_META;
+    r->channel_id = cid;
+    r->exp_src_key = src_key;
+    r->exp_src_size = size;
+    if (sqlite3_prepare_v2(db,
+            "SELECT blob_key, bytes, duration_ms FROM exported_video"
+            " WHERE attachment_id = ?1 AND version = ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+        sqlite3_bind_text(st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *bk = (const char *)sqlite3_column_text(st, 0);
+            r->exp_blob_key = strdup(bk ? bk : "");
+            r->exp_bytes = (uint64_t)sqlite3_column_int64(st, 1);
+            r->exp_duration_ms = (uint32_t)sqlite3_column_int(st, 2);
+            r->exp_cached = r->exp_blob_key != NULL;
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* A finished copy becomes a cache row, unless its video went while it was being
+ * made: then the row would point at a copy of nothing, and the blob is left for
+ * the orphan sweep. Write, fire and forget. */
+static oc_dbres *process_export_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO exported_video"
+            "  (attachment_id, version, blob_key, bytes, duration_ms, created_at_ms, last_used_ms)"
+            "  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?6 FROM attachments"
+            "   WHERE id = ?1 AND reclaimed_at_ms = 0;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    sqlite3_bind_text (st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, j->exp_blob_key ? j->exp_blob_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->exp_bytes);
+    sqlite3_bind_int  (st, 5, (int)j->exp_duration_ms);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Serving a stored copy makes it recently used, which is what the storage sweep
+ * evicts by. Write, fire and forget. */
+static oc_dbres *process_export_touch(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE exported_video SET last_used_ms = ?3 WHERE attachment_id = ?1 AND version = ?2;",
+            -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    sqlite3_bind_text (st, 2, j->exp_version ? j->exp_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
 /* Write back the voice the daemon chose for an author, once, so the profile
  * shows it. Never overwrites a voice the user set. Write, fire and forget. */
 static oc_dbres *process_tts_voice_set(sqlite3 *db, const oc_job *j) {
@@ -12310,10 +15575,13 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_FILE_CHANNELS || type == OC_JOB_LIST_SESSIONS ||
            type == OC_JOB_LIST_EMOJI || type == OC_JOB_GET_CHANNEL_DESCRIPTION ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
-           type == OC_JOB_CALL_AUTH ||
+           type == OC_JOB_CALL_AUTH || type == OC_JOB_CALL_HISTORY || type == OC_JOB_CALL_DETAIL ||
+           type == OC_JOB_RECORDINGS_PENDING || type == OC_JOB_REC_PEOPLE ||
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY || type == OC_JOB_USAGE || type == OC_JOB_LIST_BLOCKS ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
+           type == OC_JOB_EXPORT_LOOKUP || type == OC_JOB_PREVIEW_LOOKUP ||
+           type == OC_JOB_MCP_CHANNELS || type == OC_JOB_MCP_READ || type == OC_JOB_MCP_SEARCH ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
            type == OC_JOB_SUMMARY_LOOKUP || type == OC_JOB_LIST_POLL_VOTERS;
 }
@@ -12345,6 +15613,11 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_BLOCKS)    return process_list_blocks(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
+    if (j->type == OC_JOB_EXPORT_LOOKUP)  return process_export_lookup(rdb, j);
+    if (j->type == OC_JOB_PREVIEW_LOOKUP) return process_preview_lookup(rdb, j);
+    if (j->type == OC_JOB_MCP_CHANNELS)  return process_mcp_channels(rdb, j);
+    if (j->type == OC_JOB_MCP_READ)      return process_mcp_read(rdb, j);
+    if (j->type == OC_JOB_MCP_SEARCH)    return process_mcp_search(rdb, j);
     if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
@@ -12356,6 +15629,10 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
+    if (j->type == OC_JOB_CALL_HISTORY)   return process_call_history(rdb, j);
+    if (j->type == OC_JOB_CALL_DETAIL)    return process_call_detail(rdb, j);
+    if (j->type == OC_JOB_RECORDINGS_PENDING) return process_recordings_pending(rdb, j);
+    if (j->type == OC_JOB_REC_PEOPLE)         return process_rec_people(rdb, j);
     return NULL;
 }
 
@@ -12842,6 +16119,11 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SUMMARY_SEEN)  return process_summary_seen(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
+    if (j->type == OC_JOB_TTS_USE)       return process_tts_use(w->db, j);
+    if (j->type == OC_JOB_EXPORT_STORE)  return process_export_store(w->db, j);
+    if (j->type == OC_JOB_EXPORT_TOUCH)  return process_export_touch(w->db, j);
+    if (j->type == OC_JOB_PREVIEW_STORE) return process_preview_store(w->db, j);
+    if (j->type == OC_JOB_PREVIEW_TOUCH) return process_preview_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w, j);
     if (j->type == OC_JOB_RESTORE)       return process_restore(w, j);
@@ -12849,6 +16131,30 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
     if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
     if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
+    if (j->type == OC_JOB_AGENT_CREATE)   return process_agent_create(w->db, j);
+    if (j->type == OC_JOB_AGENT_REMOVE)   return process_agent_remove(w->db, j);
+    if (j->type == OC_JOB_TOKEN_MINT)     return process_token_mint(w->db, j);
+    if (j->type == OC_JOB_TOKEN_LIST)     return process_token_list(w->db, j);
+    if (j->type == OC_JOB_TOKEN_REVOKE)   return process_token_revoke(w->db, j);
+    if (j->type == OC_JOB_TOKEN_LOOKUP)   return process_token_lookup(w->db, j);
+    if (j->type == OC_JOB_MCP_AUDIT)      return process_mcp_audit(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REGISTER)  return process_oauth_register(w->db, j);
+    if (j->type == OC_JOB_OAUTH_DOC_STORE) return process_oauth_doc_store(w->db, j);
+    if (j->type == OC_JOB_OAUTH_BEGIN)     return process_oauth_begin(w->db, j);
+    if (j->type == OC_JOB_OAUTH_POLL)      return process_oauth_poll(w->db, j);
+    if (j->type == OC_JOB_OAUTH_CODE_FIND) return process_oauth_code_find(w->db, j);
+    if (j->type == OC_JOB_OAUTH_DECIDE)    return process_oauth_decide(w->db, j);
+    if (j->type == OC_JOB_OAUTH_EXCHANGE)  return process_oauth_exchange(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REFRESH)   return process_oauth_refresh(w->db, j);
+    if (j->type == OC_JOB_OAUTH_LOOKUP)    return process_oauth_lookup(w->db, j);
+    if (j->type == OC_JOB_OAUTH_LIST)      return process_oauth_list(w->db, j);
+    if (j->type == OC_JOB_OAUTH_REVOKE)    return process_oauth_revoke(w->db, j);
+    if (j->type == OC_JOB_OUTWH_CREATE)   return process_owh_create(w, j);
+    if (j->type == OC_JOB_OUTWH_LIST)     return process_owh_list(w->db, j);
+    if (j->type == OC_JOB_OUTWH_SET)      return process_owh_set(w->db, j);
+    if (j->type == OC_JOB_OUTWH_DELETE)   return process_owh_delete(w->db, j);
+    if (j->type == OC_JOB_OUTWH_TAKE)     return process_owh_take(w->db, j);
+    if (j->type == OC_JOB_OUTWH_DONE)     return process_owh_done(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_E2E_CLOSE)      return process_e2e_close(w->db, j);
@@ -12912,7 +16218,13 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_WEBHOOK_STATE) return process_set_webhook_state(w->db, j);
     if (j->type == OC_JOB_ROTATE_WEBHOOK)    return process_rotate_webhook(w->db, j);
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
-    if (j->type == OC_JOB_CALL_EVENT)      return process_call_event(w->db, j);
+    if (j->type == OC_JOB_CALL_START)      return process_call_start(w->db, j);
+    if (j->type == OC_JOB_CALL_LOG)        return process_call_log(w->db, j);
+    if (j->type == OC_JOB_CALL_DELETE)     return process_call_delete(w->db, j);
+    if (j->type == OC_JOB_CALL_TRANSCRIPT) return process_call_transcript(w->db, j);
+    if (j->type == OC_JOB_RECORDING_START) return process_recording_start(w->db, j);
+    if (j->type == OC_JOB_RECORDING_STOP)  return process_recording_stop(w->db, j);
+    if (j->type == OC_JOB_RECORDING_DONE)  return process_recording_done(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_CHANNEL_THREAD_FOLLOW) return process_set_channel_thread_follow(w->db, j);
@@ -13198,8 +16510,18 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
  * evidence. Each family is pruned against its own age budget instead, so
  * security noise can only evict security noise. */
 static void prune_audit(sqlite3 *db, uint64_t max_age_ms) {
-    if (!max_age_ms) return;
     uint64_t now = dbw_now_ms();
+    /* The MCP access family has its own age, whatever the others' (REQ-325). */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "DELETE FROM audit_log WHERE family=?1 AND at_ms < ?2;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(st, 1, OC_AUDIT_MCP);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(now > OC_AUDIT_MCP_KEEP_MS ? now - OC_AUDIT_MCP_KEEP_MS : 0));
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    if (!max_age_ms) return;
     uint64_t cutoff = (now > max_age_ms) ? now - max_age_ms : 0;
     static const int FAMILIES[] = { OC_AUDIT_ADMIN, OC_AUDIT_ACCOUNT,
                                     OC_AUDIT_SECURITY, OC_AUDIT_MODERATION };
@@ -13271,6 +16593,291 @@ static void reclaim_poster_of(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t vid
 /* Run one maintenance pass. Three tiers in order, stopping at the batch cap so a
  * badly over-limit box recovers across several passes instead of stalling the
  * daemon in one long sweep (REQ-212/218). */
+/* Calls' recordings kept their days (OPENCHIME_CALL_RECORDING_DAYS, CALLS.md
+ * §8): one whose call ended longer ago goes -- its bytes as any file reclaimed,
+ * the message that carried it showing it gone, and its row. Sixteen a pass.
+ * (The space cap is kept at the start: at it, no recording starts.) */
+static void prune_recordings(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now, uint32_t days) {
+    uint64_t keep = (uint64_t)days * 24ull * 60 * 60 * 1000;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT r.id, a.id, a.storage_key FROM call_recordings r"
+            "  JOIN calls c ON c.id = r.call_id JOIN attachments a ON a.id = r.attachment_id"
+            " WHERE r.state = 'ready' AND c.ended_at_ms IS NOT NULL AND c.ended_at_ms < ?1 ORDER BY r.id LIMIT 16;",
+            -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return; }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(now > keep ? now - keep : 0));
+    uint64_t gone[16]; int ng = 0;
+    while (ng < 16 && r->n_reclaim < cap && sqlite3_step(st) == SQLITE_ROW) {
+        reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 1), (const char *)sqlite3_column_text(st, 2), now,
+                    OC_RECLAIM_EXPIRED);
+        gone[ng++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    for (int i = 0; i < ng; i++) {
+        sqlite3_int64 v[1] = { (sqlite3_int64)gone[i] };
+        call_exec(db, "DELETE FROM call_recordings WHERE id=?1;", 1, v, 0, NULL);
+    }
+}
+
+/* Message retention (REQ-250). Run a statement over the set in temp.aged_ids. */
+static void aged_exec(sqlite3 *db, const char *sql) {
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
+/* Every table that names a message by `message_id` -- found from the schema, as
+ * purge_channel does, so a table added later is not missed -- loses the rows
+ * naming the messages in temp.aged_ids. Attachments are not among them: they
+ * are detached, not deleted, so the orphan sweep reclaims their bytes. */
+static void aged_delete_named(sqlite3 *db) {
+    sqlite3_stmt *t = NULL;
+    char names[64][64]; int n = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.name FROM sqlite_master m JOIN pragma_table_info(m.name) p "
+            " WHERE m.type='table' AND m.name NOT IN ('messages','attachments') "
+            "   AND m.name NOT LIKE 'messages_fts%' AND m.name NOT LIKE 'sqlite_%' "
+            "   AND p.name = 'message_id';", -1, &t, NULL) == SQLITE_OK) {
+        while (sqlite3_step(t) == SQLITE_ROW && n < 64)
+            snprintf(names[n++], sizeof names[0], "%s", (const char *)sqlite3_column_text(t, 0));
+    }
+    sqlite3_finalize(t);
+    for (int i = 0; i < n; i++) {
+        char sql[192];
+        snprintf(sql, sizeof sql, "DELETE FROM \"%.63s\" WHERE message_id IN (SELECT id FROM temp.aged_ids);", names[i]);
+        aged_exec(db, sql);
+    }
+}
+
+/* Remove by age every message older than `keep_ms`, a thread only whole: a
+ * top-level message goes with all its replies once it and its newest reply are
+ * both past the age, and not before. At most `batch` threads a pass, so a long
+ * backlog clears over several. With each message go its search entries (the
+ * delete trigger), every row naming it, every summary built on it and every
+ * read-aloud rendering it was spoken under; its attachments are detached for
+ * the orphan sweep. A forward of it elsewhere keeps its excerpt: that belongs
+ * to the forward, which ages out by its own time. */
+static void purge_aged(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now, uint64_t keep_ms, uint32_t batch) {
+    if (!keep_ms) return;
+    const uint64_t cutoff = now > keep_ms ? now - keep_ms : 0;
+    uint64_t roots[256]; int nr = 0;
+    if (batch == 0 || batch > 256) batch = 256;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.id FROM messages m WHERE m.parent_id IS NULL AND m.created_at_ms < ?1"
+            "   AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.parent_id = m.id AND x.created_at_ms >= ?1)"
+            " ORDER BY m.id LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)batch);
+        while (sqlite3_step(st) == SQLITE_ROW && nr < 256) roots[nr++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!nr) return;
+
+    aged_exec(db, "CREATE TEMP TABLE IF NOT EXISTS aged_ids(id INTEGER PRIMARY KEY);");
+    aged_exec(db, "DELETE FROM temp.aged_ids;");
+    /* A thread whose renderings would not fit what is left of this pass's
+     * reclaim list waits for the next pass, rather than leaving bytes behind. */
+    for (int i = 0; i < nr; i++) {
+        int64_t renders = 0;
+        if (sqlite3_prepare_v2(db,
+                "SELECT COUNT(*) FROM rendered_audio a WHERE a.handle IN"
+                " (SELECT u.handle FROM rendered_audio_uses u JOIN messages m ON m.id = u.message_id"
+                "   WHERE m.id = ?1 OR m.parent_id = ?1);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            if (sqlite3_step(st) == SQLITE_ROW) renders = sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        if (r->n_reclaim + (size_t)renders > cap) break;
+        if (sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO temp.aged_ids(id) SELECT id FROM messages WHERE id = ?1 OR parent_id = ?1;",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+        /* Its renderings: the rows go now and their bytes with this pass. */
+        if (sqlite3_prepare_v2(db,
+                "DELETE FROM rendered_audio WHERE handle IN"
+                " (SELECT u.handle FROM rendered_audio_uses u JOIN messages m ON m.id = u.message_id"
+                "   WHERE m.id = ?1 OR m.parent_id = ?1) RETURNING blob_key;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)roots[i]);
+            while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+                const char *key = (const char *)sqlite3_column_text(st, 0);
+                char *dup = key ? strdup(key) : NULL;
+                if (!dup) continue;
+                r->reclaim[r->n_reclaim].storage_key = dup;
+                r->reclaim[r->n_reclaim].attachment_id = 0;
+                r->n_reclaim++;
+                r->maint_renders++;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* Summaries first, while the messages they were built on can still be read. */
+    if (sqlite3_prepare_v2(db, "SELECT id FROM temp.aged_ids ORDER BY id;", -1, &st, NULL) == SQLITE_OK)
+        while (sqlite3_step(st) == SQLITE_ROW) sum_purge_msg(db, (uint64_t)sqlite3_column_int64(st, 0));
+    sqlite3_finalize(st);
+
+    aged_exec(db, "DELETE FROM snippets_fts WHERE rowid IN"
+                  " (SELECT id FROM attachments WHERE message_id IN (SELECT id FROM temp.aged_ids));");
+    aged_exec(db, "UPDATE attachments SET message_id = NULL WHERE message_id IN (SELECT id FROM temp.aged_ids);");
+    aged_delete_named(db);
+    aged_exec(db, "DELETE FROM thread_follows WHERE root_id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM thread_reads WHERE root_id IN (SELECT id FROM temp.aged_ids);");
+    /* Replies before their roots: a reply names its root. */
+    aged_exec(db, "DELETE FROM messages WHERE parent_id IS NOT NULL AND id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM messages WHERE id IN (SELECT id FROM temp.aged_ids);");
+    aged_exec(db, "DELETE FROM temp.aged_ids;");
+}
+
+/* A change of retention is audited (REQ-250, REQ-251): it is the operator's
+ * setting, read at start, so at start the writer compares it with the value the
+ * newest `retention.change` entry recorded (none recorded: off) and, when they
+ * differ, records one administrative entry, by no user, old and new in
+ * `detail`. An unchanged value records nothing. */
+static void retention_audit(sqlite3 *db, int days) {
+    int was = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT detail FROM audit_log WHERE action = 'retention.change' ORDER BY id DESC LIMIT 1;",
+                           -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        const char *d = (const char *)sqlite3_column_text(st, 0);
+        const char *n = d ? strstr(d, "new=") : NULL;
+        if (n) was = atoi(n + 4);
+    }
+    sqlite3_finalize(st);
+    if (was == days) return;
+    char detail[64];
+    snprintf(detail, sizeof detail, "old=%d new=%d", was, days);
+    audit_log(db, OC_AUDIT_ADMIN, "retention.change", 0, NULL, 0, "workspace", 1, detail);
+}
+
+/* Count of one statement bound to one id. */
+static int64_t aged_count(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    int64_t n = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Run one statement bound to one id, queueing each blob key it RETURNs for
+ * reclaim as the daemon's own work (no attachment row behind it). */
+static void aged_reclaim_keys(sqlite3 *db, oc_dbres *r, size_t cap, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            const char *key = (const char *)sqlite3_column_text(st, 0);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            r->reclaim[r->n_reclaim].storage_key = dup;
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+static void aged_exec_id(sqlite3 *db, const char *sql, uint64_t id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Remove by age every call that ended longer ago than `keep_ms` (REQ-250): its
+ * people, invitations, timeline, recordings, transcripts and its chat, whose
+ * files -- the recording among them -- their previews and exported copies, and every
+ * read-aloud rendering of its messages are reclaimed. The message a call left
+ * in the conversation it was started from is a message, and ages by its own
+ * time; until then it stays, naming no call. A call not yet ended never goes.
+ * At most `batch` calls a pass, and a call whose bytes would not fit what is
+ * left of this pass's reclaim list waits for the next. */
+static void purge_aged_calls(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t now, uint64_t keep_ms, uint32_t batch) {
+    if (!keep_ms) return;
+    const uint64_t cutoff = now > keep_ms ? now - keep_ms : 0;
+    uint64_t calls[256]; int nc = 0;
+    if (batch == 0 || batch > 256) batch = 256;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id FROM calls WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1 ORDER BY id LIMIT ?2;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)batch);
+        while (sqlite3_step(st) == SQLITE_ROW && nc < 256) calls[nc++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    for (int i = 0; i < nc; i++) {
+        const uint64_t call = calls[i];
+        /* What its chat's bytes need of the reclaim list: every file not yet
+         * reclaimed, every exported copy of one, every rendering of a message. */
+        int64_t need =
+            aged_count(db, "SELECT COUNT(*) FROM attachments a JOIN channels c ON c.id = a.channel_id"
+                           " WHERE c.call_id = ?1 AND a.reclaimed_at_ms = 0;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM exported_video e JOIN attachments a ON a.id = e.attachment_id"
+                           " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM attachment_previews p JOIN attachments a ON a.id = p.attachment_id"
+                           " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1;", call) +
+            aged_count(db, "SELECT COUNT(*) FROM rendered_audio WHERE handle IN (SELECT u.handle FROM rendered_audio_uses u"
+                           " JOIN messages m ON m.id = u.message_id JOIN channels c ON c.id = m.channel_id WHERE c.call_id = ?1);", call);
+        if (r->n_reclaim + (size_t)need > cap) break;
+
+        /* The chat's files, the recording among them: tombstoned and queued. */
+        if (sqlite3_prepare_v2(db, "SELECT a.id, a.storage_key FROM attachments a JOIN channels c ON c.id = a.channel_id"
+                                   " WHERE c.call_id = ?1 AND a.reclaimed_at_ms = 0;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+            while (sqlite3_step(st) == SQLITE_ROW)
+                reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0), (const char *)sqlite3_column_text(st, 1),
+                            now, OC_RECLAIM_EXPIRED);
+        }
+        sqlite3_finalize(st);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM exported_video WHERE attachment_id IN (SELECT a.id FROM attachments a"
+            " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) RETURNING blob_key;", call);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM attachment_previews WHERE attachment_id IN (SELECT a.id FROM attachments a"
+            " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) RETURNING storage_key;", call);
+        aged_reclaim_keys(db, r, cap,
+            "DELETE FROM rendered_audio WHERE handle IN (SELECT u.handle FROM rendered_audio_uses u"
+            " JOIN messages m ON m.id = u.message_id JOIN channels c ON c.id = m.channel_id WHERE c.call_id = ?1)"
+            " RETURNING blob_key;", call);
+
+        /* The call's own rows, then its chat and the chat's files, then the call. */
+        aged_exec_id(db, "UPDATE messages SET call_id = NULL WHERE call_id = ?1 AND channel_id NOT IN"
+                         " (SELECT id FROM channels WHERE call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM call_recordings WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_transcript_lines WHERE transcript_id IN"
+                         " (SELECT id FROM call_transcripts WHERE call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM call_transcripts WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_events WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_invitees WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM call_participants WHERE call_id = ?1;", call);
+        aged_exec_id(db, "DELETE FROM snippets_fts WHERE rowid IN (SELECT a.id FROM attachments a"
+                         " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1);", call);
+        aged_exec_id(db, "DELETE FROM attachment_media WHERE attachment_id IN (SELECT a.id FROM attachments a"
+                         " JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1) OR poster_id IN"
+                         " (SELECT a.id FROM attachments a JOIN channels c ON c.id = a.channel_id WHERE c.call_id = ?1);", call);
+        uint64_t chats[8]; int nch = 0;
+        if (sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE call_id = ?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)call);
+            while (sqlite3_step(st) == SQLITE_ROW && nch < 8) chats[nch++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        for (int k = 0; k < nch; k++) {
+            /* The files go first, by message and by channel, so purge_channel
+             * meets no row naming them. */
+            aged_exec_id(db, "UPDATE attachments SET message_id = NULL WHERE channel_id = ?1;", chats[k]);
+            aged_exec_id(db, "DELETE FROM attachments WHERE channel_id = ?1;", chats[k]);
+            purge_channel(db, chats[k]);
+        }
+        aged_exec_id(db, "DELETE FROM calls WHERE id = ?1;", call);
+    }
+}
+
 static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -13296,6 +16903,20 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_finalize(st);
     st = NULL;
+    /* Calls' recordings kept their days (OPENCHIME_CALL_RECORDING_DAYS, CALLS.md
+     * §8): one older, from its call's end, goes -- its bytes and its row; the
+     * message that carried it shows it gone, as any file reclaimed. */
+    if (j->maint_rec_days) prune_recordings(db, r, cap, now, j->maint_rec_days);
+    /* Message retention (REQ-250): messages, and calls, past the age go, in one
+     * transaction, a bounded batch a pass. */
+    if (j->maint_retention_days) {
+        const uint64_t keep = (uint64_t)j->maint_retention_days * 24ull * 60 * 60 * 1000;
+        const uint32_t batch = j->maint_batch ? j->maint_batch : 64;
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        purge_aged(db, r, cap, now, keep, batch);
+        purge_aged_calls(db, r, cap, now, keep, batch);
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    }
 
     /* Tier 0 (ARCH-111): read-aloud renderings, before anything a user uploaded.
      * A rendering is the daemon's own work and can be made again from the message
@@ -13336,6 +16957,91 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             }
             sqlite3_finalize(st);
         }
+    }
+
+    /* Exported copies (ARCH-135) go with their video: every pass, pressure or
+     * not, a copy whose video has been reclaimed is deleted. Then, under
+     * pressure, they are reclaimed with the read-aloud renderings above, least
+     * recently used first: a copy is the daemon's own work and is made again
+     * from its video, so it is as cheap to lose. No tombstone either. */
+    for (int under_pressure = 0; under_pressure < 2 && r->n_reclaim < cap; under_pressure++) {
+        if (under_pressure && !j->maint_evict) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db, under_pressure
+                ? "SELECT attachment_id, version, blob_key FROM exported_video"
+                  " ORDER BY last_used_ms ASC LIMIT ?1;"
+                : "SELECT e.attachment_id, e.version, e.blob_key FROM exported_video e"
+                  "  JOIN attachments a ON a.id = e.attachment_id"
+                  " WHERE a.reclaimed_at_ms != 0 LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(cap - r->n_reclaim));
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            sqlite3_int64 att = sqlite3_column_int64(st, 0);
+            const unsigned char *ver = sqlite3_column_text(st, 1);
+            const char *key = (const char *)sqlite3_column_text(st, 2);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            sqlite3_stmt *del = NULL;
+            int gone = 0;
+            if (sqlite3_prepare_v2(db, "DELETE FROM exported_video WHERE attachment_id = ?1 AND version = ?2;",
+                                   -1, &del, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(del, 1, att);
+                sqlite3_bind_text(del, 2, ver ? (const char *)ver : "", -1, SQLITE_TRANSIENT);
+                gone = sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0;
+                sqlite3_finalize(del);
+            }
+            if (!gone) { free(dup); continue; }
+            r->reclaim[r->n_reclaim].storage_key = dup;     /* not an attachment: the key alone */
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+            r->maint_renders++;
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* Image previews (ARCH-137) are derived data too, and go the same way as
+     * the exported copies: every pass, pressure or not, a preview whose
+     * attachment's bytes are gone (reclaimed, or the row itself deleted) goes
+     * with them; and under pressure, least recently served first, before any
+     * attachment tier below. No tombstone: a client that finds a rung missing
+     * shows the original. */
+    for (int under_pressure = 0; under_pressure < 2 && r->n_reclaim < cap; under_pressure++) {
+        if (under_pressure && !j->maint_evict) break;
+        st = NULL;
+        if (sqlite3_prepare_v2(db, under_pressure
+                ? "SELECT attachment_id, rung, storage_key FROM attachment_previews"
+                  " ORDER BY last_used_ms ASC LIMIT ?1;"
+                : "SELECT p.attachment_id, p.rung, p.storage_key FROM attachment_previews p"
+                  "  LEFT JOIN attachments a ON a.id = p.attachment_id"
+                  " WHERE a.id IS NULL OR a.reclaimed_at_ms != 0 LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(cap - r->n_reclaim));
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            sqlite3_int64 att = sqlite3_column_int64(st, 0);
+            int rung = sqlite3_column_int(st, 1);
+            const char *key = (const char *)sqlite3_column_text(st, 2);
+            char *dup = key ? strdup(key) : NULL;
+            if (!dup) continue;
+            sqlite3_stmt *del = NULL;
+            int gone = 0;
+            if (sqlite3_prepare_v2(db, "DELETE FROM attachment_previews WHERE attachment_id = ?1 AND rung = ?2;",
+                                   -1, &del, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(del, 1, att);
+                sqlite3_bind_int(del, 2, rung);
+                gone = sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0;
+                sqlite3_finalize(del);
+            }
+            if (!gone) { free(dup); continue; }
+            r->reclaim[r->n_reclaim].storage_key = dup;     /* not an attachment: the key alone */
+            r->reclaim[r->n_reclaim].attachment_id = 0;
+            r->n_reclaim++;
+            r->maint_previews++;
+        }
+        sqlite3_finalize(st);
     }
 
     /* Tier 1 (REQ-213): orphans — uploaded but never referenced by a message,
@@ -13868,6 +17574,12 @@ oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w) {
 }
 
 int oc_dbwriter_eventfd(oc_dbwriter *w) { return w->evfd; }
+
+int oc_dbwriter_factor_key(oc_dbwriter *w, uint8_t key[OC_FACTOR_KEY_LEN]) {
+    if (!w || !w->have_factor_key) return -1;
+    memcpy(key, w->factor_key, OC_FACTOR_KEY_LEN);
+    return 0;
+}
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
@@ -14465,6 +18177,9 @@ oc_dbwriter *oc_dbwriter_start_boot(const char *path, oc_dbwriter_boot *b) {
      * request waits again, watched by nobody, and is made and told as a notice
      * (migration 0059). */
     sqlite3_exec(w->db, "UPDATE summary_requests SET state='queued', conn_id=0, req_id=0;", NULL, NULL, NULL);
+    /* A call open when the daemon stopped ended then (CALLS.md §1). */
+    calls_close_stopped(w->db);
+    retention_audit(w->db, oc_config_get()->retention_days);
     if (local_issuer_load(w) != 0) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;
@@ -14585,7 +18300,9 @@ int oc_db_blob_referenced(void *db_path, const char *const *keys, size_t n, uint
     int rc = -1;
     if (sqlite3_prepare_v2(db,
             "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_key=?1)"
-            "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1);",
+            "    OR EXISTS(SELECT 1 FROM rendered_audio WHERE blob_key=?1)"
+            "    OR EXISTS(SELECT 1 FROM exported_video WHERE blob_key=?1)"
+            "    OR EXISTS(SELECT 1 FROM attachment_previews WHERE storage_key=?1);",
             -1, &st, NULL) == SQLITE_OK) {
         rc = 0;
         for (size_t i = 0; i < n && rc == 0; i++) {

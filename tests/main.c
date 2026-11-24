@@ -6,7 +6,7 @@
  * run against a real daemon is the full suite's (scripts/test/full/e2e.sh).
  *
  * SUITES[] below is the one list of the suites and of where each runs
- * (docs/TESTING.md, "The two suites"): `build/tests --list
+ * (docs/details/TESTING.md, "The two suites"): `build/tests --list
  * fast|full|plain|threads` prints the names the scripts select by. */
 
 #include <pthread.h>
@@ -59,6 +59,9 @@ int run_sigv4_tests(void);
 int run_blob_s3_tests(void);
 int run_blob_cache_tests(void);
 int run_xferpool_tests(void);
+int run_preview_tests(void);
+int run_mcp_tests(void);
+int run_oauth_tests(void);
 int run_storage_tests(void);
 int run_config_tests(void);
 int run_slow_blob_tests(void);
@@ -74,6 +77,7 @@ int run_client_core_tests(void);
 int run_enroll_tests(void);
 int run_push_tests(void);
 int run_invite_mail_tests(void);
+int run_webhooks_out_tests(void);
 int run_address_report_tests(void);
 int run_mention_tests(void);
 int run_searchq_tests(void);
@@ -89,6 +93,11 @@ int run_sumkit_tests(void);
 int run_sttkit_tests(void);
 int run_recognizer_parity_tests(void);
 int run_tts_worker_tests(void);
+int run_export_tests(void);
+int run_callrec_tests(void);
+int run_callrec_media_tests(void);
+int run_export_wire_tests(void);
+int run_export_media_tests(void);
 int run_summary_tests(void);
 int run_voice_pick_tests(void);
 int run_tts_data_tests(void);
@@ -232,7 +241,7 @@ static int suite_wanted(const char *name) {
 static int g_ran;
 
 /* How long each suite took, printed slowest first at the end: the fast suite
- * has a budget (docs/TESTING.md, "The two suites"), and this says where it
+ * has a budget (docs/details/TESTING.md, "The two suites"), and this says where it
  * goes. */
 static struct { const char *name; double s; } g_times[128];
 static int g_ntimes;
@@ -313,12 +322,17 @@ static const struct suite {
     S(run_blob_s3_tests,         FAST, THREADS),
     S(run_blob_cache_tests,      FAST, THREADS),
     S(run_xferpool_tests,        FAST, THREADS),
+    S(run_preview_tests,         FAST, THREADS),
+    S(run_mcp_tests,             FAST, PLAIN),
+    S(run_oauth_tests,           FAST, PLAIN),
     S(run_config_tests,          FAST, PLAIN),
     S(run_storage_tests,         FAST, THREADS),
     S(run_slow_blob_tests,       FAST, THREADS),
     S(run_audio_tests,           FAST, PLAIN),
     S(run_listen_tests,          FAST, PLAIN),
     S(run_media_tests,           FULL, WALK),
+    S(run_export_media_tests,    FULL, WALK),
+    S(run_callrec_media_tests,   FULL, WALK),
     S(run_video_media_tests,     FAST, THREADS),
     S(run_emoji_tests,           FAST, PLAIN),
     S(run_tls_tests,             FAST, THREADS),
@@ -329,6 +343,7 @@ static const struct suite {
     S(run_enroll_tests,          FAST, THREADS),
     S(run_push_tests,            FAST, THREADS),
     S(run_invite_mail_tests,     FAST, THREADS),
+    S(run_webhooks_out_tests,    FAST, THREADS),
     S(run_address_report_tests,  FAST, THREADS),
     S(run_mention_tests,         FAST, PLAIN),
     S(run_searchq_tests,         FAST, PLAIN),
@@ -342,6 +357,9 @@ static const struct suite {
     S(run_sumkit_tests,          FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),
     S(run_tts_worker_tests,      FAST, THREADS),
+    S(run_export_tests,          FAST, THREADS),
+    S(run_callrec_tests,         FAST, THREADS),
+    S(run_export_wire_tests,     FAST, THREADS),
     S(run_summary_tests,         FAST, WALK),
     S(run_voice_pick_tests,      FAST, PLAIN),
     S(run_tts_data_tests,        FAST, PLAIN),

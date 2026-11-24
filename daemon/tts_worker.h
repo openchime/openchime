@@ -1,5 +1,5 @@
 /*
- * OpenChime — the read-aloud render worker (ARCH-111, docs/READ-ALOUD.md §4).
+ * OpenChime — the read-aloud render worker (ARCH-111, docs/details/READ-ALOUD.md §4).
  *
  * One thread beside the net loop. The net thread submits a render (a request id,
  * the 32-byte handle, a voice, the speakable text) to a bounded queue; the worker
@@ -64,6 +64,11 @@ int oc_tts_worker_next_result(oc_tts_worker *w, oc_tts_result *out);
 
 /* The blob key a render of `handle` by `engine` is stored under. */
 void oc_tts_render_key(const oc_tts_engine *engine, const uint8_t handle[32], char *key, size_t cap);
+
+/* Whether a rendering is running right now: the export of a video message
+ * waits for it (ARCH-135), since the two together would not fit in a managed
+ * box's memory. */
+int oc_tts_worker_rendering(oc_tts_worker *w);
 
 /* Whether the engine is open right now (for tests and the log). */
 int oc_tts_worker_engine_open(oc_tts_worker *w);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cameras in the call view, two clients end to end (REQ-160, docs/CALLS.md §2, §7).
+# Cameras in the call view, two clients end to end (REQ-160, docs/details/CALLS.md §2, §7).
 #
 #   tools/gui/features/camera.sh            # run; the pair and its daemon stop at the end
 #   tools/gui/features/camera.sh --keep     # ... and leave them running
@@ -16,6 +16,8 @@
 #   - the grid: a card each, and the view takes every camera;
 #   - the speaker layout: bob large on alice's view, alice in the strip; and
 #     back to the grid with one click, remembered;
+#   - self-view: shrunk to a corner, hidden, shown again, each kept with the
+#     preferences;
 #   - away from the call view nothing is drawn and no camera is taken; back,
 #     the view takes the cameras of the cards it draws again;
 #   - bob turns his off: his card on alice's view is his face again;
@@ -47,6 +49,7 @@ has_aid() { grep "^a11yitem $2 " "$(dfile "$1")" >/dev/null; }
 # The card or tile <who>'s view drew for <uid>: the value of <key> on its line.
 tile() { field "$(dfile "$1")" "^camera\.tile uid=$2 " "$3"; }     # tile <who> <uid> <key>
 cpeer() { field "$(dfile "$1")" "^camera\.peer uid=$2 " "$3"; }    # cpeer <who> <uid> <key>: the engine's view of <uid>'s camera
+has() { grep -E "$2" "$(dfile "$1")" >/dev/null; }
 nbig() { grep -c "^camera\.tile .* big=$2 " "$(dfile "$1")"; }    # nbig <who> 0|1: cards (not) the large one
 
 step "a fresh daemon, alice and bob at $OC_TEST_HOST:$OC_TEST_PORT"
@@ -56,9 +59,16 @@ a_in() { [ "$(f a 'call ' in)" = 1 ]; }
 
 step "alice starts a call in #general, and bob joins"
 act a call start $CH
+# The call button opens New Call, its subject and people filled in; Start starts it.
+picker_up() { grep -q '^callpick ' "$(dfile a)"; }
+waitfor 10 seen a picker_up || gui_abort "alice's call button did not open New Call"
+act a call pick-go
 act a call ns off
 waitfor 10 seen a a_in || gui_abort "alice is not in the call she started"
 act b call join $CH
+pj_up() { grep -q '^prejoin open=1' "$(dfile b)"; }   # every join goes through the pre-join screen
+waitfor 10 seen b pj_up || gui_abort "bob's pre-join screen did not open"
+act b call prejoin-join
 act b call ns off
 two_a() { [ "$(f a 'call ' parts)" = 2 ]; }
 two_b() { [ "$(f b 'call ' parts)" = 2 ]; }
@@ -117,6 +127,19 @@ act a shot camera_speaker
 act a call layout grid
 grid() { [ "$(f a 'camera ' layout)" = grid ] && [ "$(nbig a 1)" = 0 ]; }
 check "one click, and it is the grid again" waitfor 10 seen a grid
+
+step "self-view"
+press a call.selfview || gui_abort "the call view has no self-view button"
+small() { has a '^selfview mode=1 small=[0-9]+,[0-9]+,[1-9]' && [ "$(f a selfview stored)" = 1 ] &&
+          [ "$(tile a "$ua" rect)" = "$(f a selfview small)" ] && [ "$(grep -c "^camera\.tile uid=$ua " "$(dfile a)")" = 1 ]; }
+check "shrunk: alice's own picture small in the corner, bob's card alone in the grid, kept in her preferences" waitfor 10 seen a small
+act a shot camera_selfview_small
+press a call.selfview || gui_abort "the self-view button went away"
+hidden() { has a '^selfview mode=2 small=0,0,0,0' && [ "$(nbig a 0)" = 1 ] && [ "$(f a selfview stored)" = 2 ]; }
+check "hidden: no picture of herself at all, and kept" waitfor 10 seen a hidden
+press a call.selfview || gui_abort "the self-view button went away"
+shown() { has a '^selfview mode=0 ' && [ "$(nbig a 0)" = 2 ] && [ "$(f a selfview stored)" = 0 ]; }
+check "shown again: her card back beside bob's" waitfor 10 seen a shown
 
 step "the subscriptions follow what is drawn"
 act a view home

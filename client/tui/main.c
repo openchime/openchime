@@ -49,6 +49,7 @@
 #include "mention.h"    /* OC_MENTION_NAME_MAX: a broadcast mention as written */
 #include "richtext.h"   /* time tokens in this terminal's own zone; spoilers covered */
 #include "complete.h"
+#include "scopes.h"     /* the scope catalog an agent's token is minted from */
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the sign-in box) */
 #include "secret_os.h" /* OS keyring for the session token */
@@ -456,7 +457,11 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
         }
     } else {
         msg_nick(nick, sizeof nick, m, me, ch);
-        snprintf(line, sizeof line, "%s  %s", stamp, nick);
+        snprintf(line, sizeof line, "%s  %s%s", stamp, nick, oc_model_user_is_agent(mdl, m->author_id) ? "  [Agent]" : "");
+        if (m->via[0]) {   /* posted through an AI client (AUTH.md §8.13) */
+            size_t l = strlen(line);
+            snprintf(line + l, sizeof line - l, "  via %s", m->via);
+        }
         if (m->edited && !m->deleted) {
             size_t l = strlen(line);
             snprintf(line + l, sizeof line - l, " (edited)");
@@ -557,6 +562,8 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             oc_model_format_duration(a->duration_ms, d, sizeof d);
             snprintf(al, sizeof al, "    [video message %s, open in the desktop client] #%llu",
                      d, (unsigned long long)a->id);
+            /* Its actions (Enter) are Download file, and Save compatible copy
+             * where the daemon makes one (ARCH-135). */
         } else {
             /* 📎 filename (12.3 KB) #id — download with /download <id> */
             double kb = (double)a->size / 1024.0;
@@ -817,7 +824,8 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
         char stamp[8] = "--:--";
         if (s->server_time) { time_t t = (time_t)(s->server_time / 1000); struct tm tv;
             if (oc_localtime_r(&t, &tv)) strftime(stamp, sizeof stamp, "%H:%M", &tv); }
-        snprintf(line, sizeof line, "#%s  %s  user%llu:", cn, stamp, (unsigned long long)s->author_id);
+        snprintf(line, sizeof line, "#%s  %s  user%llu%s:", cn, stamp, (unsigned long long)s->author_id,
+                 oc_model_user_is_agent(m, s->author_id) ? " [Agent]" : "");
         char *hd = malloc(strlen(line) + 1);
         if (hd) { strcpy(hd, line); rows_push(r, hd, TB_CYAN); }
         char said[1024];   /* an action reads "<name> <text>" (REQ-058) */
@@ -828,6 +836,19 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
 
 static const char *active_address(void);   /* the workspace as the person typed it */
 static const char *invite_link(void);      /* the last invite as a link, where one works anywhere */
+
+/* The members panel's order: the people, then the agents (docs/details/MCP.md
+ * §7), each an index into m->users; *n_people is where the agents start. A
+ * removed agent is left out. */
+static size_t mem_order(const oc_model *m, size_t *out, size_t cap, size_t *n_people) {
+    size_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) *n_people = n;
+        for (size_t i = 0; i < m->n_users && n < cap; i++)
+            if ((int)m->users[i].agent == pass && !(m->users[i].agent && m->users[i].disabled)) out[n++] = i;
+    }
+    return n;
+}
 
 /* Build the rows for the roster overlay: each member with a presence dot,
  * colored by presence, plus a role tag. */
@@ -851,8 +872,21 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
             if (blank) { blank[0] = '\0'; rows_push(r, blank, TB_DEFAULT); }
         }
     }
+    /* People, then the agents under their own heading: an agent has no
+     * presence, status or local time (docs/details/MCP.md §7). */
+    int agents_head = 0;
+    for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < m->n_users; i++) {
         const oc_member *u = &m->users[i];
+        if ((int)u->agent != pass) continue;
+        if (u->agent) {
+            if (u->disabled) continue;
+            if (!agents_head) { agents_head = 1; rows_push(r, strdup("Agents"), TB_YELLOW | TB_BOLD); }
+            snprintf(line, sizeof line, "  %s  [Agent]", u->name[0] ? u->name : "?");
+            char *ar = malloc(strlen(line) + 1);
+            if (ar) { strcpy(ar, line); rows_push(r, ar, TB_DEFAULT); }
+            continue;
+        }
         uint8_t pr = oc_model_presence_of(m, u->user_id);
         const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"    /* ● */
                         : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x90"    /* ◐ */
@@ -1280,7 +1314,8 @@ static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == uid) { role = m->users[i].role; pm = &m->users[i]; break; }
     uint8_t pr = oc_model_presence_of(m, uid);
-    const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
+    int agent = oc_model_user_is_agent(m, uid);
+    const char *rn = agent ? "Agent" : role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
     const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
     const tk_theme *th = tk_theme_active();
     char idbuf[32];
@@ -1291,7 +1326,7 @@ static void draw_profile(const oc_model *m, uint64_t uid, int W, int H) {
     R[n].label = "Name";     R[n++].value = me[0] ? me : "(unknown)";
     R[n].label = "User ID";  R[n++].value = idbuf;
     R[n].label = "Role";     R[n++].value = rn;
-    R[n].label = "Presence"; R[n++].value = pn;
+    if (!agent) { R[n].label = "Presence"; R[n++].value = pn; }   /* an agent has none */
     if (pm && pm->title[0])    { R[n].label = "Title";    R[n++].value = pm->title; }
     if (pm && pm->pronouns[0]) { R[n].label = "Pronouns"; R[n++].value = pm->pronouns; }
     /* Out of office (REQ-122), while it is in force, and its message. */
@@ -1346,7 +1381,7 @@ typedef oc_completion ac_cand;
  * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
  * commands. One generic menu holds {label,id} items; the SELECT handler
  * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
-enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_UNREAD,
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_EXPORT, ACT_UNREAD,
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
@@ -1383,7 +1418,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_REMIND_AT, ACT_REMIND_CLEAR,
        /* blocks and DM privacy: block or unblock a person, who may start a DM
         * with me, my blocked people (each an Unblock), and an admin's list */
-       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN,
+       ACT_BLOCK, ACT_UNBLOCK, ACT_DMPRIV, ACT_BLOCKED, ACT_BLOCKS_ADMIN, ACT_CALLS,
        ACT_UNBLOCK0, ACT_UNBLOCK_LAST = ACT_UNBLOCK0 + 27,
        /* a member's profile, the workspace's own fields with it */
        ACT_PROFILE_OF,
@@ -1391,9 +1426,23 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_OOO,
        /* a to-do list: mark a task, add one, or (its author) rename it */
        ACT_TODO_MARK, ACT_TODO_ADD, ACT_TODO_RENAME,
+       /* agents (docs/details/MCP.md §6): a new one; one's tokens, a new token,
+        * into the open channel, removed; a scope ticked, the scopes done; a
+        * token revoked */
+       ACT_AGT_NEW, ACT_AGT_TOKENS, ACT_AGT_MINT, ACT_AGT_ADDHERE, ACT_AGT_REMOVE, ACT_AGT_PROFILE,
+       ACT_SCOPE_DONE, ACT_SCOPE0, ACT_SCOPE_LAST = ACT_SCOPE0 + 23,
+       ACT_ATOK0, ACT_ATOK_LAST = ACT_ATOK0 + 23,
+       /* AI clients (AUTH.md §8.13): approve by code; the lifetime chosen and
+        * the decision; one's own and, for an owner or admin, everyone's, each
+        * revoked by Enter */
+       ACT_CONN_APPROVE, ACT_CONN_MINE, ACT_CONN_ALL, ACT_CONN_LIFE30, ACT_CONN_LIFE90, ACT_CONN_LIFE365,
+       ACT_CONN_LIFE0, ACT_CONN_DECLINE, ACT_CONN0, ACT_CONN_LAST = ACT_CONN0 + 23,
        ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
+/* The selected message holds a video message the daemon will export (ARCH-135):
+ * its menu offers Save compatible copy beside Download. Set before menu_build_msg. */
+static int g_menu_can_export;
 static int      g_nmenu;
 static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
 static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
@@ -1425,6 +1474,7 @@ static void menu_build_msg(int own, int may_edit, int may_del, int deleted, int 
     if (poll && own && !(poll->close_at_ms && (uint64_t)time(NULL) * 1000u >= poll->close_at_ms))
         g_menu[g_nmenu++] = (menuitem){ "Close poll now", ACT_POLL_CLOSE };
     if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
+    if (has_attach && g_menu_can_export) g_menu[g_nmenu++] = (menuitem){ "Save compatible copy", ACT_EXPORT };
     if (may_edit) g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
     if (may_del)  g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
@@ -1526,6 +1576,159 @@ static void menu_build_member(int is_self, int blocked) {
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
+/* ---- agents (docs/details/MCP.md §3.1, §6) ------------------------------------
+ * An agent in the members panel opens its administration: its tokens (each
+ * revoked from the list), a new token, into the open channel, removed. New
+ * agent and New token ask for a name, then tick the scopes in a list that
+ * shows what each allows; a token minted is shown once, alone on its line to
+ * be selected and copied, until a key closes it. */
+static uint64_t g_agt_chan;            /* the open channel an agent can be added to; 0: none */
+static uint64_t g_agt_uid;             /* the agent the menu, or the token being made, is for; 0: a new one */
+static char     g_agt_title[160], g_agt_here[160];
+static char     g_agt_name[128], g_agt_tname[64];
+static uint8_t  g_agt_scope_on[24];
+static char     g_agt_scope_labels[24][160];
+static char     g_atok_labels[24][200];
+static uint64_t g_atok_ids[24];
+static uint64_t g_agt_await;           /* tokens asked for this agent: the list opens when they land */
+static char     g_tok_shown[96], g_tok_scopes[512];
+static uint64_t g_tok_agent;
+
+static int self_admin(const oc_model *m) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) return m->users[i].role == OC_ROLE_OWNER || m->users[i].role == OC_ROLE_ADMIN;
+    return 0;
+}
+
+static void menu_build_agent(const oc_model *m, uint64_t uid, uint64_t chan) {
+    const char *nm = oc_model_user_name((oc_model *)m, uid);
+    snprintf(g_agt_title, sizeof g_agt_title, "%s  [Agent]", nm && nm[0] ? nm : "Agent");
+    g_agt_uid = uid;
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "Profile",   ACT_AGT_PROFILE };
+    if (!self_admin(m)) return;
+    g_menu[g_nmenu++] = (menuitem){ "Tokens",    ACT_AGT_TOKENS };
+    g_menu[g_nmenu++] = (menuitem){ "New token", ACT_AGT_MINT };
+    const oc_channel *c = chan ? oc_model_channel((oc_model *)m, chan) : NULL;
+    if (c && c->name) {
+        snprintf(g_agt_here, sizeof g_agt_here, "Add to #%s", c->name);
+        g_menu[g_nmenu++] = (menuitem){ g_agt_here, ACT_AGT_ADDHERE };
+    }
+    g_menu[g_nmenu++] = (menuitem){ "Remove agent", ACT_AGT_REMOVE };
+}
+
+/* The scopes, each ticked or not, with what it allows; Done first. */
+static void menu_build_scopes(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "Done: make the token", ACT_SCOPE_DONE };
+    for (size_t i = 0; i < oc_scope_count() && i < 24 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); i++) {
+        const oc_scope *sc = oc_scope_at(i);
+        snprintf(g_agt_scope_labels[i], sizeof g_agt_scope_labels[i], "[%c] %-18s %s",
+                 g_agt_scope_on[i] ? 'x' : ' ', sc->name, sc->desc);
+        g_menu[g_nmenu++] = (menuitem){ g_agt_scope_labels[i], ACT_SCOPE0 + (int)i };
+    }
+}
+static void scopes_text(char *out, size_t cap) {
+    size_t at = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < oc_scope_count() && i < 24; i++) {
+        if (!g_agt_scope_on[i]) continue;
+        int k = snprintf(out + at, cap - at, "%s%s", at ? " " : "", oc_scope_at(i)->name);
+        if (k < 0 || (size_t)k >= cap - at) break;
+        at += (size_t)k;
+    }
+}
+
+/* An agent's tokens, each a Revoke; never the token itself. */
+static void menu_build_atokens(const oc_model *m) {
+    g_nmenu = 0;
+    for (uint8_t i = 0; i < m->n_atokens && i < 24 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); i++) {
+        const oc_agent_token_row *t = &m->atokens[i];
+        char used[96] = "never used";
+        if (t->last_used_at) {
+            time_t lu = (time_t)(t->last_used_at / 1000);
+            struct tm tv; char day[24] = "";
+            if (oc_localtime_r(&lu, &tv)) strftime(day, sizeof day, "%Y-%m-%d %H:%M", &tv);
+            snprintf(used, sizeof used, "last used %s%s%s", day, t->last_from[0] ? " from " : "", t->last_from);
+        }
+        snprintf(g_atok_labels[i], sizeof g_atok_labels[i], "Revoke %s  (%s; %s)", t->name,
+                 t->scopes[0] ? t->scopes : "no access", used);
+        g_atok_ids[i] = t->id;
+        g_menu[g_nmenu++] = (menuitem){ g_atok_labels[i], ACT_ATOK0 + i };
+    }
+}
+
+/* AI clients (AUTH.md §8.13): what a code names, as a menu of the lifetimes to
+ * approve with and Decline; and a list of connections, each Enter revokes. */
+static char     g_conn_labels[24][200];
+static uint64_t g_conn_ids[24];
+static int      g_conn_all;            /* the list open is everyone's */
+static int      g_conn_await;          /* 1: one's own asked for, 2: everyone's; opens when it lands */
+static char     g_conn_title[200];
+
+static void menu_build_conn_request(const oc_model *m) {
+    g_nmenu = 0;
+    snprintf(g_conn_title, sizeof g_conn_title, "%.80s wants to connect as you; it returns to %.60s",
+             m->conn_req_client, m->conn_req_return);
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 30 days", ACT_CONN_LIFE30 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 90 days", ACT_CONN_LIFE90 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve for 365 days", ACT_CONN_LIFE365 };
+    g_menu[g_nmenu++] = (menuitem){ "Approve with no end", ACT_CONN_LIFE0 };
+    g_menu[g_nmenu++] = (menuitem){ "Decline", ACT_CONN_DECLINE };
+}
+
+static void menu_build_conns(const oc_model *m, int all) {
+    g_nmenu = 0;
+    g_conn_all = all;
+    const oc_conn_view *v = all ? m->all_conns : m->my_conns;
+    size_t n = all ? m->n_all_conns : m->n_my_conns;
+    for (size_t i = 0; i < n && i < 24 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); i++) {
+        char used[40] = "never used", ends[32] = "no end";
+        struct tm tv;
+        if (v[i].last_used_at) {
+            time_t t = (time_t)(v[i].last_used_at / 1000);
+            if (oc_localtime_r(&t, &tv)) strftime(used, sizeof used, "used %Y-%m-%d %H:%M", &tv);
+        }
+        if (v[i].expires_at) {
+            time_t t = (time_t)(v[i].expires_at / 1000);
+            if (oc_localtime_r(&t, &tv)) strftime(ends, sizeof ends, "ends %Y-%m-%d", &tv);
+        }
+        snprintf(g_conn_labels[i], sizeof g_conn_labels[i], "Revoke %s%s%s  (%s; %s)", v[i].client_name,
+                 all ? " for " : "", all ? v[i].user_name : "", used, ends);
+        g_conn_ids[i] = v[i].id;
+        g_menu[g_nmenu++] = (menuitem){ g_conn_labels[i], ACT_CONN0 + (int)i };
+    }
+}
+
+/* The token just minted, shown once. */
+static void draw_agent_token(const oc_model *m, int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    static char L[32][200];
+    int n = 0, cw = 0;
+    const char *an = oc_model_user_name((oc_model *)m, g_tok_agent);
+    snprintf(L[n++], sizeof L[0], "A new token for %s. Copy it now: it is not shown again.", an && an[0] ? an : "the agent");
+    L[n++][0] = '\0';
+    snprintf(L[n++], sizeof L[0], "%s", g_tok_shown);
+    L[n++][0] = '\0';
+    snprintf(L[n++], sizeof L[0], "%s", g_tok_scopes[0] ? "What it may do:" : "No access was chosen.");
+    for (const char *p = g_tok_scopes; *p && n < 30; ) {
+        const char *e = strchr(p, ' ');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        const oc_scope *sc = oc_scope_find(p, len);
+        snprintf(L[n++], sizeof L[0], "  %-18.*s %s", (int)len, p, sc ? sc->desc : "");
+        p = e ? e + 1 : p + len;
+    }
+    for (int i = 0; i < n; i++) { int w = tk_str_width(L[i]); if (w > cw) cw = w; }
+    tk_rect r = modal_frame(W, H, cw, n, "New token  ·  any key closes");
+    for (int i = 0; i < n && i < r.h; i++)
+        tk_text(r.x, r.y + i, r.x + r.w, L[i], i == 2 ? (th->accent | TB_BOLD) : th->fg, th->bg);
+    tb_present();
+}
+static void agent_token_forget(void) {
+    for (volatile char *z = g_tok_shown; z < g_tok_shown + sizeof g_tok_shown; z++) *z = 0;
+    g_tok_scopes[0] = '\0';
+}
+
 /* What can be done about an encrypted DM, by its session's state on this device
  * (0: none here): trust a changed key, end it while it lives, or forget it once
  * it cannot be read. Into the menu, or the launcher with `section`. */
@@ -1609,6 +1812,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Channel", "Upload a file",       NULL, NULL, ACT_UPLOAD },
     { "Messages","Search messages",     NULL, "Ctrl+F", ACT_SEARCH },
     { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
+    { "You",     "Calls",               NULL, NULL, ACT_CALLS },
     { "You",     "Set away",            NULL, NULL, ACT_AWAY },
     { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
     { "You",     "Change display name", NULL, NULL, ACT_NICK },
@@ -1622,7 +1826,11 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Deactivate account",  NULL, NULL, ACT_DEACTIVATE },
     { "You",     "Blocked people",      NULL, NULL, ACT_BLOCKED },
     { "You",     "Who can start a DM with you (anyone/nobody)", NULL, NULL, ACT_DMPRIV },
+    { "You",     "Approve an AI client", NULL, NULL, ACT_CONN_APPROVE },
+    { "You",     "Your AI clients",     NULL, NULL, ACT_CONN_MINE },
+    { "Admin",   "Everyone's AI clients", NULL, NULL, ACT_CONN_ALL },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
+    { "Admin",   "New agent",           NULL, NULL, ACT_AGT_NEW },
     { "Admin",   "Blocks",              NULL, NULL, ACT_BLOCKS_ADMIN },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
@@ -1653,6 +1861,9 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
         if (g_launcher_items[i].id == ACT_SUMMARIZE && (!oc_model_summarize_available(m) || e2e)) continue;
         if (g_launcher_items[i].id == ACT_UPLOAD && e2e) continue;
         if (g_launcher_items[i].id == ACT_VOICES && !oc_model_tts_available(m)) continue;
+        if ((g_launcher_items[i].id == ACT_CONN_APPROVE || g_launcher_items[i].id == ACT_CONN_MINE ||
+             g_launcher_items[i].id == ACT_CONN_ALL) && !oc_model_connections_on(m)) continue;
+        if (g_launcher_items[i].id == ACT_CONN_ALL && !self_admin(m)) continue;
         g_launcher_now[n++] = g_launcher_items[i];
     }
     if (m->summary_open && cid && m->summary_channel == cid)
@@ -2147,8 +2358,22 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     if (mem_w) {
         int mx = msg_x + msg_w;
         tk_panel(mx, panels_top, mem_w, panels_h, "Members", mem_act);
-        for (size_t i = 0, iy = panels_top + 1; i < m->n_users && (int)iy < panels_top + panels_h - 1; i++, iy++) {
-            const oc_member *u = &m->users[i];
+        size_t *ord = malloc((m->n_users ? m->n_users : 1) * sizeof *ord), np = 0;
+        size_t no = ord ? mem_order(m, ord, m->n_users, &np) : 0;
+        for (size_t oi = 0, iy = panels_top + 1; oi < no && (int)iy < panels_top + panels_h - 1; oi++, iy++) {
+            size_t i = oi;   /* the position in the panel, which the selection counts */
+            const oc_member *u = &m->users[ord[oi]];
+            if (oi == np) {   /* the agents, below the people, under their own heading */
+                tk_text(mx + 1, (int)iy, mx + mem_w - 1, "Agents", th->muted | TB_BOLD, th->bg);
+                if ((int)++iy >= panels_top + panels_h - 1) break;
+            }
+            if (u->agent) {
+                int asel = (mem_act && (int)i == mem_sel);
+                if (asel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, th->sel_bg);
+                char al[160]; snprintf(al, sizeof al, "  %s [Agent]", u->name[0] ? u->name : "?");
+                tk_text(mx + 1, (int)iy, mx + mem_w - 1, al, asel ? (th->sel_fg | TB_BOLD) : th->fg, asel ? th->sel_bg : th->bg);
+                continue;
+            }
             uint8_t p = oc_model_presence_of(m, u->user_id);
             const char *d = p == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : p == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
             int sel = (mem_act && (int)i == mem_sel);
@@ -2168,6 +2393,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
             tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
+        free(ord);
     }
 
     /* Row H-3: the autocomplete suggestion strip when completing, else the status
@@ -2179,7 +2405,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         int active = ((ac_idx % nc) + nc) % nc;
         int cx = tk_text(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
         for (int i = 0; i < nc && cx < W - 2; i++) {
-            char item[110]; snprintf(item, sizeof item, "%s", cands[i].disp);
+            char item[120];
+            int ag = cands[i].repl[0] == '@' && oc_model_user_is_agent(m, oc_model_user_id(m, cands[i].repl + 1));
+            snprintf(item, sizeof item, "%s%s", cands[i].disp, ag ? " [Agent]" : "");
             uintattr_t fg = (i == active) ? TB_BLACK : TB_WHITE | TB_BOLD;
             uintattr_t bg = (i == active) ? TB_CYAN : TB_DEFAULT;
             if (i == active) tb_set_cell(cx - 1, H - 3, ' ', fg, bg);
@@ -2392,6 +2620,100 @@ static void draw_blocks(const oc_model *m, int W, int H) {
     tb_present();
 }
 
+/* Calls (CALLS.md §1): the call history, newest first -- each call's subject,
+ * when, how many were in it, and whether it was missed, recorded or has a
+ * transcript -- with the selection's row marked. Enter opens its page. */
+static void draw_calls(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    if (!m->call_hist_loaded || !m->n_call_hist) {
+        const char *e = !m->call_hist_loaded ? "Loading…" : "No calls yet.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Calls  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    static char L[64][OC_CALL_SUBJECT_MAX + 96];
+    int n = 0, cw = 0;
+    for (size_t i = 0; i < m->n_call_hist && n < 64; i++, n++) {
+        const oc_call_hist_view *h = &m->call_hist[i];
+        time_t t = (time_t)(h->started_at / 1000);
+        char day[32] = "";
+        const struct tm *tm = localtime(&t);   /* the UI thread's alone */
+        if (tm) strftime(day, sizeof day, "%Y-%m-%d %H:%M", tm);
+        snprintf(L[n], sizeof L[n], "%s  %s  %u %s%s%s%s%s", day, h->subject[0] ? h->subject : "Call",
+                 (unsigned)h->n_people, h->n_people == 1 ? "person" : "people",
+                 !h->ended_at ? "  · going on" : "",
+                 (h->flags & OC_CALL_HIST_MISSED) ? "  · missed" : "",
+                 (h->flags & OC_CALL_HIST_RECORDING) ? "  · recorded" : "",
+                 (h->flags & OC_CALL_HIST_TRANSCRIPT) ? "  · transcript" : "");
+        int w = tk_str_width(L[n]) + 2;
+        if (w > cw) cw = w;
+    }
+    tk_rect r = modal_frame(W, H, cw, n, "Calls  ·  Enter opens  ·  Esc closes");
+    int top = sel >= r.h ? sel - r.h + 1 : 0;
+    for (int i = top; i < n && i - top < r.h; i++) {
+        int on = i == sel;
+        tk_text(r.x, r.y + i - top, r.x + r.w, on ? "> " : "  ", th->accent, th->bg);
+        tk_text(r.x + 2, r.y + i - top, r.x + r.w, L[i],
+                (m->call_hist[i].flags & OC_CALL_HIST_MISSED) ? th->err : on ? th->fg : th->muted, th->bg);
+    }
+    tb_present();
+}
+
+/* A call's page: who was in it and when, its recordings, and its transcript;
+ * 'c' opens its chat, 'm' the transcript's next lines. */
+static void draw_call_page(const oc_model *m, int W, int H, uint64_t id) {
+    const tk_theme *th = tk_theme_active();
+    const oc_call_page_view *p = m->call_page && m->call_page->call_id == id ? m->call_page : NULL;
+    if (!p) {
+        tk_rect r = modal_frame(W, H, 20, 1, "Call  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, "Loading…", th->muted, th->bg);
+        tb_present();
+        return;
+    }
+    enum { MAXL = 260 };
+    static char L[MAXL][OC_CALL_SUBJECT_MAX + 160];
+    static int  dim[MAXL];
+    int n = 0, cw = 0;
+    #define LINE(d, ...) do { if (n < MAXL) { snprintf(L[n], sizeof L[n], __VA_ARGS__); dim[n] = (d); \
+                              int w_ = tk_str_width(L[n]); if (w_ > cw) cw = w_; n++; } } while (0)
+    LINE(1, "People");
+    for (uint16_t i = 0; i < p->n_stays; i++) {
+        const char *nm = oc_model_user_name((oc_model *)m, p->stays[i].user_id);
+        char a[16] = "", b[16] = "now";
+        time_t t1 = (time_t)(p->stays[i].joined_at / 1000), t2 = (time_t)(p->stays[i].left_at / 1000);
+        const struct tm *tm = localtime(&t1);
+        if (tm) strftime(a, sizeof a, "%H:%M", tm);
+        if (p->stays[i].left_at && (tm = localtime(&t2))) strftime(b, sizeof b, "%H:%M", tm);
+        LINE(0, "  %s  %s to %s", nm && nm[0] ? nm : "someone", a, b);
+    }
+    for (uint16_t i = 0; i < p->n_recordings; i++) {
+        if (!i) LINE(1, "Recording");
+        const oc_call_recording *r = &p->recordings[i];
+        const char *nm = oc_model_user_name((oc_model *)m, r->started_by);
+        const char *st = r->state == OC_CALL_REC_READY ? "ready" : r->state == OC_CALL_REC_RECORDING ? "recording now"
+                       : r->state == OC_CALL_REC_PROCESSING ? "being made" : "could not be made";
+        LINE(0, "  by %s  %u:%02u  %s%s", nm && nm[0] ? nm : "someone", r->duration_ms / 60000,
+             (r->duration_ms / 1000) % 60, st, r->state == OC_CALL_REC_READY ? " (in the call's chat: c)" : "");
+    }
+    if (p->has_transcript) {
+        LINE(1, "Transcript");
+        for (uint32_t i = 0; i < p->n_lines; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, p->lines[i].speaker);
+            LINE(0, "  %u:%02u %s: %s", p->lines[i].start_ms / 60000, (p->lines[i].start_ms / 1000) % 60,
+                 nm && nm[0] ? nm : "someone", p->lines[i].text ? p->lines[i].text : "");
+        }
+        if (p->n_lines < p->n_lines_total) LINE(1, "  … %u more lines (m)", p->n_lines_total - p->n_lines);
+    }
+    #undef LINE
+    char title[OC_CALL_SUBJECT_MAX + 64];
+    snprintf(title, sizeof title, "%s  ·  c chat  ·  Esc closes", p->subject[0] ? p->subject : "Call");
+    if (cw > W - 6) cw = W - 6;
+    tk_rect r = modal_frame(W, H, cw, n, title);
+    for (int i = 0; i < n && i < r.h; i++) tk_text(r.x, r.y + i, r.x + r.w, L[i], dim[i] ? th->accent : th->fg, th->bg);
+    tb_present();
+}
+
 /* The /audit overlay (REQ-251): administrative and security-relevant actions,
  * newest first. Owner/admin only — a member's request is refused server-side.
  * Denied and failed entries are drawn in red, since those are what an operator
@@ -2595,7 +2917,17 @@ static void draw_summary(const oc_model *m, int W, int H, int sel) {
         const oc_summary_view *v = &m->summary;
         char dates[48], who[512], line[700];
         oc_summary_dates(m->summary_start, m->summary_end, dates, sizeof dates);
-        oc_summary_posters_text(v, who, sizeof who);
+        {   /* who posted, each agent named as one (docs/details/MCP.md §7) */
+            size_t ww = 0, np = v->n_posters;
+            who[0] = '\0';
+            for (size_t i = 0; i < np && ww < sizeof who; i++) {
+                const char *sep = i == 0 ? "" : np == 2 ? " and " : i + 1 == np ? ", and " : ", ";
+                int k = snprintf(who + ww, sizeof who - ww, "%s%s%s", sep, v->posters[i].name,
+                                 oc_model_user_is_agent(m, v->posters[i].id) ? " [Agent]" : "");
+                if (k < 0) break;
+                ww += (size_t)k;
+            }
+        }
         snprintf(line, sizeof line, "%s · %llu message%s%s%s", dates, (unsigned long long)v->count,
                  v->count == 1 ? "" : "s", who[0] ? " · " : "", who);
         wrap_words_push(&r, line, th->muted, cw, 2);
@@ -3730,6 +4062,8 @@ int main(int argc, char **argv) {
     int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int blocks_open = 0;                      /* an admin's list of blocks */
+    int calls_open = 0, csel = 0;             /* the call history (CALLS.md §1) */
+    uint64_t cpage_id = 0;                    /* ...and a call's page, open */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
     int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
@@ -3777,7 +4111,8 @@ int main(int argc, char **argv) {
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_NICK, PROMPT_UPLOAD,
            PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE, PROMPT_DATE, PROMPT_MOVE, PROMPT_REMIND, PROMPT_PFVALUE, PROMPT_OOO,
-           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME };
+           PROMPT_TODO_MARK, PROMPT_TODO_ADD, PROMPT_TODO_RENAME, PROMPT_AGENT_NAME, PROMPT_AGENT_TOKEN,
+           PROMPT_CONN_CODE };
     /* A move into a private channel (REQ-053): y/N, naming who will no longer
      * see it, before it is sent. */
     uint64_t move_ask_mid = 0, move_ask_to = 0;
@@ -4038,6 +4373,44 @@ int main(int argc, char **argv) {
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (blocks_open) draw_blocks(oc_client_model(cl), tb_width(), tb_height());
+        {   /* agents: a token minted is taken to be shown once; tokens asked for open as a list */
+            oc_model *am = (oc_model *)oc_client_model(cl);
+            if (am->agent_token[0])
+                oc_model_take_agent_token(am, g_tok_shown, sizeof g_tok_shown, &g_tok_agent, NULL,
+                                          g_tok_scopes, sizeof g_tok_scopes);
+            /* AI clients: what a code names opens as the choice; a list asked for opens as it lands. */
+            if (am->conn_req_open && !action_open && !prompt_kind) {
+                menu_build_conn_request(am);
+                act_title = g_conn_title;
+                action_menu.sel = action_menu.top = 0;
+                action_open = 1; tk_list_reset_filter(&action_menu);
+                am->conn_req_open = 0;   /* asked once; the code is kept for the answer */
+            }
+            if (g_conn_await && !action_open && !prompt_kind &&
+                (g_conn_await == 1 || am->all_conns_known)) {
+                menu_build_conns(am, g_conn_await == 2);
+                act_title = g_conn_await == 2 ? "Everyone's AI clients: Enter revokes one" : "Your AI clients: Enter revokes one";
+                g_conn_await = 0;
+                action_menu.sel = action_menu.top = 0;
+                action_open = 1; tk_list_reset_filter(&action_menu);
+                if (!g_nmenu) {   /* nothing to revoke: said as the list's one line */
+                    g_menu[g_nmenu++] = (menuitem){ "None connected", 0 };
+                }
+            }
+            if (g_agt_await && am->atokens_agent == g_agt_await && !action_open) {
+                act_uid = g_agt_await; g_agt_await = 0;
+                menu_build_atokens(am);
+                const char *an = oc_model_user_name(am, act_uid);
+                snprintf(g_agt_title, sizeof g_agt_title, "%s's tokens: Enter revokes one", an && an[0] ? an : "Agent");
+                act_title = g_agt_title;
+                action_menu.sel = action_menu.top = 0;
+                action_open = g_nmenu > 0; tk_list_reset_filter(&action_menu);
+                if (!g_nmenu) snprintf(g_closed_note, sizeof g_closed_note, "%s has no tokens.", an && an[0] ? an : "The agent");
+            }
+            if (g_tok_shown[0]) draw_agent_token(am, tb_width(), tb_height());
+        }
+        if (cpage_id) draw_call_page(oc_client_model(cl), tb_width(), tb_height(), cpage_id);
+        else if (calls_open) draw_calls(oc_client_model(cl), tb_width(), tb_height(), csel);
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
@@ -4256,6 +4629,35 @@ int main(int argc, char **argv) {
             if (sv_top < 0) sv_top = 0;
             continue;
         }
+        if (cpage_id) {                        /* a call's page: c its chat, m more lines, any other key back */
+            const oc_model *cm = oc_client_model(cl);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.ch == 'm' && cm->call_page && cm->call_page->call_id == cpage_id)
+                oc_client_call_detail(cl, cpage_id, cm->call_page->n_lines);
+            else if (ev.ch == 'c' && cm->call_page && cm->call_page->call_id == cpage_id) {
+                /* The call's chat, as any conversation is shown. */
+                for (size_t i = 0; i < cm->n_channels; i++)
+                    if (cm->channels[i].channel_id == cm->call_page->chat_channel) focus = i;
+                cpage_id = 0; calls_open = 0;
+            } else cpage_id = 0;
+            continue;
+        }
+        if (calls_open) {                      /* the history: j/k or arrows, Enter opens, Esc closes */
+            const oc_model *cm = oc_client_model(cl);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN || ev.ch == 'j') { if (csel + 1 < (int)cm->n_call_hist) csel++; }
+            else if (ev.key == TB_KEY_ARROW_UP || ev.ch == 'k') { if (csel > 0) csel--; }
+            else if (ev.key == TB_KEY_ENTER && csel < (int)cm->n_call_hist) {
+                cpage_id = cm->call_hist[csel].call_id;
+                oc_client_call_detail(cl, cpage_id, 0);
+            } else calls_open = 0;
+            continue;
+        }
+        if (g_tok_shown[0]) {                  /* the token shown once: any key closes, and it is forgotten */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            agent_token_forget();
+            continue;
+        }
         if (blocks_open) {                     /* the blocks overlay: any key closes */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else blocks_open = 0;
@@ -4305,6 +4707,20 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v, g_search_sort);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_CONN_CODE && *v) oc_client_connection_code(cl, v);
+                else if (k == PROMPT_AGENT_NAME && *v) {   /* then its first token's name */
+                    snprintf(g_agt_name, sizeof g_agt_name, "%s", v);
+                    prompt_kind = PROMPT_AGENT_TOKEN; prompt_title = "Its first token's name (where it is used, such as CI)";
+                    tk_input_init(&prompt_input, 0, "first");
+                }
+                else if (k == PROMPT_AGENT_TOKEN) {        /* then its scopes */
+                    snprintf(g_agt_tname, sizeof g_agt_tname, "%s", *v ? v : "first");
+                    memset(g_agt_scope_on, 0, sizeof g_agt_scope_on);
+                    menu_build_scopes();
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = "What the token may do: Enter ticks, Done makes it";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
                 else if (k == PROMPT_DATE && *v) {
                     uint64_t day = tui_parse_day(v);
                     /* In the thread only while it is still the one open here. */
@@ -4515,11 +4931,25 @@ int main(int argc, char **argv) {
                     } else await_invite = 1;
                 }
                 else if (id == ACT_PROFILE) { oc_client_get_profile(cl, 0); profile_uid = 0; profile_open = 1; }
+                else if (id == ACT_CONN_APPROVE) {
+                    prompt_kind = PROMPT_CONN_CODE; prompt_title = "Approve an AI client: the code its page shows";
+                    tk_input_init(&prompt_input, 0, "e.g. BCDF-GHJK");
+                }
+                else if (id == ACT_CONN_MINE) { oc_client_list_connections(cl, 0); g_conn_await = 1; }
+                else if (id == ACT_CONN_ALL)  {
+                    ((oc_model *)oc_client_model(cl))->all_conns_known = 0;
+                    oc_client_list_connections(cl, 1); g_conn_await = 2;
+                }
+                else if (id == ACT_AGT_NEW) {
+                    g_agt_uid = 0;
+                    prompt_kind = PROMPT_AGENT_NAME; prompt_title = "New agent: its name"; tk_input_init(&prompt_input, 0, "name");
+                }
                 else if (id == ACT_DEACTIVATE) deactivate_ask = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
                 else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                 else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                else if (id == ACT_CALLS) { oc_client_call_history(cl, 0); calls_open = 1; csel = 0; }
                 else if (id == ACT_DMPRIV)
                     oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
                 else if (id == ACT_BLOCKED) {
@@ -4654,6 +5084,7 @@ int main(int argc, char **argv) {
                     else if (id == ACT_DMPRIV)
                         oc_client_set_dm_privacy(cl, oc_client_model(cl)->dm_privacy != OC_DM_PRIVACY_NOBODY);
                     else if (id == ACT_BLOCKS_ADMIN) { oc_client_list_blocks(cl); blocks_open = 1; }
+                    else if (id == ACT_CALLS) { oc_client_call_history(cl, 0); calls_open = 1; csel = 0; }
                     else if (id == ACT_BLOCKED) {
                         menu_build_blocked(oc_client_model(cl));
                         action_menu.sel = action_menu.top = 0;
@@ -4663,6 +5094,39 @@ int main(int argc, char **argv) {
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
                     else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
                     else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
+                    else if (id == ACT_AGT_PROFILE) { oc_client_get_profile(cl, act_uid); profile_uid = act_uid; profile_open = 1; }
+                    else if (id == ACT_AGT_TOKENS)  { oc_client_list_agent_tokens(cl, act_uid); g_agt_await = act_uid; }
+                    else if (id == ACT_AGT_MINT) {
+                        g_agt_uid = act_uid;
+                        prompt_kind = PROMPT_AGENT_TOKEN; prompt_title = "New token: its name (where it is used, such as CI)";
+                        tk_input_init(&prompt_input, 0, "name");
+                    }
+                    else if (id == ACT_AGT_ADDHERE) { if (g_agt_chan) oc_client_channel_invite(cl, g_agt_chan, act_uid); }
+                    else if (id == ACT_AGT_REMOVE)  oc_client_remove_agent(cl, act_uid);
+                    else if (id >= ACT_SCOPE0 && id <= ACT_SCOPE_LAST) {   /* ticked or not; the list stays */
+                        int k = id - ACT_SCOPE0;
+                        g_agt_scope_on[k] = (uint8_t)!g_agt_scope_on[k];
+                        menu_build_scopes();
+                        tk_list_reset_filter(&action_menu);
+                        action_menu.sel = ai;
+                        action_open = 1;
+                    }
+                    else if (id == ACT_SCOPE_DONE) {
+                        char sc[512];
+                        scopes_text(sc, sizeof sc);
+                        if (g_agt_uid) oc_client_mint_agent_token(cl, g_agt_uid, g_agt_tname, sc);
+                        else if (g_agt_name[0]) oc_client_create_agent(cl, g_agt_name, g_agt_tname, sc);
+                        g_agt_name[0] = '\0';
+                    }
+                    else if (id >= ACT_ATOK0 && id <= ACT_ATOK_LAST)
+                        oc_client_revoke_agent_token(cl, act_uid, g_atok_ids[id - ACT_ATOK0]);
+                    else if (id >= ACT_CONN0 && id <= ACT_CONN_LAST)
+                        oc_client_revoke_connection(cl, g_conn_ids[id - ACT_CONN0], g_conn_all);
+                    else if (id == ACT_CONN_DECLINE)
+                        oc_client_connection_decide(cl, oc_client_model(cl)->conn_req_code, 0, 0);
+                    else if (id == ACT_CONN_LIFE30 || id == ACT_CONN_LIFE90 || id == ACT_CONN_LIFE365 || id == ACT_CONN_LIFE0)
+                        oc_client_connection_decide(cl, oc_client_model(cl)->conn_req_code, 1,
+                                                    id == ACT_CONN_LIFE30 ? 30 : id == ACT_CONN_LIFE90 ? 90 : id == ACT_CONN_LIFE365 ? 365 : 0);
                     else if (id == ACT_PROFILE_OF) {
                         /* Their whole profile, which is what carries the
                          * workspace's fields; shown as it lands. */
@@ -4677,6 +5141,21 @@ int main(int argc, char **argv) {
                                 editing = act_mid;
                                 snprintf(composer, sizeof composer, "%s", ec->msgs[k].body ? ec->msgs[k].body : "");
                                 clen = strlen(composer); panel = 0; break;
+                            }
+                    }
+                    else if (id == ACT_EXPORT) {     /* the video's playable copy -> "<name>-compatible.mp4" in cwd */
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                for (uint8_t ak = 0; ak < ec->msgs[k].n_attach; ak++)
+                                    if (ec->msgs[k].attach[ak].media_kind == OC_MEDIA_VIDEO_MESSAGE &&
+                                        !ec->msgs[k].attach[ak].reclaimed) {
+                                        char name[160];
+                                        oc_export_copy_name(ec->msgs[k].attach[ak].filename, name, sizeof name);
+                                        oc_client_export(cl, ec->msgs[k].attach[ak].id, name);
+                                        break;
+                                    }
+                                break;
                             }
                     }
                     else if (id == ACT_DOWNLOAD) {   /* first live attachment -> its filename in cwd */
@@ -4884,16 +5363,30 @@ int main(int argc, char **argv) {
                 }
             }
             else if (panel == 3) {                                          /* members */
+                /* In the panel's order: the people, then the agents. */
+                size_t *ord = malloc((mm->n_users ? mm->n_users : 1) * sizeof *ord), np = 0;
+                int nshown = ord ? (int)mem_order(mm, ord, mm->n_users, &np) : 0;
                 if (up && mem_sel > 0) mem_sel--;
-                else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
+                else if (down && mem_sel + 1 < nshown) mem_sel++;
                 else if (ev.ch == 'n') { dmp_open(&dmpick, mm); dmpick_open = 1; }
-                else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
-                    /* discoverable member action menu (Message / role / remove) */
-                    uint64_t uid = mm->users[mem_sel].user_id;
-                    menu_build_member(uid == mm->user_id, oc_model_is_blocked(mm, uid));
-                    act_uid = uid; act_cid = 0; act_mid = 0; act_title = "Member";
+                else if (ev.key == TB_KEY_ENTER && mem_sel < nshown) {
+                    /* discoverable member action menu (Message / role / remove);
+                     * an agent's is its administration (docs/details/MCP.md §6) */
+                    const oc_member *mu = &mm->users[ord[mem_sel]];
+                    uint64_t uid = mu->user_id;
+                    if (mu->agent) {
+                        const oc_channel *fc = focus < mm->n_channels ? &mm->channels[focus] : NULL;
+                        g_agt_chan = fc && fc->kind != OC_CHANNEL_KIND_DM && !fc->n_peers && fc->joined ? fc->channel_id : 0;
+                        menu_build_agent(mm, uid, g_agt_chan);
+                        act_title = g_agt_title;
+                    } else {
+                        menu_build_member(uid == mm->user_id, oc_model_is_blocked(mm, uid));
+                        act_title = "Member";
+                    }
+                    act_uid = uid; act_cid = 0; act_mid = 0;
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
+                free(ord);
             }
             else if (panel == 2 && ch) {                                    /* messages */
                 int n = (int)ch->n_msgs;
@@ -4922,6 +5415,11 @@ int main(int argc, char **argv) {
                         if (sel->author_id && sel->author_id != mm->user_id &&
                             !oc_model_is_workspace_sender(mm, sel->author_id))
                             blk = oc_model_is_blocked(mm, sel->author_id) ? 2 : 1;
+                        g_menu_can_export = 0;
+                        if (oc_model_export_available(mm))
+                            for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                                if (sel->attach[ak].media_kind == OC_MEDIA_VIDEO_MESSAGE && !sel->attach[ak].reclaimed)
+                                    g_menu_can_export = 1;
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
                                        has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
                                        sel->saved && sel->remind_at);

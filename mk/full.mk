@@ -1,4 +1,4 @@
-# The full build and the full suite (docs/TESTING.md): everything a release
+# The full build and the full suite (docs/details/TESTING.md): everything a release
 # ships, built and checked, in CI only, once per release-candidate
 # (release-candidate.yml, which calls test-all.yml for the code tests). The
 # full suite is a superset of the fast one (mk/tests.mk): every suite, the
@@ -35,7 +35,7 @@
 #
 # A check on a binary or an image this machine cannot run says so and skips
 # it (the arm64 package and image, on an x86 runner).
-FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1 REMEMBER=0
+FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1 EXPORT=1 CALLREC=1 REMEMBER=0
 FULL_PARTS    := plain threads packages image windows
 PKG_ARCH    ?= $(if $(filter aarch64,$(ARCH)),arm64,amd64)
 PKG_VERSION ?= 0

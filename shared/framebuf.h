@@ -5,7 +5,7 @@
  * This buffer accumulates bytes as they arrive (from oc_tls_read) and yields
  * complete protocol frames one at a time, applying the two-phase length
  * discipline and the size limits from PROTOCOL.md §2. It is pure logic — no
- * sockets — so it is unit-tested directly (docs/TESTING.md §2.2).
+ * sockets — so it is unit-tested directly (docs/details/TESTING.md §2.2).
  */
 
 #ifndef OPENCHIME_FRAMEBUF_H

@@ -1,11 +1,13 @@
 /* Thin wrappers over libvpx (VP9) and libopus for video messages (ARCH-110,
- * docs/VIDEO-MESSAGES.md §4) and calls (CALLS.md §6-§7). The settings live here
+ * docs/details/VIDEO-MESSAGES.md §4) and calls (CALLS.md §6-§7). The settings live here
  * and nowhere else, so the recorder, the player and the call engine never touch
  * a library API directly. */
 #ifndef OC_CODEC_H
 #define OC_CODEC_H
 
 #include "oc_media.h"
+#include "oc_opusdec.h"   /* the decoders are shared with the daemon's export (ARCH-135) */
+#include "oc_vp9dec.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -44,18 +46,8 @@ int  oc_vp9enc_encode(oc_vp9enc *e, const oc_frame *f, int force_keyframe,
                       void (*emit)(void *ctx, const oc_packet *p), void *ctx);
 void oc_vp9enc_close(oc_vp9enc *e);
 
-typedef struct oc_vp9dec oc_vp9dec;
-
-oc_vp9dec *oc_vp9dec_open(void);
-/* Decode one sample. On success `out` points at the decoder's own frame
- * (valid until the next call) and 0 is returned; 1 means no frame this time;
- * -1 an error. `out->pts_us` is set to `pts_us`. */
-int  oc_vp9dec_decode(oc_vp9dec *d, const uint8_t *data, size_t len, int64_t pts_us, oc_frame *out);
-void oc_vp9dec_close(oc_vp9dec *d);
-
 /* ---- Opus ----------------------------------------------------------------------- */
 
-#define OC_OPUS_RATE        48000
 #define OC_OPUS_FRAME       960          /* 20 ms at 48 kHz */
 #define OC_OPUS_MAX_PACKET  1500
 
@@ -69,15 +61,7 @@ int  oc_opusenc_lookahead(oc_opusenc *e);
 int  oc_opusenc_encode(oc_opusenc *e, const int16_t *pcm, uint8_t *out, size_t cap);
 void oc_opusenc_close(oc_opusenc *e);
 
-typedef struct oc_opusdec oc_opusdec;
-
-oc_opusdec *oc_opusdec_open(int channels);
-/* Decode one packet into mono PCM (a stereo stream is downmixed). Returns the
- * number of samples written (at most `cap`) or -1. */
-int  oc_opusdec_decode(oc_opusdec *d, const uint8_t *data, size_t len, int16_t *pcm, int cap);
-void oc_opusdec_close(oc_opusdec *d);
-
-/* ---- Opus for calls (docs/CALLS.md §3) --------------------------------------- */
+/* ---- Opus for calls (docs/details/CALLS.md §3) --------------------------------------- */
 
 #define OC_VOICE_RATE   16000
 #define OC_VOICE_FRAME  320              /* 20 ms at 16 kHz */
@@ -92,13 +76,5 @@ void oc_opusenc_set_loss(oc_opusenc *e, int percent);
  * packet of 2 bytes or fewer is silence the encoder need not have sent: the
  * caller does not send it. */
 int  oc_opusenc_encode_voice(oc_opusenc *e, const int16_t *pcm, uint8_t *out, size_t cap);
-
-/* A mono decoder at `rate`. */
-oc_opusdec *oc_opusdec_open_rate(int rate);
-/* One frame of `frame` samples: `data` decoded; or, with `fec`, the frame
- * BEFORE `data` rebuilt from the redundancy `data` carries; or, with `data`
- * NULL, a frame concealed from what came before (PLC). Returns samples or -1. */
-int  oc_opusdec_decode_frame(oc_opusdec *d, const uint8_t *data, size_t len, int fec,
-                             int16_t *pcm, int frame);
 
 #endif

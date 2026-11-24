@@ -1,4 +1,4 @@
-/* The audio device layer's platform seam (audio_dev.h, docs/AUDIO.md §3.2).
+/* The audio device layer's platform seam (audio_dev.h, docs/details/AUDIO.md §3.2).
  * audio_dev.c owns everything that is the same everywhere -- the rings, the
  * timestamps, the far-end reference, the microphone's one owner, the
  * synthetic test devices -- and a backend owns the devices: how they are

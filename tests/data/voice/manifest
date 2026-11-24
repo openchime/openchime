@@ -1,6 +1,6 @@
 # The voice model's reference renderings: made once from the published model,
 # before the engine they were made with was withdrawn; they cannot be made
-# again, and these files are the reference (docs/TTSKIT.md §9).
+# again, and these files are the reference (docs/details/TTSKIT.md §9).
 # Per fixture <name>: <name>.ids, the model's input ids, int64 little-endian;
 # <name>.f32, run A's raw waveform (before the daemon's high pass, tail trim and
 # fade), float32 little-endian, 24,000 a second; <name>.quiet.f32, the same with

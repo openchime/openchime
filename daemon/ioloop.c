@@ -515,7 +515,8 @@ static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n)
 
     c->http_done = 1;
     c->deadline = 0;
-    size_t len = req.method_len + req.path_len + req.body_len + req.host_len + req.origin_len;
+    size_t len = req.method_len + req.path_len + req.body_len + req.host_len + req.origin_len +
+                 req.authorization_len + req.mcp_version_len + req.mcp_method_len + req.mcp_name_len;
     oc_io_event *e = calloc(1, sizeof *e);
     if (e && len && !(e->data = malloc(len))) { free(e); e = NULL; }
     if (e) {
@@ -526,9 +527,15 @@ static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n)
         if (req.body_len)   { memcpy(o, req.body, req.body_len);     o += req.body_len; }
         if (req.host_len)   { memcpy(o, req.host, req.host_len);     o += req.host_len; }
         if (req.origin_len) { memcpy(o, req.origin, req.origin_len); o += req.origin_len; }
+        if (req.authorization_len) { memcpy(o, req.authorization, req.authorization_len); o += req.authorization_len; }
+        if (req.mcp_version_len) { memcpy(o, req.mcp_version, req.mcp_version_len); o += req.mcp_version_len; }
+        if (req.mcp_method_len)  { memcpy(o, req.mcp_method, req.mcp_method_len);   o += req.mcp_method_len; }
+        if (req.mcp_name_len)    { memcpy(o, req.mcp_name, req.mcp_name_len);       o += req.mcp_name_len; }
         e->len = len;
         e->method_len = req.method_len; e->path_len = req.path_len; e->body_len = req.body_len;
         e->host_len = req.host_len; e->origin_len = req.origin_len;
+        e->auth_len = req.authorization_len; e->mcpv_len = req.mcp_version_len;
+        e->mcpm_len = req.mcp_method_len; e->mcpn_len = req.mcp_name_len;
         e->is_json = req.is_json; e->is_form = req.is_form;
     }
     free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;

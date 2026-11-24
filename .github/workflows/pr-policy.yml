@@ -1,6 +1,6 @@
 # Pull request policy, and the only thing that runs on a pull request: policy,
 # not tests. The fast suite ran locally before the push (.githooks/pre-push),
-# and the full suite runs once per release-candidate (docs/TESTING.md). The
+# and the full suite runs once per release-candidate (docs/details/TESTING.md). The
 # title becomes the commit subject once merged (squash-only merges, repo
 # setting), so the title is checked here, beside the attribution scan and the
 # tree's issue references, each by its one rule in scripts/policy/. The body

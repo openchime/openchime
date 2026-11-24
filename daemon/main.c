@@ -21,10 +21,13 @@
 #include "dbwriter.h"
 #include "enroll.h"
 #include "invite_mail.h"
+#include "webhooks_out.h"
 #include "address_report.h"
 #include "listen.h"
 #include "migrate.h"
 #include "netloop.h"
+#include "export_render.h"   /* oc_export_codecs_builtin (ARCH-135) */
+#include "callrec_render.h"  /* oc_callrec_codecs_builtin (CALLS.md §8) */
 #include "oidcrp.h"
 #include "push.h"
 #include "relaykeys.h"
@@ -640,8 +643,12 @@ int main(int argc, char **argv) {
             tts_engine = NULL;
         }
         oc_netloop_set_tts(tts_engine);
+        oc_netloop_set_export(oc_export_codecs_builtin());   /* NULL unless built with EXPORT=1 */
     }
 #endif
+    /* The codecs a call's recording is made with (CALLS.md §8): NULL unless
+     * built with CALLREC=1, and then nobody records a call here. */
+    oc_netloop_set_callrec(oc_callrec_codecs_builtin());
 #ifdef OC_STT
     /* Voice input's engine (ARCH-112): the recognizer built into this binary,
      * its data beside it in a directory of its own. Absent data turns voice input
@@ -1028,6 +1035,16 @@ int main(int argc, char **argv) {
         if (oc_webapp_load(exe, werr, sizeof werr)) fprintf(stderr, "web client: serving /app/\n");
         else fprintf(stderr, "web client: not served (%s)\n", werr);
     }
+    /* Outgoing webhooks' deliveries (docs/details/WEBHOOKS.md), off the loop:
+     * only with the factor key, which their secrets are sealed under. */
+    oc_webhooks_out *owh = NULL;
+    {
+        uint8_t fk[OC_FACTOR_KEY_LEN];
+        if (oc_dbwriter_factor_key(db, fk) == 0) owh = oc_webhooks_out_start(fk, NULL, NULL, NULL);
+        for (volatile uint8_t *z = fk; z < fk + sizeof fk; z++) *z = 0;
+        if (!owh) fprintf(stderr, "openchimed: outgoing webhooks are off: no factor key, or no worker\n");
+        oc_netloop_set_webhooks_out(owh);
+    }
     int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
     if (audio_udp >= 0) close(audio_udp);
 
@@ -1044,6 +1061,8 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&svc.adopt_mu);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
+    oc_netloop_set_webhooks_out(NULL);
+    oc_webhooks_out_stop(owh);
     oc_push_stop(svc.push);
     oc_invite_mail_stop(svc.invite_mail);
     free(svc.privkey);

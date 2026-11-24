@@ -1,6 +1,6 @@
 # scripts/test/lib/common.sh: sourced by every test script, never run.
 #
-# The tests come in two suites (docs/TESTING.md): the fast one, scripts in
+# The tests come in two suites (docs/details/TESTING.md): the fast one, scripts in
 # scripts/test/fast/, run by `make test` before every push; and the full one,
 # scripts in scripts/test/full/, run by `make test-all` in CI, once per
 # release-candidate. A make target calls the scripts; the workflows call only

@@ -370,70 +370,125 @@ void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id)        { pdm_cmd(c, OC_C
 
 /* ---- calls (REQ-150, REQ-301-305) ------------------------------------------ */
 
-static void call_cmd(oc_client *c, int type, uint64_t channel_id, const uint64_t *uids, int n) {
-    if (!c || !channel_id) return;
+static void call_cmd(oc_client *c, int type, uint64_t call_id, const uint64_t *uids, int n) {
+    if (!c || !call_id) return;
     oc_cmd *cmd = oc_cmd_new(type);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
     for (int i = 0; uids && i < n; i++) cmd->uids[cmd->n_uids++] = uids[i];
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n) {
-    if (!c) return;
-    c->model.call_pending = channel_id;
-    call_cmd(c, OC_CMD_CALL_JOIN, channel_id, invite, n);
+void oc_client_call_start(oc_client *c, uint64_t from_channel, const char *subject,
+                          const uint64_t *invite, int n) {
+    if (!c || !subject) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_START);
+    if (!cmd) return;
+    if (!(cmd->body = strdup(subject))) { oc_cmd_free(cmd); return; }
+    cmd->channel_id = from_channel;
+    if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
+    for (int i = 0; invite && i < n; i++) cmd->uids[cmd->n_uids++] = invite[i];
+    c->model.call_pending = 1;
+    oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_join(oc_client *c, uint64_t channel_id) {
-    oc_client_call_start(c, channel_id, NULL, 0);
+void oc_client_call_join(oc_client *c, uint64_t call_id) {
+    if (!c || !call_id) return;
+    c->model.call_pending = 1;
+    call_cmd(c, OC_CMD_CALL_JOIN, call_id, NULL, 0);
 }
 
-void oc_client_call_leave(oc_client *c, uint64_t channel_id) {
+void oc_client_call_subject(oc_client *c, uint64_t call_id, const char *subject) {
+    if (!c || !call_id || !subject) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SUBJECT);
+    if (!cmd) return;
+    if (!(cmd->body = strdup(subject))) { oc_cmd_free(cmd); return; }
+    cmd->call_id = call_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_record(oc_client *c, uint64_t call_id, int on) {
+    if (!c || !call_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_RECORD);
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_history(oc_client *c, uint64_t before_ms) {
+    oc_cmd *cmd = c ? oc_cmd_new(OC_CMD_CALL_HISTORY) : NULL;
+    if (!cmd) return;
+    cmd->start_ms = before_ms;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_calls_seen(oc_client *c, uint64_t seen_ms) {
+    if (c) oc_model_calls_seen(&c->model, seen_ms);
+}
+
+void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from) {
+    oc_cmd *cmd = c && call_id ? oc_cmd_new(OC_CMD_CALL_DETAIL) : NULL;
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->req_id = line_from;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_delete(oc_client *c, uint64_t call_id, uint8_t what, uint64_t rec_id) {
+    oc_cmd *cmd = c && call_id ? oc_cmd_new(OC_CMD_CALL_DELETE) : NULL;
+    if (!cmd) return;
+    cmd->call_id = call_id;
+    cmd->op = what;
+    cmd->message_id = rec_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_leave(oc_client *c, uint64_t call_id) {
     if (!c) return;
     /* Leaving while getting back in is over here at once, connected or not:
      * the command waits for a connection, the window does not. */
-    if (c->model.call_rejoining && c->model.call_rejoining == channel_id) {
+    if (c->model.call_rejoining && c->model.call_rejoining == call_id) {
         c->model.call_rejoining = 0;
         memset(&c->model.call, 0, sizeof c->model.call);
     }
-    call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0);
+    call_cmd(c, OC_CMD_CALL_LEAVE, call_id, NULL, 0);
 }
-void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
-void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
+void oc_client_call_decline(oc_client *c, uint64_t call_id) { call_cmd(c, OC_CMD_CALL_DECLINE, call_id, NULL, 0); }
+void oc_client_call_end(oc_client *c, uint64_t call_id)     { call_cmd(c, OC_CMD_CALL_END, call_id, NULL, 0); }
 
-void oc_client_call_share(oc_client *c, uint64_t channel_id, int on) {
+void oc_client_call_share(oc_client *c, uint64_t call_id, int on) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SHARE);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(on ? 1 : 0);
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on) {
+void oc_client_call_camera(oc_client *c, uint64_t call_id, int on) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_CAMERA);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(on ? 1 : 0);
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n) {
+void oc_client_call_video_sub(oc_client *c, uint64_t call_id, int all, const uint64_t *users, int n) {
     if (!c || n < 0) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_VIDEO_SUB);
     if (!cmd) return;
-    cmd->channel_id = channel_id;
+    cmd->call_id = call_id;
     cmd->op = (uint8_t)(all ? 1 : 0);
     if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
     for (int i = 0; !all && users && i < n; i++) cmd->uids[cmd->n_uids++] = users[i];
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
-    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
+void oc_client_call_invite(oc_client *c, uint64_t call_id, const uint64_t *uids, int n) {
+    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, call_id, uids, n);
 }
 
 void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx) {
@@ -1769,11 +1824,149 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_export(oc_client *c, uint64_t attachment_id, const char *dest_path) {
+    if (!c || !attachment_id || !dest_path || !dest_path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_EXPORT);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;   /* reused as the attachment id */
+    cmd->xfer_tag = OC_EXPORT_TAG(attachment_id);
+    cmd->body = strdup(dest_path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_export_copy_name(const char *video_name, char *out, size_t cap) {
+    if (!out || !cap) return;
+    const char *n = video_name && video_name[0] ? video_name : "video.mp4";
+    size_t len = strlen(n);
+    int has_ext = len >= 4 && n[len - 4] == '.' && (n[len - 3] | 0x20) == 'm' &&
+                  (n[len - 2] | 0x20) == 'p' && n[len - 1] == '4';
+    snprintf(out, cap, "%.*s-compatible.mp4", (int)(has_ext ? len - 4 : len), n);
+}
+
 void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
     if (!c || !attachment_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
     if (!cmd) return;
     cmd->message_id = attachment_id;
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_create_agent(oc_client *c, const char *name, const char *token_name, const char *scopes) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_AGENT);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->body2 = strdup(token_name ? token_name : "");
+    cmd->body3 = strdup(scopes ? scopes : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_mint_agent_token(oc_client *c, uint64_t agent_id, const char *name, const char *scopes) {
+    if (!c || !agent_id || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MINT_AGENT_TOKEN);
+    if (!cmd) return;
+    cmd->message_id = agent_id;
+    cmd->body = strdup(name);
+    cmd->body3 = strdup(scopes ? scopes : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void agent_cmd(oc_client *c, int type, uint64_t agent_id, uint64_t token_id) {
+    if (!c || !agent_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = agent_id;
+    cmd->channel_id = token_id;   /* reused as the token's id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_remove_agent(oc_client *c, uint64_t agent_id) { agent_cmd(c, OC_CMD_REMOVE_AGENT, agent_id, 0); }
+void oc_client_list_agent_tokens(oc_client *c, uint64_t agent_id) { agent_cmd(c, OC_CMD_LIST_AGENT_TOKENS, agent_id, 0); }
+void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t token_id) {
+    if (token_id) agent_cmd(c, OC_CMD_REVOKE_AGENT_TOKEN, agent_id, token_id);
+}
+
+void oc_client_connection_code(oc_client *c, const char *code) {
+    if (!c || !code || !code[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CONNECTION_CODE);
+    if (!cmd) return;
+    cmd->body = strdup(code);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days) {
+    if (!c || !code || !code[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CONNECTION_DECIDE);
+    if (!cmd) return;
+    cmd->body = strdup(code);
+    cmd->op = (uint8_t)(approve ? 1 : 0);
+    cmd->message_id = lifetime_days;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_connections(oc_client *c, int everyone) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_CONNECTIONS);
+    if (!cmd) return;
+    cmd->op = (uint8_t)(everyone ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int everyone) {
+    if (!c || !connection_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_CONNECTION);
+    if (!cmd) return;
+    cmd->message_id = connection_id;
+    cmd->op = (uint8_t)(everyone ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_create_outgoing_webhook(oc_client *c, const char *url, const char *events,
+                                       const uint64_t *channels, size_t n_channels) {
+    if (!c || !url || !url[0] || !events) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_OUTWH);
+    if (!cmd) return;
+    char ids[OC_OUTWH_MAX_CHANNELS * 21 + 1] = "";
+    size_t at = 0;
+    for (size_t i = 0; i < n_channels && i < OC_OUTWH_MAX_CHANNELS; i++) {
+        int k = snprintf(ids + at, sizeof ids - at, "%s%llu", at ? " " : "", (unsigned long long)channels[i]);
+        if (k < 0 || (size_t)k >= sizeof ids - at) break;
+        at += (size_t)k;
+    }
+    cmd->body = strdup(url);
+    cmd->body2 = strdup(events);
+    cmd->body3 = strdup(ids);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void outwh_cmd(oc_client *c, int type, uint64_t id, uint64_t arg) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = id;
+    cmd->channel_id = arg;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_outgoing_webhooks(oc_client *c) { outwh_cmd(c, OC_CMD_LIST_OUTWH, 0, 0); }
+void oc_client_set_outgoing_webhook(oc_client *c, uint64_t webhook_id, int enabled) {
+    if (webhook_id) outwh_cmd(c, OC_CMD_SET_OUTWH, webhook_id, enabled ? 1 : 0);
+}
+void oc_client_delete_outgoing_webhook(oc_client *c, uint64_t webhook_id) {
+    if (webhook_id) outwh_cmd(c, OC_CMD_DELETE_OUTWH, webhook_id, 0);
+}
+
+void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
+    if (!c || !attachment_id) return;
+    if (rung != OC_PREVIEW_RUNG_INLINE_WIRE && rung != OC_PREVIEW_RUNG_EXPANDED_WIRE) {
+        oc_client_fetch_attachment(c, attachment_id);
+        return;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH_PREVIEW);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    cmd->op = rung;
     cmd->xfer_tag = attachment_id;
     oc_queue_push(&c->cmds, cmd);
 }

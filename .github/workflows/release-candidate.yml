@@ -17,7 +17,7 @@
 #      and the commit policy, which only warns, so one bad subject already on
 #      staging does not stop every later release-candidate -- and then the
 #      full suite's code tests (`make build-all` and `make test-all`,
-#      PART=plain then threads; docs/TESTING.md);
+#      PART=plain then threads; docs/details/TESTING.md);
 #   2. `stage` (the `release` environment), only when they pass: the release
 #      credentials reported; everything a release ships -- both daemons with
 #      their data and their packages, the container images, the Windows
@@ -249,7 +249,7 @@ jobs:
 
       # --- The tools and the shared caches -----------------------------------------
       # No MAKEFLAGS: every build compiles one file at a time here as anywhere
-      # (docs/TESTING.md, "One build at a time").
+      # (docs/details/TESTING.md, "One build at a time").
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # the release-* tags: the number below, and the prune at the end
@@ -344,7 +344,7 @@ jobs:
         with:
           path: *opus-amd64-path
           key: *opus-amd64-key
-      # What the release ships, checked (scripts/test/full/, docs/TESTING.md):
+      # What the release ships, checked (scripts/test/full/, docs/details/TESTING.md):
       # the glibc floor, one binary in all three packages, speech on the
       # release binary, the .deb installed and speaking, and its unit file.
       - name: make test-all PART=packages (amd64)

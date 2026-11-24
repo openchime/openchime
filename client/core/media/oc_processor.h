@@ -1,4 +1,4 @@
-/* The processor seam between capture and whatever consumes it (docs/AUDIO.md
+/* The processor seam between capture and whatever consumes it (docs/details/AUDIO.md
  * §3.3): a vtable in the shape of oc_blob_backend, so an echo canceller is a
  * swap rather than a restructure. `process` receives the capture frame AND the
  * far-end frame played at the same instant (oc_audio_reference), which is what

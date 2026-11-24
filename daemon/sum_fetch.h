@@ -1,6 +1,6 @@
 /*
  * OpenChime — the local summary model, made by the daemon at the first start
- * with summaries on (REQ-310, ARCH-116, docs/SUMMARIES.md §6).
+ * with summaries on (REQ-310, ARCH-116, docs/details/SUMMARIES.md §6).
  *
  * The model is data, not code, and is never shipped in a package. When an
  * operator turns summaries on, the daemon's next start fetches Qwen's release

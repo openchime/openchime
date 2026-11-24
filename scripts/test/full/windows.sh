@@ -8,7 +8,7 @@
 # PE at 1.0.<version>.0, 32-bit or 64-bit (NSIS builds on a 32-bit stub), and
 # the MSIX holds its manifest, block map, content types and both binaries, its
 # Identity at 1.0.<version>.0. Read on Linux;
-# whether they install is checked on Windows (docs/TESTING.md §4).
+# whether they install is checked on Windows (docs/details/TESTING.md §4).
 #
 # Needs: python3 with pefile (apt: python3-pefile); <bindir>/openchime.exe and
 # openchime-tui.exe, and the installer and MSIX in <dist>

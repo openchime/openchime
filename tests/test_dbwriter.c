@@ -6,6 +6,7 @@
 #include "auth.h"       /* oc_sha256, to re-derive an invitation's id */
 #include "config.h"     /* OC_DEPLOY_* */
 #include "dbwriter.h"
+#include "oauth.h"      /* the authorize page's states */
 #include "relaykeys.h"
 #include "migrate.h"
 #include "notify.h"   /* the badge asks the same rule a toast does */
@@ -2421,103 +2422,36 @@ static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
  * (a loaded export writes none), so the server's unread count read 0
  * where the client, reading the text, counted the @channel lines. Crossing
  * schema step 60 the writer scans every message without rows once, with the
- * scanner a send uses. Made here by sending, wiping the rows and the step, and
- * starting again. */
+ * scanner a send uses. Made here as test_migrate.c makes a database of an
+ * earlier step: the migrations up to 59 only, its people and messages written
+ * there with SQL, and the writer started on it, which runs the rest. Nothing
+ * here names a later step, so a new migration cannot break it. */
 static void test_index_mentions(void) {
     const char *path = tdb("index_mentions.db");
     cleanup_db(path);
-    oc_dbwriter *w = start_db(path);
-    CHECK(w != NULL);
-    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
-    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
-    CHECK(alice && bob);
-    uint8_t idem[OC_IDEM_LEN] = { 0x60, 1 };
-    uint64_t m1 = send_msg(w, alice, idem, "@channel the office is closed Friday");
-    idem[1] = 2;
-    uint64_t m2 = send_msg(w, alice, idem, "@bob can you take the 3 o'clock");
-    idem[1] = 3;
-    uint64_t m3 = send_msg(w, alice, idem, "nothing for anyone here");
-    CHECK(m1 && m2 && m3);
-    oc_dbwriter_stop(w);
-
     sqlite3 *db = NULL;
+    char *err = NULL;
     CHECK(raw_open(path, &db) == SQLITE_OK);
-    /* Back to before step 60; the columns of steps 61 to 63 go too (with 63's
-     * and 72's triggers, back to step 6's), so that they can run again. */
-    CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
-                           "DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad; DROP TRIGGER messages_fts_au;"
-                           "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN"
-                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
-                           "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN"
-                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body); END;"
-                           "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN"
-                           "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
-                           "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;"
-                           "ALTER TABLE channels DROP COLUMN e2e;"
-                           "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;"
-                           "ALTER TABLE local_credentials DROP COLUMN kdf;"
-                           "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;"
-                           /* Before 0064 the identity's tables were the data's. */
-                           "CREATE TABLE server_identity (id INTEGER PRIMARY KEY, cert_pem TEXT, key_pem TEXT, created_at_ms INTEGER);"
-                           "CREATE TABLE enrollment (id INTEGER PRIMARY KEY, privkey_pem TEXT, audience TEXT, state TEXT,"
-                           "  activated_at_ms INTEGER, created_at_ms INTEGER);"
-                           "CREATE TABLE acme_account (id INTEGER PRIMARY KEY, directory_url TEXT, account_key_pem TEXT,"
-                           "  account_url TEXT, created_at_ms INTEGER);"
-                           "CREATE TABLE tls_certificate (id INTEGER PRIMARY KEY, source TEXT, names TEXT, chain_pem TEXT,"
-                           "  key_pem TEXT, issued_at_ms INTEGER, not_after_ms INTEGER);"
-                           "CREATE TABLE local_issuer (id INTEGER PRIMARY KEY, key_pem TEXT, issuer TEXT, created_at_ms INTEGER);"
-                           /* 0065's polls. */
-                           "DROP TABLE poll_votes; DROP TABLE poll_options; DROP TABLE polls;"
-                           /* 0066's workspace sender. */
-                           "ALTER TABLE users DROP COLUMN is_system;"
-                           /* 0067's own-schedule flag. */
-                           "ALTER TABLE users DROP COLUMN dnd_own;"
-                           /* 0068's read receipts. */
-                           "ALTER TABLE users DROP COLUMN share_receipts; ALTER TABLE users DROP COLUMN receipts_since_ms;"
-                           /* 0069's invitation time. */
-                           "ALTER TABLE invites DROP COLUMN created_at_ms;"
-                           /* 0070's collapsed messages. */
-                           "DROP TABLE collapsed_messages;"
-                           /* 0071's kind of principal. */
-                           "ALTER TABLE users DROP COLUMN kind;"
-                           /* 0073's reply also in the channel. */
-                           "ALTER TABLE messages DROP COLUMN also_channel;"
-                           /* 0074's following every thread. */
-                           "ALTER TABLE notification_prefs DROP COLUMN follow_threads;"
-                           /* 0075's reminders on saved items. */
-                           "DROP INDEX idx_saved_remind;"
-                           "ALTER TABLE saved_items DROP COLUMN remind_at_ms;"
-                           "ALTER TABLE saved_items DROP COLUMN reminded_at_ms;"
-                           /* 0076's active days. */
-                           "DROP TABLE user_active_days;"
-                           /* 0077's muted people. */
-                           "DROP TABLE muted_users;"
-                           /* 0078's snippets. */
-                           "DROP TABLE snippets_fts;"
-                           "ALTER TABLE attachment_media DROP COLUMN title;"
-                           "ALTER TABLE attachment_media DROP COLUMN language;"
-                           /* 0079's blocks and DM privacy. */
-                           "DROP TABLE blocks; DROP TABLE withheld_messages;"
-                           "ALTER TABLE users DROP COLUMN dm_privacy;"
-                           /* 0080's profile fields. */
-                           "DROP TABLE profile_field_values; DROP TABLE profile_fields;"
-                           /* 0081's out of office. */
-                           "ALTER TABLE users DROP COLUMN ooo_start_ms; ALTER TABLE users DROP COLUMN ooo_end_ms;"
-                           "ALTER TABLE users DROP COLUMN ooo_message;"
-                           /* 0082's channel managers. */
-                           "DROP TABLE channel_managers; ALTER TABLE channels DROP COLUMN created_by;"
-                           /* 0083's emoji aliases. */
-                           "DROP TABLE custom_emoji_aliases;"
-                           /* 0084's audit channel. */
-                           "ALTER TABLE audit_log DROP COLUMN channel_id;"
-                           /* 0085's to-do lists. */
-                           "DROP TABLE todo_tasks; DROP TABLE todo_lists;",
-                       NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 59, &err) == SQLITE_OK);
+    sqlite3_free(err); err = NULL;
+    CHECK(oc_schema_version(db) == 59);
+    const uint64_t bob = 2, m1 = 1, m2 = 2, m3 = 3;   /* the ids written below */
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,display_name,role,created_at_ms) VALUES"
+        "  (1,'local:alice','alice','owner',1),(2,'local:bob','bob','member',1);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);"
+        "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(1,1,1),(1,2,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES"
+        "  (1,1,1,CAST('@channel the office is closed Friday' AS BLOB),10),"
+        "  (2,1,1,CAST('@bob can you take the 3 o''clock' AS BLOB),11),"
+        "  (3,1,1,CAST('nothing for anyone here' AS BLOB),12);",
+        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
-    w = start_db(path);
+    oc_dbwriter *w = start_db(path);   /* the file is there: no template copied */
     CHECK(w != NULL);
     CHECK(raw_open(path, &db) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == OC_MIGRATIONS[OC_MIGRATIONS_COUNT - 1].version);
     sqlite3_stmt *st = NULL;
     int rows = 0, chan = 0, named = 0, none = 0;
     sqlite3_prepare_v2(db, "SELECT message_id, user_id, kind FROM mentions;", -1, &st, NULL);
@@ -12749,10 +12683,1520 @@ static void test_muted_people(void) {
     cleanup_db(path);
 }
 
+/* A call's recording in the database (CALLS.md §8): made, it is a video in
+ * the call's chat -- an attachment with its media row, carried by a message
+ * from who started it -- and the recording is ready with it; not made, it is
+ * failed with why. Those stopped and not yet made are listed for a start. And
+ * past OPENCHIME_CALL_RECORDING_DAYS from its call's end, the storage pass
+ * deletes it, its bytes reclaimed. */
+static void test_call_recordings(void) {
+    const char *path = tdb("callrec.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw-alice", OC_ROLE_MEMBER), bob = reg(w, "bob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    oc_job *j = oc_job_new(OC_JOB_CALL_START, 80);
+    j->user_id = alice;
+    j->call_subject = strdup("Weekly review");
+    j->call_uids = calloc(1, sizeof *j->call_uids);
+    j->call_uids[0] = bob; j->n_call_uids = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CALL_STARTED && r->call_id && r->call_chat);
+    const uint64_t call = r ? r->call_id : 0, chat = r ? r->call_chat : 0;
+    oc_dbres_free(r);
+
+    /* Two recordings, by bob, both stopped. */
+    uint64_t rec[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        j = oc_job_new(OC_JOB_RECORDING_START, 81);
+        j->user_id = bob; j->call_id = call; j->call_spool = strdup("/var/lib/oc/recordings");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_RECORDING_STARTED && r->rec_id);
+        rec[i] = r ? r->rec_id : 0;
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
+        j->rec_id = rec[i];
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    /* Both wait to be made, with their spools. */
+    j = oc_job_new(OC_JOB_RECORDINGS_PENDING, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDINGS_PENDING && r->n_recs == 2);
+    if (r && r->n_recs == 2) {
+        char want[64];
+        snprintf(want, sizeof want, "/var/lib/oc/recordings/%llu", (unsigned long long)rec[1]);
+        CHECK(r->rec_ids[0] == rec[0] && r->rec_ids[1] == rec[1] && strcmp(r->rec_spools[1], want) == 0);
+    }
+    oc_dbres_free(r);
+
+    /* The first made: the message in the chat, to its people, with the file. */
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec[0]; j->call_spool = strdup("ca11_0000000000000001");
+    j->exp_bytes = 123456; j->exp_duration_ms = 61000;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDING_DONE && r->channel_id == chat && r->author_id == bob && r->n_attach == 1);
+    CHECK(r && r->body_len == strlen("Recording of Weekly review") && !memcmp(r->body, "Recording of Weekly review", r->body_len));
+    CHECK(r && r->n_members == 2);
+    const uint64_t mid = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings r JOIN attachments a ON a.id = r.attachment_id"
+                           " JOIN attachment_media m ON m.attachment_id = a.id"
+                           " WHERE r.id = ?1 AND r.state = 'ready' AND r.spool IS NULL AND r.bytes = 123456"
+                           " AND r.duration_ms = 61000 AND a.storage_key = 'ca11_0000000000000001' AND a.mime = 'video/mp4'"
+                           " AND a.size = 123456 AND m.kind = 1 AND m.width = 1280 AND m.height = 720"
+                           " AND m.duration_ms = 61000;", rec[0]) == 1);
+    CHECK(e2e_scalar(path, "SELECT channel_id FROM messages WHERE id = ?1;", mid) == (int64_t)chat);
+    /* The second not: failed, with why, and nothing in the chat. */
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec[1]; j->rec_failed = 1;
+    oc_job_set_body(j, "a picture's spool is damaged", strlen("a picture's spool is damaged"));
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OK);
+    oc_dbres_free(r);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings WHERE id = ?1 AND state = 'failed' AND spool IS NULL"
+                           " AND attachment_id IS NULL AND error = 'a picture''s spool is damaged';", rec[1]) == 1);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM messages WHERE channel_id = ?1;", chat) == 1);
+    /* Nothing waits now. */
+    j = oc_job_new(OC_JOB_RECORDINGS_PENDING, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDINGS_PENDING && r->n_recs == 0);
+    oc_dbres_free(r);
+
+    /* Kept 30 days: the call ended 29 days ago, kept; 31, deleted. */
+    for (int days = 29; days <= 31; days += 2) {
+        sqlite3 *db = NULL;
+        CHECK(raw_open(path, &db) == SQLITE_OK);
+        char sql[200];
+        snprintf(sql, sizeof sql, "UPDATE calls SET ended_at_ms = %llu, end_reason = 'left' WHERE id = %llu;",
+                 (unsigned long long)((uint64_t)time(NULL) * 1000 - (uint64_t)days * 86400000ull), (unsigned long long)call);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+        j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        j->maint_grace_ms = 3600000;
+        j->maint_batch = 8;
+        j->maint_rec_days = 30;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_STORAGE_MAINT);
+        int reclaimed = 0;
+        for (size_t i = 0; r && i < r->n_reclaim; i++)
+            if (r->reclaim[i].storage_key && strcmp(r->reclaim[i].storage_key, "ca11_0000000000000001") == 0) reclaimed = 1;
+        CHECK(reclaimed == (days == 31));
+        oc_dbres_free(r);
+        CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM call_recordings WHERE id = ?1;", rec[0]) == (days == 31 ? 0 : 1));
+    }
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Message retention (REQ-250). A workspace whose messages are seeded straight
+ * into the database at chosen times, and the storage pass run over it with a
+ * retention in days. */
+#define RET_DAY (86400000ull)
+static uint64_t ret_now(void) { return (uint64_t)time(NULL) * 1000; }
+
+static void ret_sql(const char *path, const char *sql) {
+    sqlite3 *db = NULL;
+    CHECK(raw_open(path, &db) == SQLITE_OK);
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+    if (rc != SQLITE_OK) printf("    ret_sql: %s\n", err ? err : "?");
+    CHECK(rc == SQLITE_OK);
+    sqlite3_free(err);
+    sqlite3_close(db);
+}
+
+/* A message in the default channel, `age_ms` old, by `uid`; its id. */
+static uint64_t ret_msg(const char *path, uint64_t uid, uint64_t age_ms, uint64_t parent, const char *body) {
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT OR IGNORE INTO channels(id,kind,name,is_public,created_at_ms) VALUES(%d,'channel','general',1,0);"
+             "INSERT INTO messages(channel_id,author_id,body,created_at_ms,parent_id) VALUES(%d,%llu,'%s',%llu,%s);",
+             OC_DEFAULT_CHANNEL, OC_DEFAULT_CHANNEL, (unsigned long long)uid, body,
+             (unsigned long long)(ret_now() - age_ms), parent ? "?" : "NULL");
+    if (parent) {
+        char *q = strstr(sql, ",?);");
+        char tail[32];
+        snprintf(tail, sizeof tail, ",%llu);", (unsigned long long)parent);
+        if (q) strcpy(q, tail);
+    }
+    ret_sql(path, sql);
+    return (uint64_t)e2e_scalar(path, "SELECT MAX(id) FROM messages;", 0);
+}
+
+/* One storage pass with retention `days` (0: off) and `batch`; its result. */
+static oc_dbres *ret_pass(oc_dbwriter *w, uint32_t days, uint32_t batch) {
+    oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = batch;
+    j->maint_retention_days = days;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_STORAGE_MAINT);
+    return r;
+}
+
+static int64_t ret_count(const char *path, const char *sql, uint64_t arg) { return e2e_scalar(path, sql, arg); }
+
+/* The MCP access family (docs/details/MCP.md §11): a tool call's row names the
+ * token and the ids, never what was read, searched for or posted, and it ages
+ * out at 365 days whatever age the other families keep. */
+static void test_mcp_audit(void) {
+    const char *path = tdb("mcp_audit.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t a = reg(w, "mcp-agent", "pw", OC_ROLE_MEMBER);
+    oc_job *j = oc_job_new(OC_JOB_MCP_AUDIT, 0);
+    j->user_id = a;
+    j->mcp_family = OC_AUDIT_MCP;
+    j->mcp_outcome = 1;
+    j->mcp_action = strdup("mcp.search");
+    j->mcp_target = strdup("#general");
+    j->mcp_detail = strdup("token=ci results=3 conversations=1");
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.search'"
+                           " AND detail='token=ci results=3 conversations=1';", OC_AUDIT_MCP) == 1);
+    /* Nothing of a message, a query or a token rides in it. */
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND (detail LIKE '%ocpt_%'"
+                           " OR detail LIKE '%query%' OR detail LIKE '%text%');", OC_AUDIT_MCP) == 0);
+
+    /* Rows either side of 365 days, and an admin row as old. */
+    uint64_t now = wall_ms_now();
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO audit_log(at_ms, family, action, outcome) VALUES"
+             " (%llu, %d, 'mcp.read_history', 1), (%llu, %d, 'mcp.post', 1), (%llu, 1, 'user.remove', 1);",
+             (unsigned long long)(now - 366 * RET_DAY), OC_AUDIT_MCP,
+             (unsigned long long)(now - 364 * RET_DAY), OC_AUDIT_MCP,
+             (unsigned long long)(now - 366 * RET_DAY));
+    ret_sql(path, sql);
+    /* The others kept 1000 days: the old MCP row goes, the admin row stays. */
+    j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = 8;
+    j->audit_max_age_ms = 1000 * RET_DAY;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.read_history';", OC_AUDIT_MCP) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.post';", OC_AUDIT_MCP) == 1);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1;", 1) == 1);
+    /* The others kept 30 days: the admin row goes, the younger MCP row stays. */
+    j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    j->maint_grace_ms = 3600000;
+    j->maint_batch = 8;
+    j->audit_max_age_ms = 30 * RET_DAY;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1;", 1) == 0);
+    CHECK(e2e_scalar(path, "SELECT COUNT(*) FROM audit_log WHERE family=?1 AND action='mcp.post';", OC_AUDIT_MCP) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_off(void) {
+    const char *path = tdb("ret_off.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 400 * RET_DAY, 0, "very old");
+    oc_dbres_free(ret_pass(w, 0, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", m) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_boundary(void) {
+    const char *path = tdb("ret_edge.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    /* A second either side of thirty days: the clock moves between seeding
+     * and the pass, so the margin is the clock's, not the rule's. */
+    uint64_t past  = ret_msg(path, a, 30 * RET_DAY + 1000, 0, "just past");
+    uint64_t short_ = ret_msg(path, a, 30 * RET_DAY - 60000, 0, "just short");
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", past) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", short_) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_linked_rows(void) {
+    const char *path = tdb("ret_rows.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "a poll and a list");
+    char sql[1024];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO pins(message_id,channel_id,pinned_by,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,0);"
+             "INSERT INTO saved_items(user_id,message_id,created_at_ms) VALUES(%3$llu,%1$llu,0);"
+             "INSERT INTO reactions(message_id,user_id,emoji,created_at_ms) VALUES(%1$llu,%3$llu,'+1',0);"
+             "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,0,0,3,0);"
+             "INSERT INTO polls(message_id,channel_id,created_at_ms) VALUES(%1$llu,%2$d,0);"
+             "INSERT INTO poll_options(message_id,idx,label) VALUES(%1$llu,0,'yes');"
+             "INSERT INTO todo_lists(message_id,channel_id,author_id,title,created_at_ms) VALUES(%1$llu,%2$d,%3$llu,'list',0);"
+             "INSERT INTO todo_tasks(message_id,idx,name) VALUES(%1$llu,0,'task');",
+             (unsigned long long)m, OC_DEFAULT_CHANNEL, (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    const char *tables[] = { "pins", "saved_items", "reactions", "mentions", "polls", "poll_options",
+                             "todo_lists", "todo_tasks" };
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
+        char q[128];
+        snprintf(q, sizeof q, "SELECT COUNT(*) FROM %s WHERE message_id = ?1;", tables[i]);
+        CHECK(ret_count(path, q, m) == 0);
+    }
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", m) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_attachments(void) {
+    const char *path = tdb("ret_files.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "with a file");
+    char sql[1024];
+    unsigned long long old = (unsigned long long)(ret_now() - 40 * RET_DAY);
+    snprintf(sql, sizeof sql,
+             "INSERT INTO attachments(id,channel_id,uploader_id,message_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(901,%1$d,%2$llu,%3$llu,'ret_file','a.txt','text/plain',4,%4$llu);"
+             "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(902,%1$d,%2$llu,'ret_avatar','me.png','image/png',4,%4$llu);"
+             "INSERT INTO attachments(id,channel_id,uploader_id,storage_key,filename,mime,size,created_at_ms)"
+             " VALUES(903,%1$d,%2$llu,'ret_emoji','shipit.png','image/png',4,%4$llu);"
+             "UPDATE users SET avatar_attachment_id = 902 WHERE id = %2$llu;"
+             "INSERT INTO custom_emoji(name,attachment_id,created_by,created_at_ms) VALUES('shipit',903,%2$llu,%4$llu);",
+             OC_DEFAULT_CHANNEL, (unsigned long long)a, (unsigned long long)m, old);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    /* Detached by retention, then reclaimed by the orphan tier. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachments WHERE id = 901 AND message_id IS NULL;", 0) == 1);
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int file = 0, avatar = 0, emoji = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        file |= !strcmp(k, "ret_file"); avatar |= !strcmp(k, "ret_avatar"); emoji |= !strcmp(k, "ret_emoji");
+    }
+    oc_dbres_free(r);
+    CHECK(file || ret_count(path, "SELECT reclaimed_at_ms > 0 FROM attachments WHERE id = 901;", 0) == 1);
+    CHECK(!avatar && !emoji);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachments WHERE id IN (902,903) AND reclaimed_at_ms = 0;", 0) == 2);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_search(void) {
+    const char *path = tdb("ret_fts.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    ret_msg(path, a, 40 * RET_DAY, 0, "zebracorn quarterly");
+    ret_msg(path, a, 1 * RET_DAY, 0, "fresh words");
+    ret_sql(path, "INSERT INTO attachments(id,channel_id,uploader_id,message_id,storage_key,filename,mime,size,created_at_ms)"
+                  " SELECT 911,channel_id,author_id,id,'ret_snip','s.txt','text/plain',4,created_at_ms FROM messages"
+                  " WHERE body = 'zebracorn quarterly';"
+                  "INSERT INTO snippets_fts(rowid,title,body) VALUES(911,'snippet','okapiword');");
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'zebracorn';", 0) == 1);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'zebracorn';", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM snippets_fts WHERE snippets_fts MATCH 'okapiword';", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'fresh';", 0) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_summaries(void) {
+    const char *path = tdb("ret_sum.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t m = ret_msg(path, a, 40 * RET_DAY, 0, "summarised");
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO summary_nodes(id,channel_id,kind,ikey,start_ms,end_ms,version,body,created_at_ms)"
+             " VALUES(77,%d,0,'k',0,1,'v',x'00',0);"
+             "INSERT INTO summary_inputs(parent_id,ord,child_kind,child_id) VALUES(77,0,0,%llu);",
+             OC_DEFAULT_CHANNEL, (unsigned long long)m);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM summary_nodes WHERE id = 77;", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_threads(void) {
+    const char *path = tdb("ret_thread.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t root = ret_msg(path, a, 60 * RET_DAY, 0, "old root");
+    uint64_t r1 = ret_msg(path, a, 50 * RET_DAY, root, "old reply");
+    uint64_t r2 = ret_msg(path, a, 10 * RET_DAY, root, "recent reply");
+    char sql[256];
+    snprintf(sql, sizeof sql, "INSERT INTO thread_follows(user_id,root_id,follow,created_at_ms) VALUES(%llu,%llu,1,0);",
+             (unsigned long long)a, (unsigned long long)root);
+    sqlite3 *db = NULL;
+    int has_follows = raw_open(path, &db) == SQLITE_OK && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    /* A reply is recent: the whole thread stays, the old reply too. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1 OR parent_id = ?1;", root) == 3);
+    /* Once that reply ages too, the thread goes whole. */
+    snprintf(sql, sizeof sql, "UPDATE messages SET created_at_ms = %llu WHERE id = %llu;",
+             (unsigned long long)(ret_now() - 40 * RET_DAY), (unsigned long long)r2);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id IN (?1);", root) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", r1) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", r2) == 0);
+    if (has_follows) CHECK(ret_count(path, "SELECT COUNT(*) FROM thread_follows WHERE root_id = ?1;", root) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_forward_kept(void) {
+    const char *path = tdb("ret_fwd.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t src = ret_msg(path, a, 40 * RET_DAY, 0, "the original");
+    uint64_t fwd = ret_msg(path, a, 2 * RET_DAY, 0, "look at this");
+    char sql[512];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO forwards(message_id,src_channel,src_message,src_author,excerpt,n_attach)"
+             " VALUES(%llu,%d,%llu,%llu,'the original',0);",
+             (unsigned long long)fwd, OC_DEFAULT_CHANNEL, (unsigned long long)src, (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres_free(ret_pass(w, 30, 8));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1;", src) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM forwards WHERE message_id = ?1 AND excerpt = 'the original';", fwd) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_rendered_audio(void) {
+    const char *path = tdb("ret_tts.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    uint64_t old = ret_msg(path, a, 40 * RET_DAY, 0, "spoken long ago");
+    uint64_t young = ret_msg(path, a, 1 * RET_DAY, 0, "spoken today");
+    /* The use is recorded through the writer's own job, as a lookup does. */
+    uint8_t h1[32], h2[32];
+    memset(h1, 0x11, 32); memset(h2, 0x22, 32);
+    oc_job *j = oc_job_new(OC_JOB_TTS_USE, 0);
+    j->message_id = old; memcpy(j->tts_handle, h1, 32);
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    j = oc_job_new(OC_JOB_TTS_USE, 0);
+    j->message_id = young; memcpy(j->tts_handle, h2, 32);
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio_uses;", 0) == 2);
+    ret_sql(path, "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
+                  " VALUES(zeroblob(32),'v1','ret_r0',1,1,0,0);"
+                  "UPDATE rendered_audio SET handle = x'1111111111111111111111111111111111111111111111111111111111111111'"
+                  " WHERE blob_key = 'ret_r0';"
+                  "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
+                  " VALUES(x'1111111111111111111111111111111111111111111111111111111111111111','v2','ret_r1',1,1,0,0),"
+                  "       (x'2222222222222222222222222222222222222222222222222222222222222222','v1','ret_r2',1,1,0,0);");
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int k0 = 0, k1 = 0, k2 = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        k0 |= !strcmp(k, "ret_r0"); k1 |= !strcmp(k, "ret_r1"); k2 |= !strcmp(k, "ret_r2");
+    }
+    oc_dbres_free(r);
+    CHECK(k0 && k1 && !k2);   /* every model version of the aged one, not the young one's */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio WHERE blob_key IN ('ret_r0','ret_r1');", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio WHERE blob_key = 'ret_r2';", 0) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM rendered_audio_uses WHERE message_id = ?1;", old) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_batch(void) {
+    const char *path = tdb("ret_batch.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER);
+    for (int i = 0; i < 5; i++) ret_msg(path, a, 40 * RET_DAY, 0, "backlog");
+    int64_t before = ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0);
+    CHECK(before == 5);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 3);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 1);
+    oc_dbres_free(ret_pass(w, 30, 2));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE body = 'backlog';", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A call started, recorded once and made, in a fresh workspace; its id and
+ * chat through the out-parameters, and the recording's message. */
+static uint64_t ret_call(oc_dbwriter *w, uint64_t starter, uint64_t other, const char *key, uint64_t *chat) {
+    oc_job *j = oc_job_new(OC_JOB_CALL_START, 80);
+    j->user_id = starter;
+    j->call_subject = strdup("Old review");
+    j->call_uids = calloc(1, sizeof *j->call_uids);
+    j->call_uids[0] = other; j->n_call_uids = 1;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CALL_STARTED && r->call_id && r->call_chat);
+    const uint64_t call = r ? r->call_id : 0;
+    *chat = r ? r->call_chat : 0;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_RECORDING_START, 81);
+    j->user_id = other; j->call_id = call; j->call_spool = strdup("/var/lib/oc/recordings");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    const uint64_t rec = r ? r->rec_id : 0;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_RECORDING_STOP, 0);
+    j->rec_id = rec;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    j = oc_job_new(OC_JOB_RECORDING_DONE, 0);
+    j->rec_id = rec; j->call_spool = strdup(key);
+    j->exp_bytes = 1000; j->exp_duration_ms = 1000;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_RECORDING_DONE);
+    oc_dbres_free(r);
+    return call;
+}
+
+static void test_retention_calls(void) {
+    const char *path = tdb("ret_calls.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t a = reg(w, "ada", "pw-ada", OC_ROLE_MEMBER), b = reg(w, "bob", "pw-bob", OC_ROLE_MEMBER);
+    uint64_t old_chat = 0, live_chat = 0;
+    uint64_t old_call = ret_call(w, a, b, "ret_rec_old", &old_chat);
+    uint64_t live_call = ret_call(w, a, b, "ret_rec_live", &live_chat);
+    /* The line the old call left where it was started, a recent message; a
+     * transcript; the old call ended forty days ago, the other still going. */
+    uint64_t line = ret_msg(path, a, 1 * RET_DAY, 0, "Call: Old review");
+    /* The recording has a preview, as an image would: it goes with its file. */
+    char pv[256];
+    snprintf(pv, sizeof pv,
+             "INSERT INTO attachment_previews(attachment_id,rung,storage_key,width,height,size,mime,created_at_ms,last_used_ms)"
+             " SELECT id,1,'ret_rec_old-1',1,1,1,'image/png',0,0 FROM attachments WHERE storage_key = 'ret_rec_old';");
+    ret_sql(path, pv);
+    char sql[768];
+    snprintf(sql, sizeof sql,
+             "UPDATE messages SET kind = 1, call_id = %1$llu WHERE id = %2$llu;"
+             "UPDATE calls SET ended_at_ms = %3$llu, end_reason = 'left' WHERE id = %1$llu;"
+             "INSERT INTO call_transcripts(id,call_id,created_at_ms) VALUES(31,%1$llu,0);"
+             "INSERT INTO call_transcript_lines(transcript_id,speaker,start_ms,end_ms,text) VALUES(31,%4$llu,0,1,'pelicanword');",
+             (unsigned long long)old_call, (unsigned long long)line,
+             (unsigned long long)(ret_now() - 40 * RET_DAY), (unsigned long long)a);
+    ret_sql(path, sql);
+    oc_dbres *r = ret_pass(w, 30, 8);
+    int old_key = 0, live_key = 0;
+    for (size_t i = 0; r && i < r->n_reclaim; i++) {
+        const char *k = r->reclaim[i].storage_key;
+        if (!k) continue;
+        old_key |= !strcmp(k, "ret_rec_old"); live_key |= !strcmp(k, "ret_rec_live");
+    }
+    oc_dbres_free(r);
+    CHECK(old_key && !live_key);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM attachment_previews WHERE storage_key = 'ret_rec_old-1';", 0) == 0);
+    const char *gone[] = { "SELECT COUNT(*) FROM calls WHERE id = ?1;",
+                           "SELECT COUNT(*) FROM call_participants WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_invitees WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_events WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_recordings WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM call_transcripts WHERE call_id = ?1;",
+                           "SELECT COUNT(*) FROM channels WHERE call_id = ?1;" };
+    for (size_t i = 0; i < sizeof gone / sizeof gone[0]; i++) CHECK(ret_count(path, gone[i], old_call) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channels WHERE id = ?1;", old_chat) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE channel_id = ?1;", old_chat) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_transcript_lines WHERE transcript_id = 31;", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_transcripts_fts WHERE call_transcripts_fts MATCH 'pelicanword';", 0) == 0);
+    /* The line it left keeps its body, naming no call. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE id = ?1 AND call_id IS NULL AND body = 'Call: Old review';", line) == 1);
+    /* The call still going is untouched, chat and recording. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM calls WHERE id = ?1;", live_call) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channels WHERE id = ?1;", live_chat) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM call_recordings WHERE call_id = ?1;", live_call) == 1);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+static void test_retention_audit(void) {
+    const char *path = tdb("ret_audit.db");
+    cleanup_db(path);
+    const char *q = "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.change';";
+    /* Off, never set: nothing recorded. */
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 0);
+    /* Set to 30: one entry, by no user, old and new in its detail. */
+    setenv("OPENCHIME_RETENTION_DAYS", "30", 1);
+    CHECK(oc_config_load(NULL, 0) == 0);
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.change' AND family = 1"
+                          " AND actor_id IS NULL AND detail = 'old=0 new=30';", 0) == 1);
+    /* Started again unchanged: nothing more. */
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 1);
+    /* Turned off: a second entry. */
+    unsetenv("OPENCHIME_RETENTION_DAYS");
+    CHECK(oc_config_load(NULL, 0) == 0);
+    w = start_db(path);
+    oc_dbwriter_stop(w);
+    CHECK(ret_count(path, q, 0) == 2);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE detail = 'old=30 new=0';", 0) == 1);
+    cleanup_db(path);
+}
+
+/* ---- Agents and their tokens (docs/details/MCP.md §3.1, §6, §7) ----------- */
+
+static oc_dbres *agent_job(oc_dbwriter *w, int type, uint64_t actor, uint64_t agent, const char *name,
+                           const char *scopes, uint64_t token_id) {
+    oc_job *j = oc_job_new(type, 801);
+    j->user_id = actor;
+    j->target_user_id = agent;
+    j->token_id = token_id;
+    if (type == OC_JOB_AGENT_CREATE) j->agent_name = name ? strdup(name) : NULL;
+    else j->token_name = name ? strdup(name) : NULL;
+    j->token_scopes = scopes ? strdup(scopes) : NULL;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int agent_err(oc_dbres *r) {
+    int e = !r ? -1 : r->type == OC_RES_AGENT_ERR ? (int)r->err_code : 0;
+    oc_dbres_free(r);
+    return e;
+}
+
+/* The token as it is shown and presented: the prefix and its bytes in base64url. */
+static void token_text(const uint8_t raw[OC_SESSION_TOKEN_LEN], char *out) {
+    size_t p = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    memcpy(out, OC_PRINCIPAL_TOKEN_PREFIX, p);
+    out[p + oc_base64url_encode(raw, OC_SESSION_TOKEN_LEN, out + p)] = '\0';
+}
+
+static oc_dbres *token_lookup(oc_dbwriter *w, const char *text) {
+    oc_job *j = oc_job_new(OC_JOB_TOKEN_LOOKUP, 0);
+    j->token = strdup(text);
+    j->token_len = strlen(text);
+    j->token_from = strdup("192.0.2.7");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* ---- Outgoing webhooks (docs/details/WEBHOOKS.md) -------------------------- */
+
+static oc_dbres *owh_create(oc_dbwriter *w, uint64_t actor, const char *url, const char *events,
+                            const uint64_t *chans, uint16_t n, const uint8_t *secret) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_CREATE, 802);
+    j->user_id = actor;
+    j->owh_url = strdup(url);
+    j->owh_events = strdup(events);
+    j->owh_n_channels = n;
+    for (uint16_t i = 0; i < n; i++) j->owh_channels[i] = chans[i];
+    if (secret) { j->owh_verified = 1; memcpy(j->owh_secret, secret, OC_OUTWH_SECRET_LEN); }
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *owh_job(oc_dbwriter *w, int type, uint64_t actor, uint64_t id, uint8_t enabled) {
+    oc_job *j = oc_job_new(type, 803);
+    j->user_id = actor;
+    j->owh_id = id;
+    j->owh_enabled = enabled;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int owh_err(oc_dbres *r) {
+    int e = !r ? -1 : r->type == OC_RES_OUTWH_ERR ? (int)r->err_code : 0;
+    oc_dbres_free(r);
+    return e;
+}
+
+static oc_dbres *owh_take(oc_dbwriter *w) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_TAKE, 0);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *owh_done(oc_dbwriter *w, uint64_t delivery, int ok, const char *reason) {
+    oc_job *j = oc_job_new(OC_JOB_OUTWH_DONE, 0);
+    j->owh_delivery = delivery;
+    j->owh_ok = (uint8_t)ok;
+    j->owh_reason = reason ? strdup(reason) : NULL;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* The deliveries queued for webhook `hook` whose envelope holds `needle`. */
+static int64_t owh_count(const char *path, uint64_t hook, const char *needle) {
+    char sql[512];
+    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1 AND instr(payload, '%s') > 0;",
+             needle);
+    return ret_count(path, sql, hook);
+}
+
+/* The sealed secret stored for `hook`. Its length, or -1. */
+static int owh_sealed(const char *path, uint64_t hook, uint8_t *out, size_t cap) {
+    sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int n = -1;
+    if (raw_open(path, &db) == SQLITE_OK &&
+        sqlite3_prepare_v2(db, "SELECT secret_sealed FROM outgoing_webhooks WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)hook);
+        if (sqlite3_step(st) == SQLITE_ROW && (size_t)sqlite3_column_bytes(st, 0) <= cap) {
+            n = sqlite3_column_bytes(st, 0);
+            memcpy(out, sqlite3_column_blob(st, 0), (size_t)n);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+static void test_outgoing_webhooks(void) {
+    const char *path = tdb("outwh.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint8_t key[OC_FACTOR_KEY_LEN];
+    memset(key, 0x42, sizeof key);
+    oc_dbwriter_set_factor_key(w, key);
+    uint64_t own = reg(w, "whown", "pw-own", OC_ROLE_OWNER);
+    uint64_t adm = reg(w, "whadm", "pw-adm", OC_ROLE_ADMIN);
+    uint64_t bob = reg(w, "whbob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(own && adm && bob);
+    oc_dbres *r = create_channel(w, own, "hooks-pub", 1);
+    uint64_t pub = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, own, "hooks-priv", 0);
+    uint64_t priv = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = open_dm(w, own, bob);
+    uint64_t dm = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(pub && priv && dm);
+    const char *all = "user_change reaction_added message member_joined_channel member_left_channel "
+                      "channel_rename channel_archive channel_unarchive reaction_removed message";
+    uint64_t two[2] = { pub, priv };
+
+    /* Owners and admins alone; https only; the events listed; named channels. */
+    CHECK(owh_err(owh_create(w, bob, "https://hooks.example/in", "message", two, 2, NULL)) == OC_ERR_FORBIDDEN);
+    CHECK(owh_err(owh_create(w, own, "http://hooks.example/in", "message", two, 2, NULL)) == OC_ERR_WEBHOOK_URL);
+    CHECK(owh_err(owh_create(w, own, "https:// spaced", "message", two, 2, NULL)) == OC_ERR_WEBHOOK_URL);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message app_mention", two, 2, NULL)) == OC_ERR_WEBHOOK_EVENT);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "", two, 2, NULL)) == OC_ERR_WEBHOOK_EVENT);
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message", &dm, 1, NULL)) == OC_ERR_FORBIDDEN);
+    uint64_t none = 987654;
+    CHECK(owh_err(owh_create(w, own, "https://hooks.example/in", "message", &none, 1, NULL)) == OC_ERR_UNKNOWN_CHANNEL);
+
+    /* Checked before it is saved: a secret for the check, and no row yet. */
+    r = owh_create(w, own, "https://hooks.example/in", all, two, 2, NULL);
+    CHECK(r && r->type == OC_RES_OUTWH_CHECK);
+    const char *canon = "message reaction_added reaction_removed member_joined_channel member_left_channel "
+                        "channel_rename channel_archive channel_unarchive user_change";
+    CHECK(r && r->owh_events && strcmp(r->owh_events, canon) == 0);   /* contract: the catalog's order */
+    CHECK(r && r->owh_n_channels == 2);
+    uint8_t secret[OC_OUTWH_SECRET_LEN] = { 0 }, zero[OC_OUTWH_SECRET_LEN] = { 0 };
+    if (r) memcpy(secret, r->owh_secret, sizeof secret);
+    oc_dbres_free(r);
+    CHECK(memcmp(secret, zero, sizeof secret) != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhooks WHERE ?1=?1;", 0) == 0);
+
+    /* Saved once its endpoint answered: the secret back once, kept sealed. */
+    r = owh_create(w, own, "https://hooks.example/in", all, two, 2, secret);
+    CHECK(r && r->type == OC_RES_OUTWH_SECRET && r->message_id);
+    uint64_t hook = r ? r->message_id : 0;
+    CHECK(r && memcmp(r->owh_secret, secret, sizeof secret) == 0);
+    oc_dbres_free(r);
+    uint8_t sealed[128], opened[OC_TOTP_SECRET_LEN];
+    int sl = owh_sealed(path, hook, sealed, sizeof sealed);
+    CHECK(sl == (int)OC_TOTP_SEALED_LEN);
+    CHECK(sl > 0 && memmem(sealed, (size_t)sl, secret, sizeof secret) == NULL);
+    CHECK(sl > 0 && oc_factor_open(key, hook, sealed, (size_t)sl, opened) == 0 && memcmp(opened, secret, sizeof secret) == 0);
+    CHECK(sl > 0 && oc_factor_open(key, hook + 1, sealed, (size_t)sl, opened) != 0);   /* bound to its row */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.create' AND target_id=?1;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE webhook_id=?1;", hook) == 2);
+
+    /* One naming no channel: user_change alone reaches it. */
+    r = owh_create(w, adm, "https://other.example/in", "message user_change", NULL, 0, secret);
+    CHECK(r && r->type == OC_RES_OUTWH_SECRET);
+    uint64_t bare = r ? r->message_id : 0;
+    oc_dbres_free(r);
+
+    r = owh_job(w, OC_JOB_OUTWH_LIST, adm, 0, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 2);
+    CHECK(r && r->n_owh_rows == 2 && r->owh_rows[0].id == hook && r->owh_rows[0].enabled &&
+          r->owh_rows[0].n_channels == 2 && r->owh_rows[0].created_by == own &&
+          strcmp(r->owh_rows[0].url, "https://hooks.example/in") == 0 && r->owh_rows[1].n_channels == 0);
+    oc_dbres_free(r);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_LIST, bob, 0, 0)) == OC_ERR_FORBIDDEN);
+
+    /* Each event, queued in its envelope. */
+    char body[128], want[96];
+    snprintf(body, sizeof body, "hi <@U%llu> @here", (unsigned long long)bob);
+    uint64_t mid = send_id(w, own, pub, body);
+    CHECK(mid != 0);
+    CHECK(owh_count(path, hook, "\"type\":\"event_callback\"") == 1);
+    snprintf(want, sizeof want, "\"api_app_id\":\"W%llu\"", (unsigned long long)hook);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, hook, "\"authorizations\":[]") == 1);
+    CHECK(owh_count(path, hook, "\"team_id\":\"T") == 1);
+    CHECK(owh_count(path, hook, "\"event_time\":") == 1);
+    snprintf(want, sizeof want, "\"channel\":\"C%llu\",\"channel_type\":\"channel\",\"user\":\"U%llu\"",
+             (unsigned long long)pub, (unsigned long long)own);
+    CHECK(owh_count(path, hook, want) == 1);
+    snprintf(want, sizeof want, "\"text\":\"hi <@U%llu> <!here>\",\"ts\":\"%llu\"", (unsigned long long)bob,
+             (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, bare, "\"type\":\"message\"") == 0);          /* names no channel */
+    /* A mention by name becomes the id form too. */
+    char *bobname = NULL;
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+        if (raw_open(path, &db) == SQLITE_OK &&
+            sqlite3_prepare_v2(db, "SELECT display_name FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)bob);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                bobname = strdup((const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, own, pub, bob));
+    snprintf(want, sizeof want, "\"type\":\"member_joined_channel\",\"user\":\"U%llu\",\"channel\":\"C%llu\","
+             "\"channel_type\":\"C\"", (unsigned long long)bob, (unsigned long long)pub);
+    CHECK(owh_count(path, hook, want) == 1);
+    if (bobname) {
+        snprintf(body, sizeof body, "thanks @%s", bobname);
+        CHECK(send_id(w, own, pub, body) != 0);
+        snprintf(want, sizeof want, "\"text\":\"thanks <@U%llu>\"", (unsigned long long)bob);
+        CHECK(owh_count(path, hook, want) == 1);
+    }
+    free(bobname);
+    /* A private channel's, as a group. */
+    CHECK(send_id(w, own, priv, "quiet") != 0);
+    CHECK(owh_count(path, hook, "\"channel_type\":\"group\"") == 1);
+    /* Never a DM's. */
+    int64_t before = ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE ?1=?1;", 0);
+    CHECK(send_id(w, own, dm, "just us") != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE ?1=?1;", 0) == before);
+    /* An action, a reply, an edit, a delete. */
+    CHECK(send_id(w, own, pub, "/me waves") != 0);
+    CHECK(owh_count(path, hook, "\"subtype\":\"me_message\"") == 1);
+    CHECK(owh_count(path, hook, "\"text\":\"waves\"") == 1);
+    oc_job *rj = oc_job_new(OC_JOB_SEND_REPLY, 804);
+    rj->user_id = bob; rj->channel_id = pub; rj->parent_id = mid;
+    memset(rj->idem, 0x7e, OC_IDEM_LEN);
+    oc_job_set_body(rj, "a reply", 7);
+    oc_dbwriter_submit(w, rj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    oc_dbres_free(r);
+    snprintf(want, sizeof want, "\"thread_ts\":\"%llu\"", (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    r = do_edit(w, own, pub, mid, "hi again");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    CHECK(owh_count(path, hook, "\"subtype\":\"message_changed\"") == 1);
+    CHECK(owh_count(path, hook, "\"text\":\"hi again\"") == 1);
+    /* Reactions: added and removed, and nothing for one already there. */
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_ADD));
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_ADD));
+    snprintf(want, sizeof want, "\"type\":\"reaction_added\",\"user\":\"U%llu\",\"reaction\":\"thumbsup\"",
+             (unsigned long long)bob);
+    CHECK(owh_count(path, hook, want) == 1);
+    oc_dbres_free(react(w, bob, pub, mid, "thumbsup", OC_REACT_REMOVE));
+    CHECK(owh_count(path, hook, "\"type\":\"reaction_removed\"") == 1);
+    oc_job *dj = oc_job_new(OC_JOB_DELETE, 805);
+    dj->user_id = own; dj->channel_id = pub; dj->message_id = mid;
+    oc_dbwriter_submit(w, dj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    snprintf(want, sizeof want, "\"subtype\":\"message_deleted\",\"hidden\":true,\"channel\":\"C%llu\"",
+             (unsigned long long)pub);
+    CHECK(owh_count(path, hook, want) == 1);
+    snprintf(want, sizeof want, "\"deleted_ts\":\"%llu\"", (unsigned long long)mid);
+    CHECK(owh_count(path, hook, want) == 1);
+    /* Leaving, and the channel's own changes. */
+    oc_dbres_free(chan_ref(w, OC_JOB_LEAVE_CHANNEL, bob, pub));
+    CHECK(owh_count(path, hook, "\"type\":\"member_left_channel\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_RENAME, "hooks-renamed"));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_rename\",\"channel\":{") == 1);
+    CHECK(owh_count(path, hook, "\"name\":\"hooks-renamed\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_ARCHIVE, NULL));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_archive\"") == 1);
+    oc_dbres_free(chan_update(w, own, pub, OC_CHUP_UNARCHIVE, NULL));
+    CHECK(owh_count(path, hook, "\"type\":\"channel_unarchive\"") == 1);
+    /* A profile: to both, whatever their channels. */
+    oc_job *pj = oc_job_new(OC_JOB_SET_PROFILE, 806);
+    pj->user_id = bob;
+    pj->pf_full_name = strdup("Bob \"Builder\"");
+    pj->pf_title = strdup("Crew");
+    oc_dbwriter_submit(w, pj);
+    oc_dbres_free(wait_result(w));
+    snprintf(want, sizeof want, "\"type\":\"user_change\",\"user\":{\"id\":\"U%llu\"", (unsigned long long)bob);
+    CHECK(owh_count(path, hook, want) == 1);
+    CHECK(owh_count(path, bare, want) == 1);
+    CHECK(owh_count(path, bare, "\"real_name\":\"Bob \\\"Builder\\\"\"") == 1);   /* escaped as JSON */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", bare) == 1);
+    /* Every delivery its own event id. */
+    CHECK(ret_count(path, "SELECT COUNT(*) - COUNT(DISTINCT event_id) FROM webhook_deliveries WHERE ?1=?1;", 0) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE event_id NOT LIKE 'Ev%' AND ?1=?1;", 0) == 0);
+
+    /* Disabled by hand: no events queued; enabled, they are again. */
+    r = owh_job(w, OC_JOB_OUTWH_SET, adm, hook, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 2 && !r->owh_rows[0].enabled);
+    oc_dbres_free(r);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_SET, bob, hook, 1)) == OC_ERR_FORBIDDEN);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.disable' AND target_id=?1;", hook) == 1);
+    int64_t queued = ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook);
+    CHECK(send_id(w, own, pub, "while off") != 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook) == queued);
+    oc_dbres_free(owh_job(w, OC_JOB_OUTWH_SET, own, hook, 1));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.enable' AND target_id=?1;", hook) == 1);
+
+    /* The queue: what is due is taken once, and held. */
+    {
+        sqlite3 *db = NULL;
+        if (raw_open(path, &db) == SQLITE_OK) sqlite3_exec(db, "DELETE FROM webhook_deliveries;", NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    CHECK(send_id(w, own, pub, "deliver me") != 0);
+    r = owh_take(w);
+    CHECK(r && r->type == OC_RES_OUTWH_DUE && r->n_owh_due == 1);
+    uint64_t dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    CHECK(r && r->n_owh_due == 1 && r->owh_due[0].webhook_id == hook && r->owh_due[0].attempts == 0 &&
+          r->owh_due[0].sealed_len == OC_TOTP_SEALED_LEN && strcmp(r->owh_due[0].url, "https://hooks.example/in") == 0 &&
+          strstr(r->owh_due[0].payload, "deliver me") && strncmp(r->owh_due[0].event_id, "Ev", 2) == 0);
+    oc_dbres_free(r);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 0);                     /* held while it is being sent */
+    oc_dbres_free(r);
+    char *evid = NULL;
+    {
+        sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+        if (raw_open(path, &db) == SQLITE_OK &&
+            sqlite3_prepare_v2(db, "SELECT event_id FROM webhook_deliveries WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)dv);
+            if (sqlite3_step(st) == SQLITE_ROW) evid = strdup((const char *)sqlite3_column_text(st, 0));
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    /* A failure: tried again after 1 s, then 2 s, ..., the same event id. */
+    oc_dbres_free(owh_done(w, dv, 0, "http_error"));
+    CHECK(ret_count(path, "SELECT attempts FROM webhook_deliveries WHERE id=?1;", dv) == 1);
+    CHECK(ret_count(path, "SELECT d.next_at_ms - w.failing_since_ms FROM webhook_deliveries d"
+                          " JOIN outgoing_webhooks w ON w.id=d.webhook_id WHERE d.id=?1;", dv) == 1000);
+    CHECK(ret_count(path, "SELECT last_reason='http_error' FROM webhook_deliveries WHERE id=?1;", dv) == 1);
+    for (uint32_t a = 1; a < OC_OUTWH_ATTEMPTS; a++) {
+        oc_dbwriter_advance_clock_ms((uint64_t)a * 120000u);
+        r = owh_take(w);
+        CHECK(r && r->n_owh_due == 1 && r->owh_due[0].id == dv && r->owh_due[0].attempts == a &&
+              evid && strcmp(r->owh_due[0].event_id, evid) == 0);
+        oc_dbres_free(r);
+        oc_dbres_free(owh_done(w, dv, 0, a == 1 ? "http_timeout" : "connection_failed"));
+    }
+    free(evid);
+    /* The eighth failure ends it. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE id=?1;", dv) == 0);
+    CHECK(ret_count(path, "SELECT enabled FROM outgoing_webhooks WHERE id=?1;", hook) == 1);
+
+    /* Failing for a day: turned off, owners and admins told, audited. */
+    CHECK(send_id(w, own, pub, "still failing") != 0);
+    oc_dbwriter_advance_clock_ms(OC_OUTWH_DISABLE_MS);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 1);
+    dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    oc_dbres_free(r);
+    r = owh_done(w, dv, 0, "http_error");
+    CHECK(r && r->type == OC_RES_OUTWH_DONE && r->owh_disabled == 1);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT enabled FROM outgoing_webhooks WHERE id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT disabled_reason <> '' FROM outgoing_webhooks WHERE id=?1;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.disable' AND target_id=?1"
+                          " AND actor_id IS NULL;", hook) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(DISTINCT cm.user_id) FROM messages m JOIN channel_members cm ON cm.channel_id=m.channel_id"
+                          " JOIN users u ON u.id=cm.user_id WHERE u.is_system=0 AND instr(m.body, 'outgoing webhook to"
+                          " https://hooks.example/in was turned off') > 0 AND ?1=?1;", 0) == 2);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages m JOIN channel_members cm ON cm.channel_id=m.channel_id"
+                          " WHERE cm.user_id=?1 AND instr(m.body, 'was turned off') > 0;", bob) == 0);
+
+    /* Turned on again and answered: done, and failing no more. */
+    oc_dbres_free(owh_job(w, OC_JOB_OUTWH_SET, own, hook, 1));
+    oc_dbwriter_advance_clock_ms(OC_OUTWH_DISABLE_MS + 600000u);
+    r = owh_take(w);
+    CHECK(r && r->n_owh_due == 1);
+    dv = r && r->n_owh_due ? r->owh_due[0].id : 0;
+    oc_dbres_free(r);
+    oc_dbres_free(owh_done(w, dv, 1, NULL));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE id=?1;", dv) == 0);
+    CHECK(ret_count(path, "SELECT failing_since_ms FROM outgoing_webhooks WHERE id=?1;", hook) == 0);
+
+    /* Deleted: its channels and deliveries with it. */
+    CHECK(send_id(w, own, pub, "one more") != 0);
+    CHECK(owh_err(owh_job(w, OC_JOB_OUTWH_DELETE, bob, hook, 0)) == OC_ERR_FORBIDDEN);
+    r = owh_job(w, OC_JOB_OUTWH_DELETE, own, hook, 0);
+    CHECK(r && r->type == OC_RES_OUTWH_LIST && r->n_owh_rows == 1 && r->owh_rows[0].id == bare);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM outgoing_webhook_channels WHERE webhook_id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=?1;", hook) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='webhook.outgoing.delete' AND target_id=?1;", hook) == 1);
+
+    oc_dbwriter_stop(w);
+    oc_dbwriter_advance_clock_ms(0);
+    cleanup_db(path);
+}
+
+static void test_agents(void) {
+    const char *path = tdb("agents.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "agown", "pw-own", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "agbob", "pw-bob", OC_ROLE_MEMBER);
+    CHECK(own && bob);
+    /* The workspace is at its cap: an agent takes no seat. */
+    oc_dbwriter_set_max_users(w, 2);
+    int64_t humans = ret_count(path, "SELECT COUNT(*) FROM users WHERE kind='human' AND is_system=0 AND ?1=?1;", 0);
+
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_CREATE, bob, 0, "Helper", "chat:write", 0)) == OC_ERR_FORBIDDEN);
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_CREATE, own, 0, "Helper", "chat:write admin", 0)) == OC_ERR_UNKNOWN_SCOPE);
+    oc_dbres *r = agent_job(w, OC_JOB_AGENT_CREATE, own, 0, "Helper", "channels:history chat:write", 0);
+    CHECK(r && r->type == OC_RES_AGENT_TOKEN && r->user_id && r->message_id);
+    uint64_t agent = r ? r->user_id : 0;
+    uint8_t first[OC_SESSION_TOKEN_LEN] = { 0 };
+    if (r) memcpy(first, r->session_token, sizeof first);
+    CHECK(r && r->tok_scopes && strcmp(r->tok_scopes, "chat:write channels:history") == 0);   /* contract: the catalog's order */
+    CHECK(r && r->n_ulist == 1 && r->ulist[0].user_id == agent && (r->ulist[0].flags & OC_USER_AGENT));
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM users WHERE id=?1 AND kind='agent' AND subject LIKE 'agent:%'"
+                          " AND display_name='Helper';", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM users WHERE kind='human' AND is_system=0 AND ?1=?1;", 0) == humans);
+    CHECK(ret_count(path, "SELECT (SELECT COUNT(*) FROM local_credentials WHERE user_id=?1)"
+                          " + (SELECT COUNT(*) FROM sessions WHERE user_id=?1);", agent) == 0);
+    /* Stored as its hash alone. */
+    uint8_t hash[OC_SHA256_LEN];
+    CHECK(oc_sha256(first, sizeof first, hash) == 0);
+    char hex[2 * OC_SHA256_LEN + 1], q[256];
+    for (unsigned i = 0; i < OC_SHA256_LEN; i++) snprintf(hex + 2 * i, 3, "%02X", hash[i]);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1 AND hex(token_hash)='%s';", hex);
+    CHECK(ret_count(path, q, agent) == 1);
+    char text[96];
+    token_text(first, text);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM audit_log WHERE COALESCE(target,'')||COALESCE(detail,'') LIKE '%%%s%%' AND ?1=?1;",
+             text + strlen(OC_PRINCIPAL_TOKEN_PREFIX));
+    CHECK(ret_count(path, q, 0) == 0);
+
+    /* Minting: owners and admins only, scopes from the catalog, ten at most. */
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, bob, agent, "laptop", "chat:write", 0)) == OC_ERR_FORBIDDEN);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "laptop", "chat:delete", 0)) == OC_ERR_UNKNOWN_SCOPE);
+    for (unsigned i = 1; i < OC_AGENT_MAX_TOKENS; i++)
+        CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "more", "im:history", 0)) == 0);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "eleventh", "im:history", 0)) == OC_ERR_TOO_MANY_TOKENS);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, bob, "person", "im:history", 0)) == OC_ERR_FORBIDDEN);
+    ret_sql(path, "INSERT INTO users(id, subject, display_name, role, kind, created_at_ms)"
+                  " VALUES(9900, 'bot:test', 'Botty', 'member', 'bot', 1);");
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_MINT, own, 9900, "install", "chat:write", 0)) == 0);
+
+    /* The list: everything but the token. */
+    r = agent_job(w, OC_JOB_TOKEN_LIST, own, agent, NULL, NULL, 0);
+    CHECK(r && r->type == OC_RES_TOKEN_LIST && r->n_ptokens == OC_AGENT_MAX_TOKENS);
+    uint64_t first_id = r && r->n_ptokens ? r->ptokens[0].id : 0;
+    CHECK(r && r->n_ptokens && r->ptokens[0].created_by == own && strcmp(r->ptokens[0].name, "first") == 0);
+    oc_dbres_free(r);
+    CHECK(agent_err(agent_job(w, OC_JOB_TOKEN_LIST, bob, agent, NULL, NULL, 0)) == OC_ERR_FORBIDDEN);
+
+    /* The lookup: one probe, the agent and its scopes; last use at most once a minute. */
+    r = token_lookup(w, text);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL && r->user_id == agent && r->message_id == first_id);
+    CHECK(r && r->tok_scopes && strcmp(r->tok_scopes, "chat:write channels:history") == 0);   /* contract: the stored scopes */
+    oc_dbres_free(r);
+    int64_t used = ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id);
+    CHECK(used > 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM principal_tokens WHERE id=?1 AND last_used_from='192.0.2.7';", first_id) == 1);
+    snprintf(q, sizeof q, "UPDATE principal_tokens SET last_used_at_ms=%lld WHERE id=%llu;", (long long)used - 30000,
+             (unsigned long long)first_id);
+    ret_sql(path, q);
+    oc_dbres_free(token_lookup(w, text));                                  /* 30 s after: not written */
+    CHECK(ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id) == used - 30000);
+    snprintf(q, sizeof q, "UPDATE principal_tokens SET last_used_at_ms=%lld WHERE id=%llu;", (long long)used - 61000,
+             (unsigned long long)first_id);
+    ret_sql(path, q);
+    oc_dbres_free(token_lookup(w, text));                                  /* a minute on: written */
+    CHECK(ret_count(path, "SELECT last_used_at_ms FROM principal_tokens WHERE id=?1;", first_id) >= used);
+    CHECK(agent_err(token_lookup(w, "ocpt_not-a-token")) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* Revoking: the row goes, and the very next lookup refuses it. */
+    r = agent_job(w, OC_JOB_TOKEN_REVOKE, own, agent, NULL, NULL, first_id);
+    CHECK(r && r->type == OC_RES_TOKEN_LIST && r->n_ptokens == OC_AGENT_MAX_TOKENS - 1);
+    oc_dbres_free(r);
+    CHECK(agent_err(token_lookup(w, text)) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* Channels: an owner or admin who is in the channel; never a DM or a group. */
+    ret_sql(path, "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(9801,'channel','ag-ops',1,1),"
+                  " (9802,'channel','ag-secret',0,1);");
+    snprintf(q, sizeof q, "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9801,%llu,1),(9801,%llu,1),"
+             "(9802,%llu,1);", (unsigned long long)own, (unsigned long long)bob, (unsigned long long)bob);
+    ret_sql(path, q);
+    oc_job *j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = bob; j->channel_id = 9801; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = own; j->channel_id = 9802; j->target_user_id = agent;     /* private, and not theirs */
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_INVITE_CHANNEL, 802);
+    j->user_id = own; j->channel_id = 9801; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channel_members WHERE channel_id=9801 AND user_id=?1;", agent) == 1);
+    j = oc_job_new(OC_JOB_OPEN_DM, 803);
+    j->user_id = own; j->target_user_id = agent;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type != OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 804);
+    j->user_id = own;
+    j->group_uids[0] = bob; j->group_uids[1] = agent; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type != OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    uint64_t gid = grp_create(w, own, "agentsgrp");
+    CHECK(gid != 0);
+    oc_dbres_free(grp_members(w, own, gid, 1, &agent, 1));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM user_group_members WHERE user_id=?1;", agent) == 0);
+
+    /* Removing it: its tokens and memberships go, its messages stay. */
+    snprintf(q, sizeof q, "INSERT INTO messages(channel_id,author_id,body,created_at_ms) VALUES(9801,%llu,'agent says hi',5);",
+             (unsigned long long)agent);
+    ret_sql(path, q);
+    char second[96];
+    {
+        r = agent_job(w, OC_JOB_TOKEN_MINT, own, agent, "spare", "chat:write", 0);   /* below the limit again */
+        CHECK(r && r->type == OC_RES_AGENT_TOKEN);
+        if (r) token_text(r->session_token, second); else second[0] = '\0';
+        oc_dbres_free(r);
+    }
+    CHECK(agent_err(agent_job(w, OC_JOB_AGENT_REMOVE, bob, agent, NULL, NULL, 0)) == OC_ERR_FORBIDDEN);
+    r = agent_job(w, OC_JOB_AGENT_REMOVE, own, agent, NULL, NULL, 0);
+    CHECK(r && r->type == OC_RES_USER_UPDATED && r->user_id == agent && r->disabled);
+    CHECK(r && r->n_mchg == 1 && r->mchg[0].channel_id == 9801 && !r->mchg[0].joined);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM principal_tokens WHERE user_id=?1;", agent) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM channel_members WHERE user_id=?1;", agent) == 0);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE author_id=?1;", agent) == 1);
+    CHECK(agent_err(token_lookup(w, second)) == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* One administrative row each, naming the agent, never a token. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.create' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.token.mint' AND target_id=?1;", agent) ==
+          OC_AGENT_MAX_TOKENS + 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.token.revoke' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.channel.add' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='agent.remove' AND target_id=?1;", agent) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'agent.%' AND family<>?1;", OC_AUDIT_ADMIN) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* ---- A person's AI clients (docs/details/AUTH.md §8.13) ------------------- */
+
+#define OA_CH  "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"   /* RFC 7636 appendix B */
+#define OA_VER "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+#define OA_RES "https://ws.example/mcp"
+
+static oc_dbres *oa_job(oc_dbwriter *w, int type, uint64_t uid) {
+    oc_job *j = oc_job_new(type, 805);
+    j->user_id = uid;
+    return j ? (oc_dbwriter_submit(w, j), wait_result(w)) : NULL;
+}
+
+static oc_dbres *oa_register(oc_dbwriter *w, const char *name, const char *uris) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_REGISTER, 805);
+    j->oa_name = strdup(name); j->oa_uris = strdup(uris); j->token_from = strdup("192.0.2.9");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_begin(oc_dbwriter *w, const char *client, const char *redirect) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_BEGIN, 805);
+    j->oa_client_id = strdup(client); j->oa_redirect = strdup(redirect); j->oa_challenge = strdup(OA_CH);
+    j->oa_state = strdup("st-1"); j->oa_resource = strdup(OA_RES);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_code_job(oc_dbwriter *w, int type, uint64_t uid, const char *code, int approve, uint32_t days) {
+    oc_job *j = oc_job_new(type, 805);
+    j->user_id = uid; j->oa_code = strdup(code); j->oa_approve = (uint8_t)approve; j->oa_lifetime = days;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_poll(oc_dbwriter *w, const char *request) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_POLL, 805);
+    j->oa_request = strdup(request);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_exchange(oc_dbwriter *w, const char *code, const char *client, const char *verifier) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_EXCHANGE, 805);
+    j->oa_code = strdup(code); j->oa_client_id = strdup(client); j->oa_verifier = strdup(verifier);
+    j->oa_redirect = strdup("http://127.0.0.1:4000/cb"); j->oa_resource = strdup(OA_RES);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_refresh(oc_dbwriter *w, const char *refresh, const char *client) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_REFRESH, 805);
+    j->oa_refresh = strdup(refresh); j->oa_client_id = strdup(client);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *oa_lookup(oc_dbwriter *w, const char *access) {
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_LOOKUP, 805);
+    j->token = strdup(access); j->token_len = strlen(access); j->token_from = strdup("192.0.2.10");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* The error a refusal carries: the OAuth code, or "#<reason>" for a person's. */
+static int oa_refused(oc_dbres *r, const char *oauth, uint16_t code) {
+    int ok = r && r->type == OC_RES_OAUTH_ERR && (oauth ? r->oa_error && strcmp(r->oa_error, oauth) == 0 : r->err_code == code);
+    oc_dbres_free(r);
+    return ok;
+}
+
+/* One flow up to the code the person types: its page handle and code. */
+static int oa_start(oc_dbwriter *w, const char *client, char *request, char *code) {
+    oc_dbres *r = oa_begin(w, client, "http://127.0.0.1:4000/cb");
+    int ok = r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_PENDING && r->oa_request && r->oa_code;
+    if (ok) { snprintf(request, 64, "%s", r->oa_request); snprintf(code, 16, "%s", r->oa_code); }
+    oc_dbres_free(r);
+    return ok;
+}
+
+/* Approved and collected: the authorization code the page hands back. */
+static int oa_approved(oc_dbwriter *w, uint64_t uid, const char *client, uint32_t days, char *authcode) {
+    char request[64], code[16];
+    if (!oa_start(w, client, request, code)) return 0;
+    oc_dbres *r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, uid, code, 1, days);
+    int ok = r && r->type == OC_RES_OAUTH_DECIDED;
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    ok = ok && r && r->type == OC_RES_OAUTH_REDIRECT && r->oa_code;
+    if (ok) snprintf(authcode, 64, "%s", r->oa_code);
+    oc_dbres_free(r);
+    return ok;
+}
+
+static void test_connections(void) {
+    const char *path = tdb("connections.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "cnown", "pw-own", OC_ROLE_OWNER);
+    uint64_t bob = reg(w, "cnbob", "pw-bob", OC_ROLE_MEMBER);
+    uint64_t cat = reg(w, "cncat", "pw-cat", OC_ROLE_MEMBER);
+    CHECK(own && bob && cat);
+    ret_sql(path, "INSERT INTO users(id, subject, display_name, role, kind, created_at_ms) VALUES"
+                  " (9910, 'visitor:v', 'Vis', 'member', 'visitor', 1), (9911, 'agent:a', 'Bot', 'member', 'agent', 1),"
+                  " (9912, 'local:gone', 'Gone', 'member', 'human', 1);");
+    ret_sql(path, "UPDATE users SET disabled=1 WHERE id=9912;");
+
+    /* A registered client, and an authorize request against it. */
+    oc_dbres *r = oa_register(w, "Desk AI", "http://127.0.0.1:5000/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_CLIENT && r->oa_client_id && strncmp(r->oa_client_id, "occl_", 5) == 0);   /* contract: the client prefix */
+    char client[64] = "";
+    if (r && r->oa_client_id) snprintf(client, sizeof client, "%s", r->oa_client_id);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM oauth_clients WHERE kind='registered' AND created_from='192.0.2.9' AND ?1=?1;", 0) == 1);
+    r = oa_begin(w, "occl_nobody", "http://127.0.0.1:4000/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);
+    oc_dbres_free(r);
+    r = oa_begin(w, client, "https://elsewhere.example/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);
+    oc_dbres_free(r);
+    /* A document's URL never fetched is fetched first. */
+    r = oa_begin(w, "https://client.example/c.json", "https://client.example/cb");
+    CHECK(r && r->type == OC_RES_OAUTH_NEED_FETCH);
+    oc_dbres_free(r);
+
+    char request[64] = "", code[16] = "";
+    CHECK(oa_start(w, client, request, code));
+    CHECK(strlen(code) == 8 && strncmp(request, "ocrq_", 5) == 0);
+    /* Hashed only. */
+    char q[300];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM oauth_approvals WHERE CAST(code_hash AS TEXT) LIKE '%%%s%%' AND ?1=?1;", code);
+    CHECK(ret_count(path, q, 0) == 0);
+
+    /* Pending: the page waits. */
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_PENDING && r->oa_name &&
+          strcmp(r->oa_name, "Desk AI") == 0);   /* contract: the registered name */
+    oc_dbres_free(r);
+
+    /* Who may act on the code: a person; never a visitor, an agent or a removed account. */
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9910, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9911, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, 9912, code, 0, 0), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, 9910, code, 1, 30), NULL, OC_ERR_FORBIDDEN));
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, "BBBB-BBBB", 0, 0), NULL, OC_ERR_UNKNOWN_CODE));
+    char lower[16];
+    for (int i = 0; code[i]; i++) lower[i] = (char)(code[i] - 'A' + 'a'), lower[i + 1] = '\0';
+    r = oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, lower, 0, 0);   /* as typed: any case */
+    CHECK(r && r->type == OC_RES_OAUTH_APPROVAL && r->oa_name && strcmp(r->oa_name, "Desk AI") == 0 && r->oa_redirect &&
+          strcmp(r->oa_redirect, "http://127.0.0.1:4000/cb") == 0);   /* contract: what the request named */
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, bob, code, 1, 7), NULL, OC_ERR_BAD_LIFETIME));
+
+    /* Approved for 30 days; the page collects a one-minute code, once. */
+    r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, bob, code, 1, 30);
+    CHECK(r && r->type == OC_RES_OAUTH_DECIDED);
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_DECIDE, cat, code, 1, 30), NULL, OC_ERR_UNKNOWN_CODE));   /* used */
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_REDIRECT && r->oa_code && strncmp(r->oa_code, "ocac_", 5) == 0 && r->oa_state &&
+          strcmp(r->oa_state, "st-1") == 0);   /* contract: the client's state, returned */
+    char authcode[64] = "";
+    if (r && r->oa_code) snprintf(authcode, sizeof authcode, "%s", r->oa_code);
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_ERR);   /* collected: over */
+    oc_dbres_free(r);
+
+    /* The exchange: PKCE and the client checked; the code good once. */
+    CHECK(oa_refused(oa_exchange(w, authcode, "occl_other", OA_VER), "invalid_grant", 0));
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER "x"), "invalid_grant", 0));
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));    /* spent by the wrong try */
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    ret_sql(path, "UPDATE oauth_approvals SET auth_code_until=1 WHERE auth_code_hash IS NOT NULL;");   /* a minute gone */
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));
+    CHECK(oa_approved(w, bob, client, 30, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS && r->oa_access && r->oa_refresh);
+    char access[64] = "", refresh[64] = "";
+    if (r && r->oa_access) { snprintf(access, sizeof access, "%s", r->oa_access); snprintf(refresh, sizeof refresh, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    CHECK(strncmp(access, "ocpa_", 5) == 0 && strncmp(refresh, "ocpr_", 5) == 0);   /* contract: the prefixes */
+    CHECK(oa_refused(oa_exchange(w, authcode, client, OA_VER), "invalid_grant", 0));   /* once */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND lifetime_days=30"
+                          " AND expires_at_ms - created_at_ms = 30*86400000;", bob) == 1);
+
+    /* The access token acts as the person, through the client. */
+    r = oa_lookup(w, access);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL && r->oa_person && r->user_id == bob && r->oa_name &&
+          strcmp(r->oa_name, "Desk AI") == 0);   /* contract: the approved name */
+    uint64_t conn = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE id=?1 AND last_used_from='192.0.2.10';", conn) == 1);
+    CHECK(agent_err(oa_lookup(w, "ocpa_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(agent_err(oa_lookup(w, refresh)) == OC_ERR_AUTH_INVALID_TOKEN);   /* a refresh token is no access token */
+
+    /* Refresh: a new pair; the old refresh token is retired, and refused, audited. */
+    r = oa_refresh(w, refresh, client);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS && r->oa_access && r->oa_refresh && strcmp(r->oa_refresh, refresh) != 0);
+    char access2[64] = "", refresh2[64] = "";
+    if (r && r->oa_access) { snprintf(access2, sizeof access2, "%s", r->oa_access); snprintf(refresh2, sizeof refresh2, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    CHECK(oa_refused(oa_refresh(w, refresh, client), "invalid_grant", 0));
+    CHECK(oa_refused(oa_refresh(w, refresh2, "occl_other"), "invalid_grant", 0));
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.refresh_refused' AND family=?1;", OC_AUDIT_SECURITY) == 2);
+    r = oa_lookup(w, access2);
+    CHECK(r && r->type == OC_RES_TOKEN_PRINCIPAL);
+    oc_dbres_free(r);
+
+    /* An access token an hour old, and a connection past its lifetime, are refused. */
+    ret_sql(path, "UPDATE mcp_access_tokens SET expires_at_ms=1;");
+    CHECK(agent_err(oa_lookup(w, access2)) == OC_ERR_AUTH_INVALID_TOKEN);
+    r = oa_refresh(w, refresh2, client);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS);
+    char access3[64] = "", refresh3[64] = "";
+    if (r && r->oa_access) { snprintf(access3, sizeof access3, "%s", r->oa_access); snprintf(refresh3, sizeof refresh3, "%s", r->oa_refresh); }
+    oc_dbres_free(r);
+    snprintf(q, sizeof q, "UPDATE mcp_connections SET expires_at_ms=2 WHERE id=%llu;", (unsigned long long)conn);
+    ret_sql(path, q);
+    CHECK(agent_err(oa_lookup(w, access3)) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(oa_refused(oa_refresh(w, refresh3, client), "invalid_grant", 0));
+
+    /* Never: no end. A pending approval past ten minutes is gone to the app, expired to the page. */
+    CHECK(oa_approved(w, bob, client, 0, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    CHECK(r && r->type == OC_RES_OAUTH_TOKENS);
+    char access4[64] = "";
+    if (r && r->oa_access) snprintf(access4, sizeof access4, "%s", r->oa_access);
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND lifetime_days=0 AND expires_at_ms=0;", bob) == 1);
+    CHECK(oa_start(w, client, request, code));
+    ret_sql(path, "UPDATE oauth_approvals SET expires_at_ms=5 WHERE status=0;");
+    CHECK(oa_refused(oa_code_job(w, OC_JOB_OAUTH_CODE_FIND, bob, code, 0, 0), NULL, OC_ERR_UNKNOWN_CODE));
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_PAGE && r->oa_page == OC_OAUTH_PAGE_EXPIRED);
+    oc_dbres_free(r);
+
+    /* Declined: the page returns access_denied. */
+    CHECK(oa_start(w, client, request, code));
+    r = oa_code_job(w, OC_JOB_OAUTH_DECIDE, cat, code, 0, 0);
+    CHECK(r && r->type == OC_RES_OAUTH_DECIDED);
+    oc_dbres_free(r);
+    r = oa_poll(w, request);
+    CHECK(r && r->type == OC_RES_OAUTH_REDIRECT && !r->oa_code && r->oa_error && strcmp(r->oa_error, "access_denied") == 0);   /* contract: RFC 6749's code */
+    oc_dbres_free(r);
+
+    /* cat's own connection, for the lists. */
+    CHECK(oa_approved(w, cat, client, 90, authcode));
+    oc_dbres_free(oa_exchange(w, authcode, client, OA_VER));
+
+    /* Lists: one's own; everyone's for an owner or admin only; never a token. */
+    r = oa_job(w, OC_JOB_OAUTH_LIST, bob);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 1 && r->oa_conns[0].user_id == bob &&
+          r->oa_conns[0].lifetime_days == 0);
+    uint64_t bob_conn = r && r->n_oa_conns ? r->oa_conns[0].id : 0;
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_OAUTH_LIST, 805);
+    j->user_id = bob; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    CHECK(oa_refused(wait_result(w), NULL, OC_ERR_FORBIDDEN));
+    j = oc_job_new(OC_JOB_OAUTH_LIST, 805);
+    j->user_id = own; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 2);
+    uint64_t cat_conn = 0;
+    for (size_t i = 0; r && i < r->n_oa_conns; i++) if (r->oa_conns[i].user_id == cat) cat_conn = r->oa_conns[i].id;
+    oc_dbres_free(r);
+
+    /* Revoking: not another's as a member; one's own; anyone's as an owner. */
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = bob; j->oa_conn_id = cat_conn;
+    oc_dbwriter_submit(w, j);
+    CHECK(oa_refused(wait_result(w), NULL, OC_ERR_UNKNOWN_CONNECTION));
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = bob; j->oa_conn_id = bob_conn;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 0);
+    oc_dbres_free(r);
+    CHECK(agent_err(oa_lookup(w, access4)) == OC_ERR_AUTH_INVALID_TOKEN);
+    j = oc_job_new(OC_JOB_OAUTH_REVOKE, 805);
+    j->user_id = own; j->oa_conn_id = cat_conn; j->oa_all = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OAUTH_LIST && r->n_oa_conns == 0);
+    oc_dbres_free(r);
+
+    /* A post through a connection names its client. */
+    ret_sql(path, "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(9821,'channel','cn-room',1,1);");
+    snprintf(q, sizeof q, "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9821,%llu,1);", (unsigned long long)bob);
+    ret_sql(path, q);
+    j = oc_job_new(OC_JOB_SEND, 806);
+    j->user_id = bob; j->channel_id = 9821; j->via = strdup("Desk AI");
+    memset(j->idem, 0x5A, OC_IDEM_LEN);
+    oc_job_set_body(j, "from the client", 15);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->via && strcmp(r->via, "Desk AI") == 0);   /* contract: the client's name */
+    oc_dbres_free(r);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM messages WHERE author_id=?1 AND via='Desk AI';", bob) == 1);
+
+    /* Removing a person revokes their connections. */
+    CHECK(oa_approved(w, cat, client, 365, authcode));
+    r = oa_exchange(w, authcode, client, OA_VER);
+    char access5[64] = "";
+    if (r && r->oa_access) snprintf(access5, sizeof access5, "%s", r->oa_access);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_REMOVE_USER, 807);
+    j->user_id = own; j->target_user_id = cat;
+    oc_dbwriter_submit(w, j);
+    oc_dbres_free(wait_result(w));
+    CHECK(agent_err(oa_lookup(w, access5)) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM mcp_connections WHERE user_id=?1 AND revoked_at_ms=0;", cat) == 0);
+
+    /* The audit: approvals and declines in the account family, a person's own
+     * revoke there too, an owner's of another's administrative; never a token or code. */
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_approve' AND family=?1;", OC_AUDIT_ACCOUNT) >= 6);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_decline' AND family=?1;", OC_AUDIT_ACCOUNT) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=?1;", OC_AUDIT_ACCOUNT) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=?1;", OC_AUDIT_ADMIN) == 1);
+    CHECK(ret_count(path, "SELECT COUNT(*) FROM audit_log WHERE (COALESCE(detail,'')||COALESCE(target,'')) GLOB '*oc[pa][arc]_*' AND ?1=?1;", 0) == 0);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_call_recordings();
+    test_mcp_audit();
+    test_retention_off();
+    test_retention_boundary();
+    test_retention_linked_rows();
+    test_retention_attachments();
+    test_retention_search();
+    test_retention_summaries();
+    test_retention_threads();
+    test_retention_forward_kept();
+    test_retention_rendered_audio();
+    test_agents();
+    test_connections();
+    test_outgoing_webhooks();
+    test_retention_batch();
+    test_retention_calls();
+    test_retention_audit();
     test_usage();
     test_muted_people();
     test_change_password();

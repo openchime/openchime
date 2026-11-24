@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the pinned NSIS plugins the Windows installer uses into
 # third_party/nsis-plugins/x86-unicode/ -- the "fetched at build" vendoring
-# class (docs/VENDORS.md §2), SHA-256-pinned, gitignored. makensis itself is
+# class (docs/details/VENDORS.md §2), SHA-256-pinned, gitignored. makensis itself is
 # Ubuntu's (apt: nsis), run natively, so no Windows machine is in the build.
 #
 #   WinShell  sets the Start-menu shortcut's AppUserModelID, without which

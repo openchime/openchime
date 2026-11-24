@@ -1,6 +1,6 @@
 /*
  * OpenChime client — call signaling and media keys (REQ-150, REQ-301-305,
- * ARCH-113, docs/CALLS.md §4-§5).
+ * ARCH-113, docs/details/CALLS.md §4-§5).
  *
  * Runs on the network thread, which owns the connection and the credential
  * store: it answers the CALL_* frames, keeps this device's key pair, makes and
@@ -89,7 +89,7 @@ typedef struct {
     uint8_t  sk[32], pk[32];       /* this device's key pair (CALLS.md §5.2) */
 
     int      in_call;
-    uint64_t channel_id, call_id, self_user;
+    uint64_t call_id, self_user;
     uint8_t  slot;
     uint32_t epoch;
     uint16_t n;
@@ -107,7 +107,7 @@ typedef struct {
      * a sweep or a moved media path, not by its own act. */
     struct {
         int      on;
-        uint64_t channel_id, call_id;
+        uint64_t call_id;
         uint64_t since_ms;         /* when it was lost */
         uint64_t authed_ms;        /* a connection signed in since; 0 = none yet */
         int      sent;             /* its CALL_JOIN went on this connection */

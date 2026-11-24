@@ -1,5 +1,5 @@
 /*
- * The build id (ARCH-20, docs/UPGRADING.md): the short commit a candidate build
+ * The build id (ARCH-20, docs/details/UPGRADING.md): the short commit a candidate build
  * compiled, stamped by the build (-DOC_BUILD_ID=...). It is the binary's
  * identity. A release number is a label assigned to a build afterwards and is
  * not in any binary; the package that carries the binary says it. A source

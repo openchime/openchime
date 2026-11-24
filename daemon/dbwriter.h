@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "protocol.h"   /* OC_SESSION_TOKEN_LEN, OC_AUTH_*, OC_ROLE_* */
+#include "totp.h"       /* the sealed length of an outgoing webhook's secret */
 
 #define OC_IDEM_LEN 16
 
@@ -104,7 +105,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Notification preferences (REQ-130/131). */
        OC_JOB_SET_NOTIFY_PREF = 37, /* 38 was SET_DND, retired with REQ-131's window */
        OC_JOB_LIST_NOTIFY_PREFS = 39,
-       /* Audio call join authorization (REQ-150): read job, channel access gate. */
+       /* Who may be invited to a call (CALLS.md §1). Read. */
        OC_JOB_CALL_AUTH = 40,
        /* Synced client settings bucket. SET upserts/deletes one key; LIST reads a
         * client_type bucket. Both answer with a CLIENT_SETTINGS snapshot. */
@@ -195,13 +196,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * turning a spoken "at Name" into a mention. user_id, channel_id,
         * stt_mode, stt_req. Read. */
        OC_JOB_STT_PREP = 103,
-       /* Calls (REQ-301-305). CALL_AUTH (40, above) answers a join or an
-        * invitation: may the actor read the conversation, which of `call_uids`
-        * may, and who are its members. CALL_EVENT writes a call event -- a
-        * missed call -- as a message of kind OC_MSG_KIND_CALL, authored by
-        * user_id in channel_id, body in body/body_len; the net thread raises it
-        * with no connection behind it. Write. */
-       OC_JOB_CALL_EVENT = 104,
+       /* 104 was CALL_EVENT, the missed-call line: a call now writes its own
+        * record (CALL_START, CALL_LOG). */
        /* Catch-up: advance every one of a user's memberships (OC_MSG_MARK_ALL_READ).
         * A write, and on the writer for the same reason CLIENT_ACK is. */
        OC_JOB_MARK_ALL_READ = 105,
@@ -349,7 +345,182 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* To-do lists: a task added (todo_name, todo_desc), marked (todo_task,
         * todo_done), or the list renamed by its author (todo_name). Writes;
         * answered OC_RES_TODO to the conversation, or OC_RES_TODO_ERR. */
-       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163 };
+       OC_JOB_TODO_ADD = 161, OC_JOB_TODO_MARK = 162, OC_JOB_TODO_RENAME = 163,
+       /* The export of a video message (ARCH-135). EXPORT_LOOKUP (read):
+        * attachment_id + user_id, with exp_version the codecs' version; answered
+        * OC_RES_EXPORT_META -- the source to transcode, or the copy already made --
+        * or OC_RES_EXPORT_ERR. EXPORT_STORE writes a finished copy's row,
+        * EXPORT_TOUCH marks one served: write, fire and forget. */
+       OC_JOB_EXPORT_LOOKUP = 164, OC_JOB_EXPORT_STORE = 165, OC_JOB_EXPORT_TOUCH = 166,
+       /* A call's record (CALLS.md §1, SCHEMA.md `calls`). CALL_START: user_id
+        * the starter, call_subject, channel_id the conversation it is started
+        * from (0 none), call_uids the people asked; makes the row and its
+        * invitees (the starter the first), answered OC_RES_CALL_STARTED with
+        * the call's id and the invitees taken, or OC_RES_CALL_ERR. CALL_LOG:
+        * one change to call_id, call_log the OC_CALL_LOG_* -- write, fire and
+        * forget. */
+       OC_JOB_CALL_START = 244, OC_JOB_CALL_LOG = 245,
+       /* Calls home and a call's page (CALLS.md §1). CALL_HISTORY (read):
+        * user_id, call_before_ms, call_limit; answered OC_RES_CALL_FRAME.
+        * CALL_DETAIL (read): user_id, call_id, call_line_from; answered
+        * OC_RES_CALL_FRAME, or OC_RES_CALL_ERR to anyone not asked to it.
+        * CALL_DELETE (write): user_id, call_id, call_del_what, call_del_id;
+        * answered OC_RES_CALL_DELETED or OC_RES_CALL_ERR. CALL_TRANSCRIPT
+        * (write, fire and forget): a transcript stored, oc_dbwriter_call_transcript. */
+       OC_JOB_CALL_HISTORY = 246, OC_JOB_CALL_DETAIL = 247, OC_JOB_CALL_DELETE = 248,
+       OC_JOB_CALL_TRANSCRIPT = 249,
+       /* A call's recording (CALLS.md §8). RECORDING_START (write): call_id,
+        * user_id who started it, call_spool the directory its spool is made in
+        * (as <call_spool>/<rec_id>),
+        * call_cap_bytes the recordings' cap (0 none); answered
+        * OC_RES_RECORDING_STARTED with rec_id, or OC_RES_CALL_ERR at the cap.
+        * RECORDING_STOP (write, fire and forget): rec_id stopped, to process. */
+       OC_JOB_RECORDING_START = 250, OC_JOB_RECORDING_STOP = 251,
+       /* RECORDINGS_PENDING (read): the recordings waiting to be processed,
+        * answered OC_RES_RECORDINGS_PENDING with `rec_ids`/`rec_spools`.
+        * RECORDING_DONE (write): rec_id made (call_spool the blob key,
+        * exp_bytes, exp_duration_ms) or not (rec_failed, body the reason);
+        * answered OC_RES_RECORDING_DONE with the message it posts in the
+        * call's chat, or OC_RES_OK. */
+       OC_JOB_RECORDINGS_PENDING = 252, OC_JOB_RECORDING_DONE = 253,
+       /* REC_PEOPLE (read): who call_uids are -- a name and an avatar's store
+        * key each -- for call_id's recording; answered OC_RES_REC_PEOPLE. */
+       OC_JOB_REC_PEOPLE = 254,
+       /* Image previews (ARCH-137, SCHEMA.md `attachment_previews`).
+        * PREVIEW_STORE (write, fire and forget): attachment_id's dimensions
+        * (pv_width, pv_height; 0 unknown) and its pv_count rungs (pv_keys,
+        * pv_w, pv_h, pv_size, pv_mime); answered OC_RES_PREVIEW_STORED, whose
+        * pv_drop names the rungs' bytes to delete when the attachment went
+        * while they were made. PREVIEW_LOOKUP (read): attachment_id + user_id
+        * + pv_rung, the download's gate; answered OC_RES_PREVIEW_META or
+        * OC_RES_PREVIEW_ERR. PREVIEW_TOUCH (write, fire and forget): a rung
+        * served, for the least-recently-used reclaim. */
+       OC_JOB_PREVIEW_STORE = 255, OC_JOB_PREVIEW_LOOKUP = 256, OC_JOB_PREVIEW_TOUCH = 257,
+       /* TTS_USE (write): message_id's speech was looked up under tts_handle,
+        * so a removal by age (REQ-250) finds the rendering and deletes it;
+        * answered OC_RES_OK. */
+       OC_JOB_TTS_USE = 258,
+       /* Agents and their tokens (docs/details/MCP.md §3.1, §6; SCHEMA.md
+        * `principal_tokens`). All but TOKEN_LOOKUP are an owner's or admin's,
+        * user_id the actor. AGENT_CREATE: agent_name, and its first token's
+        * token_name and token_scopes; answered OC_RES_AGENT_TOKEN with the
+        * agent's roster row. AGENT_REMOVE: target_user_id; answered
+        * OC_RES_USER_UPDATED (disabled) with the memberships it ended.
+        * TOKEN_MINT: target_user_id, token_name, token_scopes; answered
+        * OC_RES_AGENT_TOKEN. TOKEN_LIST: target_user_id; answered
+        * OC_RES_TOKEN_LIST. TOKEN_REVOKE: target_user_id, token_id; answered
+        * OC_RES_TOKEN_LIST. Each refused as OC_RES_AGENT_ERR. TOKEN_LOOKUP:
+        * token/token_len the presented token, token_from its address; answered
+        * OC_RES_TOKEN_PRINCIPAL, or OC_RES_AGENT_ERR when it is no token. */
+       OC_JOB_AGENT_CREATE = 259, OC_JOB_AGENT_REMOVE = 260, OC_JOB_TOKEN_MINT = 261,
+       OC_JOB_TOKEN_LIST = 262, OC_JOB_TOKEN_REVOKE = 263, OC_JOB_TOKEN_LOOKUP = 264,
+       /* The MCP surface (docs/details/MCP.md), as an agent, user_id. Reads:
+        * MCP_CHANNELS, the conversations it is a member of (OC_RES_MCP_CHANNELS);
+        * MCP_READ, channel_id's messages or thread mcp_thread's replies, paged by
+        * mcp_before / mcp_after / mcp_since and mcp_limit; MCP_SEARCH, mcp_query
+        * over its channels (channel_id 0: all), mcp_from, mcp_since, mcp_until,
+        * after the cursor (mcp_rank, mcp_after), in public channels only when
+        * mcp_pub and private ones when mcp_priv; both answered
+        * OC_RES_MCP_MESSAGES, or that with err_code. MCP_AUDIT (write, fire and
+        * forget): one row in family mcp_family. */
+       OC_JOB_MCP_CHANNELS = 265, OC_JOB_MCP_READ = 266, OC_JOB_MCP_SEARCH = 267, OC_JOB_MCP_AUDIT = 268,
+       /* A person's AI clients (docs/details/AUTH.md §8.13; SCHEMA.md 0091),
+        * every one a write. OAUTH_REGISTER: oa_name, oa_uris (one to a line),
+        * token_from the registering address; answered OC_RES_OAUTH_CLIENT with
+        * the minted oa_client_id. OAUTH_DOC_STORE: a fetched metadata document,
+        * oa_client_id its URL, oa_name, oa_uris; answered OC_RES_OAUTH_CLIENT.
+        * OAUTH_BEGIN: the checked authorize request (oa_client_id,
+        * oa_redirect, oa_challenge, oa_state, oa_resource), token_from;
+        * answered OC_RES_OAUTH_PAGE (pending: oa_name, oa_code, oa_request),
+        * OC_RES_OAUTH_NEED_FETCH (a document's URL unknown or older than a
+        * day), or OC_RES_OAUTH_ERR (oa_error: the page's sentence).
+        * OAUTH_POLL: oa_request, the page's handle; answered OC_RES_OAUTH_PAGE
+        * (pending, or oa_page OC_OAUTH_PAGE_EXPIRED) or OC_RES_OAUTH_REDIRECT
+        * (oa_redirect, oa_state, and oa_code the authorization code or
+        * oa_error "access_denied"). OAUTH_CODE_FIND: oa_code as the person
+        * typed it, user_id the person; answered OC_RES_OAUTH_APPROVAL (oa_name,
+        * oa_redirect). OAUTH_DECIDE: the same and oa_approve, oa_lifetime;
+        * answered OC_RES_OAUTH_DECIDED. OAUTH_EXCHANGE: oa_code, oa_verifier,
+        * oa_redirect, oa_client_id, oa_resource; OAUTH_REFRESH: oa_refresh,
+        * oa_client_id, oa_resource; both answered OC_RES_OAUTH_TOKENS
+        * (oa_access, oa_refresh) or OC_RES_OAUTH_ERR (oa_error, the OAuth
+        * code). OAUTH_LOOKUP: token, token_from; answered
+        * OC_RES_TOKEN_PRINCIPAL with oa_person set, or OC_RES_AGENT_ERR.
+        * OAUTH_LIST: user_id, oa_all for everyone's (an owner's or admin's);
+        * OAUTH_REVOKE: the same and oa_conn_id; both answered
+        * OC_RES_OAUTH_LIST. Refusals to a person are OC_RES_OAUTH_ERR with
+        * err_code. */
+       OC_JOB_OAUTH_REGISTER = 269, OC_JOB_OAUTH_DOC_STORE = 270, OC_JOB_OAUTH_BEGIN = 271,
+       OC_JOB_OAUTH_POLL = 272, OC_JOB_OAUTH_CODE_FIND = 273, OC_JOB_OAUTH_DECIDE = 274,
+       OC_JOB_OAUTH_EXCHANGE = 275, OC_JOB_OAUTH_REFRESH = 276, OC_JOB_OAUTH_LOOKUP = 277,
+       OC_JOB_OAUTH_LIST = 278, OC_JOB_OAUTH_REVOKE = 279,
+       /* Outgoing webhooks (docs/details/WEBHOOKS.md; SCHEMA.md
+        * `outgoing_webhooks`). All but TAKE and DONE are an owner's or admin's,
+        * user_id the actor. OUTWH_CREATE: owh_url, owh_events, owh_channels.
+        * Without owh_verified it is checked and answered OC_RES_OUTWH_CHECK
+        * with a new secret, for the endpoint check; with it (and that secret,
+        * owh_secret) it is saved, answered OC_RES_OUTWH_SECRET. OUTWH_LIST;
+        * OUTWH_SET, owh_id and owh_enabled; OUTWH_DELETE, owh_id: each
+        * answered OC_RES_OUTWH_LIST. Each refused as OC_RES_OUTWH_ERR.
+        * OUTWH_TAKE (the net thread, for the worker): up to owh_limit
+        * deliveries due, each held for OC_OUTWH_LEASE_MS, answered
+        * OC_RES_OUTWH_DUE. OUTWH_DONE: delivery owh_delivery succeeded (owh_ok)
+        * or failed with owh_reason, answered OC_RES_OUTWH_DONE. */
+       OC_JOB_OUTWH_CREATE = 280, OC_JOB_OUTWH_LIST = 281, OC_JOB_OUTWH_SET = 282,
+       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285 };
+
+/* Outgoing webhooks (docs/details/WEBHOOKS.md). A signing secret is 20 random
+ * bytes, shown and used as its 40 hex digits; it is kept sealed under the
+ * factor key (daemon/totp.h). */
+#define OC_OUTWH_SECRET_LEN   OC_TOTP_SECRET_LEN
+#define OC_OUTWH_ATTEMPTS     8                       /* the first included */
+#define OC_OUTWH_FIRST_RETRY_MS 1000u                 /* doubling after */
+#define OC_OUTWH_DISABLE_MS   (24ull * 60 * 60 * 1000) /* failing this long: disabled */
+#define OC_OUTWH_LEASE_MS     60000u                  /* a taken delivery's hold */
+#define OC_OUTWH_TAKE_MAX     16
+
+/* One outgoing webhook, as the list shows it: never its secret. */
+typedef struct {
+    uint64_t id, created_by, created_at_ms;
+    char    *url, *events, *disabled_reason;   /* heap */
+    uint8_t  enabled;
+    uint16_t n_channels;
+    uint64_t channels[OC_OUTWH_MAX_CHANNELS];
+} oc_outwh_row;
+
+/* One delivery due, for the worker: the webhook's secret still sealed. */
+typedef struct {
+    uint64_t id, webhook_id;
+    uint32_t attempts;                     /* made before this one */
+    char     last_reason[24];              /* the last one's retry reason */
+    char    *url, *event_id, *payload;     /* heap */
+    uint8_t  sealed[OC_TOTP_SEALED_LEN];
+    size_t   sealed_len;
+} oc_outwh_due;
+
+/* At most this many tokens an agent holds (docs/details/MCP.md §3.1). */
+#define OC_AGENT_MAX_TOKENS 10
+
+/* One token of an agent, as its list shows it: never the token. */
+typedef struct {
+    uint64_t id;
+    char    *name;          /* heap */
+    char    *scopes;        /* heap: names separated by single spaces */
+    uint64_t created_by;
+    uint64_t created_at_ms;
+    uint64_t last_used_at_ms;
+    char    *last_used_from;/* heap */
+} oc_token_row;
+
+/* CALL_LOG's changes. JOIN opens user_id's stay and LEAVE closes it; INVITE
+ * adds call_uids, asked by user_id; DECLINE marks user_id's invitation;
+ * EVENT adds call_event (OC_CALL_EV_*) by user_id; SUBJECT sets call_subject
+ * and adds its event; END ends the call (call_reason, OC_CALL_END_*) and every
+ * stay still open. */
+enum { OC_CALL_LOG_JOIN = 1, OC_CALL_LOG_LEAVE = 2, OC_CALL_LOG_INVITE = 3, OC_CALL_LOG_DECLINE = 4,
+       OC_CALL_LOG_EVENT = 5, OC_CALL_LOG_SUBJECT = 6, OC_CALL_LOG_END = 7 };
+enum { OC_CALL_END_LEFT = 0, OC_CALL_END_ENDED = 1, OC_CALL_END_STOPPED = 2 };
+/* call_event is OC_CALL_EV_* (protocol.h). */
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -507,8 +678,54 @@ typedef struct oc_job {
     /* A WARMING job: the same cache probe, with nobody waiting for the answer.
      * The eight voices all audition with one sentence, so rendering it once per
      * voice at startup turns every later press of Play into a cache hit
-     * (docs/READ-ALOUD.md §5). */
+     * (docs/details/READ-ALOUD.md §5). */
     uint8_t        tts_warm;
+
+    /* The export of a video message (ARCH-135): attachment_id (the upload
+     * fields, below), and the codecs' version (exp_version) the cache is keyed
+     * by; STORE adds what the worker made. */
+    char          *exp_version;
+    char          *exp_blob_key;
+    uint64_t       exp_bytes;
+    uint32_t       exp_duration_ms;
+
+    /* Agents and tokens: AGENT_CREATE's name, a token's name and scopes
+     * (names separated by single spaces), TOKEN_REVOKE's token, and
+     * TOKEN_LOOKUP's address. All heap. */
+    char          *agent_name, *token_name, *token_scopes, *token_from;
+    uint64_t       token_id;
+
+    /* The MCP surface's reads and audit rows (OC_JOB_MCP_*). Strings heap. */
+    uint64_t       mcp_thread, mcp_before, mcp_after, mcp_since, mcp_until;
+    uint8_t        mcp_has_before, mcp_has_after, mcp_has_since, mcp_has_until;
+    uint16_t       mcp_limit;
+    uint8_t        mcp_pub, mcp_priv, mcp_has_cursor;
+    /* As a person through an AI client (AUTH.md §8.13), not an agent: DMs and
+     * group DMs are theirs to read too, never an encrypted one. */
+    uint8_t        mcp_person;
+    double         mcp_rank;
+    char          *mcp_query, *mcp_from;
+    int            mcp_family;
+    uint8_t        mcp_outcome;
+    char          *mcp_action, *mcp_target, *mcp_detail;
+
+    /* A person's AI clients (OC_JOB_OAUTH_*). Strings heap. `via` on a SEND
+     * or SEND_REPLY: the client a post came through, stored on the message. */
+    char          *oa_client_id, *oa_name, *oa_uris, *oa_redirect, *oa_challenge, *oa_state, *oa_resource;
+    char          *oa_request, *oa_code, *oa_verifier, *oa_refresh, *via;
+    uint32_t       oa_lifetime;
+    uint8_t        oa_approve, oa_all;
+    uint64_t       oa_conn_id;
+
+    /* Image previews (ARCH-137): PREVIEW_STORE's and PREVIEW_LOOKUP's
+     * fields, with attachment_id. pv_keys and pv_mime are heap. */
+    uint8_t        pv_rung;
+    uint8_t        pv_count;
+    uint32_t       pv_width, pv_height;
+    char          *pv_keys[2];
+    char          *pv_mime[2];
+    uint32_t       pv_w[2], pv_h[2];
+    uint64_t       pv_size[2];
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -671,6 +888,8 @@ typedef struct oc_job {
      * caller has, 0/0 for the first page (REQ-143). */
     uint64_t       files_before_ms, files_before_id;
     uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
+    uint32_t       maint_rec_days;    /* STORAGE_MAINT: delete calls' recordings this old (0 = keep) */
+    uint32_t       maint_retention_days; /* STORAGE_MAINT: delete messages and calls this old (REQ-250; 0 = keep) */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
     /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
     uint64_t       stt_req;
@@ -682,6 +901,25 @@ typedef struct oc_job {
     uint16_t       n_call_uids;
     uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
     uint8_t        call_codecs;                        /* a join's decodable codecs, echoed */
+    /* CALL_START / CALL_LOG: the call, its subject (heap), the change. */
+    uint64_t       call_id;
+    char          *call_subject;
+    uint8_t        call_log, call_reason, call_event;
+    /* RECORDING_START / _STOP: the spool (heap), the cap, the recording. */
+    char          *call_spool;
+    uint64_t       call_cap_bytes;
+    uint64_t       rec_id;
+    uint8_t        rec_failed;
+    /* CALL_HISTORY, CALL_DETAIL, CALL_DELETE. */
+    uint64_t       call_before_ms;
+    uint16_t       call_limit;
+    uint32_t       call_line_from;
+    uint8_t        call_del_what;
+    uint64_t       call_del_id;
+    /* CALL_TRANSCRIPT: the language (heap) and the lines (heap, each text heap). */
+    char          *tr_lang;
+    struct oc_transcript_line *tr_lines;
+    size_t         n_tr_lines;
     /* ALERT_* (REQ-263): heap strings; the entry acknowledged. */
     char          *alert_key, *alert_message;
     uint64_t       alert_id;
@@ -700,11 +938,19 @@ typedef struct oc_job {
     uint8_t        pfd_op, pfd_kind;
     uint16_t       pfd_position;
     uint64_t       ooo_start, ooo_end;   /* SET_OUT_OF_OFFICE */
+    /* Outgoing webhooks (OC_JOB_OUTWH_*). owh_url, owh_events and owh_reason
+     * heap. */
+    char          *owh_url, *owh_events, *owh_reason;
+    uint16_t       owh_n_channels, owh_limit;
+    uint64_t       owh_channels[OC_OUTWH_MAX_CHANNELS];
+    uint8_t        owh_secret[OC_OUTWH_SECRET_LEN];
+    uint8_t        owh_verified, owh_enabled, owh_ok;
+    uint64_t       owh_id, owh_delivery;
 } oc_job;
 
-/* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
- * invitation from someone already in the call. */
-enum { OC_CALL_OP_JOIN = 0, OC_CALL_OP_INVITE = 1 };
+/* CALL_AUTH's question: who of call_uids may be invited to call_id (CALLS.md
+ * §1) -- each an account that is on and not a visitor. */
+enum { OC_CALL_OP_INVITE = 1 };
 
 /* --- Results (writer -> net thread) ------------------------------------- */
 
@@ -735,7 +981,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_WEBHOOK_DELETED = 42,
        /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
        OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44,
-       /* Call join authorized (net thread then updates in-memory call state) / denied. */
+       /* Who may be invited to a call (CALL_AUTH) / a call request refused. */
        OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46,
        /* Synced client settings bucket snapshot (also fanned as a device-sync push). */
        OC_RES_CLIENT_SETTINGS = 47,
@@ -790,8 +1036,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Voice input (ARCH-112): the STT_PREP answer -- err_code 0 and the
         * member names, or the refusal. stt_req names the segment. */
        OC_RES_STT_PREP = 93,
-       /* A call event written (REQ-304): the SEND-shaped fields and `members`,
-        * which the net thread broadcasts with kind OC_MSG_KIND_CALL. */
+       /* A call's message in the conversation it was started from (CALLS.md
+        * §1), changed as the call is renamed or ends: the SEND-shaped fields
+        * and `members`, which the net thread sends as MSG_EDITED. */
        OC_RES_CALL_EVENT = 94,
        /* A channel's description: the answer to a fetch (to the asker only) and,
         * with ch_fanout, the announcement of a change (to every member). The
@@ -891,7 +1138,92 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * server_time; saved_at and remind_at the item's. To that person's
         * connections and their devices' push. A chain, one per reminder; an
         * empty one (user_id 0) when none was due. */
-       OC_RES_REMINDER_DUE = 135 };
+       OC_RES_REMINDER_DUE = 135,
+       /* EXPORT_LOOKUP's answer (ARCH-135): `exp_cached` says the copy is stored,
+        * described by exp_blob_key/exp_bytes/exp_duration_ms; otherwise
+        * exp_src_key/exp_src_size is the video to transcode. EXPORT_ERR carries
+        * err_code. attachment_id is echoed either way. */
+       OC_RES_EXPORT_META = 138, OC_RES_EXPORT_ERR = 139,
+       /* A call's row made (OC_JOB_CALL_START): call_id, server_time its start,
+        * call_uids the invitees taken; and when it was started from a
+        * conversation, the message it left there -- the SEND-shaped fields and
+        * `members` -- which the net thread broadcasts with kind
+        * OC_MSG_KIND_CALL. */
+       OC_RES_CALL_STARTED = 140,
+       /* An answer the writer encoded whole (frame/frame_len), for the asker:
+        * CALL_HISTORY_PAGE or CALL_PAGE. */
+       OC_RES_CALL_FRAME = 141,
+       /* A call's transcript or recording deleted: call_id, call_del_what,
+        * call_del_id; `members` the call's invitees, who are told; `reclaim`
+        * what bytes go. */
+       OC_RES_CALL_DELETED = 142,
+       /* A recording's row made: call_id, rec_id, user_id who started it. */
+       OC_RES_RECORDING_STARTED = 143,
+       /* The recordings to process: rec_ids and rec_spools, n_recs of each. */
+       OC_RES_RECORDINGS_PENDING = 144,
+       /* A recording made: the message carrying it in the call's chat, the
+        * SEND-shaped fields with its attachment, and `members`. */
+       OC_RES_RECORDING_DONE = 145,
+       /* Who people in a recording are: call_id, rec_people (n_rec_people). */
+       OC_RES_REC_PEOPLE = 146,
+       /* Image previews (ARCH-137): a rung to serve (pv_key, pv_size, pv_w,
+        * pv_h, pv_mime, pv_rung), or why not (err_code); and a store done. */
+       OC_RES_PREVIEW_META = 147, OC_RES_PREVIEW_ERR = 148, OC_RES_PREVIEW_STORED = 149,
+       /* Agents and tokens: a token minted (user_id the agent, message_id the
+        * token's id, session_token its bytes, shown once; ulist the agent's
+        * roster row when it was just created); an agent's token list
+        * (user_id, ptokens); a refusal (err_code); and a token found
+        * (user_id its agent, message_id its id, tok_scopes). */
+       OC_RES_AGENT_TOKEN = 150, OC_RES_TOKEN_LIST = 151, OC_RES_AGENT_ERR = 152,
+       OC_RES_TOKEN_PRINCIPAL = 153,
+       /* The MCP surface: an agent's conversations (mcp_chans), and a page of
+        * messages (mcp_rows, in id order, with mcp_more_older / mcp_more_newer,
+        * and mcp_newest_kept when it was read backwards). */
+       OC_RES_MCP_CHANNELS = 154, OC_RES_MCP_MESSAGES = 155,
+       /* A person's AI clients (OC_JOB_OAUTH_*): what each job above answers. */
+       OC_RES_OAUTH_CLIENT = 156, OC_RES_OAUTH_PAGE = 157, OC_RES_OAUTH_REDIRECT = 158,
+       OC_RES_OAUTH_NEED_FETCH = 159, OC_RES_OAUTH_TOKENS = 160, OC_RES_OAUTH_ERR = 161,
+       OC_RES_OAUTH_APPROVAL = 162, OC_RES_OAUTH_DECIDED = 163, OC_RES_OAUTH_LIST = 164,
+       /* Outgoing webhooks: a creation may be checked (owh_url, owh_events,
+        * owh_channels, and owh_secret, new); one saved (message_id its id,
+        * owh_secret, shown once); the list (owh_rows); a refusal (err_code);
+        * deliveries due (owh_due); a delivery's outcome written (owh_disabled
+        * when it turned its webhook off). */
+       OC_RES_OUTWH_CHECK = 165, OC_RES_OUTWH_SECRET = 166, OC_RES_OUTWH_LIST = 167,
+       OC_RES_OUTWH_ERR = 168, OC_RES_OUTWH_DUE = 169, OC_RES_OUTWH_DONE = 170 };
+
+/* One AI-client connection as a list shows it: never a token. */
+typedef struct {
+    uint64_t id, user_id;
+    char    *user_name, *client_name;   /* heap */
+    uint64_t created_ms, last_used_ms, expires_ms;   /* expires 0: never */
+    uint32_t lifetime_days;
+} oc_conn_row;
+
+/* A conversation an agent may read, as the MCP surface names it. */
+/* `is_dm`: a DM or group DM, its name the others' handles ("alice" or
+ * "alice,@bob"), shown with '@' where a channel's is shown with '#'. */
+typedef struct { uint64_t id; char *name; uint8_t is_public, is_dm; } oc_mcp_chan;
+/* A message as the MCP surface returns it; every string heap. */
+typedef struct {
+    uint64_t id, channel_id, at_ms;
+    char    *author, *handle, *kind, *text, *channel;
+    size_t   text_len;
+    uint8_t  edited;
+    uint32_t replies;
+    double   rank;              /* search: bm25, lower is better */
+    size_t   n_files;
+    char   **file_names, **file_types;
+    uint64_t *file_sizes;
+} oc_mcp_row;
+
+/* A line of a call's transcript as the daemon's transcript function takes it:
+ * the speaker (0 unknown), from and to in ms from the call's start, the text. */
+typedef struct oc_transcript_line {
+    uint64_t    speaker;
+    uint32_t    start_ms, end_ms;
+    char       *text;
+} oc_transcript_line;
 
 /* The usage figures (REQ-043), as USAGE carries them; the channels' names are
  * held here, since the frame only points at them. */
@@ -1046,10 +1378,16 @@ typedef struct { uint64_t id, channel_id, thread_root, send_at_ms, created_ms;
 /* Audit families (REQ-251, ARCH-79). The cap is applied per family so a flood of
  * attacker-controlled security events cannot evict administrative history. */
 enum { OC_AUDIT_ADMIN = 1, OC_AUDIT_ACCOUNT = 2,
-       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4 };
+       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4,
+       /* What reached the MCP surface (REQ-325): one row per tool call. Kept
+        * 365 days whatever the other families' age, so heavy reading cannot
+        * push their entries out. */
+       OC_AUDIT_MCP = 5 };
+#define OC_AUDIT_MCP_KEEP_MS (365ull * 24 * 60 * 60 * 1000)
 
 enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
-       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3 };
+       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3,
+       OC_RECLAIM_DELETED = 4 };   /* deleted by someone allowed to: a call's recording */
 
 typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
 
@@ -1153,7 +1491,11 @@ typedef struct {
     /* Folded away by the REQUESTING user, likewise private to them: the net
      * thread replays it as a COLLAPSED_UPDATED down this connection. */
     uint8_t  collapsed;
+    /* The AI client it was posted through (messages.via), heap, NULL for none. */
+    char    *via;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
+    uint64_t call_id;      /* a call message's call (CALLS.md §1), 0 for none */
+    uint64_t call_line;    /* SEARCH: a transcript line's id (its hit), 0 for a message */
     /* Replays and THREAD: its send stored a broadcast mention row (REQ-221),
      * whatever the body says now; the byte BROADCAST and THREAD_REPLY carry. */
     uint8_t  broadcast_stored;
@@ -1166,6 +1508,10 @@ typedef struct {
     /* SEARCH only: the row's relevance, bm25 × 1,000,000 (0 unless sorted so). */
     int64_t  rank;
 } oc_replay_msg;
+
+/* Who someone in a recording is (OC_RES_REC_PEOPLE): their name, and their
+ * avatar's store key, "" for none. */
+typedef struct oc_rec_person { uint64_t user; char name[81]; char avatar_key[65]; } oc_rec_person;
 
 typedef struct oc_dbres {
     struct oc_dbres *next;
@@ -1540,6 +1886,37 @@ typedef struct oc_dbres {
     uint32_t                tts_duration_ms;
     uint8_t                 tts_voice, tts_cached, tts_persist, tts_warm;
     uint64_t                tts_author_id;
+    /* OC_RES_EXPORT_META (ARCH-135). */
+    uint64_t                exp_attachment_id;
+    char                   *exp_blob_key, *exp_src_key;
+    uint64_t                exp_bytes, exp_src_size;
+    uint32_t                exp_duration_ms;
+    uint8_t                 exp_cached;
+    /* OC_RES_TOKEN_LIST and OC_RES_TOKEN_PRINCIPAL. */
+    oc_token_row           *ptokens;
+    size_t                  n_ptokens;
+    char                   *tok_scopes;
+    /* OC_RES_MCP_CHANNELS and OC_RES_MCP_MESSAGES. */
+    oc_mcp_chan            *mcp_chans;
+    size_t                  n_mcp_chans;
+    oc_mcp_row             *mcp_rows;
+    size_t                  n_mcp_rows;
+    uint8_t                 mcp_more_older, mcp_more_newer, mcp_newest_kept;
+    /* OC_RES_OAUTH_* (heap strings), and `via` on SEND_OK / REPLY_OK. On
+     * OC_RES_TOKEN_PRINCIPAL, oa_person says the token is a person's access
+     * token: message_id its connection, oa_name its client. */
+    char                   *oa_client_id, *oa_name, *oa_uris, *oa_request, *oa_code, *oa_redirect, *oa_state;
+    char                   *oa_error, *oa_access, *oa_refresh, *via;
+    uint8_t                 oa_page, oa_person;
+    uint8_t                 oa_approve_echo;   /* DECIDED: approved; LIST: everyone's */
+    oc_conn_row            *oa_conns;
+    size_t                  n_oa_conns;
+    /* OC_RES_PREVIEW_META and OC_RES_PREVIEW_STORED (ARCH-137). */
+    char                   *pv_key, *pv_mime;
+    uint64_t                pv_size;
+    uint32_t                pv_w, pv_h;
+    uint8_t                 pv_rung;
+    char                   *pv_drop[2];
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;
@@ -1554,6 +1931,7 @@ typedef struct oc_dbres {
     uint64_t                maint_expired;
     uint64_t                maint_evicted;
     uint64_t                maint_renders;   /* read-aloud renderings reclaimed (ARCH-111) */
+    uint64_t maint_previews;   /* image previews reclaimed (ARCH-137) */
     /* Storage report (REQ-214). The free-space half is filled in by the net
      * thread from its cached statvfs sample; the writer supplies what only the
      * database knows. */
@@ -1594,6 +1972,19 @@ typedef struct oc_dbres {
     size_t                  n_call_uids;
     uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
     uint8_t                 call_codecs;
+    uint64_t                call_id;         /* OC_RES_CALL_STARTED, OC_RES_CALL_EVENT */
+    char                   *call_subject;    /* OC_RES_CALL_STARTED: the subject, heap */
+    uint8_t                *frame;           /* OC_RES_CALL_FRAME: the encoded answer, heap */
+    size_t                  frame_len;
+    uint64_t                rec_id;          /* OC_RES_RECORDING_STARTED */
+    uint64_t               *rec_ids;         /* OC_RES_RECORDINGS_PENDING, heap */
+    char                  **rec_spools;      /* ...each heap */
+    struct oc_rec_person   *rec_people;      /* OC_RES_REC_PEOPLE, heap */
+    size_t                  n_rec_people;
+    size_t                  n_recs;
+    uint8_t                 call_del_what;   /* OC_RES_CALL_DELETED */
+    uint64_t                call_del_id;
+    uint64_t                call_chat;       /* OC_RES_CALL_STARTED: the call's chat */
 
     /* Critical failures (REQ-263). On AUTH_OK for an owner or admin, and on
      * OC_RES_ALERTS_SUMMARY: `alerts_admin` set, and the counts. On
@@ -1637,6 +2028,16 @@ typedef struct oc_dbres {
     size_t                  n_pfd;
     struct oc_pfv_row { uint64_t field_id; char value[OC_PROFILE_FIELD_VALUE_MAX + 1]; } *pfv;
     size_t                  n_pfv;
+    /* Outgoing webhooks (OC_RES_OUTWH_*). Strings and arrays heap. */
+    char                   *owh_url, *owh_events;
+    uint16_t                owh_n_channels;
+    uint64_t                owh_channels[OC_OUTWH_MAX_CHANNELS];
+    uint8_t                 owh_secret[OC_OUTWH_SECRET_LEN];
+    uint8_t                 owh_disabled;
+    oc_outwh_row           *owh_rows;
+    size_t                  n_owh_rows;
+    oc_outwh_due           *owh_due;
+    size_t                  n_owh_due;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -1669,6 +2070,9 @@ void         oc_dbwriter_stop(oc_dbwriter *w);
 
 /* The eventfd the net thread registers in epoll; readable when results wait. */
 int  oc_dbwriter_eventfd(oc_dbwriter *w);
+/* The factor key, for the outgoing webhooks' worker, which alone opens their
+ * secrets (docs/details/WEBHOOKS.md): 0 and the key, or -1 when there is none. */
+int  oc_dbwriter_factor_key(oc_dbwriter *w, uint8_t key[OC_FACTOR_KEY_LEN]);
 
 /* Enable the relay source (AUTH.md §3, §8): AUTH{oidc} tokens are verified
  * against the pinned ES256 keys. Other sources are left as they are. Copies its
@@ -1869,5 +2273,12 @@ int        oc_dbwriter_sum_take(oc_dbwriter *w, int64_t row);
 /* Pop the next completed result, or NULL when drained. Caller frees it. */
 oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
 void       oc_dbres_free(oc_dbres *r);
+
+/* The daemon's transcript function (CALLS.md §1): store the transcript of call
+ * `call_id`, replacing any it had -- its language (NULL for none) and `n`
+ * lines, copied -- searchable by the call's people. What makes transcripts
+ * calls it; nothing does yet. Returns 0 when queued for the writer. */
+int oc_dbwriter_call_transcript(oc_dbwriter *w, uint64_t call_id, const char *language,
+                                const oc_transcript_line *lines, size_t n);
 
 #endif /* OPENCHIME_DBWRITER_H */

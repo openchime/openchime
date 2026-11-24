@@ -1,4 +1,4 @@
-/* The coverage-guided fuzzing tier (docs/TESTING.md, "Fuzzing"). Each harness
+/* The coverage-guided fuzzing tier (docs/details/TESTING.md, "Fuzzing"). Each harness
  * is a function over one input, called by libFuzzer through tests/fuzz/main.c
  * and, for every checked-in corpus file and reproducer, by `make test`
  * (tests/test_fuzz_replay.c). A harness aborts on a broken contract, so the
@@ -26,7 +26,7 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad);
 /* The harnesses: 0, or abort(). */
 int oc_fuzz_frame(const uint8_t *data, size_t len);
 int oc_fuzz_framebuf(const uint8_t *data, size_t len);
-/* The pre-authentication parsers (docs/TESTING.md, "Fuzzing"). */
+/* The pre-authentication parsers (docs/details/TESTING.md, "Fuzzing"). */
 int oc_fuzz_http(const uint8_t *data, size_t len);
 int oc_fuzz_ws(const uint8_t *data, size_t len);
 int oc_fuzz_proxy(const uint8_t *data, size_t len);
@@ -35,6 +35,8 @@ int oc_fuzz_cbor(const uint8_t *data, size_t len);
 int oc_fuzz_jwt(const uint8_t *data, size_t len);
 int oc_fuzz_webauthn(const uint8_t *data, size_t len);
 int oc_fuzz_idtoken(const uint8_t *data, size_t len);
+/* The image-preview decoders (ARCH-137). */
+int oc_fuzz_image(const uint8_t *data, size_t len);
 
 /* An input as `n` parts, for a function that takes several: each part but the
  * last is prefixed by its length, a big-endian u16, cut short where the input

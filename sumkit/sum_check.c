@@ -1,5 +1,5 @@
 /* sum_check: sumkit against its references, its quantisation measured, its
- * speed timed (docs/SUMKIT.md §6). Not part of the daemon.
+ * speed timed (docs/details/SUMKIT.md §6). Not part of the daemon.
  *
  *   sum_check parity DIR FULL.bin       the unquantised model against the
  *                                       references in DIR (tests/data/summary)

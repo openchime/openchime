@@ -1,4 +1,4 @@
-/* The capture interface (REQ-163, ARCH-110, docs/VIDEO-MESSAGES.md §3): cameras,
+/* The capture interface (REQ-163, ARCH-110, docs/details/VIDEO-MESSAGES.md §3): cameras,
  * and screens and windows. One interface for every platform; every backend
  * delivers oc_frame (planar I420, BT.709 limited range, even dimensions) stamped
  * from oc_media_clock_us(). */

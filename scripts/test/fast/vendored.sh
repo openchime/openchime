@@ -2,7 +2,7 @@
 # scripts/test/fast/vendored.sh
 #
 # mbedTLS and SDL3 are committed in third_party/mbedtls and third_party/SDL3
-# (docs/VENDORS.md §1) and built from there with nothing downloaded.
+# (docs/details/VENDORS.md §1) and built from there with nothing downloaded.
 #
 # mbedTLS: Its version is written in six places
 # that must agree: the tree's own include/mbedtls/build_info.h, the build
@@ -29,7 +29,7 @@ grep -qE "$download" <<<'URL="https://example.org/mbedtls.tar.bz2"' || fail "the
 [ "$(header_version <<<'#define MBEDTLS_VERSION_STRING         "1.2.3"')" = 1.2.3 ] || fail "the header's version line is no longer read"
 [ "$(script_version <<<'MBEDTLS_VERSION=1.2.3')" = 1.2.3 ] || fail "a script's version line is no longer read"
 
-[ -f "$tree_dir/include/mbedtls/build_info.h" ] || fail "$tree_dir is missing: mbedTLS is committed there (docs/VENDORS.md)"
+[ -f "$tree_dir/include/mbedtls/build_info.h" ] || fail "$tree_dir is missing: mbedTLS is committed there (docs/details/VENDORS.md)"
 tree=$(header_version "$tree_dir/include/mbedtls/build_info.h")
 [ -n "$tree" ] || fail "$tree_dir/include/mbedtls/build_info.h names no version"
 
@@ -68,7 +68,7 @@ sdl_script_version() { sed -n 's/^SDL3_VERSION=\([0-9][0-9.]*\)$/\1/p' "$@"; }
 grep -qE "$download" <<<'curl -fsSL -o "$TARBALL" "https://github.com/libsdl-org/SDL/releases/download/x"' ||
     fail "the pattern no longer matches a planted SDL3 download"
 
-[ -f "$sdl_dir/include/SDL3/SDL_version.h" ] || fail "$sdl_dir is missing: SDL3 is committed there (docs/VENDORS.md)"
+[ -f "$sdl_dir/include/SDL3/SDL_version.h" ] || fail "$sdl_dir is missing: SDL3 is committed there (docs/details/VENDORS.md)"
 sdl=$(sdl_header_version "$sdl_dir/include/SDL3/SDL_version.h")
 [ -n "$sdl" ] || fail "$sdl_dir/include/SDL3/SDL_version.h names no version"
 bad=0

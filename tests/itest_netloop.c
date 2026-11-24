@@ -4,6 +4,7 @@
  * acked. Runs the non-blocking epoll server (with a real DB-writer thread) in a
  * thread and drives it with blocking TLS clients. */
 
+#include "callrec_render.h"   /* the stand-in codecs (CALLS.md §8) */
 #include "netloop.h"
 #include "enroll.h"        /* the address proof (AUTH.md §3.6) */
 #include "webapp.h"
@@ -31,6 +32,10 @@
 #include "oidcrp.h"        /* a direct connection's worker */
 #include "jwt.h"
 #include "json.h"          /* a summary's document, parsed */
+#include "export_render.h" /* the export's stub codecs (ARCH-135) */
+#include "export_worker.h" /* where a copy is stored */
+#include "blobstore.h"
+#include "oc_mp4.h"
 #include <poll.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/sha256.h>
@@ -407,6 +412,8 @@ static _Atomic uint32_t g_auth_stt_max_ms;
 
 static _Atomic int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
 static _Atomic int g_auth_polls;       /* ... and "polls" (REQ-225) */
+static _Atomic int g_auth_export;      /* ... and "h264-export" (ARCH-135) */
+static _Atomic int g_auth_callrec;     /* ... and "call-recording" (CALLS.md §8) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 /* Sign `c` in as a person does (AUTH.md §8.10): the page, then the token on
  * AUTH; the post-auth pushes drained, so the stream is positional after. */
@@ -477,7 +484,13 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         g_auth_stt = 0;
         g_auth_summarize = 0;
         g_auth_polls = 0;
+        g_auth_export = 0;
+        g_auth_callrec = 0;
         for (uint8_t k = 0; k < cp.count; k++) {
+            if (cp.names[k].len == strlen(OC_CAP_CALL_RECORDING) &&
+                memcmp(cp.names[k].ptr, OC_CAP_CALL_RECORDING, cp.names[k].len) == 0) g_auth_callrec = 1;
+            if (cp.names[k].len == strlen(OC_CAP_H264_EXPORT) &&
+                memcmp(cp.names[k].ptr, OC_CAP_H264_EXPORT, cp.names[k].len) == 0) g_auth_export = 1;
             if (cp.names[k].len == strlen(OC_CAP_POLLS) &&
                 memcmp(cp.names[k].ptr, OC_CAP_POLLS, cp.names[k].len) == 0) g_auth_polls = 1;
             if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, OC_CAP_STT, 3) == 0) g_auth_stt = 1;
@@ -4721,6 +4734,183 @@ static void test_read_aloud_absent(void) {
     db_unlink("itest_tts_off.db");
 }
 
+/* The export of a video message over the wire (ARCH-135). Off -- the setting
+ * off, or on in a daemon without the codecs, which is how the test build stands
+ * in for one built without EXPORT=1 -- it is not offered and EXPORT_GET is
+ * refused EXPORT_UNAVAILABLE, naming the attachment, with the connection kept.
+ * On, with the stub codecs: EXPORT_INFO, EXPORT_CHUNKs and EXPORT_END carry
+ * exactly the copy the worker stored, and asked again it is served from the
+ * cache. Its own daemon and database each time. */
+static uint64_t read_export(client *c, uint64_t aid, uint8_t **bytes, uint16_t *code) {
+    oc_header hdr;
+    oc_rbuf p;
+    *code = 0;
+    if (bytes) *bytes = NULL;
+    do {
+        if (read_frame(c, &hdr, &p) != 0) return 0;
+    } while (hdr.msg_type == OC_MSG_BROADCAST);
+    if (hdr.msg_type == OC_MSG_ERROR) {
+        oc_error e;
+        CHECK(oc_decode_error(&p, &e) == OC_OK);
+        CHECK(!e.fatal && e.context.len == 8);
+        uint64_t named = 0;
+        for (size_t i = 0; e.context.len == 8 && i < 8; i++) named = named << 8 | e.context.ptr[i];
+        CHECK(named == aid);
+        *code = e.code;
+        return 0;
+    }
+    CHECK(hdr.msg_type == OC_MSG_EXPORT_INFO);
+    oc_export_info ei;
+    CHECK(oc_decode_export_info(&p, &ei) == OC_OK && ei.attachment_id == aid);
+    uint8_t *all = malloc(ei.total_size ? ei.total_size : 1);
+    uint64_t got = 0;
+    uint32_t seq = 0;
+    for (;;) {
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_EXPORT_END) {
+            oc_export_end ee;
+            CHECK(oc_decode_export_end(&p, &ee) == OC_OK && ee.attachment_id == aid);
+            break;
+        }
+        CHECK(hdr.msg_type == OC_MSG_EXPORT_CHUNK);
+        oc_export_chunk ec;
+        CHECK(oc_decode_export_chunk(&p, &ec) == OC_OK && ec.attachment_id == aid && ec.seq == seq++);
+        if (all && got + ec.data.len <= ei.total_size) memcpy(all + got, ec.data.ptr, ec.data.len);
+        got += ec.data.len;
+    }
+    CHECK(got == ei.total_size);
+    if (bytes) *bytes = all; else free(all);
+    return got;
+}
+
+/* The copies the daemon has recorded. */
+static int export_rows(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int rows = -1;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM exported_video;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return rows;
+}
+
+static uint64_t fetch_export(client *c, uint64_t aid, uint8_t **bytes, uint16_t *code) {
+    uint8_t buf[64];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_export_get eg = { aid };
+    CHECK(oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &eg) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    return read_export(c, aid, bytes, code);
+}
+
+/* mode 0: setting off; 1: setting on, no codecs; 2: on, the stub codecs. */
+static void test_export_wire(int mode) {
+    setenv("OPENCHIME_H264_EXPORT", mode ? "on" : "off", 1);
+    oc_netloop_set_export(mode == 2 ? &oc_export_stub_codecs : NULL);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_export.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_export.db"));
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
+    CHECK(dbw2 != NULL);
+    uint64_t alice_id = oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048);
+    CHECK(alice_id != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_export == (mode == 2));
+    uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "A clip.", 0x75);
+    CHECK(mid != 0);
+
+    /* A video message: its row, its media row and its bytes, put in place. */
+    const uint64_t aid = 0x5150;
+    size_t len = 0;
+    uint8_t *src = NULL;
+    {
+        oc_mp4_writer *mw = oc_mp4_writer_open(320, 240);
+        uint8_t v[64], au[24];
+        memset(v, 0x5A, sizeof v);
+        memset(au, 0x6B, sizeof au);
+        for (int i = 0; i < 12; i++) {
+            oc_mp4_write_video(mw, v, sizeof v, (int64_t)i * 33333, i == 0);
+            oc_mp4_write_audio(mw, au, sizeof au, 960);
+        }
+        uint32_t ms;
+        CHECK(oc_mp4_writer_finish(mw, &src, &len, &ms) == 0);
+    }
+    char blobs[700];
+    snprintf(blobs, sizeof blobs, "%s/blobs", tpath("data"));
+    oc_blobstore *bs = oc_blobstore_open(blobs, NULL);
+    CHECK(bs != NULL);
+    if (bs && src) {
+        oc_blob_writer *bw = oc_blob_put_begin(bs, "0000000000005150", len);
+        CHECK(bw && oc_blob_put_chunk(bw, src, len) == 0 && oc_blob_put_commit(bw) == 0);
+    }
+    free(src);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(tpath("itest_export.db"), &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char sql[600];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO attachments(id, channel_id, message_id, uploader_id, storage_key, filename, mime, size,"
+             " sha256, created_at_ms) VALUES(%llu, %d, %llu, %llu, '0000000000005150', 'v.mp4', 'video/mp4', %zu, x'00', 1);"
+             "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, created_at_ms)"
+             " VALUES(%llu, 1, 400, 320, 240, NULL, 1);",
+             (unsigned long long)aid, OC_DEFAULT_CHANNEL, (unsigned long long)mid, (unsigned long long)alice_id, len,
+             (unsigned long long)aid);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+
+    uint16_t code = 0;
+    if (mode != 2) {
+        /* Refused by name, and the connection kept: the next request is answered. */
+        CHECK(fetch_export(&a, aid, NULL, &code) == 0 && code == OC_ERR_EXPORT_UNAVAILABLE);
+        CHECK(say_something(&a, OC_DEFAULT_CHANNEL, "Still here.", 0x76) != 0);
+    } else {
+        uint8_t *got = NULL;
+        uint64_t n = fetch_export(&a, aid, &got, &code);
+        CHECK(n > 0 && code == 0);
+        /* The bytes are the copy the worker stored, under its key. */
+        char key[OC_EXPORT_KEY_MAX];
+        oc_export_copy_key(&oc_export_stub_codecs, aid, key, sizeof key);
+        uint64_t stored = 0;
+        oc_blob_reader *rd = bs ? oc_blob_get_begin(bs, key, &stored) : NULL;
+        CHECK(rd && stored == n);
+        uint8_t *want = malloc(n ? n : 1);
+        uint64_t at = 0;
+        long k;
+        while (rd && want && at < n && (k = oc_blob_get_chunk(rd, want + at, n - at)) > 0) at += (uint64_t)k;
+        if (rd) oc_blob_get_close(rd);
+        CHECK(got && want && at == n && memcmp(got, want, n) == 0);
+        free(want);
+        /* Asked again, the same copy, from the cache once its row is written. */
+        CHECK(WAIT_UNTIL(export_rows(db) == 1, 5000));
+        uint8_t *again = NULL;
+        CHECK(fetch_export(&a, aid, &again, &code) == n && code == 0 && again && memcmp(again, got, n) == 0);
+        free(again);
+        free(got);
+        /* A message that is not a video, and one that does not exist. */
+        CHECK(fetch_export(&a, 0x9999, NULL, &code) == 0 && code == OC_ERR_UNKNOWN_ATTACHMENT);
+    }
+    sqlite3_close(db);
+    if (bs) oc_blobstore_close(bs);
+    client_close(&a);
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    oc_netloop_set_export(NULL);
+    unsetenv("OPENCHIME_H264_EXPORT");
+    db_unlink("itest_export.db");
+}
+
 /* Summaries over the wire (REQ-310, ARCH-116): the "summarize" capability is
  * told only when the worker is wired; a SUMMARIZE is built by the worker (a stub
  * model here) and answered with SUMMARY; asked again it comes from the store
@@ -5350,6 +5540,742 @@ static void test_address_proof_route(int port, const uint8_t *pin) {
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
  * the sender gets 200. An unknown token gets 404. */
+/* Agents over the wire (docs/details/MCP.md §3.1, §6): an owner makes one and
+ * gets its token once; every roster learns it, marked; a member cannot make
+ * one or put one in a channel; an owner puts it in a channel and the members'
+ * list shows it there; tokens are minted, listed without themselves and
+ * revoked; removing the agent takes it out of the channel. */
+static int members_include(client *c, uint64_t channel, uint64_t user) {
+    uint8_t buf[64]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_members lm = { channel };
+    if (oc_encode_list_members(&w, OC_PROTOCOL_VERSION, &lm) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    int found = 0;
+    for (;;) {
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_MEMBERS) return found;
+        if (hdr.msg_type != OC_MSG_MEMBER_ENTRY) continue;
+        oc_member_entry me;
+        if (oc_decode_member_entry(&p, &me) == OC_OK && me.user_id == user) found = 1;
+    }
+}
+
+static void test_agent_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    oc_header hdr; oc_rbuf p; uint8_t buf[512]; oc_wbuf w;
+
+    /* A member is refused. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_agent ca = { oc_slice_str("Robo"), oc_slice_str("first"), oc_slice_str("chat:write") };
+    CHECK(oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN && !er.fatal);
+
+    /* The owner makes it: the token to her alone, the roster row to both. */
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at; CHECK(oc_decode_agent_token(&p, &at) == OC_OK);
+    uint64_t agent = at.agent_id;
+    size_t pl = strlen(OC_PRINCIPAL_TOKEN_PREFIX);
+    CHECK(agent && at.token.len == pl + 43 && memcmp(at.token.ptr, OC_PRINCIPAL_TOKEN_PREFIX, pl) == 0);
+    for (int k = 0; k < 2; k++) {
+        client *c = k ? &b : &a;
+        CHECK(read_type(c, OC_MSG_USER_LIST, &hdr, &p) == 0);
+        oc_user_list_entry ue[4]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, ue, 4, &n) == OC_OK && n == 1 && ue[0].user_id == agent &&
+              (ue[0].flags & OC_USER_AGENT));
+    }
+
+    /* Another token; the list shows two, without either token. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt = { agent, oc_slice_str("laptop"), oc_slice_str("im:history") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at2; CHECK(oc_decode_agent_token(&p, &at2) == OC_OK && at2.agent_id == agent);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_agent_tokens lt = { agent };
+    CHECK(oc_encode_list_agent_tokens(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN_LIST, &hdr, &p) == 0);
+    {
+        oc_agent_token_entry te[4]; uint16_t n = 0; uint64_t aid = 0;
+        CHECK(oc_decode_agent_token_list(&p, &aid, te, 4, &n) == OC_OK && aid == agent && n == 2);
+        CHECK(te[0].created_by == ua && te[1].token_id == at2.token_id);
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_agent_token rt = { agent, at2.token_id };
+    CHECK(oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &rt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN_LIST, &hdr, &p) == 0);
+    {
+        oc_agent_token_entry te[4]; uint16_t n = 0; uint64_t aid = 0;
+        CHECK(oc_decode_agent_token_list(&p, &aid, te, 4, &n) == OC_OK && n == 1);
+    }
+
+    /* Into the general channel: a member may not put it there; the owner may,
+     * and the members' list then has it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op inv = { OC_DEFAULT_CHANNEL, agent };
+    CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    CHECK(members_include(&b, OC_DEFAULT_CHANNEL, agent) == 1);
+
+    /* Removed: everyone hears it, and it is no longer in the channel. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_agent ra = { agent };
+    CHECK(oc_encode_remove_agent(&w, OC_PROTOCOL_VERSION, &ra) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    for (int k = 0; k < 2; k++) {
+        client *c = k ? &b : &a;
+        CHECK(read_type(c, OC_MSG_USER_UPDATED, &hdr, &p) == 0);
+        oc_user_updated uu; CHECK(oc_decode_user_updated(&p, &uu) == OC_OK && uu.user_id == agent && uu.disabled);
+    }
+    CHECK(members_include(&b, OC_DEFAULT_CHANNEL, agent) == 0);
+    client_close(&a);
+    client_close(&b);
+}
+
+/* The MCP endpoint over the wire (docs/details/MCP.md): off, /mcp is not there;
+ * on, discovery needs no token, everything else a valid agent token (401 with
+ * a challenge otherwise); tools/list's channel enum is the agent's channels;
+ * read_history pages back by cursor; search finds; a post reaches a member as a
+ * BROADCAST from the agent, and the same key posts once; a channel the agent is
+ * not in and a missing scope are tool errors; every tool call is one audit row. */
+#define MCP_V "2026-07-28"
+
+/* One request to /mcp: the status, with the answer's body in `out`. */
+static int mcp_call(int port, const uint8_t *pin, const char *verb, const char *token, const char *method,
+                    const char *name, const char *params, char *out, size_t cap) {
+    client h;
+    if (http_client_open(&h, port, pin) != 0) return -1;
+    char body[2048], req[4096], auth[160] = "", mh[96] = "", nh[96] = "";
+    int bn = snprintf(body, sizeof body,
+                      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":{%s%s\"_meta\":"
+                      "{\"io.modelcontextprotocol/protocolVersion\":\"" MCP_V "\"}}}",
+                      method ? method : "", params ? params : "", params && params[0] ? "," : "");
+    if (token) snprintf(auth, sizeof auth, "Authorization: Bearer %s\r\n", token);
+    if (method) snprintf(mh, sizeof mh, "Mcp-Method: %s\r\n", method);
+    if (name) snprintf(nh, sizeof nh, "Mcp-Name: %s\r\n", name);
+    int rn = snprintf(req, sizeof req,
+                      "%s /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nMCP-Protocol-Version: " MCP_V
+                      "\r\n%s%s%sContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                      verb, auth, mh, nh, strcmp(verb, "POST") ? 0 : bn, strcmp(verb, "POST") ? "" : body);
+    int st = -1;
+    if (write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0) {
+        http_read_response(&h, out, cap);
+        if (strncmp(out, "HTTP/1.1 ", 9) == 0) st = atoi(out + 9);
+    }
+    client_close(&h);
+    return st;
+}
+
+static void test_mcp_off(int port, const uint8_t *pin) {
+    char resp[4096];
+    CHECK(mcp_call(port, pin, "POST", NULL, "server/discover", NULL, "", resp, sizeof resp) == 404);
+}
+
+static int64_t mcp_scalar(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int64_t v = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        v = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
+/* alice sends `text` to channel 1 over her socket; the message's id. */
+static uint64_t mcp_seed(client *a, const char *text, uint8_t tag) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = OC_DEFAULT_CHANNEL; memset(s.idem, tag, OC_IDEM_SIZE);
+    s.body = oc_slice_str(text);
+    if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || send_frame(a, buf, w.len) != 0) return 0;
+    oc_header hdr; oc_rbuf p;
+    if (read_type(a, OC_MSG_SEND_ACK, &hdr, &p) != 0) return 0;
+    oc_send_ack ack;
+    if (oc_decode_send_ack(&p, &ack) != OC_OK) return 0;
+    if (read_type(a, OC_MSG_BROADCAST, &hdr, &p) != 0) return 0;
+    return ack.message_id;
+}
+
+static void test_mcp_wire(void) {
+    setenv("OPENCHIME_MCP", "on", 1);
+    /* A refill of one a minute: within this test the budget is spent by count
+     * alone, never earned back by how long it takes. */
+    setenv("OPENCHIME_MCP_CALLS_PER_MINUTE", "1", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_mcp.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_mcp.db"));
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);
+    CHECK(dbw2 != NULL);
+    if (!dbw2) { unsetenv("OPENCHIME_MCP"); unsetenv("OPENCHIME_MCP_CALLS_PER_MINUTE"); return; }
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+    char resp[65536];
+
+    /* Discovery asks no token; a GET is not served; no token or a wrong one is
+     * challenged. */
+    CHECK(mcp_call(port, pin2, "POST", NULL, "server/discover", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"supportedVersions\":[\"" MCP_V "\"]") != NULL);
+    CHECK(mcp_call(port, pin2, "GET", NULL, NULL, NULL, NULL, resp, sizeof resp) == 405);
+    CHECK(mcp_call(port, pin2, "DELETE", NULL, NULL, NULL, NULL, resp, sizeof resp) == 405);
+    /* The earlier era's handshake is refused with the revision this speaks. */
+    CHECK(mcp_call(port, pin2, "POST", NULL, "initialize", NULL, "", resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "UnsupportedProtocolVersionError") && strstr(resp, "\"" MCP_V "\""));
+    {   /* A body over the route's limit is refused before it is read. */
+        client h;
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *big = "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 10000000\r\nConnection: close\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)big, strlen(big)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 413", 12) == 0);
+        client_close(&h);
+    }
+    CHECK(mcp_call(port, pin2, "POST", NULL, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(strstr(resp, "WWW-Authenticate: Bearer") != NULL);   /* contract: the challenge RFC 6750 names */
+    CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                   resp, sizeof resp) == 401);
+
+    /* An agent with two tokens: one reads and posts, one only posts; in the
+     * general channel; and a private channel it is not in. */
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    oc_header hdr; oc_rbuf p; uint8_t buf[512]; oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_agent ca = { oc_slice_str("Robo"), oc_slice_str("ci"), oc_slice_str("chat:write channels:history groups:history") };
+    CHECK(oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at; CHECK(oc_decode_agent_token(&p, &at) == OC_OK);
+    uint64_t agent = at.agent_id;
+    char tok[96] = "", tok2[96] = "";
+    if (at.token.len < sizeof tok) { memcpy(tok, at.token.ptr, at.token.len); tok[at.token.len] = '\0'; }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt = { agent, oc_slice_str("poster"), oc_slice_str("chat:write") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at2; CHECK(oc_decode_agent_token(&p, &at2) == OC_OK);
+    if (at2.token.len < sizeof tok2) { memcpy(tok2, at2.token.ptr, at2.token.len); tok2[at2.token.len] = '\0'; }
+    char tok3[96] = "";
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mint_agent_token mt3 = { agent, oc_slice_str("burst"), oc_slice_str("channels:history") };
+    CHECK(oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &mt3) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_AGENT_TOKEN, &hdr, &p) == 0);
+    oc_agent_token at3; CHECK(oc_decode_agent_token(&p, &at3) == OC_OK);
+    if (at3.token.len < sizeof tok3) { memcpy(tok3, at3.token.ptr, at3.token.len); tok3[at3.token.len] = '\0'; }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op inv = { OC_DEFAULT_CHANNEL, agent };
+    CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("mcp-secret"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    static oc_channel_info info;
+    CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    uint64_t secret = info.channel_id;
+
+    /* Three messages to page through and search. */
+    uint64_t m1 = mcp_seed(&a, "alpha deploy started", 0x41);
+    uint64_t m2 = mcp_seed(&a, "beta checks green", 0x42);
+    uint64_t m3 = mcp_seed(&a, "gamma deploy finished", 0x43);
+    CHECK(m1 && m2 && m3 && m1 < m2 && m2 < m3);
+
+    /* tools/list: the three tools, the enum the agent's channels only. */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"read_history\"") && strstr(resp, "\"search\"") && strstr(resp, "\"post\""));
+    CHECK(strstr(resp, "\"enum\":[\"#") != NULL && strstr(resp, "mcp-secret") == NULL);
+    CHECK(strstr(resp, "\"cacheScope\":\"private\"") != NULL);
+
+    /* read_history: the newest two, then the one before by the cursor. */
+    char args[512], want[64];
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"limit\":2}", resp, sizeof resp) == 200);
+    snprintf(want, sizeof want, "\"older\":%llu", (unsigned long long)m2);
+    CHECK(strstr(resp, "\"isError\":false") && strstr(resp, "gamma deploy finished") && strstr(resp, want) &&
+          !strstr(resp, "alpha deploy started"));
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"limit\":2,\"before\":%llu}",
+             (unsigned long long)m2);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "alpha deploy started") && !strstr(resp, "beta checks green") && !strstr(resp, "\"older\""));
+
+    /* search: both deploys, by their excerpts. */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "search",
+                   "\"name\":\"search\",\"arguments\":{\"query\":\"deploy\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"excerpt\"") && strstr(resp, "alpha deploy started") && strstr(resp, "gamma deploy finished") &&
+          !strstr(resp, "beta checks green"));
+
+    /* post: alice receives it as a BROADCAST from the agent; the same key
+     * again posts nothing new and answers the same id. */
+    const char *pa = "\"name\":\"post\",\"arguments\":{\"channel\":1,\"text\":\"hello from robo\",\"key\":\"k-1\"}";
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", pa, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":false") != NULL);
+    char first_id[64] = "";
+    const char *idp = strstr(resp, "\\\"id\\\":");
+    if (idp) snprintf(first_id, sizeof first_id, "%.20s", idp);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.author_id == agent && bc.channel_id == OC_DEFAULT_CHANNEL && bc.body.len == 15);
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", pa, resp, sizeof resp) == 200);
+    CHECK(first_id[0] && strstr(resp, first_id) != NULL);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(tpath("itest_mcp.db"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM messages WHERE author_id=%llu;", (unsigned long long)agent);
+    CHECK(mcp_scalar(db, q) == 1);
+
+    /* A reply in a thread: the thread's first message counts it, and `thread`
+     * reads the replies alone. */
+    snprintf(args, sizeof args, "\"name\":\"post\",\"arguments\":{\"channel\":1,\"thread\":%llu,\"text\":\"on it\"}",
+             (unsigned long long)m1);
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "post", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":false") != NULL);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"replies\":1") != NULL && strstr(resp, "on it") == NULL);
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":1,\"thread\":%llu}",
+             (unsigned long long)m1);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "on it") != NULL && strstr(resp, "gamma deploy finished") == NULL);
+
+    /* Refused as tool errors: a channel it is not in, said as if it did not
+     * exist; and a token without the scope to read. */
+    snprintf(args, sizeof args, "\"name\":\"read_history\",\"arguments\":{\"channel\":%llu}", (unsigned long long)secret);
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history", args, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":true") && strstr(resp, "no such conversation"));   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"#nope\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "no such conversation") != NULL);   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin2, "POST", tok2, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":1}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"isError\":true") && strstr(resp, "channels:history"));
+
+    /* One audit row a tool call: four reads, a search, three posts, three
+     * refusals; none of it text, a query or a token. */
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5;") == 11, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND (detail LIKE '%deploy%' OR detail LIKE '%hello%'"
+                         " OR detail LIKE '%ocpt_%');") == 0);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.post' AND detail LIKE 'token=poster %';") == 3);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 1);
+
+    /* The budget, by count: a burst of 20 holds six searches of three; the
+     * seventh is 429 with Retry-After before anything is read, and is still a
+     * row, refused, holding no query. */
+    const char *sq = "\"name\":\"search\",\"arguments\":{\"query\":\"zebra\"}";
+    for (int i = 0; i < 6; i++)
+        CHECK(mcp_call(port, pin2, "POST", tok3, "tools/call", "search", sq, resp, sizeof resp) == 200);
+    CHECK(mcp_call(port, pin2, "POST", tok3, "tools/call", "search", sq, resp, sizeof resp) == 429);
+    CHECK(strstr(resp, "Retry-After: ") != NULL);   /* contract: the header RFC 9110 names */
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.search'"
+                                    " AND outcome=0 AND detail='token=burst over the limit';") == 1, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND action='mcp.search' AND outcome=1"
+                         " AND detail LIKE 'token=burst %';") == 6);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND detail LIKE '%zebra%';") == 0);
+
+    /* Refused tokens count against the source (REQ-191): after twenty, the
+     * next request is refused as rate-limited, a valid token or not, without a
+     * lookup or a row of its own. */
+    for (int i = 0; i < 20; i++)
+        CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                       resp, sizeof resp) == 401);
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 21, 5000));
+    CHECK(mcp_call(port, pin2, "POST", tok, "tools/list", NULL, "", resp, sizeof resp) == 429);
+    CHECK(mcp_call(port, pin2, "POST", "ocpt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "tools/list", NULL, "",
+                   resp, sizeof resp) == 429);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=3 AND action='mcp.auth_failed';") == 21);
+    sqlite3_close(db);
+
+    client_close(&a);
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unsetenv("OPENCHIME_MCP");
+    unsetenv("OPENCHIME_MCP_CALLS_PER_MINUTE");
+    db_unlink("itest_mcp.db");
+}
+
+/* A person's AI client over the wire (AUTH.md §8.13): the metadata documents
+ * and /mcp's challenge; a registration and a metadata document served from a
+ * loopback server; the authorize page, the approval in the app by its code,
+ * the redirect, the code exchanged once; /mcp as the person -- their DM read,
+ * an encrypted DM not listed, a post carrying "via" to another member; refresh
+ * rotating; an expired token, a connection past its lifetime, a revoked one and
+ * a removed person refused; the lists, one's own and an owner's; and the
+ * setting off and on again. */
+#define OA_CH  "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"   /* RFC 7636 appendix B */
+#define OA_VER "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+#define OA_CB  "http%3A%2F%2F127.0.0.1%3A4000%2Fcb"
+#define OA_RES "https%3A%2F%2Fx%2Fmcp"
+
+/* One HTTP request to the daemon (Host: x): its status, the answer in `out`. */
+static int oa_http(int port, const uint8_t *pin, const char *verb, const char *path, const char *ctype, const char *body,
+                   char *out, size_t cap) {
+    client h;
+    if (http_client_open(&h, port, pin) != 0) return -1;
+    char req[4096], ct[96] = "";
+    if (ctype) snprintf(ct, sizeof ct, "Content-Type: %s\r\n", ctype);
+    int rn = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: x\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                      verb, path, ct, body ? strlen(body) : 0, body ? body : "");
+    int st = -1;
+    out[0] = '\0';
+    if (rn > 0 && (size_t)rn < sizeof req && write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0) {
+        http_read_response(&h, out, cap);
+        if (strncmp(out, "HTTP/1.1 ", 9) == 0) st = atoi(out + 9);
+    }
+    client_close(&h);
+    return st;
+}
+
+/* The value after `key` in `s`, up to any of `stop`. */
+static void oa_take(const char *s, const char *key, const char *stop, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *p = s ? strstr(s, key) : NULL;
+    if (!p) return;
+    p += strlen(key);
+    size_t n = strcspn(p, stop);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+static void oa_pct(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~') out[o++] = (char)*p;
+        else o += (size_t)snprintf(out + o, cap - o, "%%%02X", *p);
+    }
+    out[o] = '\0';
+}
+
+/* The authorize page for `client_id`: 200 with its handle and code, or the status. */
+static int oa_authorize(int port, const uint8_t *pin, const char *client_id, char *request, char *code, char *page, size_t cap) {
+    char id[600], path[1200];
+    oa_pct(client_id, id, sizeof id);
+    snprintf(path, sizeof path, "/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s"
+             "&code_challenge=" OA_CH "&code_challenge_method=S256&state=st%%2042&resource=%s", id, OA_CB, OA_RES);
+    int st = oa_http(port, pin, "GET", path, NULL, NULL, page, cap);
+    oa_take(page, "request=", "&\"", request, 64);
+    oa_take(page, ";code=", "&\"", code, 16);
+    return st;
+}
+
+/* The person signed in on `pc` approves `code` for `days`. 0, or the ERROR's code. */
+static int oa_approve(client *pc, const char *code, int approve, uint32_t days) {
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_connection_code cc = { oc_slice_str(code) };
+    if (oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &cc) != OC_OK || send_frame(pc, buf, w.len) != 0) return -1;
+    for (int i = 0; i < 64; i++) {
+        if (read_frame_raw(pc, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_ERROR) { oc_error e; return oc_decode_error(&p, &e) == OC_OK ? e.code : -1; }
+        if (hdr.msg_type == OC_MSG_CONNECTION_REQUEST) break;
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_connection_decide cd = { oc_slice_str(code), (uint8_t)approve, days };
+    if (oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &cd) != OC_OK || send_frame(pc, buf, w.len) != 0) return -1;
+    return read_type(pc, OC_MSG_CONNECTION_DECIDED, &hdr, &p);
+}
+
+/* Exchange an authorization code: the status, the tokens into `access`/`refresh`. */
+static int oa_token(int port, const uint8_t *pin, const char *form, char *access, char *refresh) {
+    char resp[4096];
+    int st = oa_http(port, pin, "POST", "/oauth/token", "application/x-www-form-urlencoded", form, resp, sizeof resp);
+    if (access) oa_take(resp, "\"access_token\":\"", "\"", access, 64);
+    if (refresh) oa_take(resp, "\"refresh_token\":\"", "\"", refresh, 64);
+    return st;
+}
+
+/* A whole connection, for the person on `pc`: 0 with its tokens. */
+static int oa_connect(int port, const uint8_t *pin, client *pc, const char *client_id, uint32_t days, char *access, char *refresh) {
+    char request[64], code[16], page[8192], path[300], resp[4096], loc[600], authcode[64], form[1200], id[600];
+    if (oa_authorize(port, pin, client_id, request, code, page, sizeof page) != 200 || !code[0]) return -1;
+    if (oa_approve(pc, code, 1, days) != 0) return -1;
+    snprintf(path, sizeof path, "/oauth/authorize?request=%s&code=%s", request, code);
+    if (oa_http(port, pin, "GET", path, NULL, NULL, resp, sizeof resp) != 302) return -1;
+    oa_take(resp, "Location: ", "\r", loc, sizeof loc);
+    oa_take(loc, "code=", "&", authcode, sizeof authcode);
+    oa_pct(client_id, id, sizeof id);
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, id, OA_RES);
+    return oa_token(port, pin, form, access, refresh) == 200 && access[0] && refresh[0] ? 0 : -1;
+}
+
+/* A loopback server for one client metadata document. */
+typedef struct { int lfd, port, stop; char doc[600]; } oa_docsrv;
+
+static void *oa_doc_thread(void *arg) {
+    oa_docsrv *d = arg;
+    while (!__atomic_load_n(&d->stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd pf = { d->lfd, POLLIN, 0 };
+        if (poll(&pf, 1, 100) <= 0) continue;
+        int fd = accept(d->lfd, NULL, NULL);
+        if (fd < 0) continue;
+        char req[2048];
+        ssize_t r = read(fd, req, sizeof req - 1);
+        (void)r;
+        idp_reply(fd, 200, "application/json", d->doc);
+        close(fd);
+    }
+    return NULL;
+}
+
+static void test_oauth_wire(void) {
+    setenv("OPENCHIME_MCP", "on", 1);
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    char cfgerr[256];
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    oc_netloop_set_oauth_test_documents(1);
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, pin) == 0);
+    db_unlink("itest_oauth.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_oauth.db"));
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);
+    CHECK(dbw != NULL);
+    if (!dbw) { unsetenv("OPENCHIME_MCP"); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "bob", "pw-bob", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "carol", "pw-carol", OC_ROLE_MEMBER, 2048) != 0);
+    struct loop_arg arg;
+    pthread_t th;
+    int port = start_loop(&arg, &th, &srv, dbw, 0);
+    CHECK(port != 0);
+    static char resp[65536];
+    char access[64] = "", refresh[64] = "";
+
+    /* The documents, and the challenge that points to them. */
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-protected-resource", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"resource\":\"https://x/mcp\"") && strstr(resp, "\"authorization_servers\":[\"https://x\"]"));   /* contract: RFC 9728 */
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-protected-resource/mcp", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(oa_http(port, pin, "GET", "/.well-known/oauth-authorization-server", NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"issuer\":\"https://x\"") && strstr(resp, "\"code_challenge_methods_supported\":[\"S256\"]") &&
+          strstr(resp, "\"token_endpoint\":\"https://x/oauth/token\"") &&
+          strstr(resp, "\"client_id_metadata_document_supported\":true"));   /* contract: RFC 8414 and the MCP revision */
+    CHECK(mcp_call(port, pin, "POST", NULL, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(strstr(resp, "WWW-Authenticate: Bearer resource_metadata=\"https://x/.well-known/oauth-protected-resource\"") != NULL);   /* contract: RFC 9728 §5.1 */
+
+    /* A registration. */
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"client_name\":\"Desk AI\",\"redirect_uris\":[\"http://evil.example/cb\"]}", resp, sizeof resp) == 400);
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"client_name\":\"Desk AI\",\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"],\"token_endpoint_auth_method\":\"none\"}",
+                  resp, sizeof resp) == 201);
+    char client_id[64] = "";
+    oa_take(resp, "\"client_id\":\"", "\"", client_id, sizeof client_id);
+    CHECK(strncmp(client_id, "occl_", 5) == 0);
+
+    /* The page refuses what is wrong in place, never redirecting. */
+    CHECK(oa_http(port, pin, "GET", "/oauth/authorize?response_type=code&client_id=occl_x&redirect_uri=" OA_CB
+                  "&code_challenge=" OA_CH "&code_challenge_method=S256&state=s&resource=https%3A%2F%2Felsewhere%2Fmcp",
+                  NULL, NULL, resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "Location:") == NULL && strstr(resp, "<script") == NULL);
+    CHECK(oa_http(port, pin, "GET", "/oauth/authorize?response_type=code&client_id=occl_nobody&redirect_uri=" OA_CB
+                  "&code_challenge=" OA_CH "&code_challenge_method=S256&state=s&resource=" OA_RES,
+                  NULL, NULL, resp, sizeof resp) == 400);
+    CHECK(strstr(resp, "Location:") == NULL);
+
+    /* bob, alice and carol signed in; alice and bob share a DM; bob and carol an encrypted one. */
+    client a, b, cc;
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&cc, port, pin) == 0 && do_handshake(&cc) == 0 && do_auth(&cc, "carol", "pw-carol", &uc) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = dm; memset(s.idem, 0x61, OC_IDEM_SIZE); s.body = oc_slice_str("hi bob, from alice");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(tpath("itest_oauth.db"), &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char q[400];
+    snprintf(q, sizeof q, "INSERT INTO channels(id,kind,is_public,created_at_ms,dm_key,e2e) VALUES(9301,'dm',0,1,'e2e-test',1);"
+             "INSERT INTO channel_members(channel_id,user_id,joined_at_ms) VALUES(9301,%llu,1),(9301,%llu,1);",
+             (unsigned long long)ub, (unsigned long long)uc);
+    CHECK(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+
+    /* The flow: the page names the client and a code; bob approves it in the
+     * app; the page sends him back with a code and the state; it is exchanged once. */
+    char request[64], code[16], page[8192];
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 200);
+    CHECK(strstr(page, "Desk AI") && strlen(code) == 8 && strncmp(request, "ocrq_", 5) == 0);
+    CHECK(strstr(page, "http-equiv=\"refresh\" content=\"3;") && !strstr(page, "<script") && !strstr(page, "<form"));   /* contract: HTML's refresh, no script, no form */
+    snprintf(q, sizeof q, "/oauth/authorize?request=%s&code=%s", request, code);
+    CHECK(oa_http(port, pin, "GET", q, NULL, NULL, resp, sizeof resp) == 200);   /* still waiting */
+    CHECK(strstr(resp, "Desk AI") != NULL);
+    CHECK(oa_approve(&b, "BBBB-BBBB", 1, 30) == OC_ERR_UNKNOWN_CODE);
+    CHECK(oa_approve(&b, code, 1, 30) == 0);
+    CHECK(oa_http(port, pin, "GET", q, NULL, NULL, resp, sizeof resp) == 302);
+    char loc[600], authcode[64];
+    oa_take(resp, "Location: ", "\r", loc, sizeof loc);
+    oa_take(loc, "code=", "&", authcode, sizeof authcode);
+    CHECK(strncmp(loc, "http://127.0.0.1:4000/cb?code=ocac_", 35) == 0 && strstr(loc, "&state=st%2042") &&
+          strstr(loc, "&iss=https%3A%2F%2Fx"));   /* contract: RFC 6749 §4.1.2, RFC 9207 */
+    char form[1200];
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "x&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, client_id, OA_RES);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);                          /* the wrong verifier spends it */
+    snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&code_verifier=" OA_VER "&redirect_uri=%s"
+             "&client_id=%s&resource=%s", authcode, OA_CB, client_id, OA_RES);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);
+    CHECK(oa_connect(port, pin, &b, client_id, 30, access, refresh) == 0);
+    CHECK(strncmp(access, "ocpa_", 5) == 0 && strncmp(refresh, "ocpr_", 5) == 0);   /* contract: the prefixes */
+
+    /* As bob: his channels and his DM by the other's handle, never the encrypted DM. */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "\"#general\"") && strstr(resp, "\"@alice\"") && !strstr(resp, "\"@carol\""));
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@alice\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "hi bob, from alice") != NULL);   /* contract: the message alice sent */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@carol\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "no such conversation") != NULL);   /* contract: the same words whether it exists or not */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "post",
+                   "\"name\":\"post\",\"arguments\":{\"channel\":\"@alice\",\"text\":\"drafted for bob\"}", resp, sizeof resp) == 200);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.author_id == ub && bc.via.len == 7 && memcmp(bc.via.ptr, "Desk AI", 7) == 0);   /* contract: the approved name */
+    CHECK(mcp_call(port, pin, "POST", access, "tools/call", "read_history",
+                   "\"name\":\"read_history\",\"arguments\":{\"channel\":\"@alice\"}", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "drafted for bob") != NULL);
+    CHECK(WAIT_UNTIL(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND detail LIKE 'client=Desk AI%'") >= 4, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM audit_log WHERE family=5 AND actor_id=%llu AND detail LIKE '%%ocp%%';", (unsigned long long)ub);
+    CHECK(mcp_scalar(db, q) == 0);
+
+    /* Refresh: a new pair; the old refresh token, once used, is refused. */
+    char access2[64] = "", refresh2[64] = "";
+    snprintf(form, sizeof form, "grant_type=refresh_token&refresh_token=%s&client_id=%s", refresh, client_id);
+    CHECK(oa_token(port, pin, form, access2, refresh2) == 200 && access2[0] && strcmp(refresh2, refresh) != 0);
+    CHECK(oa_token(port, pin, form, NULL, NULL) == 400);
+    /* An access token past its hour. */
+    CHECK(sqlite3_exec(db, "UPDATE mcp_access_tokens SET expires_at_ms=1;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    snprintf(form, sizeof form, "grant_type=refresh_token&refresh_token=%s&client_id=%s", refresh2, client_id);
+    CHECK(oa_token(port, pin, form, access2, refresh2) == 200);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 200);
+
+    /* bob's list, and his revoke: the client's next request is refused. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_connections lc = { 0 };
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    oc_connection_entry ents[8]; uint16_t n = 0; uint8_t all = 0;
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 1 && ents[0].user_id == ub &&
+          ents[0].lifetime_days == 30 && ents[0].last_used_at_ms > 0);
+    uint64_t bob_conn = n ? ents[0].connection_id : 0;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_connection rv = { bob_conn, 0 };
+    CHECK(oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &rv) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 0);
+    CHECK(mcp_call(port, pin, "POST", access2, "tools/list", NULL, "", resp, sizeof resp) == 401);
+
+    /* A connection past its lifetime. */
+    CHECK(oa_connect(port, pin, &b, client_id, 90, access, refresh) == 0);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(sqlite3_exec(db, "UPDATE mcp_connections SET expires_at_ms=2 WHERE lifetime_days=90;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 401);
+
+    /* The owner's view: everyone's; and carol, removed, is refused. A member asking for everyone's is not. */
+    char caccess[64] = "", crefresh[64] = "";
+    CHECK(oa_connect(port, pin, &cc, client_id, 0, caccess, crefresh) == 0);
+    CHECK(mcp_call(port, pin, "POST", caccess, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(oa_connect(port, pin, &b, client_id, 365, access, refresh) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    lc.all = 1;
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_ERROR, &hdr, &p) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && all == 1 && n == 2);
+    uint64_t bob365 = 0;
+    for (uint16_t i = 0; i < n; i++) if (ents[i].user_id == ub) bob365 = ents[i].connection_id;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_connection rv2 = { bob365, 1 };
+    CHECK(oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &rv2) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CONNECTION_LIST, &hdr, &p) == 0);
+    CHECK(oc_decode_connection_list(&p, &all, ents, 8, &n) == OC_OK && n == 1);
+    CHECK(mcp_call(port, pin, "POST", access, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_user ru = { uc };
+    CHECK(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(WAIT_UNTIL(mcp_call(port, pin, "POST", caccess, "tools/list", NULL, "", resp, sizeof resp) == 401, 5000));
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=1;") == 1);
+    CHECK(mcp_scalar(db, "SELECT COUNT(*) FROM audit_log WHERE action='mcp.connection_revoke' AND family=2;") == 1);
+
+    /* A client known by its metadata document, served from a loopback server. */
+    oa_docsrv ds;
+    memset(&ds, 0, sizeof ds);
+    ds.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(ds.lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(ds.lfd, 8) == 0 &&
+          getsockname(ds.lfd, (struct sockaddr *)&sa, &sl) == 0);
+    ds.port = ntohs(sa.sin_port);
+    char docid[96];
+    snprintf(docid, sizeof docid, "http://127.0.0.1:%d/client.json", ds.port);
+    snprintf(ds.doc, sizeof ds.doc, "{\"client_id\":\"%s\",\"client_name\":\"Notes Helper\",\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"]}", docid);
+    pthread_t dth;
+    CHECK(pthread_create(&dth, NULL, oa_doc_thread, &ds) == 0);
+    CHECK(oa_authorize(port, pin, docid, request, code, page, sizeof page) == 200);
+    CHECK(strstr(page, "Notes Helper") != NULL && strlen(code) == 8);   /* contract: the document's own name */
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM oauth_clients WHERE kind='document' AND client_id='%s';", docid);
+    CHECK(mcp_scalar(db, q) == 1);
+    __atomic_store_n(&ds.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(dth, NULL);
+    close(ds.lfd);
+
+    /* Off: the pages say so, the app is refused, and every connection is refused; on again, they work. */
+    char baccess[64] = "", brefresh[64] = "";
+    CHECK(oa_connect(port, pin, &b, client_id, 30, baccess, brefresh) == 0);
+    setenv("OPENCHIME_MCP_CONNECTIONS", "off", 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 403);
+    CHECK(strstr(page, "AI clients are off") != NULL);   /* contract: the page's own heading */
+    CHECK(oa_http(port, pin, "POST", "/oauth/register", "application/json",
+                  "{\"redirect_uris\":[\"http://127.0.0.1:4000/cb\"]}", resp, sizeof resp) == 403);
+    CHECK(mcp_call(port, pin, "POST", baccess, "tools/list", NULL, "", resp, sizeof resp) == 401);
+    CHECK(oa_approve(&b, "BCDF-GHJK", 1, 30) == OC_ERR_CONNECTIONS_OFF);
+    unsetenv("OPENCHIME_MCP_CONNECTIONS");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(mcp_call(port, pin, "POST", baccess, "tools/list", NULL, "", resp, sizeof resp) == 200);
+    CHECK(oa_authorize(port, pin, client_id, request, code, page, sizeof page) == 200);
+
+    sqlite3_close(db);
+    client_close(&a);
+    client_close(&b);
+    client_close(&cc);
+    stop_loop(&arg, th);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_netloop_set_oauth_test_documents(0);
+    unsetenv("OPENCHIME_MCP");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    db_unlink("itest_oauth.db");
+}
+
 static void test_webhook_vertical(int port, const uint8_t *pin) {
     client a;
     CHECK(client_open(&a, port, pin) == 0);
@@ -5614,29 +6540,64 @@ static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p) {
     return -1;
 }
 
-/* Send a CALL_JOIN: `key` fills the device key, `inv` names whom a start invites. */
-static int call_join(client *c, uint64_t ch, uint8_t key, const uint64_t *inv, uint16_t ninv) {
-    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_join cj = { ch, {0}, ninv, inv, OC_CALL_CODEC_VP9 };
+/* Send a CALL_START (CALLS.md §1): `subject`, from conversation `from` (0 for
+ * none), `key` filling the device key, `inv` whom it asks. */
+static int call_start(client *c, uint64_t from, const char *subject, uint8_t key,
+                      const uint64_t *inv, uint16_t ninv) {
+    uint8_t buf[768]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_start cs = { from, oc_slice_str(subject), {0}, OC_CALL_CODEC_VP9, ninv, inv };
+    memset(cs.device_key, key, OC_CALL_DEVICE_KEY_LEN);
+    if (oc_encode_call_start(&w, OC_PROTOCOL_VERSION, &cs) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+/* Send a CALL_JOIN for `call_id`. */
+static int call_join(client *c, uint64_t call_id, uint8_t key) {
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_join cj = { call_id, {0}, OC_CALL_CODEC_VP9 };
     memset(cj.device_key, key, OC_CALL_DEVICE_KEY_LEN);
     if (oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
 
-static int call_simple(client *c, uint16_t type, uint64_t ch) {
+static int call_subject(client *c, uint64_t call_id, const char *subject) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_subject su = { call_id, oc_slice_str(subject) };
+    if (oc_encode_call_subject(&w, OC_PROTOCOL_VERSION, &su) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+static int call_simple(client *c, uint16_t type, uint64_t call_id) {
     uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     oc_result rc = OC_E_MALFORMED;
-    if (type == OC_MSG_CALL_LEAVE)   { oc_call_leave m = { ch };   rc = oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &m); }
-    if (type == OC_MSG_CALL_DECLINE) { oc_call_decline m = { ch }; rc = oc_encode_call_decline(&w, OC_PROTOCOL_VERSION, &m); }
-    if (type == OC_MSG_CALL_END)     { oc_call_end m = { ch };     rc = oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &m); }
+    if (type == OC_MSG_CALL_LEAVE)   { oc_call_leave m = { call_id };   rc = oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &m); }
+    if (type == OC_MSG_CALL_DECLINE) { oc_call_decline m = { call_id }; rc = oc_encode_call_decline(&w, OC_PROTOCOL_VERSION, &m); }
+    if (type == OC_MSG_CALL_END)     { oc_call_end m = { call_id };     rc = oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &m); }
     return rc == OC_OK ? send_frame(c, buf, w.len) : -1;
 }
 
-static int call_invite(client *c, uint64_t ch, const uint64_t *users, uint16_t n) {
+static int call_invite(client *c, uint64_t call_id, const uint64_t *users, uint16_t n) {
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_invite ci = { ch, n, users };
+    oc_call_invite ci = { call_id, n, users };
     if (oc_encode_call_invite(&w, OC_PROTOCOL_VERSION, &ci) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
+}
+
+/* Start a call, as call_start, and take the CALL_JOINED that puts its starter
+ * in it: the call's id, 0 when none came. */
+static uint64_t start_call(client *c, uint64_t from, uint8_t key, const uint64_t *inv, uint16_t ninv,
+                           oc_call_joined *jd, oc_call_part *parts) {
+    oc_header hdr; oc_rbuf p;
+    if (call_start(c, from, "standup", key, inv, ninv) != 0) return 0;
+    if (read_type(c, OC_MSG_CALL_JOINED, &hdr, &p) != 0) return 0;
+    return oc_decode_call_joined(&p, jd, parts, 32) == OC_OK ? jd->call_id : 0;
+}
+
+/* Join `call_id` and take the CALL_JOINED; 0 on success. */
+static int join_call(client *c, uint64_t call_id, uint8_t key, oc_call_joined *jd, oc_call_part *parts) {
+    oc_header hdr; oc_rbuf p;
+    if (call_join(c, call_id, key) != 0 || read_type(c, OC_MSG_CALL_JOINED, &hdr, &p) != 0) return -1;
+    return oc_decode_call_joined(&p, jd, parts, 32) == OC_OK && jd->call_id == call_id ? 0 : -1;
 }
 
 static int read_state(client *c, oc_call_state *st, uint64_t *parts, uint64_t *inv) {
@@ -5821,37 +6782,37 @@ static void test_restore_wire(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
-/* A leave sent while the same connection's join is still being checked (REQ-301,
- * ARCH-73). The readers are held, and JOIN, LEAVE, INVITE sent: two checks
- * queued means the loop has read all three, the leave between them. Released,
- * the join's answer finds the join left and does nothing, so the invitation,
- * checked after it, is refused -- alice is in no call to invite anyone to. Her
- * next join is the one she is in: her first CALL_JOINED carries its key. */
-static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+/* A start overtaken before its row is made (CALLS.md §1): the writer is held,
+ * and alice sends a START, then a LEAVE. Released, the start's answer finds it
+ * overtaken: nobody is put in that call, its row is ended at once as left, and
+ * an invitation from alice is refused -- she is in no call. Her next start is
+ * the one she is in: its CALL_JOINED carries that start's key. */
+static void test_call_start_overtaken(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     client a;
     uint64_t ua = 0;
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    const uint64_t ch = OC_DEFAULT_CHANNEL;
-    oc_header hdr; oc_rbuf p; oc_call_part parts[32];
+    oc_call_part parts[32]; oc_call_joined jd;
 
-    oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
+    oc_dbwriter_hold(dbw, OC_DBW_HOLD_WRITER);
+    CHECK(call_start(&a, 0, "overtaken", 0xA1, NULL, 0) == 0);
+    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, 0) == 0);
+    /* An invitation is answered by the loop alone: its refusal says the leave
+     * before it was read before the writer is let go. */
     uint64_t someone[1] = { ua + 1 };
-    CHECK(call_invite(&a, ch, someone, 1) == 0);
-    CHECK(WAIT_UNTIL(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) >= 2, 5000));
-    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) == 2);   /* the join and the invitation, unanswered */
-    oc_dbwriter_hold(dbw, 0);
+    CHECK(call_invite(&a, 1, someone, 1) == 0);
     uint16_t code = 0;
-    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_NOT_IN_CALL);  /* no call: the join was void */
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
+    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_START) == 1);
+    oc_dbwriter_hold(dbw, 0);
+    CHECK(WAIT_UNTIL(main_db_int("SELECT COUNT(*) FROM calls WHERE subject='overtaken' AND end_reason='left' "
+                                 "AND NOT EXISTS(SELECT 1 FROM call_participants p WHERE p.call_id=calls.id);") == 1, 5000));
+    CHECK(call_invite(&a, 1, someone, 1) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_NOT_IN_CALL);   /* no call: the start was void */
 
-    CHECK(call_join(&a, ch, 0xA2, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    oc_call_joined jd;
-    memset(&jd, 0, sizeof jd);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 1 && parts[0].user_id == ua);
-    CHECK(parts[0].device_key[0] == 0xA2);                          /* this join's, not the left one's */
-    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
+    uint64_t id = start_call(&a, 0, 0xA2, NULL, 0, &jd, parts);
+    CHECK(id != 0 && jd.count == 1 && parts[0].user_id == ua);
+    CHECK(parts[0].device_key[0] == 0xA2);                             /* this start's */
+    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, id) == 0);
     client_close(&a);
 }
 
@@ -6046,6 +7007,542 @@ static void test_pdm_relay(int port, const uint8_t *pin) {
     client_close(&a); client_close(&b2); client_close(&b3); client_close(&c);
 }
 
+/* The participant count of the next CALL_ROSTER `c` is sent; -1 if none. */
+static int next_roster_count(client *c) {
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_roster ro;
+    if (read_type(c, OC_MSG_CALL_ROSTER, &hdr, &p) != 0 || oc_decode_call_roster(&p, &ro, parts, 32) != OC_OK) return -1;
+    return ro.count;
+}
+
+/* A call started from a conversation (CALLS.md §1): one message there, of the
+ * call kind, naming the call and readable as its subject; its members who were
+ * not asked see that and nothing of the call, and may not join it; when the
+ * call ends the message says so. A start from a conversation its starter
+ * cannot read is refused. */
+static void test_call_message(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    uint16_t code = 0;
+    const uint64_t ch = OC_DEFAULT_CHANNEL;
+
+    CHECK(call_start(&a, ch, "Q3 pricing review", 0xA1, &ub, 1) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0 && oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    const uint64_t id = jd.call_id;
+    /* carol, a member of #general who was not asked: the message, as any
+     * message reaches her, and nothing of the call. */
+    oc_broadcast bc;
+    do { CHECK(read_type(&c, OC_MSG_BROADCAST, &hdr, &p) == 0 && oc_decode_broadcast(&p, &bc) == OC_OK); }
+    while (bc.call_id != id);
+    CHECK(bc.kind == OC_MSG_KIND_CALL && bc.channel_id == ch && bc.author_id == ua);
+    CHECK(bc.body.len > 17 && memmem(bc.body.ptr, bc.body.len, "Q3 pricing review", 17) != NULL);   /* contract: the body names the subject */
+    const uint64_t mid = bc.message_id;
+    CHECK(call_join(&c, id, 0xC3) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_A_MEMBER);
+    CHECK(count_frames(&c, OC_MSG_CALL_STATE, 0, 0, NULL, 1, 0) == 0);
+    /* Kept with its call; one, whatever happens next. */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM messages WHERE call_id=%llu AND kind=1 AND channel_id=%llu;",
+             (unsigned long long)id, (unsigned long long)ch);
+    CHECK(main_db_int(q) == 1);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND from_channel=%llu;",
+             (unsigned long long)id, (unsigned long long)ch);
+    CHECK(main_db_int(q) == 1);
+
+    /* Nobody but alice joined, and she ends it: the message says it ended,
+     * and no other line is written. */
+    CHECK(call_simple(&a, OC_MSG_CALL_END, id) == 0);
+    oc_msg_edited ed;
+    do { CHECK(read_type(&c, OC_MSG_MSG_EDITED, &hdr, &p) == 0 && oc_decode_msg_edited(&p, &ed) == OC_OK); }
+    while (ed.message_id != mid);
+    CHECK(ed.body.len > 0 && memmem(ed.body.ptr, ed.body.len, "(ended after", 12) != NULL);   /* contract: the body says it ended */
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM messages WHERE call_id=%llu;", (unsigned long long)id);
+    CHECK(main_db_int(q) == 1);
+
+    /* A conversation alice cannot read is no place to start one from. */
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cc = { oc_slice_str("carolsvault"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK && send_frame(&c, buf, w.len) == 0);
+    oc_channel_info ci;
+    CHECK(read_type(&c, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0 && oc_decode_channel_info(&p, &ci) == OC_OK);
+    CHECK(call_start(&a, ci.channel_id, "in there", 0xA1, NULL, 0) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_NOT_A_MEMBER);
+    client_close(&c);
+    client_close(&b);
+    client_close(&a);
+}
+
+/* A call's chat (CALLS.md §1): a conversation the call owns, named on its
+ * CALL_STATE, whose members are the call's invitees. A message in it is
+ * stored, fetched with its history and found by search -- by the call's
+ * people, and by nobody else -- and it is in nobody's list of conversations. */
+static int chat_search(client *c, const char *q, uint64_t chat, uint64_t mid) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq; memset(&sq, 0, sizeof sq);
+    sq.query = oc_slice_str(q);
+    sq.limit = 50;
+    if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_SEARCH_RESULTS, &hdr, &p) != 0) return -1;
+    static oc_search_result_entry ents[64]; uint16_t n = 0; uint8_t tr = 0;
+    if (oc_decode_search_results(&p, ents, 64, &n, &tr) != OC_OK) return -1;
+    for (uint16_t i = 0; i < n; i++) if (ents[i].channel_id == chat && ents[i].message_id == mid) return 1;
+    return 0;
+}
+
+static void test_call_chat(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    oc_call_state st; uint64_t sp[32], si[32];
+    uint16_t code = 0;
+
+    const uint64_t id = start_call(&a, OC_DEFAULT_CHANNEL, 0xA1, &ub, 1, &jd, parts);
+    CHECK(id != 0);
+    do { CHECK(read_state(&b, &st, sp, si) == 0); } while (st.call_id != id);
+    const uint64_t chat = st.chat_channel;
+    CHECK(chat != 0 && chat != OC_DEFAULT_CHANNEL);
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM channels WHERE id=%llu AND call_id=%llu AND kind='dm' AND dm_key IS NULL;",
+             (unsigned long long)chat, (unsigned long long)id);
+    CHECK(main_db_int(q) == 1);
+
+    /* bob, asked but not joined, says something in it: alice hears it, carol
+     * does not, and it is kept. */
+    CHECK(pdm_say(&b, chat, "the zanzibar numbers are in", 0x61) == 0);
+    oc_broadcast bc;
+    do { CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0 && oc_decode_broadcast(&p, &bc) == OC_OK); }
+    while (bc.channel_id != chat);
+    CHECK(bc.author_id == ub);
+    const uint64_t mid = bc.message_id;
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM messages WHERE id=%llu AND channel_id=%llu;",
+             (unsigned long long)mid, (unsigned long long)chat);
+    CHECK(main_db_int(q) == 1);
+
+    /* Its history, for one of the call's people; a refusal for carol. */
+    {
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_history_request hr = { chat, 0, 50 };
+        CHECK(oc_encode_history_request(&w, OC_PROTOCOL_VERSION, &hr) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        int found = 0;
+        for (int i = 0; i < 64 && !found; i++) {
+            if (read_type(&a, OC_MSG_BROADCAST, &hdr, &p) != 0) break;
+            if (oc_decode_broadcast(&p, &bc) == OC_OK && bc.channel_id == chat && bc.message_id == mid) found = 1;
+        }
+        CHECK(found);
+        /* carol asks for it and is given none of it. */
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_history_request(&w, OC_PROTOCOL_VERSION, &hr) == OC_OK && send_frame(&c, buf, w.len) == 0);
+        int done = 0, leaked = 0;
+        for (int i = 0; i < 64 && !done; i++) {
+            if (read_frame_raw(&c, &hdr, &p) != 0) break;
+            if (hdr.msg_type == OC_MSG_BACKFILL_DONE) done = 1;
+            if (hdr.msg_type == OC_MSG_BROADCAST && oc_decode_broadcast(&p, &bc) == OC_OK && bc.channel_id == chat) leaked = 1;
+        }
+        CHECK(done && !leaked);
+        CHECK(pdm_say(&c, chat, "let me in", 0x62) == 0);
+        CHECK(read_error(&c, &code) == 0 && code != 0);
+    }
+
+    /* Found by search for the call's people, and not for carol. */
+    CHECK(chat_search(&a, "zanzibar", chat, mid) == 1);
+    CHECK(chat_search(&b, "zanzibar", chat, mid) == 1);
+    CHECK(chat_search(&c, "zanzibar", chat, mid) == 0);
+
+    /* In nobody's list of conversations. */
+    {
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_CHANNEL_LIST, &hdr, &p) == 0);
+        static oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &n) == OC_OK && n > 0);
+        int listed = 0;
+        for (uint16_t i = 0; i < n && i < OC_CHANNEL_LIST_PAGE; i++) if (ents[i].channel_id == chat) listed = 1;
+        CHECK(!listed);
+    }
+
+    /* Someone asked later is a member of it too. */
+    CHECK(call_invite(&a, id, &uc, 1) == 0);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM channel_members WHERE channel_id=%llu AND user_id=%llu;",
+             (unsigned long long)chat, (unsigned long long)uc);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    CHECK(chat_search(&c, "zanzibar", chat, mid) == 1);
+
+    CHECK(call_simple(&a, OC_MSG_CALL_END, id) == 0);
+    client_close(&c);
+    client_close(&b);
+    client_close(&a);
+}
+
+/* `s` is `t`, byte for byte. */
+static int slice_eq(oc_slice s, const char *t) {
+    size_t n = strlen(t);
+    return s.len == n && (n == 0 || memcmp(s.ptr, t, n) == 0);
+}
+
+/* A page of `c`'s call history: its entry for `call_id`, 1 if found, 0 not. */
+static int history_entry(client *c, uint64_t call_id, oc_call_hist_entry *out) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_history ch = { 0, OC_CALL_HISTORY_PAGE };
+    if (oc_encode_call_history(&w, OC_PROTOCOL_VERSION, &ch) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_CALL_HISTORY_PAGE, &hdr, &p) != 0) return -1;
+    static oc_call_hist_entry ents[OC_CALL_HISTORY_PAGE];
+    oc_call_history_page pg;
+    if (oc_decode_call_history_page(&p, &pg, ents, OC_CALL_HISTORY_PAGE) != OC_OK) return -1;
+    for (uint16_t i = 0; i < pg.count; i++) if (ents[i].call_id == call_id) { *out = ents[i]; return 1; }
+    return 0;
+}
+
+static oc_call_stay g_ps[OC_CALL_PAGE_STAYS];
+static oc_call_invitee g_pi[OC_CALL_PAGE_INVITEES];
+static oc_call_event g_pe[OC_CALL_PAGE_EVENTS];
+static oc_call_recording g_pr[OC_CALL_PAGE_RECORDINGS];
+static oc_call_tline g_pl[OC_CALL_PAGE_LINES];
+/* `c`'s page of `call_id` into `pg` (arrays g_p*): 0, or the refusal's code. */
+static int call_page(client *c, uint64_t call_id, oc_call_page *pg) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_detail cd = { call_id, 0 };
+    if (oc_encode_call_detail(&w, OC_PROTOCOL_VERSION, &cd) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    for (int i = 0; i < 64; i++) {
+        if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_ERROR) { oc_error er; return oc_decode_error(&p, &er) == OC_OK ? er.code : -1; }
+        if (hdr.msg_type == OC_MSG_CALL_PAGE)
+            return oc_decode_call_page(&p, pg, g_ps, g_pi, g_pe, g_pr, g_pl) == OC_OK && pg->call_id == call_id ? 0 : -1;
+    }
+    return -1;
+}
+
+static int call_delete(client *c, uint64_t call_id, uint8_t what, uint64_t id) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_delete cd = { call_id, what, id };
+    if (oc_encode_call_delete(&w, OC_PROTOCOL_VERSION, OC_MSG_CALL_DELETE, &cd) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+/* A transcript line's search hit for `c`: 1 if `call_id`'s line is found. */
+static int transcript_hit(client *c, const char *q, uint64_t call_id) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq; memset(&sq, 0, sizeof sq);
+    sq.query = oc_slice_str(q);
+    sq.limit = 50;
+    if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_SEARCH_RESULTS, &hdr, &p) != 0) return -1;
+    static oc_search_result_entry ents[64]; uint16_t n = 0; uint8_t tr = 0;
+    if (oc_decode_search_results(&p, ents, 64, &n, &tr) != OC_OK) return -1;
+    for (uint16_t i = 0; i < n && i < 64; i++)
+        if (ents[i].call_id == call_id && ents[i].line_id != 0 && ents[i].message_id == 0) return 1;
+    return 0;
+}
+
+/* Calls home and a call's page (CALLS.md §1): each person's history says how
+ * they saw a call -- took part, declined, missed, asked to one running -- and
+ * a call's page, with its people, times and timeline, is for those asked to it
+ * and nobody else. A transcript stored through the daemon's transcript
+ * function is on the page and found by search for them alone; an admin
+ * deletes it, which a member may not. */
+static void test_call_history(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+    client a, b, c, d, r;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    CHECK(client_open(&d, port, pin) == 0); CHECK(do_handshake(&d) == 0);
+    CHECK(client_open(&r, port, pin) == 0); CHECK(do_handshake(&r) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0, ud = 0, ur = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    CHECK(do_auth(&d, "bf-reader", "pw", &ud) == 0);
+    CHECK(do_auth(&r, "bf-sender", "pw", &ur) == 0);   /* asked to nothing here */
+    oc_call_part parts[32]; oc_call_joined jd; oc_call_state st; uint64_t sp[32], si[32];
+    uint16_t code = 0;
+
+    /* alice asks bob and carol (three is the cap here), and the reader once
+     * carol has said no; bob comes and goes; the reader never answers; roy is
+     * not asked. alice renames it and ends it. */
+    uint64_t two[2] = { ub, uc };
+    const uint64_t id = start_call(&a, 0, 0xA1, two, 2, &jd, parts);
+    CHECK(id != 0);
+    CHECK(join_call(&b, id, 0xB2, &jd, parts) == 0);
+    CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, id) == 0);
+    CHECK(call_simple(&c, OC_MSG_CALL_DECLINE, id) == 0);
+    do { CHECK(read_state(&a, &st, sp, si) == 0); } while (st.n_invited != 0);
+    CHECK(call_invite(&a, id, &ud, 1) == 0);
+    CHECK(call_subject(&a, id, "margins") == 0);
+    do { CHECK(read_state(&d, &st, sp, si) == 0); } while (st.subject.len != 7);
+    /* While it runs, the reader is asked and has not answered -- once the
+     * record has the invitation (it is written as it happens, beside the call). */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_invitees WHERE call_id=%llu AND user_id=%llu;",
+             (unsigned long long)id, (unsigned long long)ud);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    oc_call_hist_entry e;
+    CHECK(history_entry(&d, id, &e) == 1 && (e.flags & OC_CALL_HIST_PENDING) && e.end_reason == OC_CALL_RUNNING);
+    CHECK(call_simple(&a, OC_MSG_CALL_END, id) == 0);
+    do { CHECK(read_state(&d, &st, sp, si) == 0); } while (!st.ended);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND end_reason='ended' AND subject='margins';",
+             (unsigned long long)id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+
+    CHECK(history_entry(&a, id, &e) == 1 && (e.flags & OC_CALL_HIST_JOINED) && slice_eq(e.subject, "margins"));
+    CHECK(e.end_reason == OC_CALL_ENDED_ALL && e.ended_at >= e.started_at && e.n_people == 2 && e.chat_channel != 0);
+    CHECK(history_entry(&b, id, &e) == 1 && e.flags == OC_CALL_HIST_JOINED);
+    CHECK(history_entry(&c, id, &e) == 1 && e.flags == OC_CALL_HIST_DECLINED);
+    CHECK(history_entry(&d, id, &e) == 1 && e.flags == OC_CALL_HIST_MISSED);
+    CHECK(history_entry(&r, id, &e) == 0);
+
+    /* The page: bob, who took part, and the reader, who did not, see it; roy
+     * is refused. */
+    oc_call_page pg;
+    CHECK(call_page(&b, id, &pg) == 0);
+    CHECK(slice_eq(pg.subject, "margins") && pg.starter == ua && pg.end_reason == OC_CALL_ENDED_ALL);
+    CHECK(pg.n_stays == 2 && pg.n_invitees == 4 && pg.n_recordings == 0 && !pg.has_transcript);
+    { int b_left = 0, c_declined = 0, renamed = 0;
+      for (uint16_t i = 0; i < pg.n_stays; i++) if (g_ps[i].user_id == ub && g_ps[i].left_at >= g_ps[i].joined_at) b_left = 1;
+      for (uint16_t i = 0; i < pg.n_invitees; i++) if (g_pi[i].user_id == uc && g_pi[i].declined_at) c_declined = 1;
+      for (uint16_t i = 0; i < pg.n_events; i++)
+          if (g_pe[i].kind == OC_CALL_EV_SUBJECT && g_pe[i].user_id == ua && slice_eq(g_pe[i].detail, "margins")) renamed = 1;
+      CHECK(b_left && c_declined && renamed); }
+    CHECK(call_page(&d, id, &pg) == 0);
+    CHECK(call_page(&r, id, &pg) == OC_ERR_NOT_A_MEMBER);
+
+    /* A transcript, stored through the daemon's transcript function. */
+    oc_transcript_line tl[2] = {
+        { ub, 1000, 2500, (char *)"the quillwort margin is thin" },
+        { ua, 2600, 4000, (char *)"then we raise it" },
+    };
+    CHECK(oc_dbwriter_call_transcript(dbw, id, "en", tl, 2) == 0);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_transcript_lines l JOIN call_transcripts t ON t.id=l.transcript_id "
+             "WHERE t.call_id=%llu;", (unsigned long long)id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 2, 5000));
+    CHECK(call_page(&b, id, &pg) == 0 && pg.has_transcript && pg.n_lines_total == 2 && pg.n_lines == 2);
+    CHECK(slice_eq(pg.transcript_lang, "en") && g_pl[0].speaker == ub && g_pl[0].start_ms == 1000 &&
+          slice_eq(g_pl[0].text, "the quillwort margin is thin"));
+    CHECK(history_entry(&b, id, &e) == 1 && (e.flags & OC_CALL_HIST_TRANSCRIPT));
+    /* Found by those asked, the decliner too, and not by roy. */
+    CHECK(transcript_hit(&b, "quillwort", id) == 1);
+    CHECK(transcript_hit(&c, "quillwort", id) == 1);
+    CHECK(transcript_hit(&r, "quillwort", id) == 0);
+
+    /* bob may not delete it; alice, an admin, may, and those asked are told. */
+    CHECK(call_delete(&b, id, OC_CALL_DEL_TRANSCRIPT, 0) == 0);
+    CHECK(read_error(&b, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    CHECK(call_delete(&a, id, OC_CALL_DEL_TRANSCRIPT, 0) == 0);
+    oc_header hdr; oc_rbuf p; oc_call_delete del;
+    CHECK(read_type(&b, OC_MSG_CALL_DELETED, &hdr, &p) == 0 && oc_decode_call_delete(&p, &del) == OC_OK);
+    CHECK(del.call_id == id && del.what == OC_CALL_DEL_TRANSCRIPT);
+    CHECK(read_type(&a, OC_MSG_CALL_DELETED, &hdr, &p) == 0);
+    CHECK(call_page(&b, id, &pg) == 0 && !pg.has_transcript && pg.n_lines == 0);
+    CHECK(transcript_hit(&b, "quillwort", id) == 0);
+    CHECK(main_db_int(q) == 0);
+
+    client_close(&r);
+    client_close(&d);
+    client_close(&c);
+    client_close(&b);
+    client_close(&a);
+}
+
+static int call_record(client *c, uint64_t call_id, int on) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_record m = { call_id, (uint8_t)on };
+    if (oc_encode_call_record(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+/* The next roster `c` is sent: its epoch, and the Recorder's part in it (1
+ * there, 0 not); -1 if none came. */
+static int roster_recorder(client *c, uint32_t *epoch, int *count) {
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_roster ro;
+    if (read_type(c, OC_MSG_CALL_ROSTER, &hdr, &p) != 0 || oc_decode_call_roster(&p, &ro, parts, 32) != OC_OK) return -1;
+    if (epoch) *epoch = ro.epoch;
+    if (count) *count = ro.count;
+    for (uint16_t i = 0; i < ro.count; i++)
+        if (parts[i].flags & OC_CALL_PART_RECORDER) return parts[i].user_id == OC_CALL_RECORDER_ID ? 1 : -1;
+    return 0;
+}
+
+/* The engine, as a test has it (CALLS.md §8): the stand-in codecs. */
+#define CALLREC_STAND_IN (&oc_callrec_stub_codecs)
+
+/* Recording a call (CALLS.md §8). A daemon without the engine names no
+ * call-recording and refuses a recording; so does one whose admin turned it
+ * off. Where it is offered, anyone in the call starts it: the Recorder joins
+ * at a new epoch, marked RECORDER, not counted toward the cap; the call says
+ * it is recorded, its row and spool are made, and the timeline has it. Anyone
+ * stops it: the Recorder leaves at a new epoch and the recording waits to be
+ * processed. */
+static void test_call_recording(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    oc_netloop_set_callrec(NULL);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(!g_auth_callrec);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    oc_call_part parts[32]; oc_call_joined jd; oc_call_state st; uint64_t sp[32], si[32];
+    uint16_t code = 0;
+    const uint64_t id = start_call(&a, 0, 0xA1, &ub, 1, &jd, parts);
+    CHECK(id != 0 && join_call(&b, id, 0xB2, &jd, parts) == 0);
+    const uint32_t epoch0 = jd.epoch;
+
+    /* Not built in: refused. */
+    CHECK(call_record(&a, id, 1) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_RECORDING_UNAVAILABLE);
+    /* Built in, turned off by an admin: not offered, and refused. */
+    oc_netloop_set_callrec(CALLREC_STAND_IN);
+    char cfgerr[128];
+    setenv("OPENCHIME_CALL_RECORDING", "off", 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(client_open(&c, port, pin) == 0 && do_handshake(&c) == 0 && do_auth(&c, "carol", "pw", &uc) == 0);
+    CHECK(!g_auth_callrec);
+    client_close(&c);
+    CHECK(call_record(&a, id, 1) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_RECORDING_UNAVAILABLE);
+    /* On: offered. */
+    unsetenv("OPENCHIME_CALL_RECORDING");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(client_open(&c, port, pin) == 0 && do_handshake(&c) == 0 && do_auth(&c, "carol", "pw", &uc) == 0);
+    CHECK(g_auth_callrec);
+
+    /* bob starts it: alice's roster has the Recorder at a new epoch, and the
+     * call says it is recorded. */
+    CHECK(call_record(&b, id, 1) == 0);
+    uint32_t e1 = 0; int count = 0;
+    int got = 0;
+    for (int i = 0; i < 4 && got != 1; i++) got = roster_recorder(&a, &e1, &count);
+    CHECK(got == 1 && e1 > epoch0 && count == 3);
+    do { CHECK(read_state(&a, &st, sp, si) == 0); } while (!(st.flags & OC_CALL_STATE_RECORDING));
+    CHECK(st.n_parts == 2);                                /* the people: the Recorder is not one */
+    CHECK(st.rec_by == ub);                                /* and who is recording it */
+    char q[300];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_recordings WHERE call_id=%llu AND state='recording' "
+             "AND started_by=%llu AND spool LIKE '%%/recordings/' || id;", (unsigned long long)id, (unsigned long long)ub);
+    CHECK(main_db_int(q) == 1);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='record_on' AND user_id=%llu;",
+             (unsigned long long)id, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    {   /* its spool, made */
+        char path[700];
+        snprintf(q, sizeof q, "SELECT id FROM call_recordings WHERE call_id=%llu;", (unsigned long long)id);
+        snprintf(path, sizeof path, "%s/recordings/%d/meta", tpath("data"), main_db_int(q));
+        struct stat sb;
+        CHECK(stat(path, &sb) == 0 && sb.st_size == 30);
+        /* ...and who is in it and asked, for its picture: both of them, by name
+         * (oc_callrec_person: user, name length, name, key length, key). */
+        snprintf(path, sizeof path, "%s/recordings/%d/people", tpath("data"), main_db_int(q));
+        CHECK(WAIT_UNTIL(stat(path, &sb) == 0 && sb.st_size >= 2 * (9 + 1), 5000));
+    }
+    /* Not counted toward the cap (three here): carol, asked, gets in beside
+     * the two people and the Recorder. */
+    CHECK(call_invite(&a, id, &uc, 1) == 0);
+    do { CHECK(read_state(&c, &st, sp, si) == 0); } while (st.call_id != id);
+    CHECK(st.flags & OC_CALL_STATE_RECORDING);              /* told on being asked */
+    CHECK(join_call(&c, id, 0xC3, &jd, parts) == 0 && jd.count == 4);
+    { int rec = 0; for (uint16_t i = 0; i < jd.count; i++) if (parts[i].flags & OC_CALL_PART_RECORDER) rec = 1; CHECK(rec); }
+
+    /* alice stops it: a new epoch without it; the recording waits to be
+     * processed (the worker held, so it is seen waiting). */
+    oc_netloop_hold_callrec(1);
+    CHECK(call_record(&a, id, 0) == 0);
+    got = -1;
+    for (int i = 0; i < 6 && got != 0; i++) got = roster_recorder(&b, &e1, &count);
+    CHECK(got == 0 && count == 3);
+    do { CHECK(read_state(&b, &st, sp, si) == 0); } while (st.flags & OC_CALL_STATE_RECORDING);
+    CHECK(st.rec_by == 0);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_recordings WHERE call_id=%llu AND state='processing' "
+             "AND stopped_at_ms >= started_at_ms;", (unsigned long long)id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='record_off' AND user_id=%llu;",
+             (unsigned long long)id, (unsigned long long)ua);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    oc_netloop_hold_callrec(0);
+    /* Nobody here sent a sound or a picture: there is nothing to make, so it
+     * is closed as failed, with why, and its spool is gone. (A recording made
+     * is test_client_core's, where the clients send.) */
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_recordings WHERE call_id=%llu AND state='failed' "
+             "AND spool IS NULL AND attachment_id IS NULL AND length(error) > 0;", (unsigned long long)id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    {
+        char path[700];
+        snprintf(q, sizeof q, "SELECT id FROM call_recordings WHERE call_id=%llu;", (unsigned long long)id);
+        snprintf(path, sizeof path, "%s/recordings/%d", tpath("data"), main_db_int(q));
+        struct stat sb;
+        CHECK(stat(path, &sb) != 0);
+    }
+    /* A stop with nothing recording is nothing; someone outside the call may not. */
+    CHECK(call_record(&a, id, 0) == 0);
+    CHECK(call_simple(&a, OC_MSG_CALL_END, id) == 0);
+    do { CHECK(read_state(&c, &st, sp, si) == 0); } while (!st.ended);
+    CHECK(call_record(&c, id, 1) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
+
+    oc_netloop_set_callrec(NULL);
+    client_close(&c);
+    client_close(&b);
+    client_close(&a);
+}
+
+/* A daemon started over a database with a call left open (CALLS.md §1): the
+ * call ends by a stop, at the last thing it recorded, with every stay closed,
+ * and the message it left says it ended. */
+static void test_calls_closed_at_start(void) {
+    db_unlink("itest_callstop.db");
+    oc_dbwriter *dbw = oc_dbwriter_start(tpath("itest_callstop.db"));
+    CHECK(dbw != NULL);
+    if (!dbw) return;
+    CHECK(oc_dbwriter_register_local(dbw, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    oc_dbwriter_stop(dbw);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(tpath("itest_callstop.db"), &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO calls(id, subject, starter, from_channel, started_at_ms) "
+        "  SELECT 1, 'standup', id, 1, 1000 FROM users WHERE subject LIKE '%alice';"
+        "INSERT INTO call_participants(call_id, user_id, joined_at_ms) SELECT 1, starter, 1000 FROM calls;"
+        "INSERT INTO call_events(call_id, at_ms, user_id, kind) SELECT 1, 61000, starter, 'camera_on' FROM calls;"
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, kind, call_id) "
+        "  SELECT 1, starter, 'alice started a call: standup', 1000, 1, 1 FROM calls;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+    dbw = oc_dbwriter_start(tpath("itest_callstop.db"));
+    CHECK(dbw != NULL);
+    if (dbw) oc_dbwriter_stop(dbw);
+    db = NULL;
+    CHECK(sqlite3_open(tpath("itest_callstop.db"), &db) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db,
+        "SELECT (SELECT COUNT(*) FROM calls WHERE id=1 AND end_reason='stopped' AND ended_at_ms=61000),"
+        "       (SELECT COUNT(*) FROM call_participants WHERE call_id=1 AND left_at_ms=61000),"
+        "       (SELECT COUNT(*) FROM messages WHERE call_id=1 AND body LIKE '%(ended after 1 minute)');",
+        -1, &st, NULL) == SQLITE_OK);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(st, 0) == 1 && sqlite3_column_int(st, 1) == 1 && sqlite3_column_int(st, 2) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    db_unlink("itest_callstop.db");
+}
+
+/* Calls over the wire (REQ-150-152, REQ-301-305, CALLS.md §1): a start with a
+ * subject and invitations and no conversation; joining, only for invitees; the
+ * roster with slots, keys and epochs; sealed keys forwarded only between
+ * participants for the current epoch; the cap; declining; a rename; ending;
+ * no missed-call line; one call per connection; two calls at once; and
+ * CALL_STATE to a call's participants and invitees and nobody else. */
 static void test_call_vertical(int port, const uint8_t *pin) {
     client a, b, c, d;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -6057,40 +7554,53 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
     CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
     CHECK(do_auth(&d, "bf-reader", "pw", &ud) == 0);
-    const uint64_t ch = OC_DEFAULT_CHANNEL;
 
     oc_header hdr; oc_rbuf p; oc_call_part parts[32]; uint64_t sp[32], si[32];
     oc_call_state st; uint16_t code = 0;
 
-    /* alice starts, inviting bob: she is in it alone, at slot 0, epoch 1. */
+    /* No subject, no call. */
     uint64_t inv_b[1] = { ub };
-    CHECK(call_join(&a, ch, 0xA1, inv_b, 1) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    oc_call_joined jd; CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
-    CHECK(jd.channel_id == ch && jd.count == 1 && parts[0].user_id == ua && jd.slot == 0);
-    CHECK(jd.epoch == 1 && jd.starter == ua && jd.started_at > 0 && jd.call_id != 0);
-    CHECK(parts[0].device_key[0] == 0xA1);
-    uint64_t call_id = jd.call_id;
+    CHECK(call_start(&a, 0, "   ", 0xA1, inv_b, 1) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_CALL_SUBJECT);
 
-    /* bob hears of it: a CALL_STATE naming alice in it and himself invited. */
+    /* alice starts "standup", asking bob: she is in it alone, at slot 0, epoch 1. */
+    oc_call_joined jd;
+    uint64_t call_id = start_call(&a, 0, 0xA1, inv_b, 1, &jd, parts);
+    CHECK(call_id != 0 && jd.count == 1 && parts[0].user_id == ua && jd.slot == 0);
+    CHECK(jd.epoch == 1 && jd.starter == ua && jd.started_at > 0);
+    CHECK(parts[0].device_key[0] == 0xA1);
+    /* Its row: the subject, the starter, no conversation, running; alice and
+     * bob its invitees. */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND subject='standup' AND starter=%llu "
+             "AND from_channel IS NULL AND ended_at_ms IS NULL;", (unsigned long long)call_id, (unsigned long long)ua);
+    CHECK(main_db_int(q) == 1);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_invitees WHERE call_id=%llu;", (unsigned long long)call_id);
+    CHECK(main_db_int(q) == 2);
+
+    /* bob hears of it: a CALL_STATE naming its subject, alice in it, himself invited. */
     CHECK(read_state(&b, &st, sp, si) == 0);
-    CHECK(st.call_id == call_id && st.starter == ua && !st.ended);
+    CHECK(st.call_id == call_id && st.starter == ua && !st.ended && st.from_channel == 0);
+    CHECK(st.subject.len == 7 && memcmp(st.subject.ptr, "standup", 7) == 0);
     CHECK(st.n_parts == 1 && sp[0] == ua && st.n_invited == 1 && si[0] == ub);
+
+    /* carol was not asked: she may not join, and has been told nothing. */
+    CHECK(call_join(&c, call_id, 0xC3) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_A_MEMBER);
+    CHECK(count_frames(&c, OC_MSG_CALL_STATE, 0, 0, NULL, 1, 0) == 0);
 
     /* bob joins: two participants, epoch 2, each with a key and a slot of its
      * own; alice's roster says the same, and the invitation is taken. */
-    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 2 && jd.epoch == 2);
-    CHECK(jd.slot == 1 && jd.call_id == call_id && jd.starter == ua);
+    CHECK(join_call(&b, call_id, 0xB2, &jd, parts) == 0);
+    CHECK(jd.count == 2 && jd.epoch == 2 && jd.slot == 1 && jd.starter == ua);
     CHECK(read_type(&a, OC_MSG_CALL_ROSTER, &hdr, &p) == 0);
     oc_call_roster ro; CHECK(oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK);
-    CHECK(ro.count == 2 && ro.epoch == 2);
+    CHECK(ro.count == 2 && ro.epoch == 2 && ro.call_id == call_id);
     int seen_b = 0;
     for (int i = 0; i < ro.count; i++) if (parts[i].user_id == ub && parts[i].device_key[5] == 0xB2) seen_b = 1;
     CHECK(seen_b);
-    CHECK(read_state(&c, &st, sp, si) == 0 && st.n_parts == 1);    /* carol saw the start... */
-    CHECK(read_state(&c, &st, sp, si) == 0 && st.n_parts == 2 && st.n_invited == 0);   /* ...and the join */
+    do { CHECK(read_state(&a, &st, sp, si) == 0); } while (st.n_parts != 2);
+    CHECK(st.n_invited == 0);
 
     /* Sealed keys: alice's copy for bob reaches bob; a copy for carol, who is
      * not in the call, reaches nobody; a copy for an old epoch is dropped. */
@@ -6099,11 +7609,11 @@ static void test_call_vertical(int port, const uint8_t *pin) {
         memset(s1, 0x11, sizeof s1); memset(s2, 0x22, sizeof s2); memset(s3, 0x33, sizeof s3);
         uint8_t buf[512]; oc_wbuf w;
         oc_call_key_entry stale_e[1] = { { ub, { s3, sizeof s3 } } };
-        oc_call_key stale = { ch, call_id, 1, 1, stale_e };
+        oc_call_key stale = { call_id, 1, 1, stale_e };
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &stale) == OC_OK && send_frame(&a, buf, w.len) == 0);
         oc_call_key_entry e[2] = { { uc, { s2, sizeof s2 } }, { ub, { s1, sizeof s1 } } };
-        oc_call_key ck = { ch, call_id, 2, 2, e };
+        oc_call_key ck = { call_id, 2, 2, e };
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &ck) == OC_OK && send_frame(&a, buf, w.len) == 0);
         CHECK(read_type(&b, OC_MSG_CALL_KEY_FOR, &hdr, &p) == 0);
@@ -6112,7 +7622,7 @@ static void test_call_vertical(int port, const uint8_t *pin) {
         CHECK(kf.sealed.len == OC_CALL_SEALED_LEN && kf.sealed.ptr[0] == 0x11);   /* not the stale 0x33 */
         /* carol is not in the call, so she may not send keys into it. */
         oc_call_key_entry ce[1] = { { ua, { s2, sizeof s2 } } };
-        oc_call_key cck = { ch, call_id, 2, 1, ce };
+        oc_call_key cck = { call_id, 2, 1, ce };
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &cck) == OC_OK && send_frame(&c, buf, w.len) == 0);
         CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
@@ -6120,25 +7630,43 @@ static void test_call_vertical(int port, const uint8_t *pin) {
 
     /* The cap is 3 here: two in the call and two invited would be four. */
     uint64_t two[2] = { uc, ud };
-    CHECK(call_invite(&a, ch, two, 2) == 0);
+    CHECK(call_invite(&a, call_id, two, 2) == 0);
     CHECK(read_error(&a, &code) == 0 && code == OC_ERR_CALL_FULL);
-    CHECK(call_invite(&b, ch, two, 1) == 0);               /* anyone in the call may invite */
-    CHECK(read_state(&c, &st, sp, si) == 0 && st.n_invited == 1 && si[0] == uc);
-    CHECK(call_simple(&c, OC_MSG_CALL_DECLINE, ch) == 0);  /* carol declines */
-    CHECK(read_state(&a, &st, sp, si) == 0);
-    while (st.n_invited != 0 && read_state(&a, &st, sp, si) == 0) {}
-    CHECK(st.n_invited == 0 && st.n_parts == 2);
-    /* A full call refuses a join: d fills it, then carol cannot get in. */
-    CHECK(call_join(&d, ch, 0xD4, NULL, 0) == 0);
-    CHECK(read_type(&d, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(call_join(&c, ch, 0xC3, NULL, 0) == 0);
+    CHECK(call_invite(&b, call_id, two, 1) == 0);               /* anyone in the call may invite */
+    CHECK(read_state(&c, &st, sp, si) == 0 && st.n_invited == 1 && si[0] == uc && st.call_id == call_id);
+    CHECK(call_simple(&c, OC_MSG_CALL_DECLINE, call_id) == 0);  /* carol declines */
+    do { CHECK(read_state(&a, &st, sp, si) == 0); } while (st.n_invited != 0);
+    CHECK(st.n_parts == 2);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_invitees WHERE call_id=%llu AND user_id=%llu "
+             "AND invited_by=%llu AND declined_at_ms IS NOT NULL;",
+             (unsigned long long)call_id, (unsigned long long)uc, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    /* A full call refuses a join: d, asked, fills it; then carol -- asked once,
+     * so she may -- cannot get in. */
+    CHECK(call_invite(&a, call_id, &ud, 1) == 0);
+    CHECK(read_state(&d, &st, sp, si) == 0 && st.call_id == call_id);
+    CHECK(join_call(&d, call_id, 0xD4, &jd, parts) == 0);
+    CHECK(call_join(&c, call_id, 0xC3) == 0);
     CHECK(read_error(&c, &code) == 0 && code == OC_ERR_CALL_FULL);
-    CHECK(call_simple(&d, OC_MSG_CALL_LEAVE, ch) == 0);
+    CHECK(call_simple(&d, OC_MSG_CALL_LEAVE, call_id) == 0);
 
-    /* Only the starter ends it; a leave naming another conversation is nothing. */
-    CHECK(call_simple(&b, OC_MSG_CALL_END, ch) == 0);
+    /* Anyone in it may rename it; everyone asked is told; the rename is on its
+     * timeline. A blank one is refused. */
+    CHECK(call_subject(&b, call_id, "") == 0);
+    CHECK(read_error(&b, &code) == 0 && code == OC_ERR_CALL_SUBJECT);
+    CHECK(call_subject(&b, call_id, "standup, moved") == 0);
+    do { CHECK(read_state(&c, &st, sp, si) == 0); } while (st.subject.len != 14);
+    CHECK(memcmp(st.subject.ptr, "standup, moved", 14) == 0);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='subject' AND user_id=%llu "
+             "AND detail='standup, moved';", (unsigned long long)call_id, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND subject='standup, moved';", (unsigned long long)call_id);
+    CHECK(main_db_int(q) == 1);
+
+    /* Only the starter ends it; a leave naming another call is nothing. */
+    CHECK(call_simple(&b, OC_MSG_CALL_END, call_id) == 0);
     CHECK(read_error(&b, &code) == 0 && code == OC_ERR_NOT_CALL_STARTER);
-    CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, ch + 999) == 0);
+    CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, call_id + 999) == 0);
     /* bob disconnects: his seat is held for the rejoin grace (a short one here,
      * set by the suite), then alice's roster drops to herself in a new epoch
      * (REQ-152). */
@@ -6153,57 +7681,65 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     /* joins 1,2,3(d); leaves 4(d); bob's connection 5 (his seat held, away), his seat gone 6 */
     CHECK(ro.count == 1 && parts[0].user_id == ua && last_epoch == 6);
 
-    /* alice ends it for everyone: carol is told it is over. No missed call --
-     * bob and d joined. */
-    CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
+    /* alice ends it for everyone: carol, asked once, is told it is over, and
+     * the record says how. */
+    CHECK(call_simple(&a, OC_MSG_CALL_END, call_id) == 0);
     do { CHECK(read_state(&c, &st, sp, si) == 0); } while (!st.ended && st.call_id == call_id);
     CHECK(st.ended && st.call_id == call_id);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND end_reason='ended' AND ended_at_ms>=started_at_ms;",
+             (unsigned long long)call_id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_participants WHERE call_id=%llu AND left_at_ms IS NULL;",
+             (unsigned long long)call_id);
+    CHECK(main_db_int(q) == 0);
 
-    /* A start nobody takes: alice invites carol and leaves. The call ends, and a
-     * "Missed call" line lands in the conversation, authored by alice. */
-    uint64_t inv_c[1] = { uc };
-    CHECK(call_join(&a, ch, 0xA1, inv_c, 1) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.call_id != call_id);
-    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
-    CHECK(read_type(&c, OC_MSG_BROADCAST, &hdr, &p) == 0);
-    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
-    CHECK(bc.kind == OC_MSG_KIND_CALL && bc.author_id == ua && bc.channel_id == ch);
-    CHECK(bc.body.len == strlen(OC_CALL_MISSED_TEXT) && memcmp(bc.body.ptr, OC_CALL_MISSED_TEXT, bc.body.len) == 0);
+    /* A start nobody takes: alice asks carol and leaves. The call ends as
+     * left, and no missed-call line is written anywhere. */
+    int lines = main_db_int("SELECT COUNT(*) FROM messages WHERE kind=1;");
+    uint64_t missed = start_call(&a, 0, 0xA1, &uc, 1, &jd, parts);
+    CHECK(missed != 0 && missed != call_id);
+    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, missed) == 0);
+    do { CHECK(read_state(&c, &st, sp, si) == 0); } while (st.call_id != missed || !st.ended);
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND end_reason='left';", (unsigned long long)missed);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    CHECK(main_db_int("SELECT COUNT(*) FROM messages WHERE kind=1;") == lines);
 
-    /* A non-member is refused: carol tries to join a private channel's call. */
-    uint8_t buf[128]; oc_wbuf w;
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_create_channel cc = { oc_slice_str("callvault"), 0 };
-    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
-    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
-    uint64_t priv = ci.channel_id;
-    CHECK(call_join(&c, priv, 0xC3, NULL, 0) == 0);
-    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_A_MEMBER);
-
-    /* One call per connection: alice in the default channel's call, then in the
-     * private channel's -- the first ends (she was alone in it). */
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
-    uint64_t first = jd.call_id;
-    CHECK(call_join(&a, priv, 0xA1, NULL, 0) == 0);
+    /* One call per connection: alice in one call, then starting another --
+     * the first ends (she was alone in it). */
+    uint64_t first = start_call(&a, 0, 0xA1, NULL, 0, &jd, parts);
+    CHECK(first != 0);
+    CHECK(call_start(&a, 0, "second", 0xA1, NULL, 0) == 0);
     do { CHECK(read_state(&a, &st, sp, si) == 0); } while (st.call_id != first || !st.ended);
     CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.channel_id == priv);
-    CHECK(call_simple(&a, OC_MSG_CALL_END, priv) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.call_id != first);
+    uint64_t second = jd.call_id;
+
+    /* Two calls at once, with different people: alice's, and carol's with d.
+     * Neither hears of the other's. */
+    do { CHECK(read_state(&a, &st, sp, si) == 0); } while (st.call_id != second);   /* hers, as it starts */
+    uint64_t other = start_call(&c, 0, 0xC3, &ud, 1, &jd, parts);
+    CHECK(other != 0 && other != second);
+    CHECK(join_call(&d, other, 0xD4, &jd, parts) == 0 && jd.count == 2);
+    CHECK(count_frames(&a, OC_MSG_CALL_STATE, 0, 0, NULL, 1, 0) == 0);   /* fenced: nothing about carol's */
+    /* ...and joining a second call leaves the first: d moves to alice's. */
+    CHECK(call_invite(&a, second, &ud, 1) == 0);
+    CHECK(read_state(&d, &st, sp, si) == 0);
+    while (st.call_id != second) CHECK(read_state(&d, &st, sp, si) == 0);
+    CHECK(join_call(&d, second, 0xD5, &jd, parts) == 0 && jd.count == 2);
+    { int rc = -1; for (int i = 0; i < 4 && rc != 1; i++) rc = next_roster_count(&c); CHECK(rc == 1); }   /* carol alone in hers */
+    CHECK(call_simple(&c, OC_MSG_CALL_END, other) == 0);
+    CHECK(call_simple(&a, OC_MSG_CALL_END, second) == 0);
 
     client_close(&d);
     client_close(&c);
     client_close(&a);
 }
 
-/* Who is told a call's state (REQ-303): every connection of the conversation's
- * members, each once -- alice's second device included, though she is both a
- * member and the participant -- and nobody outside it. A private conversation,
- * so carol, connected and signed in, is not its audience. */
+/* Who is told a call's state (CALLS.md §1): every connection of its
+ * participants and invitees, each once -- alice's second device included,
+ * though she is both the starter and a participant -- and nobody else. A call
+ * started from a conversation carol belongs to, without her: she is sent the
+ * message it leaves there, and nothing of the call itself. */
 static void test_call_state_audience(int port, const uint8_t *pin) {
     client a1, a2, c;
     CHECK(client_open(&a1, port, pin) == 0); CHECK(do_handshake(&a1) == 0);
@@ -6214,51 +7750,47 @@ static void test_call_state_audience(int port, const uint8_t *pin) {
     CHECK(do_auth(&a2, "alice", "pw-alice", &ua) == 0);
     CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
     oc_header hdr; oc_rbuf p;
-    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_create_channel cc = { oc_slice_str("stateaudience"), 0 };
-    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
-    CHECK(send_frame(&a1, buf, w.len) == 0);
-    CHECK(read_type(&a1, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
-    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
-    uint64_t priv = ci.channel_id;
-
-    CHECK(call_join(&a1, priv, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a1, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
     oc_call_joined jd; oc_call_part parts[32];
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
-    CHECK(call_simple(&a1, OC_MSG_CALL_END, priv) == 0);
+    uint64_t id = start_call(&a1, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0, &jd, parts);
+    CHECK(id != 0);
+    CHECK(call_simple(&a1, OC_MSG_CALL_END, id) == 0);
 
     /* Each of alice's connections: the start, then the end, and no copy of
      * either -- a second copy of the start would come before the end. */
     client *mine[2] = { &a1, &a2 };
     for (int k = 0; k < 2; k++) {
         oc_call_state st; uint64_t sp[32], si[32];
-        do { CHECK(read_state(mine[k], &st, sp, si) == 0); } while (st.call_id != jd.call_id);
-        CHECK(!st.ended && st.n_parts == 1 && sp[0] == ua);
+        do { CHECK(read_state(mine[k], &st, sp, si) == 0); } while (st.call_id != id);
+        CHECK(!st.ended && st.n_parts == 1 && sp[0] == ua && st.from_channel == OC_DEFAULT_CHANNEL);
         CHECK(read_state(mine[k], &st, sp, si) == 0);
-        CHECK(st.call_id == jd.call_id && st.ended);
+        CHECK(st.call_id == id && st.ended);
     }
-    /* carol: told nothing about it. Her own END for the conversation is refused,
-     * and nothing about the call comes before that answer. */
-    CHECK(call_simple(&c, OC_MSG_CALL_END, priv) == 0);
-    int told = 0, answered = 0;
+    /* carol: the call's message in #general, and nothing about the call. Her
+     * END for it is refused, and nothing about the call comes before that
+     * answer. */
+    CHECK(call_simple(&c, OC_MSG_CALL_END, id) == 0);
+    int told = 0, answered = 0, message = 0;
     for (int i = 0; i < 64 && !answered; i++) {
         if (read_frame_raw(&c, &hdr, &p) != 0) break;
         if (hdr.msg_type == OC_MSG_ERROR) answered = 1;
+        if (hdr.msg_type == OC_MSG_BROADCAST) {
+            oc_broadcast b;
+            if (oc_decode_broadcast(&p, &b) == OC_OK && b.call_id == id) message = 1;
+        }
         if (hdr.msg_type == OC_MSG_CALL_STATE) {
             oc_call_state st; uint64_t sp[32], si[32];
-            if (oc_decode_call_state(&p, &st, sp, 32, si, 32) == OC_OK && st.call_id == jd.call_id) told = 1;
+            if (oc_decode_call_state(&p, &st, sp, 32, si, 32) == OC_OK && st.call_id == id) told = 1;
         }
     }
-    CHECK(answered && !told);
+    CHECK(answered && message && !told);
     client_close(&c);
     client_close(&a2);
     client_close(&a1);
 }
 
-static int call_share(client *c, uint64_t ch, int on) {
+static int call_share(client *c, uint64_t call_id, int on) {
     uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_share m = { ch, (uint8_t)on };
+    oc_call_share m = { call_id, (uint8_t)on };
     if (oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
@@ -6274,16 +7806,16 @@ static int wait_sharer(client *c, uint64_t call_id, uint64_t sharer, oc_call_sta
     return -1;
 }
 
-static int call_camera(client *c, uint64_t ch, int on) {
+static int call_camera(client *c, uint64_t call_id, int on) {
     uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_camera m = { ch, (uint8_t)on };
+    oc_call_camera m = { call_id, (uint8_t)on };
     if (oc_encode_call_camera(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
 
-static int call_video_sub(client *c, uint64_t ch, int all, const uint64_t *users, uint16_t n) {
+static int call_video_sub(client *c, uint64_t call_id, int all, const uint64_t *users, uint16_t n) {
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_video_sub m = { ch, (uint8_t)all, n, users };
+    oc_call_video_sub m = { call_id, (uint8_t)all, n, users };
     if (oc_encode_call_video_sub(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
@@ -6316,18 +7848,14 @@ static void test_call_camera(int port, const uint8_t *pin, uint16_t audio_port) 
     CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
     CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
-    const uint64_t ch = OC_DEFAULT_CHANNEL;
-    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    oc_call_part parts[32]; oc_call_joined jd;
     uint16_t code = 0;
     uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
 
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    const uint64_t ch = start_call(&a, 0, 0xA1, &ub, 1, &jd, parts);   /* the call, by its id */
+    CHECK(ch != 0 && jd.token.len == OC_AUDIO_TOKEN_RAND);
     memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
-    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    CHECK(join_call(&b, ch, 0xB2, &jd, parts) == 0 && jd.token.len == OC_AUDIO_TOKEN_RAND);
     memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     uint32_t epoch = jd.epoch, e2 = 0;
     for (uint16_t i = 0; i < jd.count; i++) CHECK(!(parts[i].flags & OC_CALL_PART_CAMERA));
@@ -6385,9 +7913,7 @@ static void test_call_camera(int port, const uint8_t *pin, uint16_t audio_port) 
     CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) == 5 && seq == 7 && g_udp_stream == OC_CALL_STREAM_CAMERA);
 
     /* alice rejoins: a new epoch, and her camera off. */
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.epoch > epoch);
+    CHECK(join_call(&a, ch, 0xA1, &jd, parts) == 0 && jd.epoch > epoch);
     for (uint16_t i = 0; i < jd.count; i++) CHECK(!(parts[i].flags & OC_CALL_PART_CAMERA));
     CHECK(roster_camera(&b, ua, &e2, NULL) == 0 && e2 == jd.epoch);
 
@@ -6399,6 +7925,14 @@ static void test_call_camera(int port, const uint8_t *pin, uint16_t audio_port) 
     int away = 0;
     CHECK(roster_camera(&a, ub, NULL, &away) == 0 && away);
 
+    /* Each camera on and off is on the call's timeline, with whose it was. */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='camera_on' AND user_id=%llu;",
+             (unsigned long long)ch, (unsigned long long)ua);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='camera_off' AND user_id=%llu;",
+             (unsigned long long)ch, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 2, 5000));   /* turned off, and gone with his connection */
     CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
     close(sa); close(sb);
     client_close(&c);
@@ -6418,24 +7952,22 @@ static void test_call_share(int port, const uint8_t *pin) {
     CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
     CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
-    const uint64_t ch = OC_DEFAULT_CHANNEL;
-    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd; oc_call_state st;
+    oc_call_part parts[32]; oc_call_joined jd; oc_call_state st;
     uint16_t code = 0;
 
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
-    uint64_t call_id = jd.call_id;
-    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 2);
+    /* alice asks bob and carol; carol stays out of it, though she is told. */
+    uint64_t both[2] = { ub, uc };
+    const uint64_t ch = start_call(&a, 0, 0xA1, both, 2, &jd, parts);
+    uint64_t call_id = ch;
+    CHECK(ch != 0);
+    CHECK(join_call(&b, ch, 0xB2, &jd, parts) == 0 && jd.count == 2);
     CHECK(parts[0].codecs == OC_CALL_CODEC_VP9 && parts[1].codecs == OC_CALL_CODEC_VP9);
 
     /* carol is not in the call: she cannot share into it. */
     CHECK(call_share(&c, ch, 1) == 0);
     CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
 
-    /* alice shares; everyone told, carol too (she is in the audience). */
+    /* alice shares; everyone told, carol too (she is asked). */
     CHECK(call_share(&a, ch, 1) == 0);
     CHECK(wait_sharer(&b, call_id, ua, &st) == 0 && !st.ended);
     CHECK(wait_sharer(&c, call_id, ua, &st) == 0);
@@ -6456,8 +7988,7 @@ static void test_call_share(int port, const uint8_t *pin) {
     CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, ch) == 0);
     CHECK(wait_sharer(&a, call_id, 0, &st) == 0 && st.n_parts == 1);
     /* ...and so does one who disconnects. */
-    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(join_call(&b, ch, 0xB2, &jd, parts) == 0);
     CHECK(call_share(&b, ch, 1) == 0);
     CHECK(wait_sharer(&a, call_id, ub, &st) == 0);
     client_close(&b);
@@ -6468,6 +7999,14 @@ static void test_call_share(int port, const uint8_t *pin) {
       for (int i = 0; i < 8 && st.n_parts != 1; i++) CHECK(read_state(&a, &st, sp, si) == 0);
       CHECK(st.call_id == call_id && st.n_parts == 1); }
 
+    /* Each share started and stopped is on the timeline. */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='share_on' AND user_id=%llu;",
+             (unsigned long long)ch, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 3, 5000));
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_events WHERE call_id=%llu AND kind='share_off';",
+             (unsigned long long)ch);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 4, 5000));   /* alice's taken over, bob's stopped, left, disconnected */
     CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
     client_close(&c);
     client_close(&a);
@@ -6482,15 +8021,13 @@ static int next_roster(client *c, oc_call_roster *ro, oc_call_part *parts) {
     return oc_decode_call_roster(&p, ro, parts, 32) == OC_OK ? ro->count : -1;
 }
 
-/* Join the default conversation's call as `user`, on a fresh connection; the
- * CALL_JOINED is decoded into `jd`. */
+/* Join call `call_id` as `user`, on a fresh connection; the CALL_JOINED is
+ * decoded into `jd`. */
 static int rejoin_as(client *c, int port, const uint8_t *pin, const char *user, const char *pw,
-                     uint8_t key, oc_call_joined *jd, oc_call_part *parts) {
-    uint64_t uid = 0; oc_header hdr; oc_rbuf p;
+                     uint64_t call_id, uint8_t key, oc_call_joined *jd, oc_call_part *parts) {
+    uint64_t uid = 0;
     if (client_open(c, port, pin) != 0 || do_handshake(c) != 0 || do_auth(c, user, pw, &uid) != 0) return -1;
-    if (call_join(c, OC_DEFAULT_CHANNEL, key, NULL, 0) != 0) return -1;
-    if (read_type(c, OC_MSG_CALL_JOINED, &hdr, &p) != 0) return -1;
-    return oc_decode_call_joined(&p, jd, parts, 32) == OC_OK ? 0 : -1;
+    return join_call(c, call_id, key, jd, parts);
 }
 
 /* A lost connection's seat is held for its rejoin (REQ-152, PROTOCOL.md §5.17):
@@ -6508,9 +8045,18 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
      * for the seats that are to go. */
     const int long_grace = 5000, short_grace = 300;
     oc_netloop_set_call_grace_ms(long_grace);
-    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA1, &jd, parts) == 0);
-    uint64_t call_id = jd.call_id;
-    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB1, &jd, parts) == 0);
+    uint64_t ub = 0;
+    {
+        client t; uint64_t ut = 0;
+        CHECK(client_open(&t, port, pin) == 0 && do_handshake(&t) == 0 && do_auth(&t, "bob", "pw-bob", &ub) == 0);
+        client_close(&t);
+        (void)ut;
+    }
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    uint64_t call_id = start_call(&a, 0, 0xA1, &ub, 1, &jd, parts);
+    CHECK(call_id != 0);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", call_id, 0xB1, &jd, parts) == 0);
     CHECK(jd.call_id == call_id && jd.count == 2);
     uint32_t epoch = jd.epoch;
     CHECK(next_roster(&a, &ro, parts) == 2);
@@ -6530,8 +8076,13 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
     /* bob is back on a new connection: what he is told at sign-in still has him
      * in the call, and his join takes the seat -- the same call, a new epoch,
      * his new key on alice's roster, and nobody away. */
-    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB2, &jd, parts) == 0);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", call_id, 0xB2, &jd, parts) == 0);
     CHECK(jd.call_id == call_id && jd.count == 2 && jd.epoch == epoch + 2);
+    /* Back within the held seat: the same stay, not a second one. */
+    char q[256];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_participants WHERE call_id=%llu AND user_id=%llu;",
+             (unsigned long long)call_id, (unsigned long long)ub);
+    CHECK(main_db_int(q) == 1);
     CHECK(next_roster(&a, &ro, parts) == 2 && ro.epoch == epoch + 2);
     { int fresh = 0, away = 0;
       for (int i = 0; i < ro.count; i++) {
@@ -6545,17 +8096,25 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
     client_close(&b);
     CHECK(next_roster(&a, &ro, parts) == 2);
     CHECK(next_roster(&a, &ro, parts) == 1 && parts[0].device_key[0] == 0xA1 && !parts[0].flags);
+    /* ...which closes his stay. */
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM call_participants WHERE call_id=%llu AND user_id=%llu "
+             "AND left_at_ms IS NOT NULL;", (unsigned long long)call_id, (unsigned long long)ub);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
 
     /* Everyone's connection goes at once, and both come back inside the grace:
      * the call is still there. An observer outside the call watches it. */
     oc_netloop_set_call_grace_ms(long_grace);
-    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB3, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", call_id, 0xB3, &jd, parts) == 0 && jd.call_id == call_id);
+    /* An observer outside the call, but asked to it, so told. */
+    uint64_t uo = 0;
     CHECK(client_open(&o, port, pin) == 0 && do_handshake(&o) == 0);
-    { uint64_t uo = 0; CHECK(do_auth(&o, "carol", "pw", &uo) == 0); }
+    CHECK(do_auth(&o, "carol", "pw", &uo) == 0);
+    CHECK(call_invite(&a, call_id, &uo, 1) == 0);
+    { oc_call_state s0; uint64_t p0[32], i0[32]; CHECK(read_state(&o, &s0, p0, i0) == 0 && s0.call_id == call_id); }
     client_close(&a);
     client_close(&b);
-    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
-    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", call_id, 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", call_id, 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
     CHECK(jd.count == 2);
 
     /* ...and when neither comes back, it ends at the grace. */
@@ -6568,6 +8127,8 @@ static void test_call_rejoin_grace(int port, const uint8_t *pin) {
           ended = st.call_id == call_id && st.ended;
       }
       CHECK(ended); }
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM calls WHERE id=%llu AND end_reason='left';", (unsigned long long)call_id);
+    CHECK(WAIT_UNTIL(main_db_int(q) == 1, 5000));
     (void)hdr; (void)p;
     client_close(&o);
 }
@@ -6586,24 +8147,21 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; oc_call_part parts[32];
     uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
 
-    /* alice joins -> CALL_JOINED with the real UDP port + a 16-byte token. */
+    /* alice starts -> CALL_JOINED with the real UDP port + a 16-byte token. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
-    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
+    oc_call_start cs = { 0, oc_slice_str("standup"), {0}, OC_CALL_CODEC_VP9, 1, &ub };
+    CHECK(oc_encode_call_start(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
     oc_call_joined jd; CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    const uint64_t call_id = jd.call_id;
     CHECK(jd.udp_port == audio_port && jd.token.len == OC_AUDIO_TOKEN_RAND);
     memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
 
     /* bob joins -> his own token; alice gets a roster update. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
-    CHECK(send_frame(&b, buf, w.len) == 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    CHECK(join_call(&b, call_id, 0xB2, &jd, parts) == 0 && jd.token.len == OC_AUDIO_TOKEN_RAND);
     memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
+    CHECK(read_type(&a, OC_MSG_CALL_ROSTER, &hdr, &p) == 0);
 
     struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
     relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -6625,9 +8183,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
 
     /* alice rejoins from the same connection: a fresh token, and the old one is
      * revoked, so nothing sent with it is relayed any more. */
-    CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    CHECK(join_call(&a, call_id, 0xA1, &jd, parts) == 0 && jd.token.len == OC_AUDIO_TOKEN_RAND);
     uint8_t atok2[OC_AUDIO_TOKEN_RAND];
     memcpy(atok2, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     CHECK(memcmp(atok2, atok, OC_AUDIO_TOKEN_RAND) != 0);
@@ -6721,15 +8277,13 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
     CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
     oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
     uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
-    const uint64_t ch = OC_DEFAULT_CHANNEL;
-    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0 && oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    uint64_t both[2] = { ub, uc };
+    const uint64_t ch = start_call(&a, 0, 0xA1, both, 2, &jd, parts);   /* the call, by its id */
+    CHECK(ch != 0);
     memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
-    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0 && oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(join_call(&b, ch, 0xB2, &jd, parts) == 0);
     memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
-    CHECK(call_join(&c, ch, 0xC3, NULL, 0) == 0);
-    CHECK(read_type(&c, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(join_call(&c, ch, 0xC3, &jd, parts) == 0);
 
     struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
     relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -6822,7 +8376,7 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
         CHECK(__atomic_load_n(&g_main->view.relay_received, __ATOMIC_ACQUIRE) > rx0 + FLOOD / 2);
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_send sm; memset(&sm, 0, sizeof sm);
-        sm.channel_id = ch; memset(sm.idem, 0x7C, OC_IDEM_SIZE);
+        sm.channel_id = OC_DEFAULT_CHANNEL; memset(sm.idem, 0x7C, OC_IDEM_SIZE);
         sm.body = oc_slice_str("still here");
         CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK && send_frame(&a, buf, w.len) == 0);
         int media = 0, chat = 0, closed = 0;
@@ -6853,6 +8407,71 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
  * the routing prefix -- and the relay, which is told each token whole, relays
  * and sweeps by them as by any other. Its own loop, since both are read from the
  * environment at startup. */
+/* A public demo never records a call (CALLS.md §8): a loop in demo mode, with
+ * a relay of its own and the engine there, names no call-recording and refuses
+ * one. */
+static void test_call_recording_demo(void) {
+    int udp2 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in u2; memset(&u2, 0, sizeof u2);
+    u2.sin_family = AF_INET; u2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(udp2, (struct sockaddr *)&u2, sizeof u2) == 0);
+    socklen_t u2l = sizeof u2; getsockname(udp2, (struct sockaddr *)&u2, &u2l);
+    oc_netloop_set_audio(udp2, ntohs(u2.sin_port));
+    /* The run's own values, put back at the end, as test_demo_signup does: the
+     * suites after this one run in development mode. The loop loads the
+     * configuration as it starts. */
+    static const char *const ENV[] = { "OPENCHIME_MODE", "OPENCHIME_AUTH", "OPENCHIME_ENROLL_URL" };
+    char saved[3][256];
+    int had[3];
+    for (int i = 0; i < 3; i++) {
+        const char *v = getenv(ENV[i]);
+        had[i] = v != NULL;
+        snprintf(saved[i], sizeof saved[i], "%s", v ? v : "");
+    }
+    setenv("OPENCHIME_MODE", "demo", 1);
+    setenv("OPENCHIME_AUTH", "local,relay", 1);
+    setenv("OPENCHIME_ENROLL_URL", "https://central.example", 1);
+    oc_netloop_set_callrec(CALLREC_STAND_IN);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    db_unlink("itest_recdemo.db");
+    oc_dbwriter *dbw2 = oc_dbwriter_start(tpath("itest_recdemo.db"));
+    CHECK(dbw2 != NULL);
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    struct loop_arg arg2;
+    pthread_t th2;
+    int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
+    CHECK(port != 0);
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin2) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(!g_auth_callrec);
+    oc_call_part parts[32]; oc_call_joined jd;
+    const uint64_t id = start_call(&a, 0, 0xA1, NULL, 0, &jd, parts);
+    CHECK(id != 0);
+    uint16_t code = 0;
+    CHECK(call_record(&a, id, 1) == 0);
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_RECORDING_UNAVAILABLE);
+    CHECK(call_simple(&a, OC_MSG_CALL_END, id) == 0);
+    client_close(&a);
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    oc_netloop_set_callrec(NULL);
+    for (int i = 0; i < 3; i++) {
+        if (had[i]) setenv(ENV[i], saved[i], 1);
+        else unsetenv(ENV[i]);
+    }
+    oc_netloop_set_audio(-1, 0);   /* its loop gave the socket back */
+    close(udp2);
+    char cfgerr[128];
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    db_unlink("itest_recdemo.db");
+}
+
 static void test_call_routed(void) {
     /* This loop runs beside the suite's main one, which holds its own socket:
      * this one gets another. */
@@ -6889,16 +8508,13 @@ static void test_call_routed(void) {
 
     enum { TLEN = 3 + OC_AUDIO_TOKEN_RAND };
     static const uint8_t PREFIX[3] = { 0x0a, 0x0b, 0x0c };
-    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    oc_call_part parts[32]; oc_call_joined jd;
     uint8_t atok[TLEN], btok[TLEN];
-    CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    const uint64_t call_id = start_call(&a, 0, 0xA1, &ub, 1, &jd, parts);
+    CHECK(call_id != 0);
     CHECK(jd.udp_port == 40001 && jd.token.len == TLEN && memcmp(jd.token.ptr, PREFIX, 3) == 0);
     if (jd.token.len == TLEN) memcpy(atok, jd.token.ptr, TLEN);
-    CHECK(call_join(&b, OC_DEFAULT_CHANNEL, 0xB2, NULL, 0) == 0);
-    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(join_call(&b, call_id, 0xB2, &jd, parts) == 0);
     CHECK(jd.udp_port == 40001 && jd.token.len == TLEN && memcmp(jd.token.ptr, PREFIX, 3) == 0);
     if (jd.token.len == TLEN) memcpy(btok, jd.token.ptr, TLEN);
     CHECK(memcmp(atok + 3, btok + 3, OC_AUDIO_TOKEN_RAND) != 0);
@@ -6921,9 +8537,7 @@ static void test_call_routed(void) {
      * nothing sent with it is relayed any more, and the new one is. (The relay's
      * GONE is read by the main loop, which holds none of these connections;
      * test_audio sees a prefixed token come back whole in one.) */
-    CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
-    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == TLEN);
+    CHECK(join_call(&a, call_id, 0xA1, &jd, parts) == 0 && jd.token.len == TLEN);
     uint8_t atok2[TLEN];
     if (jd.token.len == TLEN) memcpy(atok2, jd.token.ptr, TLEN);
     n = -1;
@@ -8795,8 +10409,8 @@ static void test_auth_begin(void) {
         CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
         oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
-        CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        oc_call_start cs = { 0, oc_slice_str("standup"), {0}, OC_CALL_CODEC_VP9, 0, NULL };
+        CHECK(oc_encode_call_start(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK && send_frame(&a, buf, w.len) == 0);
         CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
         oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_CALL_UNAVAILABLE);
         client_close(&a);
@@ -9069,14 +10683,23 @@ int run_netloop_tests(void) {
         test_upload_restarted(arg.port, pin, dbw);
         test_snippet_upload_cap(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
+        test_agent_vertical(arg.port, pin);
+        test_mcp_off(arg.port, pin);
+        test_mcp_wire();
+        test_oauth_wire();
         test_address_proof_route(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         /* The call group: a held seat goes quickly for every one of them, and
          * the knob is put back after the group, whatever it found. */
         oc_netloop_set_call_grace_ms(300);
         test_call_vertical(arg.port, pin);
+        test_call_message(arg.port, pin);
+        test_call_chat(arg.port, pin);
+        test_call_history(arg.port, pin, dbw);
+        test_call_recording(arg.port, pin);
+        test_calls_closed_at_start();
         test_pdm_relay(arg.port, pin);
-        test_call_leave_while_joining(arg.port, pin, dbw);
+        test_call_start_overtaken(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
         test_restore_wire(arg.port, pin);
         test_display_name_limits(arg.port, pin);
@@ -9127,6 +10750,7 @@ int run_netloop_tests(void) {
     test_summaries();
     test_web_signin();
     test_demo_signup();
+    test_call_recording_demo();   /* where the run's development-only settings are put back */
     test_device_signin();
     test_direct_signin();
 
@@ -9141,4 +10765,30 @@ int run_netloop_tests(void) {
     g_dir[0] = '\0';
 
     return failures;
+}
+
+/* The export of a video message over the wire (ARCH-135), in the fast suite:
+ * three daemons of its own, in a directory of its own. */
+int run_export_wire_tests(void) {
+    printf("itest_export_wire: export off, on without codecs, and on -- capability, refusal by name, the copy streamed byte for byte, the cache\n");
+    int before = failures;
+    if (oc_test_mkdtemp("export-wire", g_dir, sizeof g_dir) != 0) {
+        printf("  FAIL itest_export_wire: no directory of its own under $TMPDIR\n");
+        return 1;
+    }
+    char data_dir[600];
+    snprintf(data_dir, sizeof data_dir, "%s", tpath("data"));
+    mkdir(data_dir, 0700);
+    const char *old_data = getenv("OPENCHIME_DATA_DIR");
+    char saved_data[600] = "";
+    int had_data = old_data != NULL;
+    if (old_data) snprintf(saved_data, sizeof saved_data, "%s", old_data);
+    setenv("OPENCHIME_DATA_DIR", data_dir, 1);
+    test_export_wire(0);
+    test_export_wire(1);
+    test_export_wire(2);
+    if (had_data) setenv("OPENCHIME_DATA_DIR", saved_data, 1); else unsetenv("OPENCHIME_DATA_DIR");
+    oc_test_rmtree(g_dir);
+    g_dir[0] = '\0';
+    return failures - before;
 }

@@ -13,6 +13,8 @@ void oc_ev_free(oc_ev *e) {
     free(e->topic);
     free(e->preview);
     free(e->call);
+    free(e->call_hist);
+    oc_call_page_view_free(e->call_page);
     free(e->group);
     free(e->poll);
     oc_todo_view_free(e->todo);
@@ -22,6 +24,13 @@ void oc_ev_free(oc_ev *e) {
     free(e->usage);
     free(e->pfs);
     free(e);
+}
+
+void oc_call_page_view_free(oc_call_page_view *p) {
+    if (!p) return;
+    for (uint32_t i = 0; p->lines && i < p->n_lines; i++) free(p->lines[i].text);
+    free(p->lines);
+    free(p);
 }
 
 void oc_todo_view_free(oc_todo_view *t) {

@@ -1,6 +1,6 @@
 /*
  * OpenChime — the voice-input recognition worker (ARCH-112,
- * docs/VOICE-INPUT.md §6).
+ * docs/details/VOICE-INPUT.md §6).
  *
  * One thread beside the net loop and beside read-aloud's render worker, so a long
  * render never delays someone mid-sentence. The net thread submits a whole

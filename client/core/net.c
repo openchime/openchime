@@ -337,7 +337,11 @@ static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
 typedef struct {
     int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK,
                            * 4 a message's speech (ARCH-111): the download shape over
-                           * AUDIO_* frames, keyed by message id rather than attachment */
+                           * AUDIO_* frames, keyed by message id rather than attachment;
+                           * 5 a voice's audition; 6 a video message's playable copy
+                           * (ARCH-135): the download shape over EXPORT_* frames, into
+                           * the file the person chose; 7 an image's preview (ARCH-137):
+                           * the in-memory download shape over PREVIEW_* frames */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
     /* An in-memory download: `fp` is NULL and chunks accumulate here
@@ -362,6 +366,9 @@ typedef struct {
     uint8_t  purpose;
     char     ename[48];   /* purpose 2: the shortcode to claim it as (REQ-072) */
     char     name[128];   /* filename (upload src basename / download dest label) */
+    char    *path;        /* mode 6: the file being written, removed if the copy fails */
+    uint8_t  rung;        /* mode 7, and the original fetched in its place: the rung
+                           * asked for, which OC_EV_ATTACHMENT_DATA repeats */
 } oc_xfer;
 
 /* Per-channel high-water the net thread tracks (from every BROADCAST) so a
@@ -571,6 +578,9 @@ static const char *mime_for(const char *name) {
 
 static void xfer_reset(oc_xfer *x) {
     if (x->fp) fclose(x->fp);
+    /* A copy that did not arrive whole leaves no file (mode 6 clears `path`
+     * once it has). */
+    if (x->path) { remove(x->path); free(x->path); }
     free(x->buf);
     memset(x, 0, sizeof *x);
 }
@@ -584,6 +594,13 @@ static char *slice_text(oc_slice s) {
     if (s.len) memcpy(t, s.ptr, s.len);
     t[s.len] = '\0';
     return t;
+}
+
+/* A wire string into a fixed field, cut to fit and always terminated. */
+static void slice_into(char *out, size_t cap, oc_slice s) {
+    size_t n = s.len < cap - 1 ? s.len : cap - 1;
+    if (n) memcpy(out, s.ptr, n);
+    out[n] = '\0';
 }
 
 static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
@@ -694,6 +711,87 @@ static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max
         if (label) xfer_notice(ctx, 2, "download: begin failed");
         xfer_reset(x);
     }
+}
+
+/* The playable copy of a video message (ARCH-135), into `fp` at `path`. */
+static void begin_export(disp_ctx *ctx, uint64_t aid, FILE *fp, const char *path) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 6; x->fp = fp; x->id = aid;
+    x->path = strdup(path);
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    snprintf(x->name, sizeof x->name, "%s", slash ? slash + 1 : path);
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_export_get eg = { aid };
+    if (oc_encode_export_get(&w, OC_PROTOCOL_VERSION, &eg) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        char msg[200]; snprintf(msg, sizeof msg, "making a compatible copy for %s…", x->name);
+        xfer_notice(ctx, 0, msg);
+    } else {
+        xfer_notice(ctx, 2, "export: request failed");
+        xfer_reset(x);
+    }
+}
+
+/* An image's preview at `rung` (ARCH-137), into memory. */
+static void begin_preview(disp_ctx *ctx, uint64_t aid, uint8_t rung) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 7; x->id = aid; x->rung = rung; x->buf_max = OC_INLINE_MAX;
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_preview_begin pb = { aid, rung };
+    if (oc_encode_preview_begin(&w, OC_PROTOCOL_VERSION, &pb) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0)
+        xfer_reset(x);
+}
+
+/* No preview at that rung: the original, into memory, in its place -- as
+ * oc_client_fetch_attachment would, but answered with the rung asked for. */
+static void preview_fall_back(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    uint64_t aid = x->id;
+    uint8_t rung = x->rung;
+    xfer_reset(x);
+    begin_download(ctx, aid, NULL, OC_INLINE_MAX, NULL);
+    if (x->mode == 2) x->rung = rung;
+}
+
+/* Bytes of an in-memory transfer, bounded by its ceiling. 0, or -1 when they
+ * would pass it or memory ran out. */
+static int mem_append(oc_xfer *x, const uint8_t *d, size_t n) {
+    if (x->buf_len + n > (x->buf_max ? x->buf_max : OC_INLINE_MAX)) return -1;
+    if (x->buf_len + n > x->buf_cap) {
+        size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+        while (want < x->buf_len + n) want *= 2;
+        uint8_t *g = realloc(x->buf, want);
+        if (!g) return -1;
+        x->buf = g; x->buf_cap = want;
+    }
+    memcpy(x->buf + x->buf_len, d, n);
+    x->buf_len += n;
+    return 0;
+}
+
+/* An in-memory transfer arrived whole: its bytes to the UI thread, which owns
+ * them from here. No notice: an image on screen is not something the person
+ * asked to be told about. */
+static void mem_deliver(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    int short_read = (x->total && x->done != x->total);
+    if (!short_read && x->buf_len) {
+        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
+        if (e) {
+            e->message_id = x->id;
+            e->count = (uint32_t)x->buf_len;
+            e->body = (char *)x->buf;
+            e->op = x->rung;
+            x->buf = NULL; x->buf_len = x->buf_cap = 0;
+            oc_queue_push(ctx->to_ui, e);
+        }
+    }
+    xfer_reset(x);
 }
 
 /* A wire string as a heap C string ("" if empty, NULL on failure). */
@@ -834,11 +932,17 @@ static void xq_start(disp_ctx *ctx) {
         /* op 1: a video message, fetched whole into memory under the attachment
          * ceiling rather than the thumbnail one (ARCH-88: nothing on disk). */
         begin_download(ctx, c->message_id, NULL, c->op == 1 ? (size_t)OC_MAX_ATTACHMENT_SIZE : OC_INLINE_MAX, NULL);
+    } else if (c->type == OC_CMD_FETCH_PREVIEW) {
+        begin_preview(ctx, c->message_id, (uint8_t)c->op);
     } else if (c->type == OC_CMD_DOWNLOAD) {
         FILE *fp = fopen(c->body, "wb");
         if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
         const char *slash = strrchr(c->body, '/');
         begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
+    } else if (c->type == OC_CMD_EXPORT) {
+        FILE *fp = fopen(c->body, "wb");
+        if (!fp) { xfer_notice(ctx, 2, "export: cannot create file"); return; }
+        begin_export(ctx, c->message_id, fp, c->body);
     } else if (c->type == OC_CMD_LISTEN_FETCH) {
         begin_listen(ctx, c->message_id);
     } else if (c->type == OC_CMD_VOICE_PREVIEW) {
@@ -882,6 +986,13 @@ static void xq_pump(disp_ctx *ctx) {
  * running for the same attachment is not queued twice: frontends ask again on
  * every frame until the bytes arrive. */
 static void xq_add(oc_xqueue *q, oc_cmd *c) {
+    if (c->type == OC_CMD_FETCH_PREVIEW) {
+        int dup = q->active && q->active->type == c->type && q->active->message_id == c->message_id &&
+                  q->active->op == c->op;
+        for (size_t i = 0; i < q->n && !dup; i++)
+            dup = q->q[i]->type == c->type && q->q[i]->message_id == c->message_id && q->q[i]->op == c->op;
+        if (dup) { oc_cmd_free(c); return; }
+    }
     if (c->type == OC_CMD_FETCH) {
         if (q->active && q->active->type == OC_CMD_FETCH && q->active->message_id == c->message_id &&
             q->active->op >= c->op) { oc_cmd_free(c); return; }
@@ -1001,7 +1112,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
+                e->call_id = b.call_id;          /* a call's message: which call (CALLS.md §1) */
                 e->broadcast_stored = b.broadcast_stored;
+                slice_into(e->via, sizeof e->via, b.via);   /* an AI client's post (AUTH.md §8.13) */
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
                                     ? b.author_name.len : sizeof e->author_name - 1;
@@ -1263,6 +1376,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->pf_voice[n2] = '\0';
                 }
                 e->user_system = (ue[i].flags & OC_USER_SYSTEM) != 0;
+                e->user_agent = (ue[i].flags & OC_USER_AGENT) != 0;
                 e->ooo_start = ue[i].ooo_start;
                 e->ooo_end = ue[i].ooo_end;
                 snprintf(e->ooo_message, sizeof e->ooo_message, "%.*s",
@@ -1636,6 +1750,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
                     e->broadcast_stored = tr.broadcast_stored;
+                    slice_into(e->via, sizeof e->via, tr.via);
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
                     oc_queue_push(out, e);
                     push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
@@ -2402,17 +2517,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     /* In-memory: hand the bytes to the UI thread, which owns them
                      * from here. No notice — an inline thumbnail is not an event
                      * the user asked for and should not toast. */
-                    if (!short_read && x->buf_len) {
-                        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
-                        if (e) {
-                            e->message_id = x->id;
-                            e->count = (uint32_t)x->buf_len;
-                            e->body = (char *)x->buf;
-                            x->buf = NULL; x->buf_len = x->buf_cap = 0;
-                            oc_queue_push(ctx->to_ui, e);
-                        }
-                    }
-                    xfer_reset(x);
+                    mem_deliver(ctx);
                 } else {
                     char msg[256];
                     if (short_read)
@@ -2423,6 +2528,59 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     xfer_notice(ctx, short_read ? 2 : 1, msg);
                     xfer_reset(x);
                 }
+            }
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_INFO) {
+            oc_preview_info pi;
+            if (oc_decode_preview_info(&p, &pi) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pi.attachment_id == ctx->xfer->id && pi.rung == ctx->xfer->rung)
+                ctx->xfer->total = pi.total_size;
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_CHUNK) {
+            oc_preview_chunk pc;
+            if (oc_decode_preview_chunk(&p, &pc) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pc.attachment_id == ctx->xfer->id && pc.rung == ctx->xfer->rung && pc.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                if (pc.data.len && mem_append(x, pc.data.ptr, pc.data.len) != 0) xfer_reset(x);
+                else { x->done += pc.data.len; x->next_seq++; }
+            }
+        } else if (hdr.msg_type == OC_MSG_PREVIEW_END) {
+            oc_preview_end pe;
+            if (oc_decode_preview_end(&p, &pe) == OC_OK && ctx && ctx->xfer->mode == 7 &&
+                pe.attachment_id == ctx->xfer->id && pe.rung == ctx->xfer->rung)
+                mem_deliver(ctx);
+        } else if (hdr.msg_type == OC_MSG_EXPORT_INFO) {
+            oc_export_info ei;
+            if (oc_decode_export_info(&p, &ei) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ei.attachment_id == ctx->xfer->id)
+                ctx->xfer->total = ei.total_size;
+        } else if (hdr.msg_type == OC_MSG_EXPORT_CHUNK) {
+            oc_export_chunk ec;
+            if (oc_decode_export_chunk(&p, &ec) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ec.attachment_id == ctx->xfer->id && ec.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                if (ec.data.len && fwrite(ec.data.ptr, 1, ec.data.len, x->fp) != ec.data.len) {
+                    xfer_notice(ctx, 2, "export: write error");
+                    xfer_reset(x);
+                } else { x->done += ec.data.len; x->next_seq++; xfer_progress(ctx); }
+            }
+        } else if (hdr.msg_type == OC_MSG_EXPORT_END) {
+            oc_export_end ee;
+            if (oc_decode_export_end(&p, &ee) == OC_OK && ctx && ctx->xfer->mode == 6 &&
+                ee.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                int whole = !x->total || x->done == x->total;
+                int closed = x->fp && fclose(x->fp) == 0;
+                x->fp = NULL;
+                char msg[256];
+                if (whole && closed) {
+                    free(x->path);              /* kept: it arrived whole */
+                    x->path = NULL;
+                    snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
+                } else {
+                    snprintf(msg, sizeof msg, "export: size mismatch (%llu/%llu)",
+                             (unsigned long long)x->done, (unsigned long long)x->total);
+                }
+                xfer_notice(ctx, whole && closed ? 1 : 2, msg);
+                xfer_reset(x);
             }
         } else if (hdr.msg_type == OC_MSG_AUDIO_INFO) {
             oc_audio_info ai;
@@ -2555,6 +2713,111 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 ve->preview = slice_dup(ti.voices[i].lang);
                 oc_queue_push(to_ui, ve);
             }
+        } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN) {
+            /* A token, shown once: held for the frontend, which takes it. */
+            oc_agent_token at;
+            if (oc_decode_agent_token(&p, &at) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_AGENT_TOKEN);
+            if (e) {
+                e->user_id = at.agent_id;
+                e->message_id = at.token_id;
+                e->body = slice_text(at.token);
+                e->topic = slice_text(at.scopes);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN_LIST) {
+            oc_agent_token_entry te[OC_AGENT_TOKEN_LIST_MAX]; uint16_t count = 0; uint64_t aid = 0;
+            if (oc_decode_agent_token_list(&p, &aid, te, OC_AGENT_TOKEN_LIST_MAX, &count) != OC_OK) return -1;
+            if (count > OC_AGENT_TOKEN_LIST_MAX) count = OC_AGENT_TOKEN_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_AGENT_TOKENS_BEGIN);
+            if (b) { b->user_id = aid; oc_queue_push(to_ui, b); }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_AGENT_TOKEN_ROW);
+                if (!e) continue;
+                e->user_id = aid;
+                e->message_id = te[i].token_id;
+                e->body = slice_text(te[i].name);
+                e->topic = slice_text(te[i].scopes);
+                e->preview = slice_text(te[i].last_used_from);
+                e->author_id = te[i].created_by;
+                e->created_at = te[i].created_at_ms;
+                e->server_time = te[i].last_used_at_ms;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_REQUEST) {
+            oc_connection_request cr;
+            if (oc_decode_connection_request(&p, &cr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CONNECTION_REQUEST);
+            if (e) {
+                e->preview = slice_text(cr.code);
+                e->body = slice_text(cr.client_name);
+                e->topic = slice_text(cr.redirect_uri);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_DECIDED) {
+            oc_connection_decided cd;
+            if (oc_decode_connection_decided(&p, &cd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CONNECTION_DECIDED);
+            if (e) { e->status = cd.approved; e->body = slice_text(cd.client_name); oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CONNECTION_LIST) {
+            static oc_connection_entry ce[OC_CONNECTION_LIST_MAX];   /* the net thread's alone */
+            uint16_t count = 0; uint8_t all = 0;
+            if (oc_decode_connection_list(&p, &all, ce, OC_CONNECTION_LIST_MAX, &count) != OC_OK) return -1;
+            if (count > OC_CONNECTION_LIST_MAX) count = OC_CONNECTION_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_CONNECTIONS_BEGIN);
+            if (b) { b->status = all; oc_queue_push(to_ui, b); }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_CONNECTION_ROW);
+                if (!e) continue;
+                e->status = all;
+                e->message_id = ce[i].connection_id;
+                e->user_id = ce[i].user_id;
+                e->topic = slice_text(ce[i].user_name);
+                e->body = slice_text(ce[i].client_name);
+                e->created_at = ce[i].created_at_ms;
+                e->server_time = ce[i].last_used_at_ms;
+                e->parent_id = ce[i].expires_at_ms;
+                e->count = ce[i].lifetime_days;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_OUTGOING_WEBHOOK_SECRET) {
+            /* A webhook's secret, shown once: held for the frontend, which takes it. */
+            oc_outgoing_webhook_secret ws;
+            if (oc_decode_outgoing_webhook_secret(&p, &ws) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_OUTWH_SECRET);
+            if (e) {
+                e->message_id = ws.webhook_id;
+                e->body = slice_text(ws.secret);
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_OUTGOING_WEBHOOK_LIST) {
+            oc_outgoing_webhook_entry *we = calloc(OC_OUTWH_LIST_MAX, sizeof *we);
+            uint16_t count = 0;
+            if (!we) return -1;
+            if (oc_decode_outgoing_webhook_list(&p, we, OC_OUTWH_LIST_MAX, &count) != OC_OK) { free(we); return -1; }
+            if (count > OC_OUTWH_LIST_MAX) count = OC_OUTWH_LIST_MAX;
+            oc_ev *b = oc_ev_new(OC_EV_OUTWH_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_OUTWH_ROW);
+                if (!e) continue;
+                e->message_id = we[i].webhook_id;
+                e->body = slice_text(we[i].url);
+                e->topic = slice_text(we[i].events);
+                e->preview = slice_text(we[i].disabled_reason);
+                e->status = we[i].enabled ? 1 : 0;
+                e->author_id = we[i].created_by;
+                e->created_at = we[i].created_at_ms;
+                if (we[i].n_channels) {
+                    e->ids = malloc(we[i].n_channels * sizeof *e->ids);
+                    if (e->ids) {
+                        memcpy(e->ids, we[i].channels, we[i].n_channels * sizeof *e->ids);
+                        e->n_ids = we[i].n_channels;
+                    }
+                }
+                oc_queue_push(to_ui, e);
+            }
+            free(we);
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
             if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
@@ -2749,10 +3012,17 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     stt_where(ctx, e->count, e);
                     oc_queue_push(to_ui, e);
                 }
+            } else if (ctx && ctx->xfer->mode == 7 &&
+                       (err.code == OC_ERR_PREVIEW_MISSING || err.code == OC_ERR_PREVIEW_RUNG)) {
+                /* No preview at that rung (ARCH-137): the original instead,
+                 * and nothing said -- this is the ordinary case for a small
+                 * image, a GIF, or one uploaded before previews. */
+                preview_fall_back(ctx);
             } else if (err.code == OC_ERR_CALL_UNAVAILABLE || err.code == OC_ERR_CALL_FULL ||
                        err.code == OC_ERR_NOT_CALL_STARTER || err.code == OC_ERR_NOT_IN_CALL ||
-                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 16 &&
-                        memcmp(err.message.ptr, "call join denied", 16) == 0)) {
+                       err.code == OC_ERR_CALL_SUBJECT || err.code == OC_ERR_RECORDING_UNAVAILABLE ||
+                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 24 &&
+                        memcmp(err.message.ptr, "not invited to this call", 24) == 0)) {
                 /* A call request refused (REQ-150, REQ-305): the call view says
                  * why, in its own words, rather than a status line. */
                 oc_ev *e = oc_ev_new(OC_EV_CALL_ERROR);
@@ -2794,11 +3064,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                      * message has nothing to say, or read-aloud is off or busy. */
                     (ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                      (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
-                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE)) ||
+                    /* A copy the daemon will not make (ARCH-135): export off or
+                     * busy, not a video message, not the caller's to read, or
+                     * the transcode failed. */
+                    (ctx && ctx->xfer->mode == 6 &&
+                     (err.code == OC_ERR_EXPORT_UNAVAILABLE || err.code == OC_ERR_MEDIA_INVALID ||
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_INTERNAL));
                 /* An upload the daemon gave up on is a failure for its job, which
                  * a frontend following the tag must see. The status line above
                  * already says why, so the notice carries no text of its own. */
                 if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
+                /* The export says plainly why, and the queue moves on. */
+                if (ctx && ctx->xfer->mode == 6 && about_transfer)
+                    xfer_notice(ctx, 2, err.code == OC_ERR_EXPORT_UNAVAILABLE ? OC_EXPORT_UNAVAILABLE_TEXT
+                                        : err.code == OC_ERR_MEDIA_INVALID ? "That isn't a video message that can be exported"
+                                        : err.code == OC_ERR_ATTACHMENT_GONE ? "That video is no longer available"
+                                        : "The copy could not be made");
                 if (ctx && ctx->xfer->mode == 3 && about_transfer) {
                     int snip = ctx->xq->active && ctx->xq->active->type == OC_CMD_POST_SNIPPET;
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
@@ -3628,7 +3910,7 @@ static int run_connection(oc_net *n, int reconnecting,
                     continue;
                 }
             }
-            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_VIDEO_SUB) {
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_DELETE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
                                          ctx_write, &ctx, n->to_ui);
                 oc_cmd_free(c);
@@ -4225,6 +4507,85 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &cw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_CREATE_AGENT && c->body) {
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_agent m = { oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
+                                      oc_slice_str(c->body3 ? c->body3 : "") };
+                if (oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MINT_AGENT_TOKEN && c->body) {
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_mint_agent_token m = { c->message_id, oc_slice_str(c->body), oc_slice_str(c->body3 ? c->body3 : "") };
+                if (oc_encode_mint_agent_token(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REMOVE_AGENT || c->type == OC_CMD_LIST_AGENT_TOKENS ||
+                c->type == OC_CMD_REVOKE_AGENT_TOKEN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_REMOVE_AGENT) {
+                    oc_remove_agent m = { c->message_id };
+                    er = oc_encode_remove_agent(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_LIST_AGENT_TOKENS) {
+                    oc_list_agent_tokens m = { c->message_id };
+                    er = oc_encode_list_agent_tokens(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_revoke_agent_token m = { c->message_id, c->channel_id };
+                    er = oc_encode_revoke_agent_token(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CONNECTION_CODE || c->type == OC_CMD_CONNECTION_DECIDE ||
+                c->type == OC_CMD_LIST_CONNECTIONS || c->type == OC_CMD_REVOKE_CONNECTION) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_CONNECTION_CODE) {
+                    oc_connection_code m = { oc_slice_str(c->body ? c->body : "") };
+                    er = oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_CONNECTION_DECIDE) {
+                    oc_connection_decide m = { oc_slice_str(c->body ? c->body : ""), (uint8_t)(c->op ? 1 : 0), (uint32_t)c->message_id };
+                    er = oc_encode_connection_decide(&w, OC_PROTOCOL_VERSION, &m);
+                } else if (c->type == OC_CMD_LIST_CONNECTIONS) {
+                    oc_list_connections m = { (uint8_t)(c->op ? 1 : 0) };
+                    er = oc_encode_list_connections(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_revoke_connection m = { c->message_id, (uint8_t)(c->op ? 1 : 0) };
+                    er = oc_encode_revoke_connection(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_OUTWH && c->body && c->body2) {
+                uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_outgoing_webhook m;
+                memset(&m, 0, sizeof m);
+                m.url = oc_slice_str(c->body);
+                m.events = oc_slice_str(c->body2);
+                for (const char *q = c->body3 ? c->body3 : ""; *q && m.n_channels < OC_OUTWH_MAX_CHANNELS; ) {
+                    char *end = NULL;
+                    unsigned long long v = strtoull(q, &end, 10);
+                    if (end == q) break;
+                    if (v) m.channels[m.n_channels++] = (uint64_t)v;
+                    q = end;
+                    while (*q == ' ') q++;
+                }
+                if (oc_encode_create_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_OUTWH || c->type == OC_CMD_SET_OUTWH || c->type == OC_CMD_DELETE_OUTWH) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_result er;
+                if (c->type == OC_CMD_LIST_OUTWH) {
+                    er = oc_encode_list_outgoing_webhooks(&w, OC_PROTOCOL_VERSION);
+                } else if (c->type == OC_CMD_SET_OUTWH) {
+                    oc_set_outgoing_webhook m = { c->message_id, (uint8_t)(c->channel_id ? 1 : 0) };
+                    er = oc_encode_set_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m);
+                } else {
+                    oc_delete_outgoing_webhook m = { c->message_id };
+                    er = oc_encode_delete_outgoing_webhook(&w, OC_PROTOCOL_VERSION, &m);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_LIST_WEBHOOKS) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_webhooks lw = { c->channel_id };
@@ -4416,8 +4777,9 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+                c->type == OC_CMD_FETCH_PREVIEW ||
                 (c->type == OC_CMD_POST_FILES && c->n_paths) ||
-                (c->type == OC_CMD_DOWNLOAD && c->body) ||
+                (c->type == OC_CMD_DOWNLOAD && c->body) || (c->type == OC_CMD_EXPORT && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2) ||
                 (c->type == OC_CMD_POST_SNIPPET && c->blob && c->blob_len)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */

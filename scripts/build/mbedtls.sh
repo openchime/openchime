@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the committed mbedTLS (static libs) from third_party/mbedtls -- the
-# release tarball as upstream published it, committed (docs/VENDORS.md §1) --
+# release tarball as upstream published it, committed (docs/details/VENDORS.md §1) --
 # into third_party/mbedtls-<version>[-arch]. Nothing is downloaded.
 #
 #   scripts/build/mbedtls.sh            the native libraries
@@ -15,7 +15,7 @@
 # tree is only read. The copy under third_party/ is gitignored; this script
 # reproduces it.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

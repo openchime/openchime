@@ -1,6 +1,6 @@
 /*
  * OpenChime — sttkit: voice input's recognizer, in plain C (ARCH-112,
- * docs/STTKIT.md).
+ * docs/details/STTKIT.md).
  *
  * Takes one utterance of 16 kHz mono audio and returns its words. The model is
  * one file, recognizer.bin, used where it lies (mapped, or bytes the caller has

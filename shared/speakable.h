@@ -1,6 +1,6 @@
 /*
  * OpenChime — a message as it is read aloud (REQ-291–295, ARCH-111,
- * docs/READ-ALOUD.md §3).
+ * docs/details/READ-ALOUD.md §3).
  *
  * Synthesis turns text into sound; this decides WHICH text. It is the layer the
  * feature works or fails on: a raw body read verbatim says "asterisk" and spells

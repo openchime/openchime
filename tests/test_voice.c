@@ -1,5 +1,5 @@
 /* Tests for voice input's client half that need no daemon (ARCH-112,
- * docs/VOICE-INPUT.md §3-§4, docs/AUDIO.md §6.4):
+ * docs/details/VOICE-INPUT.md §3-§4, docs/details/AUDIO.md §6.4):
  *
  *   - the segmenter, over synthetic voiced sound (a harmonic complex with a
  *     syllable-rate envelope, which libfvad classifies as speech) and quiet:

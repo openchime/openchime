@@ -51,6 +51,39 @@ SUM_DEPS  := $(SUMKIT_HDRS)
 SUM_FLAGS := -DOC_SUM
 endif
 
+# --- The export of a video message (ARCH-135) ---------------------------------
+# The codecs a copy is made with: libvpx and libopus to decode the VP9 and Opus
+# the clients record, libavc and LAME to encode H.264 and MP3, all C and all
+# built here. The render, the worker and the frames are plain C in DAEMON_SRC,
+# so `make test` drives them with a stub; only the engine is EXPORT's.
+# Without EXPORT the daemon refuses every export, whatever OPENCHIME_H264_EXPORT says.
+# The test binary links the engine whatever EXPORT is, for the export_media
+# suite; it is the only one that asks for it (oc_export_codecs_real).
+EXPORT_TEST_SRC  := daemon/export_engine.c
+EXPORT_TEST_INC  := -I$(LIBAVC_DIR)/include -I$(LAME_DIR)/include
+EXPORT_TEST_LIBS := $(LIBAVC_A) $(LAME_A)
+ifeq ($(EXPORT),1)
+EXPORT_SRC   := daemon/export_engine.c $(CODEC_DEC_SRC)
+EXPORT_DEPS  := $(LIBAVC_A) $(LAME_A) $(LIBVPX_A) $(OPUS_A)
+EXPORT_FLAGS := -DOC_EXPORT -I$(LIBAVC_DIR)/include -I$(LAME_DIR)/include -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
+EXPORT_LIBS  := $(LIBAVC_A) $(LAME_A) $(LIBVPX_A) $(if $(filter 1,$(TTS)),,$(OPUS_A))
+endif
+
+# The codecs a call's recording is made with (CALLS.md §8): libvpx and libopus,
+# to decode what the Recorder spooled and encode the one recording. The render,
+# the worker and the Recorder are plain C in DAEMON_SRC, so `make test` drives
+# them with a stub; only the engine is CALLREC's. Without CALLREC nobody records
+# a call here (no call-recording in CAPABILITIES), whatever
+# OPENCHIME_CALL_RECORDING says. The test binary links the engine whatever
+# CALLREC is, for the callrec_media suite (oc_callrec_codecs_real).
+CALLREC_TEST_SRC := daemon/callrec_engine.c
+ifeq ($(CALLREC),1)
+CALLREC_SRC   := daemon/callrec_engine.c client/core/media/vp9.c client/core/media/opus.c $(CODEC_DEC_SRC)
+CALLREC_DEPS  := $(LIBVPX_A) $(OPUS_A)
+CALLREC_FLAGS := -DOC_CALLREC -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
+CALLREC_LIBS  := $(if $(filter 1,$(EXPORT)),,$(LIBVPX_A)) $(if $(filter 1,$(TTS) $(EXPORT)),,$(OPUS_A))
+endif
+
 # sumkit and the converter that writes its file are in every build, as the
 # other models' converters are: `openchimed --summary-pack` makes summary.bin
 # whether or not the engine runs it here. nnkit comes with read-aloud or voice
@@ -66,13 +99,13 @@ SUMKIT_DAEMON_SRC := $(SUMKIT_SRC) $(if $(filter 1,$(TTS) $(STT)),,$(NNKIT_SRC))
 # the two models' data files are written in their formats (--voice-pack,
 # daemon/voice_pack.c; --recognizer-pack, daemon/recognizer_pack.c) whether or
 # not read-aloud or voice input is compiled in.
-DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS)
-DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC))
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS)))
+DAEMON_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(PREVIEW_INC) $(CALL_INC) $(SQLITE_INC) $(TTSKIT_INC) $(STTKIT_INC) $(SUMKIT_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) $(EXPORT_FLAGS) $(CALLREC_FLAGS)
+DAEMON_OBJS := $(call oc_objs,$(OBJ_DIR)/daemon,$(sort $(SRC) $(TTS_SRC) $(STT_SRC) $(SUMKIT_DAEMON_SRC) $(SUM_SRC) $(EXPORT_SRC) $(CALLREC_SRC)))
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/daemon,DAEMON_CC,$(CC_STAMP) $(FEATURES_STAMP) $(BUILD_ID_STAMP),$(MBEDTLS_A) $(PREVIEW_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS)))
 -include $(DAEMON_OBJS:.o=.d)
-$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
+$(BIN): $(DAEMON_OBJS) $(MBEDTLS_A) $(PREVIEW_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(EXPORT_DEPS) $(CALLREC_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(TTS_LIBS) $(EXPORT_LIBS) $(CALLREC_LIBS) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever
@@ -95,7 +128,7 @@ else ifneq ($(MANIFEST_HOST_BIN),)
 # MANIFEST_HOST_BIN: a daemon already built for this machine, which writes the
 # manifests instead of a host daemon built for the purpose. The
 # release-candidate's arm64 step passes the amd64 release binary it built
-# moments before (docs/CONTRIBUTING.md, "Billed minutes": nothing built twice).
+# moments before (docs/details/CONTRIBUTING.md, "Billed minutes": nothing built twice).
 MANIFEST_BIN := $(MANIFEST_HOST_BIN)
 else
 MANIFEST_DIR := build/manifest-host

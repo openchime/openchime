@@ -1,4 +1,4 @@
-/* Message formatting (REQ-220, ARCH-100) — see richtext.h and docs/MARKDOWN.md.
+/* Message formatting (REQ-220, ARCH-100) — see richtext.h and docs/details/MARKDOWN.md.
  *
  * Three passes, outermost first, because each one suppresses the next:
  *   oc_rt_scan   splits the body around fenced code blocks (the only construct

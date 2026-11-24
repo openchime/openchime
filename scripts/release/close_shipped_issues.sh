@@ -64,7 +64,7 @@ fi
 
 oc_repo="${ISSUES_REPO:-openchime/openchime}"
 token="${GH_TOKEN:-}"
-# The workflow labels (docs/CONTRIBUTING.md), parked among them; type labels stay.
+# The workflow labels (docs/details/CONTRIBUTING.md), parked among them; type labels stay.
 workflow_labels='in-review|pending-deployment|in-progress|ready|needs-grooming|parked'
 
 echo "closing issues shipped in $what ($(printf '%s\n' "$issues" | wc -l) issues)"

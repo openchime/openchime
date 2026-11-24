@@ -1,4 +1,4 @@
-/* Tests for sumkit, the summary inference engine (sumkit/, docs/SUMKIT.md),
+/* Tests for sumkit, the summary inference engine (sumkit/, docs/details/SUMKIT.md),
  * and the converter that makes its file (daemon/summary_pack.c): a small model
  * of the family, written as Qwen publishes one (sumkit_fixture.h), converted,
  * mapped and checked; the files the converter and sumkit must refuse. */

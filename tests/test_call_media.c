@@ -1,4 +1,4 @@
-/* Tests for the call's media pieces that need no network or device (docs/CALLS.md
+/* Tests for the call's media pieces that need no network or device (docs/details/CALLS.md
  * §3): the jitter buffer against a simulated network -- steady, jittery,
  * reordered, lossy, bursty, duplicated, silent between talk spurts -- and Opus
  * at 16 kHz with FEC, concealment and DTX. */

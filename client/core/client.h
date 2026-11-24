@@ -574,14 +574,33 @@ void oc_client_voice_preview(oc_client *c, const char *voice_id);
 uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
                             const int16_t *pcm, size_t samples);
 
-/* Calls (REQ-150, REQ-301-305, docs/CALLS.md). Start a call in a conversation,
- * inviting `invite` (the members, up to the cap, or the starter's pick); join the
- * call already there; leave it; decline an invitation; end it for everyone (the
- * starter only); invite more people. The daemon's answers fold into the model:
- * `calls` for the Calls section, `call` / `in_call` for the one this client is
- * in, `call_error` for a refusal. */
-void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n);
-void oc_client_call_join(oc_client *c, uint64_t channel_id);
+/* Calls (REQ-150, REQ-301-305, docs/details/CALLS.md §1). Start a call with a subject,
+ * inviting `invite`, from the conversation `from_channel` (0 for none: that
+ * conversation gets one message about the call); join a call this user is
+ * invited to; leave it; decline an invitation; end it for everyone (the
+ * starter only); invite more people; rename it. The daemon's answers fold into
+ * the model: `calls` for Calls home, `call` / `in_call` for the one this client
+ * is in, `call_error` for a refusal. */
+void oc_client_call_start(oc_client *c, uint64_t from_channel, const char *subject,
+                          const uint64_t *invite, int n);
+void oc_client_call_join(oc_client *c, uint64_t call_id);
+void oc_client_call_subject(oc_client *c, uint64_t call_id, const char *subject);
+/* Start (on) or stop recording the call (CALLS.md §8), where the daemon
+ * offers it; the model's `call.recording` follows CALL_STATE. */
+void oc_client_call_record(oc_client *c, uint64_t call_id, int on);
+/* The call history (CALLS.md §1): a page of this user's calls started before
+ * `before_ms`, 0 from the newest, into the model's `call_hist`. */
+void oc_client_call_history(oc_client *c, uint64_t before_ms);
+/* The user has seen their missed calls (the Calls panel opened): the model's
+ * `call_missed` is cleared, and none started before `seen_ms` is counted again.
+ * The frontend keeps `seen_ms` across runs and passes it after signing in. */
+void oc_client_calls_seen(oc_client *c, uint64_t seen_ms);
+/* A call's page into the model's `call_page`, its transcript from line
+ * `line_from` (0 the page afresh; the held count to have the next lines). */
+void oc_client_call_detail(oc_client *c, uint64_t call_id, uint32_t line_from);
+/* An admin deletes a call's transcript (`what` OC_CALL_DEL_TRANSCRIPT) or its
+ * recording `rec_id` (OC_CALL_DEL_RECORDING). */
+void oc_client_call_delete(oc_client *c, uint64_t call_id, uint8_t what, uint64_t rec_id);
 
 /* Encrypted DMs (PRIVATE-DM.md, client/core/pdm.h), opened with
  * oc_client_open_dm(.., 1). What comes of each session is told as OC_EV_PDM and
@@ -592,21 +611,21 @@ void oc_client_pdm_accept(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_decline(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_close(oc_client *c, uint64_t pdm_id);
 void oc_client_pdm_trust(oc_client *c, uint64_t pdm_id);
-void oc_client_call_leave(oc_client *c, uint64_t channel_id);
-void oc_client_call_decline(oc_client *c, uint64_t channel_id);
-void oc_client_call_end(oc_client *c, uint64_t channel_id);
-void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n);
+void oc_client_call_leave(oc_client *c, uint64_t call_id);
+void oc_client_call_decline(oc_client *c, uint64_t call_id);
+void oc_client_call_end(oc_client *c, uint64_t call_id);
+void oc_client_call_invite(oc_client *c, uint64_t call_id, const uint64_t *uids, int n);
 /* Start (on) or stop sharing a screen in the call this client is in (REQ-161).
  * The daemon's CALL_STATE names the sharer; the media engine sends once it is
  * this device. */
-void oc_client_call_share(oc_client *c, uint64_t channel_id, int on);
+void oc_client_call_share(oc_client *c, uint64_t call_id, int on);
 /* Turn this device's camera on or off in the call (REQ-160). The roster marks
  * whose cameras are on (oc_call_view.camera); the media engine sends once it
  * marks this device's. */
-void oc_client_call_camera(oc_client *c, uint64_t channel_id, int on);
+void oc_client_call_camera(oc_client *c, uint64_t call_id, int on);
 /* Whose cameras the relay sends this client: every one (`all`), or the `n`
  * users named -- what the call view shows (REQ-160). */
-void oc_client_call_video_sub(oc_client *c, uint64_t channel_id, int all, const uint64_t *users, int n);
+void oc_client_call_video_sub(oc_client *c, uint64_t call_id, int all, const uint64_t *users, int n);
 /* Where the audio goes (callsig.h): a frontend that does calls plugs in its
  * media engine before offering them. NULL removes it; on return nothing is
  * calling into the old one. */
@@ -640,12 +659,65 @@ typedef struct {
 uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               const oc_post_item *items, size_t n_items, const char *text);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
+/* Save the playable copy of video message `attachment_id` -- H.264 and MP3,
+ * made by the daemon (ARCH-135) -- to `dest_path`. Queued as a download is,
+ * tagged OC_EXPORT_TAG(attachment_id); its progress and outcome arrive as
+ * OC_EV_XFER, a refusal's notice saying OC_EXPORT_UNAVAILABLE_TEXT.
+ * Offer it only when oc_model_export_available says so. */
+void oc_client_export(oc_client *c, uint64_t attachment_id, const char *dest_path);
+/* The name a saved copy is offered under: the video's own with "-compatible"
+ * before ".mp4" ("clip.mp4" -> "clip-compatible.mp4"; a name without ".mp4"
+ * gains the whole suffix). */
+void oc_export_copy_name(const char *video_name, char *out, size_t cap);
 
 /* Fetch an attachment INTO MEMORY: the bytes arrive as an
  * OC_EV_ATTACHMENT_DATA the frontend consumes, with no file written anywhere
  * (ARCH-88). For inline images; anything over the core's inline cap is dropped
  * rather than buffered, so a caller should fall back to a real download. */
 void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
+
+/* Fetch an image attachment for showing at a size (ARCH-137): the daemon's
+ * preview at `rung` -- OC_PREVIEW_RUNG_INLINE_WIRE for the timeline,
+ * OC_PREVIEW_RUNG_EXPANDED_WIRE for the image viewer -- into memory, as
+ * oc_client_fetch_attachment does. When the daemon has none at that rung (a
+ * small image, a GIF, one never previewed or one whose preview was reclaimed)
+ * the core fetches the original instead, quietly; either way the bytes arrive
+ * as OC_EV_ATTACHMENT_DATA with op = `rung`, and are taken with
+ * oc_model_take_image. */
+void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung);
+
+/* Agents and their tokens (docs/details/MCP.md §3.1, §6): an owner's or an
+ * admin's. `scopes` is catalog names (shared/scopes.h) separated by single
+ * spaces. A minted token arrives once, held in the model until
+ * oc_model_take_agent_token; a token list replaces the model's `atokens`. An
+ * agent is put in a channel with oc_client_channel_invite, as a person is. */
+void oc_client_create_agent(oc_client *c, const char *name, const char *token_name, const char *scopes);
+void oc_client_mint_agent_token(oc_client *c, uint64_t agent_id, const char *name, const char *scopes);
+void oc_client_remove_agent(oc_client *c, uint64_t agent_id);
+void oc_client_list_agent_tokens(oc_client *c, uint64_t agent_id);
+void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t token_id);
+
+/* A person's own AI clients (docs/details/AUTH.md §8.13). The code an
+ * authorize page shows is looked up (the model's `conn_req` then names the
+ * client and where it returns) and approved, with a lifetime of 0 (never), 30,
+ * 90 or 365 days, or declined. The connections in force are listed -- one's
+ * own, or with `everyone` all of them, an owner's or admin's -- into the
+ * model's `my_conns` or `all_conns`, and revoked from either. */
+void oc_client_connection_code(oc_client *c, const char *code);
+void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days);
+void oc_client_list_connections(oc_client *c, int everyone);
+void oc_client_revoke_connection(oc_client *c, uint64_t connection_id, int everyone);
+/* Outgoing webhooks (docs/details/WEBHOOKS.md): an owner's or an admin's.
+ * `events` is event names separated by single spaces; `channels` the named
+ * channels it watches (none: it is sent user_change alone). The daemon checks
+ * the address answers before saving it; the secret arrives once, held in the
+ * model until oc_model_take_outwh_secret. Each change answers with the list,
+ * which replaces the model's `outwhs`. */
+void oc_client_create_outgoing_webhook(oc_client *c, const char *url, const char *events,
+                                       const uint64_t *channels, size_t n_channels);
+void oc_client_list_outgoing_webhooks(oc_client *c);
+void oc_client_set_outgoing_webhook(oc_client *c, uint64_t webhook_id, int enabled);
+void oc_client_delete_outgoing_webhook(oc_client *c, uint64_t webhook_id);
 
 /* Transfers wait their turn in a queue rather than being refused while another
  * runs; each carries a tag that its OC_EV_XFER progress and completion events

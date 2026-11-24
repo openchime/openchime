@@ -1,5 +1,5 @@
 /* Shared types for recorded video messages (REQ-162–166, ARCH-110,
- * docs/VIDEO-MESSAGES.md): the one frame format every capture backend delivers,
+ * docs/details/VIDEO-MESSAGES.md): the one frame format every capture backend delivers,
  * the one clock video and audio are stamped with, and the conversions between
  * the frame format and what cameras and screens actually use.
  *
@@ -12,12 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct {
-    int      width, height;      /* even, > 0 */
-    int64_t  pts_us;             /* oc_media_clock_us() when captured */
-    uint8_t *plane[3];           /* Y, U, V */
-    int      stride[3];          /* bytes per row, >= plane width */
-} oc_frame;
+#include "oc_frame.h"   /* the frame itself, shared with the daemon's export */
 
 /* A monotonic clock in microseconds. Video frames and microphone buffers are
  * stamped from it, so neither device's own timestamps have to be trusted. */

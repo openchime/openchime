@@ -99,6 +99,7 @@ typedef struct {
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
+    char     via[104];        /* the AI client it was posted through, "" for none (AUTH.md §8.13) */
     uint64_t author_id;
     uint64_t message_id;
     uint64_t server_time;
@@ -149,6 +150,9 @@ typedef struct {
      * who marked each done, as the daemon last said. A frontend shows it in
      * place of the "/todo" body. */
     oc_todo_view   *todo;
+    /* A call's message in the conversation it was started from (CALLS.md §1):
+     * the call. 0 for any other, and for a missed call stored before. */
+    uint64_t        call_id;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -222,6 +226,9 @@ typedef struct {
      * texts are wiped from memory when it is forgotten, which also takes it out
      * of the sidebar. */
     uint8_t  e2e, forgotten;
+    /* A call's own chat (CALLS.md §1): the call's id. In no conversation list;
+     * reached from the call's view and its page. */
+    uint64_t call_id;
     uint32_t info_seq;     /* bumped by every CHANNEL_INFO for it: a roster on screen
                             * asks again when it moves, since an invite or a removal
                             * is answered with one and nothing else says so */
@@ -320,7 +327,36 @@ typedef struct {
      * (oc_model_ooo_active), so it goes at its end with nothing sent. */
     uint64_t ooo_start, ooo_end;
     char     ooo_message[OC_OOO_MESSAGE_MAX + 1];
+    /* An agent (USER_LIST's OC_USER_AGENT): not a person; every surface that
+     * names it tags it, and none shows its presence, status or local time. */
+    uint8_t  agent;
 } oc_member;
+
+/* One token of an agent, as member administration lists it: never the token. */
+typedef struct {
+    uint64_t id, created_by, created_at, last_used_at;
+    char     name[64];
+    char     scopes[512];
+    char     last_from[64];
+} oc_agent_token_row;
+
+/* One AI-client connection (AUTH.md §8.13), as a list shows it: never a token. */
+typedef struct {
+    uint64_t id, user_id, created_at, last_used_at, expires_at;   /* expires 0: never */
+    uint32_t lifetime_days;
+    char     user_name[64];
+    char     client_name[104];
+} oc_conn_view;
+/* One outgoing webhook, as Admin lists it: never its secret. */
+typedef struct {
+    uint64_t id, created_by, created_at;
+    char     url[512];
+    char     events[256];
+    char     reason[160];     /* why it was turned off, when the daemon did */
+    uint8_t  enabled;
+    uint16_t n_channels;
+    uint64_t channels[OC_OUTWH_MAX_CHANNELS];
+} oc_outwh_view;
 
 /* A workspace's own profile field, and one person's value for one. */
 typedef struct { uint64_t id; uint8_t kind; uint16_t position;
@@ -758,6 +794,36 @@ typedef struct {
     oc_webhook_view *webhooks;
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
+    /* Agents (docs/details/MCP.md §3.1): the token just minted, held until a
+     * frontend takes it (oc_model_take_agent_token), and the agent whose token
+     * list is held. */
+    char      agent_token[96];
+    char      agent_token_scopes[512];
+    uint64_t  agent_token_agent, agent_token_id;
+    uint64_t  atokens_agent;
+    oc_agent_token_row atokens[OC_AGENT_TOKEN_LIST_MAX];
+    uint8_t   n_atokens;
+    /* A person's AI clients (AUTH.md §8.13): what the code they entered names
+     * (conn_req_open until they approve or decline, and the code, client and
+     * return address); the last decision (conn_decided, 1 approved, 2
+     * declined, 0 none yet) and its client; and the connections listed, one's
+     * own and, for an owner or admin, everyone's. Heap. */
+    uint8_t   conn_req_open;
+    char      conn_req_code[16];
+    char      conn_req_client[104];
+    char      conn_req_return[520];
+    uint8_t   conn_decided;
+    char      conn_decided_client[104];
+    oc_conn_view *my_conns, *all_conns;
+    size_t    n_my_conns, n_all_conns;
+    uint8_t   all_conns_known;
+    /* Outgoing webhooks (docs/details/WEBHOOKS.md): the list, once asked for
+     * (`outwhs_have`), and a new one's secret, held until a frontend takes it
+     * (oc_model_take_outwh_secret). */
+    oc_outwh_view outwhs[OC_OUTWH_LIST_MAX];
+    uint8_t   n_outwhs, outwhs_have;
+    char      outwh_secret[64];
+    uint64_t  outwh_secret_id;
     /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
     uint64_t  reset_user_id;
     char      reset_token[80];
@@ -816,7 +882,7 @@ typedef struct {
      * accumulates if nobody asks. */
     /* A few, not one: transfers queue now, so a thumbnail and a video can both
      * land between two frames, and the second must not free the first. */
-    struct { uint64_t id; uint8_t *data; size_t len; } fetched[8];
+    struct { uint64_t id; uint8_t *data; size_t len; uint8_t rung; } fetched[8];
     uint8_t  n_fetched;
     /* The transfer running now (0 tag = none), for a progress bar or ring. */
     uint64_t xfer_tag, xfer_done, xfer_total;
@@ -890,24 +956,48 @@ typedef struct {
         uint32_t total_seq;
     } unresolved;
 
-    /* Calls (REQ-150, REQ-301-305, CALLS.md). `calls` is the Calls section: every
-     * call in a conversation this user belongs to or is invited to, as CALL_STATE
-     * last said, ended ones removed; the daemon sends them all again after a
-     * reconnect. `call` is the one this client is in, while `in_call`, with each
-     * participant's slot. `call_pending` is a start or join on its way. */
+    /* Calls (REQ-150, REQ-301-305, CALLS.md §1). `calls` is Calls home's
+     * running calls: every call this user is invited to, as CALL_STATE last
+     * said, ended ones removed; the daemon sends them all again after a
+     * reconnect. `call` is the one this client is in, while `in_call`, with
+     * each participant's slot. `call_pending` is set while a start or join is
+     * on its way. */
     oc_call_view calls[OC_MAX_CALLS_LISTED];
     size_t       n_calls;
     uint8_t      call_max;              /* the daemon's cap on a call (REQ-305) */
     uint64_t     max_video_size;        /* the daemon's cap on a video message (REQ-164); 0 until WORKSPACE_INFO */
     uint8_t      in_call;
     oc_call_view call;
-    uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */
-    /* Getting back into the call in this channel (0 = not), after the
+    uint8_t      call_pending;          /* a start or join on its way */
+    /* Getting back into this call (0 = not), after the
      * connection or the media path went (PROTOCOL.md §5.17); `call` still says
      * what it was. `call_back_seq` bumps when that succeeds, `call_lost_seq`
      * when it is given up -- each once, for a frontend to say so. */
     uint64_t     call_rejoining;
     uint32_t     call_back_seq, call_lost_seq;
+    /* The call history (CALLS.md §1): the pages fetched so far, newest first
+     * (heap, `n_call_hist` of them); `call_hist_more` while older ones are
+     * there to ask for (oc_client_call_history with the oldest's start).
+     * `call_hist_seq` bumps per page. */
+    oc_call_hist_view *call_hist;
+    size_t             n_call_hist;
+    uint8_t            call_hist_more, call_hist_loaded;
+    uint32_t           call_hist_seq;
+    /* The call page last fetched (heap, NULL none): its transcript's lines
+     * gathered page by page as oc_client_call_detail asks from the next.
+     * `call_page_seq` bumps per page and per delete. */
+    oc_call_page_view *call_page;
+    uint32_t           call_page_seq;
+    /* Missed calls not yet seen (CALLS.md §2): calls this user was asked to,
+     * neither joined nor declined, and over -- from CALL_STATE as they end, and
+     * from history rows newer than `call_missed_seen_ms`. The sidebar marks
+     * them; oc_client_calls_seen clears them. `call_joined` remembers the calls
+     * this user has been in, so a call they took is not counted. */
+    uint64_t           call_missed[OC_MAX_CALLS_LISTED];
+    size_t             n_call_missed;
+    uint64_t           call_missed_seen_ms;
+    uint64_t           call_joined[OC_MAX_CALLS_LISTED];
+    size_t             n_call_joined;
     /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
      * error line's does. */
     uint16_t     call_error;
@@ -1214,6 +1304,19 @@ uint64_t oc_model_now_ms(void);
 /* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
+/* The same, with the preview rung the bytes were asked for at (ARCH-137;
+ * oc_client_fetch_image): 0 for a fetch of the original. */
+uint8_t *oc_model_take_image(oc_model *m, uint64_t *attachment_id, size_t *len, uint8_t *rung);
+
+/* Whether `user_id` is an agent (USER_LIST's OC_USER_AGENT). */
+int oc_model_user_is_agent(const oc_model *m, uint64_t user_id);
+/* The token just minted, copied to `out` (with its agent, id and scopes when
+ * asked) and forgotten: it is shown once. 1 when there was one, else 0. */
+/* A new outgoing webhook's secret, once: 1 with it in `out` (and the webhook's
+ * id), the model's copy wiped; 0 when there is none. */
+int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id);
+int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
+                              char *scopes, size_t scopes_cap);
 
 /* What a message says in a one-line summary — a sidebar row, a toast, the
  * activity feed: its text, or for a message that is only a file, what the file
@@ -1231,6 +1334,9 @@ void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
 /* A workspace setting by key ("default_channels"), as the daemon told it,
  * into `out`; returns 1, or 0 (and "") when the daemon did not tell it. */
 int oc_model_workspace_setting(const oc_model *m, const char *key, char *out, size_t cap);
+/* Whether the workspace lets people connect their own AI clients
+ * (OPENCHIME_MCP_CONNECTIONS, read-only): on unless it says off. */
+int oc_model_connections_on(const oc_model *m);
 /* Whether this person may add a custom emoji (REQ-072): the workspace's
  * `custom_emoji_add`, everyone by default, or only owners and admins. */
 int oc_model_may_add_emoji(const oc_model *m);
@@ -1373,8 +1479,14 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
  * table (the oldest go first, finished ones before any still running). */
 const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);
 
-/* Calls (REQ-301-305). The Calls section's entry for a conversation, or NULL. */
-const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id);
+/* Calls (REQ-301-305, CALLS.md §1). A running call this user is invited to,
+ * by its id, or NULL; and the one started from conversation `channel_id`, or
+ * NULL -- what that conversation's call button joins rather than starts. */
+const oc_call_view *oc_model_call(const oc_model *m, uint64_t call_id);
+/* The missed calls are seen: cleared, and none older than `seen_ms` counted
+ * again (CALLS.md §2). */
+void oc_model_calls_seen(oc_model *m, uint64_t seen_ms);
+const oc_call_view *oc_model_call_from(const oc_model *m, uint64_t channel_id);
 /* Is `user_id` invited to `v` and not yet in it? */
 int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);
 /* Drain the invitations worth a toast: each is a mention of this user, so a
@@ -1482,6 +1594,9 @@ const oc_poll_view *oc_model_poll(const oc_model *m, uint64_t channel_id, uint64
 const oc_todo_view *oc_model_todo(const oc_model *m, uint64_t channel_id, uint64_t message_id);
 /* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
+/* The export of a video message is offered: the "h264-export" capability
+ * (ARCH-135). A frontend offers Save compatible copy only then. */
+uint8_t         oc_model_export_available(const oc_model *m);
 /* Voice input is offered on this connection (the "stt" capability). */
 uint8_t         oc_model_stt_available(const oc_model *m);
 /* The daemon offers calls: its relay is up (REQ-150). */

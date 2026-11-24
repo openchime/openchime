@@ -1,6 +1,6 @@
 # The summary model's references, from its unquantised weights: made once,
 # before the engine they were made with was withdrawn; they cannot be made
-# again, and these files are the reference (docs/SUMKIT.md §6).
+# again, and these files are the reference (docs/details/SUMKIT.md §6).
 # Per prompt <name>: <name>.system, .user, .grammar, the prompt as
 # daemon/sum_core.c builds it over channels/; <name>.prompt, the templated
 # prompt's token ids, one a line; <name>.steps, a line a step of the answer:
@@ -10,7 +10,7 @@
 # \t, \\ escaped). kl.txt, kl.ids: the held-out text and its tokens.
 # <name> <prompt tokens> <answer steps>, then kl_tokens, kl_chunk, and
 # kl_unsloth_q4_k_m, the KL divergence of the file the previous engine ran,
-# Unsloth's Q4_K_M, from the same unquantised weights (docs/SUMKIT.md §4).
+# Unsloth's Q4_K_M, from the same unquantised weights (docs/details/SUMKIT.md §4).
 p01 1137 32
 p02 1044 32
 p03 143 32

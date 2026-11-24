@@ -1,6 +1,6 @@
 /*
  * OpenChime — read-aloud synthesis built into the daemon (REQ-291–295, ARCH-111,
- * docs/READ-ALOUD.md §4).
+ * docs/details/READ-ALOUD.md §4).
  *
  * The voice engine (tts_render.h). The code is in the binary, the model run by
  * ttskit in plain C; the voice model's data (voice.bin, its voices included) and

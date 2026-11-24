@@ -24,6 +24,13 @@
  * packet to oc_relay_from_tcp, and the relay hands packets for such a
  * participant back through hooks.tcp_send. A participant is on whichever
  * transport its latest packet came by, so one can move either way mid-call.
+ *
+ * A call being recorded (CALLS.md §8) has a Recorder in it, which the net loop
+ * runs: every packet any participant of that call sends is handed to it
+ * through hooks.record, as it would be relayed to a participant who takes
+ * every camera -- still SFrame, which the Recorder opens with the keys sealed
+ * to it -- and what it says back (a NACK, a keyframe request) is put into the
+ * call with oc_relay_inject, as from its own user.
  */
 
 #ifndef OPENCHIME_RELAY_H
@@ -46,6 +53,11 @@ typedef struct {
      * `conn_id`, or to drop if that connection is backed up. */
     void (*tcp_send)(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq, uint8_t stream,
                      const uint8_t *ct, size_t len);
+    /* A packet of a call being recorded (oc_relay_set_recorded): `sender`'s
+     * `seq`, stream and ciphertext, for the Recorder. Never one it injected
+     * itself, nor a keep-alive. NULL: nothing is recorded. */
+    void (*record)(void *ctx, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                   const uint8_t *ct, size_t len);
 } oc_relay_hooks;
 
 /* Relay over an already-bound UDP socket, which the caller keeps and closes.
@@ -80,6 +92,17 @@ int  oc_relay_set_camera(oc_relay *r, uint64_t conn_id, int on);
  * participant or `n` is too many. */
 int  oc_relay_subscribe(oc_relay *r, uint64_t conn_id, int all, const uint64_t *users, int n);
 void oc_relay_revoke(oc_relay *r, const uint8_t *token, size_t len);
+
+/* Call `call_id` is being recorded (1) or no longer (0): while it is, each of
+ * its packets also goes to hooks.record. 0, or -1 when the table is full. */
+int  oc_relay_set_recorded(oc_relay *r, uint64_t call_id, int on);
+
+/* Put a packet into call `call_id` as from user `sender` -- the Recorder's
+ * control packets, on the audio stream -- to each of its participants by its
+ * own transport, as one of theirs would be relayed. Not a camera's, nor
+ * empty. 0, or -1 when there is no such call or the packet is not one to send. */
+int  oc_relay_inject(oc_relay *r, uint64_t call_id, uint64_t sender, uint16_t seq, uint8_t stream,
+                     const uint8_t *ct, size_t len);
 
 /* Relay up to `max_packets` waiting datagrams. 1 if it stopped at that bound
  * (more may be waiting: call again next turn), 0 once the socket is drained. */

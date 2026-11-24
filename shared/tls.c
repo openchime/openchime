@@ -1,5 +1,5 @@
 /*
- * OpenChime TLS wrapper over vendored mbedTLS. See tls.h and docs/TLS.md.
+ * OpenChime TLS wrapper over vendored mbedTLS. See tls.h and docs/details/TLS.md.
  */
 
 #include "tls.h"

@@ -129,6 +129,9 @@ void oc_netloop_set_presence_rate_ms(uint32_t ms);
 void oc_netloop_set_device_ttl_ms(uint64_t ms);
 /* ...and the interval, in seconds, a client is asked to poll at; 0 restores five. */
 void oc_netloop_set_device_interval_s(unsigned s);
+/* A test's knob (AUTH.md §8.13): an AI client's metadata document may be at
+ * http://127.0.0.1 and on a private address, where a test serves one. */
+void oc_netloop_set_oauth_test_documents(int on);
 
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. NULL (the
@@ -142,6 +145,11 @@ void oc_netloop_set_push(struct oc_push *push);
  * reports nothing. May be called while the loop runs. */
 struct oc_invite_mail;
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
+
+/* Wire the outgoing webhooks' delivery worker (webhooks_out.h), before the loop
+ * runs; NULL (the default) delivers nothing and refuses creations. */
+struct oc_webhooks_out;
+void oc_netloop_set_webhooks_out(struct oc_webhooks_out *o);
 
 /* The enrollment the address proof signs with (AUTH.md §3.6): set once the
  * binding is active, after which POST /enroll-proof answers central's check of
@@ -167,6 +175,21 @@ void oc_netloop_set_unfurler(struct oc_unfurler *u);
  * oc_netloop_run; NULL (the default, and a daemon built with TTS=0) means the
  * daemon advertises no read-aloud and answers AUDIO_GET with TTS_UNAVAILABLE. */
 struct oc_tts_engine;
+/* The export of a video message (ARCH-135): the codecs a daemon built with
+ * EXPORT=1 carries (oc_export_codecs_builtin), or a test's stub, or NULL. The
+ * worker runs only when OPENCHIME_H264_EXPORT is on as well. */
+struct oc_export_codecs;
+void oc_netloop_set_export(const struct oc_export_codecs *codecs);
+/* The engine that makes a call's recording from its spool (CALLS.md §8),
+ * when the daemon carries one (CALLREC=1); NULL, the default: calls are not
+ * recorded here, and CAPABILITIES names no call-recording. Set before the loop
+ * runs; a test that sets it later has the worker started by the first
+ * recording that stops. */
+struct oc_callrec_codecs;
+void oc_netloop_set_callrec(const struct oc_callrec_codecs *codecs);
+/* Tests: hold the recordings' worker (1) so a spool can be read before it is
+ * made into the recording, and let it go (0). */
+void oc_netloop_hold_callrec(int on);
 void oc_netloop_set_tts(const struct oc_tts_engine *engine);
 
 /* Wire voice input's recognizer (REQ-296-300, ARCH-112). The daemon passes the

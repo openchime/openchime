@@ -20,7 +20,7 @@ podman run --rm rockylinux:9 bash -euo pipefail -c "
   sed -i 's|${DIST_BASE_URL}|${DIST_VERIFY_URL}|g' /etc/yum.repos.d/openchime.repo
   # Only our repository: the package needs nothing beyond glibc and a shell,
   # which the image has, so the distribution's metadata (some 78 MB) is not
-  # fetched for it (docs/CONTRIBUTING.md, \"Billed minutes\").
+  # fetched for it (docs/details/CONTRIBUTING.md, \"Billed minutes\").
   dnf install -y --disablerepo='*' --enablerepo=openchime openchimed
   openchimed --version
 "

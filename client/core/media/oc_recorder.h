@@ -1,4 +1,4 @@
-/* Recording a video message (REQ-162, ARCH-110, docs/VIDEO-MESSAGES.md §4): a
+/* Recording a video message (REQ-162, ARCH-110, docs/details/VIDEO-MESSAGES.md §4): a
  * camera -- or a screen or window, with the camera in a box -- and a microphone
  * and the computer's sound in, a VP9 + Opus MP4 and a JPEG poster out, both in
  * memory, since a client writes no files (ARCH-88).

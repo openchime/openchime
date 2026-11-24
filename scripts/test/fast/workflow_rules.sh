@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The workflows keep the billed-minutes rules a reader cannot be trusted to
-# remember (docs/CONTRIBUTING.md, "Billed minutes"):
+# remember (docs/details/CONTRIBUTING.md, "Billed minutes"):
 #   - every job has timeout-minutes, so a hang bills a bounded time;
 #   - every step that reaches the network has its own timeout-minutes, so one
 #     stalled call does not hold the job to its limit;

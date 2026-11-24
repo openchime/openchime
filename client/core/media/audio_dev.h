@@ -1,4 +1,4 @@
-/* The audio device layer (ARCH-110, docs/AUDIO.md §3.2, docs/VIDEO-MESSAGES.md
+/* The audio device layer (ARCH-110, docs/details/AUDIO.md §3.2, docs/details/VIDEO-MESSAGES.md
  * §3.3): device lists, capture and playback over miniaudio, with a lock-free
  * single-producer ring between each device callback and the media thread that
  * reads or writes it. The callbacks never allocate, lock or do I/O.
@@ -77,7 +77,7 @@ void oc_audio_playback_flush(oc_audio_dev *d);
 /* Output gain 0..1 (mute is 0). */
 void oc_audio_playback_volume(oc_audio_dev *d, float gain);
 
-/* The far-end reference (docs/AUDIO.md §3.3, §6): everything every open playback
+/* The far-end reference (docs/details/AUDIO.md §3.3, §6): everything every open playback
  * device has handed out, mixed to mono and resampled to 16 kHz, on the media
  * clock. Writes the `n` samples that were played from `start_us` onward into
  * `out` (silence where nothing was), for an echo canceller to align with a

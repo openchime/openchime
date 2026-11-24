@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build Microsoft's makemsix (msix-packaging) at a pinned commit into
 # third_party/makemsix-<rev>/ -- the "built from pinned source" vendoring class
-# (docs/VENDORS.md §2): it packs the Windows client's MSIX on Linux
+# (docs/details/VENDORS.md §2): it packs the Windows client's MSIX on Linux
 # (packaging/build-windows.sh), so no Windows machine is in the build.
 #
 # The tagged releases (v1.7, 2019) no longer compile with a current clang

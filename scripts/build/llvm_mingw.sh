@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch the pinned llvm-mingw into third_party/llvm-mingw-<ver>/ -- the
-# "fetched at build" vendoring class (docs/VENDORS.md §2): SHA-256-pinned
+# "fetched at build" vendoring class (docs/details/VENDORS.md §2): SHA-256-pinned
 # tarball, gitignored output, reproduced by this script. It is the Windows
 # toolchain: clang, lld and the LLVM binutils behind the x86_64-w64-mingw32-*
 # names the Windows rules and the cross-build scripts call (gcc, g++, windres,

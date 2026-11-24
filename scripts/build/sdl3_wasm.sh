@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# SDL3 for the web client (docs/WEB.md): the committed tree the Windows build
-# uses too (third_party/SDL3, docs/VENDORS.md §1; scripts/build/sdl3_windows.sh),
+# SDL3 for the web client (docs/details/WEB.md): the committed tree the Windows build
+# uses too (third_party/SDL3, docs/details/VENDORS.md §1; scripts/build/sdl3_windows.sh),
 # built static with Emscripten into build/wasm/sdl3, out of tree, so the
 # committed source is only read. Nothing is downloaded. Run by make
 # (mk/web.mk), which puts the pinned Emscripten on PATH; needs cmake.
 set -euo pipefail
-# One compile at a time (docs/TESTING.md, "One build at a time"): the build below
+# One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
 # reaches it through the environment.
 unset MAKEFLAGS MFLAGS

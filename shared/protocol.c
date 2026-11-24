@@ -1,6 +1,6 @@
 /*
  * OpenChime wire protocol v1 — frame codec implementation.
- * See protocol.h and docs/PROTOCOL.md.
+ * See protocol.h and docs/details/PROTOCOL.md.
  */
 
 #include "protocol.h"
@@ -449,6 +449,8 @@ static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type
     oc_w_u8(w, m->kind);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_u64(w, m->parent_id);               /* a reply also in the channel (REQ-062), else 0 */
+    oc_w_u64(w, m->call_id);                 /* a call message's call (CALLS.md §1), else 0 */
+    oc_w_str(w, m->via);                     /* the AI client it came through (AUTH.md §8.13), else empty */
     oc_w_lstr(w, m->body);
     /* Optional trailing block (REQ-140/170): the attachment list, then an
      * optional author-name override. Both are self-describing — present only
@@ -983,6 +985,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
     oc_w_u8(w, m->participant ? 1u : 0u);
     oc_w_u8(w, m->broadcast_stored ? 1u : 0u);
     oc_w_u8(w, m->also_channel ? 1u : 0u);
+    oc_w_str(w, m->via);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -1662,6 +1665,34 @@ const char *oc_error_text(uint16_t code) {
         return "out of office needs an end after its start, and a message of at most 280 bytes";
     case OC_ERR_EMOJI_ALIAS_LIMIT:
         return "that emoji has kept as many old names as it can: add it again under the new name instead";
+    case OC_ERR_EXPORT_UNAVAILABLE:
+        return "a copy for other players isn't available here right now";
+    case OC_ERR_CALL_SUBJECT:
+        return "a call needs a subject, of at most 200 bytes";
+    case OC_ERR_RECORDING_UNAVAILABLE:
+        return "calls can't be recorded here right now";
+    case OC_ERR_PREVIEW_MISSING:
+        return "this image has no preview: the whole image is shown instead";
+    case OC_ERR_PREVIEW_RUNG:
+        return "that preview size doesn't exist";
+    case OC_ERR_UNKNOWN_SCOPE:
+        return "a token can only be given the kinds of access listed";
+    case OC_ERR_TOO_MANY_TOKENS:
+        return "this agent already has as many tokens as it can hold: revoke one first";
+    case OC_ERR_UNKNOWN_CODE:
+        return "no AI client is waiting on that code: check it, or start again from the client";
+    case OC_ERR_UNKNOWN_CONNECTION:
+        return "that connection is gone";
+    case OC_ERR_BAD_LIFETIME:
+        return "a connection lasts for ever, or 30, 90 or 365 days";
+    case OC_ERR_CONNECTIONS_OFF:
+        return "this workspace does not let people connect AI clients";
+    case OC_ERR_WEBHOOK_URL:
+        return "a webhook's address must start with https://";
+    case OC_ERR_WEBHOOK_EVENT:
+        return "a webhook can only be sent the events listed";
+    case OC_ERR_WEBHOOK_UNVERIFIED:
+        return "that address did not answer the check, so the webhook was not saved";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2227,24 +2258,134 @@ static void r_u64s(oc_rbuf *p, uint16_t *count, uint64_t *v, uint16_t cap) {
     *count = n;
 }
 
-oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {
-    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
-    oc_w_u64(w, m->channel_id);
+oc_result oc_encode_call_start(oc_wbuf *w, uint16_t version, const oc_call_start *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_START);
+    oc_w_u64(w, m->from_channel);
+    oc_w_str(w, m->subject);
     w_raw(w, m->device_key, OC_CALL_DEVICE_KEY_LEN);
     oc_w_u8(w, m->codecs);
     w_u64s(w, m->n_invite, m->invite);
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
+    oc_w_u64(w, m->call_id);
+    w_raw(w, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    oc_w_u8(w, m->codecs);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_record(oc_wbuf *w, uint16_t version, const oc_call_record *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_RECORD);
+    oc_w_u64(w, m->call_id);
+    oc_w_u8(w, m->on);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_history(oc_wbuf *w, uint16_t version, const oc_call_history *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_HISTORY);
+    oc_w_u64(w, m->before_ms);
+    oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_history_page(oc_wbuf *w, uint16_t version, const oc_call_history_page *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_HISTORY_PAGE);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_call_hist_entry *e = &m->entries[i];
+        oc_w_u64(w, e->call_id);
+        oc_w_str(w, e->subject);
+        oc_w_u64(w, e->starter);
+        oc_w_u64(w, e->started_at);
+        oc_w_u64(w, e->ended_at);
+        oc_w_u8(w, e->end_reason);
+        oc_w_u64(w, e->from_channel);
+        oc_w_u64(w, e->chat_channel);
+        oc_w_u16(w, e->n_people);
+        oc_w_u8(w, e->flags);
+        uint8_t nf = e->n_faces <= OC_CALL_HIST_FACES ? e->n_faces : (uint8_t)OC_CALL_HIST_FACES;
+        oc_w_u8(w, nf);
+        for (uint8_t k = 0; k < nf; k++) oc_w_u64(w, e->faces[k]);
+    }
+    oc_w_u8(w, m->more);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_detail(oc_wbuf *w, uint16_t version, const oc_call_detail *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_DETAIL);
+    oc_w_u64(w, m->call_id);
+    oc_w_u32(w, m->line_from);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_page(oc_wbuf *w, uint16_t version, const oc_call_page *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_PAGE);
+    oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
+    oc_w_u64(w, m->starter);
+    oc_w_u64(w, m->started_at);
+    oc_w_u64(w, m->ended_at);
+    oc_w_u8(w, m->end_reason);
+    oc_w_u64(w, m->from_channel);
+    oc_w_u64(w, m->chat_channel);
+    oc_w_u16(w, m->n_stays);
+    for (uint16_t i = 0; i < m->n_stays; i++) {
+        oc_w_u64(w, m->stays[i].user_id); oc_w_u64(w, m->stays[i].joined_at); oc_w_u64(w, m->stays[i].left_at);
+    }
+    oc_w_u16(w, m->n_invitees);
+    for (uint16_t i = 0; i < m->n_invitees; i++) {
+        oc_w_u64(w, m->invitees[i].user_id); oc_w_u64(w, m->invitees[i].invited_by);
+        oc_w_u64(w, m->invitees[i].invited_at); oc_w_u64(w, m->invitees[i].declined_at);
+    }
+    oc_w_u16(w, m->n_events);
+    for (uint16_t i = 0; i < m->n_events; i++) {
+        oc_w_u64(w, m->events[i].at); oc_w_u64(w, m->events[i].user_id);
+        oc_w_u8(w, m->events[i].kind); oc_w_str(w, m->events[i].detail);
+    }
+    oc_w_u16(w, m->n_recordings);
+    for (uint16_t i = 0; i < m->n_recordings; i++) {
+        const oc_call_recording *r = &m->recordings[i];
+        oc_w_u64(w, r->id); oc_w_u8(w, r->state); oc_w_u64(w, r->started_by); oc_w_u64(w, r->started_at);
+        oc_w_u64(w, r->stopped_at); oc_w_u32(w, r->duration_ms); oc_w_u64(w, r->bytes); oc_w_u64(w, r->attachment_id);
+    }
+    oc_w_u8(w, m->has_transcript);
+    oc_w_str(w, m->transcript_lang);
+    oc_w_u32(w, m->n_lines_total);
+    oc_w_u32(w, m->line_from);
+    oc_w_u16(w, m->n_lines);
+    for (uint16_t i = 0; i < m->n_lines; i++) {
+        oc_w_u64(w, m->lines[i].id); oc_w_u64(w, m->lines[i].speaker);
+        oc_w_u32(w, m->lines[i].start_ms); oc_w_u32(w, m->lines[i].end_ms); oc_w_str(w, m->lines[i].text);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_delete(oc_wbuf *w, uint16_t version, uint16_t type, const oc_call_delete *m) {
+    if (type != OC_MSG_CALL_DELETE && type != OC_MSG_CALL_DELETED) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->call_id);
+    oc_w_u8(w, m->what);
+    oc_w_u64(w, m->id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_subject(oc_wbuf *w, uint16_t version, const oc_call_subject *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SUBJECT);
+    oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_LEAVE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOINED);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u16(w, m->udp_port);
     oc_w_bytes(w, m->token);
@@ -2258,7 +2399,6 @@ oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_join
 
 oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_ROSTER);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     w_call_parts(w, m->count, m->parts);
@@ -2267,39 +2407,42 @@ oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_rost
 
 oc_result oc_encode_call_invite(oc_wbuf *w, uint16_t version, const oc_call_invite *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_INVITE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     w_u64s(w, m->count, m->users);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_decline(oc_wbuf *w, uint16_t version, const oc_call_decline *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_DECLINE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_end(oc_wbuf *w, uint16_t version, const oc_call_end *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_END);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_STATE);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
+    oc_w_str(w, m->subject);
     oc_w_u64(w, m->starter);
     oc_w_u64(w, m->started_at);
+    oc_w_u64(w, m->from_channel);
+    oc_w_u64(w, m->chat_channel);
+    oc_w_u8(w, m->flags);
     oc_w_u8(w, m->ended);
     w_u64s(w, m->n_parts, m->parts);
     w_u64s(w, m->n_invited, m->invited);
     oc_w_u64(w, m->sharer);
+    oc_w_u64(w, m->rec_by);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_KEY);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     oc_w_u16(w, m->count);
@@ -2312,7 +2455,6 @@ oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m)
 
 oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_KEY_FOR);
-    oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->call_id);
     oc_w_u32(w, m->epoch);
     oc_w_u64(w, m->sender);
@@ -2360,7 +2502,7 @@ oc_result oc_encode_pdm_end(oc_wbuf *w, uint16_t version, const oc_pdm_end *m) {
 
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SHARE);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->on);
     return oc_frame_end(w, off);
 }
@@ -2384,21 +2526,22 @@ oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_
 
 oc_result oc_encode_call_camera(oc_wbuf *w, uint16_t version, const oc_call_camera *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_CAMERA);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->on);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_call_video_sub(oc_wbuf *w, uint16_t version, const oc_call_video_sub *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_VIDEO_SUB);
-    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
     oc_w_u8(w, m->all);
     w_u64s(w, m->count, m->users);
     return oc_frame_end(w, off);
 }
 
-oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+oc_result oc_decode_call_start(oc_rbuf *p, oc_call_start *m, uint64_t *invite, uint16_t cap) {
+    m->from_channel = oc_r_u64(p);
+    m->subject = oc_r_str(p);
     r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
     m->codecs = oc_r_u8(p);
     m->n_invite = 0;
@@ -2407,13 +2550,130 @@ oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uin
     return r_done(p);
 }
 
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m) {
+    m->call_id = oc_r_u64(p);
+    r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    m->codecs = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_record(oc_rbuf *p, oc_call_record *m) {
+    m->call_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_history(oc_rbuf *p, oc_call_history *m) {
+    m->before_ms = oc_r_u64(p);
+    m->limit = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_history_page(oc_rbuf *p, oc_call_history_page *m, oc_call_hist_entry *entries, uint16_t cap) {
+    uint16_t n = oc_r_u16(p);
+    m->count = 0;
+    m->entries = entries;
+    if (n > cap) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        oc_call_hist_entry *e = &entries[i];
+        e->call_id = oc_r_u64(p);
+        e->subject = oc_r_str(p);
+        e->starter = oc_r_u64(p);
+        e->started_at = oc_r_u64(p);
+        e->ended_at = oc_r_u64(p);
+        e->end_reason = oc_r_u8(p);
+        e->from_channel = oc_r_u64(p);
+        e->chat_channel = oc_r_u64(p);
+        e->n_people = oc_r_u16(p);
+        e->flags = oc_r_u8(p);
+        e->n_faces = oc_r_u8(p);
+        if (e->n_faces > OC_CALL_HIST_FACES) { p->underflow = 1; break; }
+        for (uint8_t k = 0; k < e->n_faces; k++) e->faces[k] = oc_r_u64(p);
+    }
+    m->count = n;
+    m->more = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_detail(oc_rbuf *p, oc_call_detail *m) {
+    m->call_id = oc_r_u64(p);
+    m->line_from = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_page(oc_rbuf *p, oc_call_page *m, oc_call_stay *stays, oc_call_invitee *invitees,
+                              oc_call_event *events, oc_call_recording *recordings, oc_call_tline *lines) {
+    memset(m, 0, sizeof *m);
+    m->stays = stays; m->invitees = invitees; m->events = events; m->recordings = recordings; m->lines = lines;
+    m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
+    m->starter = oc_r_u64(p);
+    m->started_at = oc_r_u64(p);
+    m->ended_at = oc_r_u64(p);
+    m->end_reason = oc_r_u8(p);
+    m->from_channel = oc_r_u64(p);
+    m->chat_channel = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_STAYS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        stays[i].user_id = oc_r_u64(p); stays[i].joined_at = oc_r_u64(p); stays[i].left_at = oc_r_u64(p);
+    }
+    m->n_stays = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_INVITEES) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        invitees[i].user_id = oc_r_u64(p); invitees[i].invited_by = oc_r_u64(p);
+        invitees[i].invited_at = oc_r_u64(p); invitees[i].declined_at = oc_r_u64(p);
+    }
+    m->n_invitees = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_EVENTS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        events[i].at = oc_r_u64(p); events[i].user_id = oc_r_u64(p);
+        events[i].kind = oc_r_u8(p); events[i].detail = oc_r_str(p);
+    }
+    m->n_events = n;
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_RECORDINGS) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        oc_call_recording *r = &recordings[i];
+        r->id = oc_r_u64(p); r->state = oc_r_u8(p); r->started_by = oc_r_u64(p); r->started_at = oc_r_u64(p);
+        r->stopped_at = oc_r_u64(p); r->duration_ms = oc_r_u32(p); r->bytes = oc_r_u64(p); r->attachment_id = oc_r_u64(p);
+    }
+    m->n_recordings = n;
+    m->has_transcript = oc_r_u8(p);
+    m->transcript_lang = oc_r_str(p);
+    m->n_lines_total = oc_r_u32(p);
+    m->line_from = oc_r_u32(p);
+    n = oc_r_u16(p);
+    if (n > OC_CALL_PAGE_LINES) { p->underflow = 1; return r_done(p); }
+    for (uint16_t i = 0; i < n && !p->underflow; i++) {
+        lines[i].id = oc_r_u64(p); lines[i].speaker = oc_r_u64(p);
+        lines[i].start_ms = oc_r_u32(p); lines[i].end_ms = oc_r_u32(p); lines[i].text = oc_r_str(p);
+    }
+    m->n_lines = n;
+    return r_done(p);
+}
+
+oc_result oc_decode_call_delete(oc_rbuf *p, oc_call_delete *m) {
+    m->call_id = oc_r_u64(p);
+    m->what = oc_r_u8(p);
+    m->id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_subject(oc_rbuf *p, oc_call_subject *m) {
+    m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *parts, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->udp_port = oc_r_u16(p);
     m->token = oc_r_bytes(p);
@@ -2428,7 +2688,6 @@ oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *par
 }
 
 oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *parts, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     m->count = 0;
@@ -2438,7 +2697,7 @@ oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *par
 }
 
 oc_result oc_decode_call_invite(oc_rbuf *p, oc_call_invite *m, uint64_t *users, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->count = 0;
     m->users = users;
     r_u64s(p, &m->count, users, cap);
@@ -2446,21 +2705,24 @@ oc_result oc_decode_call_invite(oc_rbuf *p, oc_call_invite *m, uint64_t *users, 
 }
 
 oc_result oc_decode_call_decline(oc_rbuf *p, oc_call_decline *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_end(oc_rbuf *p, oc_call_end *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, uint16_t pcap,
                                uint64_t *invited, uint16_t icap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
+    m->subject = oc_r_str(p);
     m->starter = oc_r_u64(p);
     m->started_at = oc_r_u64(p);
+    m->from_channel = oc_r_u64(p);
+    m->chat_channel = oc_r_u64(p);
+    m->flags = oc_r_u8(p);
     m->ended = oc_r_u8(p);
     m->n_parts = m->n_invited = 0;
     m->parts = parts;
@@ -2468,11 +2730,11 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
     r_u64s(p, &m->n_parts, parts, pcap);
     r_u64s(p, &m->n_invited, invited, icap);
     m->sharer = oc_r_u64(p);
+    m->rec_by = oc_r_u64(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     uint16_t n = oc_r_u16(p);
@@ -2488,7 +2750,6 @@ oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entr
 }
 
 oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m) {
-    m->channel_id = oc_r_u64(p);
     m->call_id = oc_r_u64(p);
     m->epoch = oc_r_u32(p);
     m->sender = oc_r_u64(p);
@@ -2541,7 +2802,7 @@ oc_result oc_decode_pdm_end(oc_rbuf *p, oc_pdm_end *m) {
 }
 
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->on = oc_r_u8(p);
     return r_done(p);
 }
@@ -2563,13 +2824,13 @@ oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m) {
 }
 
 oc_result oc_decode_call_camera(oc_rbuf *p, oc_call_camera *m) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->on = oc_r_u8(p);
     return r_done(p);
 }
 
 oc_result oc_decode_call_video_sub(oc_rbuf *p, oc_call_video_sub *m, uint64_t *users, uint16_t cap) {
-    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
     m->all = oc_r_u8(p);
     m->count = 0;
     m->users = users;
@@ -2735,6 +2996,243 @@ oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chu
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_END);
     oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_get(oc_wbuf *w, uint16_t version, const oc_export_get *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_GET);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_info(oc_wbuf *w, uint16_t version, const oc_export_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_INFO);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->duration_ms);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_chunk(oc_wbuf *w, uint16_t version, const oc_export_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_export_end(oc_wbuf *w, uint16_t version, const oc_export_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EXPORT_END);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_begin(oc_wbuf *w, uint16_t version, const oc_preview_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_BEGIN);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_info(oc_wbuf *w, uint16_t version, const oc_preview_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_INFO);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    oc_w_u32(w, m->width);
+    oc_w_u32(w, m->height);
+    oc_w_str(w, m->mime);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_chunk(oc_wbuf *w, uint16_t version, const oc_preview_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_preview_end(oc_wbuf *w, uint16_t version, const oc_preview_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PREVIEW_END);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->rung);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_create_agent(oc_wbuf *w, uint16_t version, const oc_create_agent *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_AGENT);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->token_name);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_agent_token(oc_wbuf *w, uint16_t version, const oc_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u64(w, m->token_id);
+    oc_w_str(w, m->token);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_remove_agent(oc_wbuf *w, uint16_t version, const oc_remove_agent *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REMOVE_AGENT);
+    oc_w_u64(w, m->agent_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_mint_agent_token(oc_wbuf *w, uint16_t version, const oc_mint_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MINT_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->scopes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_agent_tokens(oc_wbuf *w, uint16_t version, const oc_list_agent_tokens *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_AGENT_TOKENS);
+    oc_w_u64(w, m->agent_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_agent_token_list(oc_wbuf *w, uint16_t version, const oc_agent_token_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AGENT_TOKEN_LIST);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_agent_token_entry *e = &m->entries[i];
+        oc_w_u64(w, e->token_id);
+        oc_w_str(w, e->name);
+        oc_w_str(w, e->scopes);
+        oc_w_u64(w, e->created_by);
+        oc_w_u64(w, e->created_at_ms);
+        oc_w_u64(w, e->last_used_at_ms);
+        oc_w_str(w, e->last_used_from);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_revoke_agent_token(oc_wbuf *w, uint16_t version, const oc_revoke_agent_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_AGENT_TOKEN);
+    oc_w_u64(w, m->agent_id);
+    oc_w_u64(w, m->token_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_code(oc_wbuf *w, uint16_t version, const oc_connection_code *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_CODE);
+    oc_w_str(w, m->code);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_request(oc_wbuf *w, uint16_t version, const oc_connection_request *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_REQUEST);
+    oc_w_str(w, m->code);
+    oc_w_str(w, m->client_name);
+    oc_w_str(w, m->redirect_uri);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_decide(oc_wbuf *w, uint16_t version, const oc_connection_decide *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_DECIDE);
+    oc_w_str(w, m->code);
+    oc_w_u8(w, m->approve ? 1u : 0u);
+    oc_w_u32(w, m->lifetime_days);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_decided(oc_wbuf *w, uint16_t version, const oc_connection_decided *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_DECIDED);
+    oc_w_u8(w, m->approved ? 1u : 0u);
+    oc_w_str(w, m->client_name);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_connections(oc_wbuf *w, uint16_t version, const oc_list_connections *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CONNECTIONS);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_connection_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CONNECTION_LIST);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_connection_entry *e = &m->entries[i];
+        oc_w_u64(w, e->connection_id);
+        oc_w_u64(w, e->user_id);
+        oc_w_str(w, e->user_name);
+        oc_w_str(w, e->client_name);
+        oc_w_u64(w, e->created_at_ms);
+        oc_w_u64(w, e->last_used_at_ms);
+        oc_w_u64(w, e->expires_at_ms);
+        oc_w_u32(w, e->lifetime_days);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_OUTGOING_WEBHOOK);
+    oc_w_str(w, m->url);
+    oc_w_str(w, m->events);
+    uint16_t n = m->n_channels > OC_OUTWH_MAX_CHANNELS ? OC_OUTWH_MAX_CHANNELS : m->n_channels;
+    oc_w_u16(w, n);
+    for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->channels[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OUTGOING_WEBHOOK_SECRET);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_str(w, m->secret);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_OUTGOING_WEBHOOKS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OUTGOING_WEBHOOK_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_outgoing_webhook_entry *e = &m->entries[i];
+        oc_w_u64(w, e->webhook_id);
+        oc_w_str(w, e->url);
+        oc_w_str(w, e->events);
+        oc_w_u8(w, e->enabled);
+        oc_w_str(w, e->disabled_reason);
+        oc_w_u64(w, e->created_by);
+        oc_w_u64(w, e->created_at_ms);
+        uint16_t n = e->n_channels > OC_OUTWH_MAX_CHANNELS ? OC_OUTWH_MAX_CHANNELS : e->n_channels;
+        oc_w_u16(w, n);
+        for (uint16_t k = 0; k < n; k++) oc_w_u64(w, e->channels[k]);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_CONNECTION);
+    oc_w_u64(w, m->connection_id);
+    oc_w_u8(w, m->all ? 1u : 0u);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_set_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_OUTGOING_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_u8(w, m->enabled);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_delete_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_delete_outgoing_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE_OUTGOING_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
     return oc_frame_end(w, off);
 }
 
@@ -2961,6 +3459,8 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_str(w, m->entries[i].snippet);
         oc_w_u8(w, m->entries[i].action);
         oc_w_u64(w, (uint64_t)m->entries[i].rank);  /* 28 */
+        oc_w_u64(w, m->entries[i].call_id);         /* a transcript's hit (CALLS.md §1) */
+        oc_w_u64(w, m->entries[i].line_id);
     }
     oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
@@ -3163,6 +3663,8 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->broadcast_stored = oc_r_u8(p);
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->parent_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
+    m->via = oc_r_str(p);
     m->body = oc_r_lstr(p);
     /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
@@ -3636,6 +4138,7 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     if (m->broadcast_stored > 1) return OC_E_MALFORMED;   /* a flag, nothing else */
     m->also_channel = oc_r_u8(p);
     if (m->also_channel > 1) return OC_E_MALFORMED;
+    m->via = oc_r_str(p);
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {
@@ -4053,6 +4556,225 @@ oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m) {
     return r_done(p);
 }
 
+oc_result oc_decode_export_get(oc_rbuf *p, oc_export_get *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_info(oc_rbuf *p, oc_export_info *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->duration_ms = oc_r_u32(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_chunk(oc_rbuf *p, oc_export_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_export_end(oc_rbuf *p, oc_export_end *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_begin(oc_rbuf *p, oc_preview_begin *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_info(oc_rbuf *p, oc_preview_info *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    m->width = oc_r_u32(p);
+    m->height = oc_r_u32(p);
+    m->mime = oc_r_str(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_chunk(oc_rbuf *p, oc_preview_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_preview_end(oc_rbuf *p, oc_preview_end *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->rung = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_create_agent(oc_rbuf *p, oc_create_agent *m) {
+    m->name = oc_r_str(p);
+    m->token_name = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_agent_token(oc_rbuf *p, oc_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->token_id = oc_r_u64(p);
+    m->token = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_remove_agent(oc_rbuf *p, oc_remove_agent *m) {
+    m->agent_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_mint_agent_token(oc_rbuf *p, oc_mint_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->name = oc_r_str(p);
+    m->scopes = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_agent_tokens(oc_rbuf *p, oc_list_agent_tokens *m) {
+    m->agent_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_agent_token_list(oc_rbuf *p, uint64_t *agent_id, oc_agent_token_entry *entries, uint16_t cap,
+                                     uint16_t *out_count) {
+    *agent_id = oc_r_u64(p);
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_agent_token_entry e;
+        e.token_id = oc_r_u64(p);
+        e.name = oc_r_str(p);
+        e.scopes = oc_r_str(p);
+        e.created_by = oc_r_u64(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.last_used_at_ms = oc_r_u64(p);
+        e.last_used_from = oc_r_str(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_revoke_agent_token(oc_rbuf *p, oc_revoke_agent_token *m) {
+    m->agent_id = oc_r_u64(p);
+    m->token_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_code(oc_rbuf *p, oc_connection_code *m) {
+    m->code = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_request(oc_rbuf *p, oc_connection_request *m) {
+    m->code = oc_r_str(p);
+    m->client_name = oc_r_str(p);
+    m->redirect_uri = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_decide(oc_rbuf *p, oc_connection_decide *m) {
+    m->code = oc_r_str(p);
+    m->approve = oc_r_u8(p);
+    if (m->approve > 1) return OC_E_MALFORMED;
+    m->lifetime_days = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_decided(oc_rbuf *p, oc_connection_decided *m) {
+    m->approved = oc_r_u8(p);
+    if (m->approved > 1) return OC_E_MALFORMED;
+    m->client_name = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_connections(oc_rbuf *p, oc_list_connections *m) {
+    m->all = oc_r_u8(p);
+    if (m->all > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_connection_list(oc_rbuf *p, uint8_t *all, oc_connection_entry *entries, uint16_t cap,
+                                    uint16_t *out_count) {
+    *all = oc_r_u8(p);
+    if (*all > 1) return OC_E_MALFORMED;
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_connection_entry e;
+        e.connection_id = oc_r_u64(p);
+        e.user_id = oc_r_u64(p);
+        e.user_name = oc_r_str(p);
+        e.client_name = oc_r_str(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.last_used_at_ms = oc_r_u64(p);
+        e.expires_at_ms = oc_r_u64(p);
+        e.lifetime_days = oc_r_u32(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m) {
+    m->url = oc_r_str(p);
+    m->events = oc_r_str(p);
+    m->n_channels = oc_r_u16(p);
+    if (m->n_channels > OC_OUTWH_MAX_CHANNELS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < m->n_channels; i++) m->channels[i] = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->secret = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,
+                                          uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_outgoing_webhook_entry e;
+        e.webhook_id = oc_r_u64(p);
+        e.url = oc_r_str(p);
+        e.events = oc_r_str(p);
+        e.enabled = oc_r_u8(p);
+        e.disabled_reason = oc_r_str(p);
+        e.created_by = oc_r_u64(p);
+        e.created_at_ms = oc_r_u64(p);
+        e.n_channels = oc_r_u16(p);
+        if (e.n_channels > OC_OUTWH_MAX_CHANNELS) return OC_E_MALFORMED;
+        for (uint16_t k = 0; k < e.n_channels; k++) e.channels[k] = oc_r_u64(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m) {
+    m->connection_id = oc_r_u64(p);
+    m->all = oc_r_u8(p);
+    if (m->all > 1) return OC_E_MALFORMED;
+    return r_done(p);
+}
+
+oc_result oc_decode_set_outgoing_webhook(oc_rbuf *p, oc_set_outgoing_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->enabled = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_delete_outgoing_webhook(oc_rbuf *p, oc_delete_outgoing_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m) {
     m->attachment_id = oc_r_u64(p);
     return r_done(p);
@@ -4294,7 +5016,10 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
         oc_slice snip = oc_r_str(p);
         uint8_t act = oc_r_u8(p);
         int64_t rank = (int64_t)oc_r_u64(p);
+        uint64_t call = oc_r_u64(p), line = oc_r_u64(p);
         if (i < cap) {
+            entries[i].call_id = call;
+            entries[i].line_id = line;
             entries[i].message_id = mid;
             entries[i].channel_id = ch;
             entries[i].author_id = author;

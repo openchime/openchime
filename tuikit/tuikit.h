@@ -2,7 +2,7 @@
  * tuikit — umbrella header. Include this to get the whole toolbox: the terminal
  * layer, the width-correct draw primitives, and the style/box layer. Widgets
  * (tk_list, tk_input, tk_textarea, tk_viewport, tk_modal) and the keymap/help
- * model (tk_key) are added here as they land. See docs/TUIKIT.md.
+ * model (tk_key) are added here as they land. See docs/details/TUIKIT.md.
  */
 
 #ifndef TUIKIT_H
