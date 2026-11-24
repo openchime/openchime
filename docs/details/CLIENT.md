@@ -710,7 +710,10 @@ surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
 `InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/harness/win32/uia_probe.ps1`. What a message says to a screen reader
+the process by `tools/gui/harness/win32/uia_probe.ps1`. Preferences' choices are
+published as tabs named for their row and choice ("Reduce motion: On"), with
+the current one marked ", selected", under ids `prefs.<row>.<value>`, the value
+being what the choice stores. What a message says to a screen reader
 is the person's to choose, in Preferences > Accessibility: the sender, the time,
 the reactions and the replies, each on or off, the text before or after the
 sender and the time, and whether a new message from someone else is read out

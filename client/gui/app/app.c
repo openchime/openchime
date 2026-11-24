@@ -1303,7 +1303,9 @@ static int geom_capture(oc_win *hwnd) {
 }
 /* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
  * silently stops recording makes the last control on a pane simply not respond. */
-static struct { rectf r; int row, val; } g_pref_hits[32];
+/* Each also carries what assistive technology is told about it (REQ-269): its
+ * row's label, the choice's own text, and whether it is the current choice. */
+static struct { rectf r; int row, val; const char *label, *text; int on; } g_pref_hits[32];
 static int g_n_pref_hits;
 /* The quick-reaction slots in Preferences: the tile that opens the picker for a
  * slot, and the small clear badge on it (empty when it is not offered). */
@@ -11904,6 +11906,9 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
             g_pref_hits[g_n_pref_hits].val = i;
+            g_pref_hits[g_n_pref_hits].label = label;
+            g_pref_hits[g_n_pref_hits].text = opts[i];
+            g_pref_hits[g_n_pref_hits].on = on;
             g_n_pref_hits++;
         }
         bx = b.left - 6;
@@ -11948,6 +11953,31 @@ enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
 /* Appearance's Reduce motion (REQ-269): a number of its own, so the rows
  * above keep theirs. */
 enum { PREF_ROW_MOTION = 130 };
+
+/* Each row's name in its choices' automation ids, `prefs.<name>.<value>`
+ * (REQ-290). Fixed here rather than derived from the label, so rewording a row
+ * or re-laying its chips out cannot move an id. */
+static const struct { int row; const char *aid; } PREF_ROW_AIDS[] = {
+    { PREF_ROW_THEME, "theme" },         { PREF_ROW_ACCENT, "scheme" },
+    { PREF_ROW_FONT, "font" },           { PREF_ROW_TEXTSIZE, "textsize" },
+    { PREF_ROW_DENSITY, "density" },     { PREF_ROW_MOTION, "motion" },
+    { PREF_ROW_MEMBERS, "members" },     { PREF_ROW_TOASTPOS, "notices" },
+    { PREF_ROW_TIME, "time" },           { PREF_ROW_DAYSEP, "daysep" },
+    { PREF_ROW_EDITOR, "editor" },       { PREF_ROW_ENTER, "enter" },
+    { PREF_ROW_EMOTICONS, "emoticons" }, { PREF_ROW_DELIVER, "deliver" },
+    { PREF_ROW_NOTIFY, "notify" },       { PREF_ROW_SNDMUTE, "sound" },
+    { PREF_ROW_FLASH, "flash" },         { PREF_ROW_NOTIFY + 100, "levels" },
+    { PREF_ROW_CLOSE, "close" },         { PREF_ROW_MINTRAY, "mintray" },
+    { PREF_ROW_STARTUP, "startup" },     { PREF_ROW_RESET, "reset" },
+    { PREF_ROW_SAY_SENDER, "say.sender" },       { PREF_ROW_SAY_TIME, "say.time" },
+    { PREF_ROW_SAY_REACTIONS, "say.reactions" }, { PREF_ROW_SAY_REPLIES, "say.replies" },
+    { PREF_ROW_SAY_ORDER, "say.order" },         { PREF_ROW_ANNOUNCE_NEW, "announcenew" },
+};
+static const char *pref_row_aid(int row) {
+    for (size_t i = 0; i < sizeof PREF_ROW_AIDS / sizeof PREF_ROW_AIDS[0]; i++)
+        if (PREF_ROW_AIDS[i].row == row) return PREF_ROW_AIDS[i].aid;
+    return NULL;
+}
 
 /* One of Accessibility's rows set to choice `v`: the one path the rows' clicks
  * and the harness's `spoken` verb both take. 0 when `row` is not one of them.
@@ -12019,6 +12049,9 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = PREF_ROW_ACCENT;
             g_pref_hits[g_n_pref_hits].val = i;
+            g_pref_hits[g_n_pref_hits].label = "Colour scheme";
+            g_pref_hits[g_n_pref_hits].text = oc_theme_scheme_name(i);
+            g_pref_hits[g_n_pref_hits].on = (i == oc_theme_scheme());
             g_n_pref_hits++;
         }
         bx = b.left - 6;
@@ -29611,7 +29644,8 @@ enum {
     AT_MORE,          /* payload: index into g_morehits -- open that cut message */
     AT_THRDATE,       /* the thread pane's Jump to date */
     AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
-    AT_JUMPCAL        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
+    AT_JUMPCAL,       /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
+    AT_PREFCHOICE     /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -30630,6 +30664,33 @@ modal_items:
                     snprintf(aid, sizeof aid, "prefs.cat.%s", CATAID[i]);
                     acc_push(items, &n, OC_ACC_BUTTON, aid, PC_NAME[i], g_pref_cats[i], ATOK(AT_PREFCAT, (uint64_t)i));
                 }
+            /* The shown category's choices (REQ-269, REQ-290), each where it is
+             * drawn: a choice in a row of several is a tab, "<row>: <choice>",
+             * with ", selected" on the current one, as the sidebar's unreads chip
+             * carries its state; a row with one action is a button named for the
+             * row. The id is the row's fixed name and the value the choice
+             * stores, so neither wording nor layout moves it. Only what is on
+             * screen: the rects were clipped to the scroller (hit_visible), and
+             * acc_push drops an empty one. pref_row records a row right to left,
+             * so each row's run is published back to front, in drawn order. */
+            for (int i = 0; i < g_n_pref_hits && n < OC_ACC_MAX; ) {
+                int j = i;
+                while (j < g_n_pref_hits && g_pref_hits[j].row == g_pref_hits[i].row) j++;
+                const char *row_aid = pref_row_aid(g_pref_hits[i].row);
+                for (int k = j - 1; k >= i && row_aid && n < OC_ACC_MAX; k--) {
+                    char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+                    snprintf(aid, sizeof aid, "prefs.%s.%d", row_aid, g_pref_hits[k].val);
+                    uint64_t tok = ATOK(AT_PREFCHOICE, (uint64_t)g_pref_hits[k].row * 256u + (uint64_t)g_pref_hits[k].val);
+                    if (j - i == 1) {
+                        acc_push(items, &n, OC_ACC_BUTTON, aid, g_pref_hits[k].label, g_pref_hits[k].r, tok);
+                    } else {
+                        snprintf(nm, sizeof nm, "%s: %s%s", g_pref_hits[k].label, g_pref_hits[k].text,
+                                 g_pref_hits[k].on ? ", selected" : "");
+                        acc_push(items, &n, OC_ACC_TAB, aid, nm, g_pref_hits[k].r, tok);
+                    }
+                }
+                i = j;
+            }
             if (g_pref_cat == PC_AICLIENTS)
                 for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
                     acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
@@ -34293,6 +34354,73 @@ static void msg_open_cut(uint64_t mid, int kind) {
     invalidate();
 }
 
+/* Preferences' choice `v` of row `row` (PREF_ROW_*), as clicking its chip or
+ * swatch makes it: the one path the click and an accessibility invoke both
+ * take (REQ-269, ARCH-99). */
+static void pref_choose(oc_win *hwnd, int row, int v) {
+    switch (row) {
+    case PREF_ROW_THEME:   theme_set(v); break;
+    case PREF_ROW_TIME:    g_pref_time24 = v; break;
+    /* Applying it live as well as saving it: a preference you have to
+     * restart to see is indistinguishable from one that did nothing. */
+    case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
+    case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+    case PREF_ROW_EDITOR:
+        g_pref_richtext = v ? 1 : 0;
+        ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
+        if (composer_remeasure()) layout_composer(hwnd);
+        break;
+    case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
+    case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+    case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
+    case PREF_ROW_FLASH:   g_pref_flash = v; break;
+    case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
+    case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
+    case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
+        spoken_pref_set(row, v);
+        break;
+    case PREF_ROW_DELIVER: g_pref_deliver = v; break;
+    case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
+    case PREF_ROW_CLOSE:   g_pref_close = v; break;
+    case PREF_ROW_MINTRAY: g_pref_min_tray = v; break;
+    /* Applied immediately, not on Save: it is a registry fact rather
+     * than a value in the settings bucket, and a checkbox that lies
+     * until you press Save is worse than no checkbox. */
+    case PREF_ROW_STARTUP: startup_set(v); break;
+    /* Appearance applies LIVE while the sheet is open — a colour, a text
+     * size and a density are their own preview and cannot be judged from a
+     * label — and reverts with everything else on Cancel. */
+    case PREF_ROW_ACCENT:   scheme_set(v); break;
+    case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
+    case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
+    case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
+
+    case PREF_ROW_MOTION:   g_pref_motion = v; break;
+    case PREF_ROW_RESET:
+        /* Not persisted here: Save commits, like every other control on
+         * this card. Cancel puts the old values back from the snapshot. */
+        theme_set(OC_THEME_SYSTEM);
+        scheme_set(OC_SCHEME_MIDNIGHT);
+        g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
+        g_pref_notify = NOTIFY_FULL;
+        g_pref_motion = OC_MOTION_SYSTEM;
+        g_pref_flash = FLASH_IDLE;
+        g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
+        g_pref_font = OC_TYPEFACE_DEFAULT;
+        snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
+        quick_rebuild();
+        scale_apply(hwnd);
+        break;
+    case PREF_ROW_NOTIFY + 100:
+        /* The notifications sheet, from here. modal_finish first, so this
+         * card's snapshot is committed rather than left half-open behind
+         * another modal. */
+        modal_finish(1);
+        modal_enter(hwnd, &g_notify_open);
+        break;
+    }
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Admin > Agents: each button, as it was drawn -- first, since the
@@ -35072,68 +35200,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
-            int v = g_pref_hits[i].val;
-            switch (g_pref_hits[i].row) {
-            case PREF_ROW_THEME:   theme_set(v); break;
-            case PREF_ROW_TIME:    g_pref_time24 = v; break;
-            /* Applying it live as well as saving it: a preference you have to
-             * restart to see is indistinguishable from one that did nothing. */
-            case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
-            case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
-            case PREF_ROW_EDITOR:
-                g_pref_richtext = v ? 1 : 0;
-                ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
-                if (composer_remeasure()) layout_composer(hwnd);
-                break;
-            case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
-            case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
-            case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
-            case PREF_ROW_FLASH:   g_pref_flash = v; break;
-            case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
-            case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
-            case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
-                spoken_pref_set(g_pref_hits[i].row, v);
-                break;
-            case PREF_ROW_DELIVER: g_pref_deliver = v; break;
-            case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
-            case PREF_ROW_CLOSE:   g_pref_close = v; break;
-            case PREF_ROW_MINTRAY: g_pref_min_tray = v; break;
-            /* Applied immediately, not on Save: it is a registry fact rather
-             * than a value in the settings bucket, and a checkbox that lies
-             * until you press Save is worse than no checkbox. */
-            case PREF_ROW_STARTUP: startup_set(v); break;
-            /* Appearance applies LIVE while the sheet is open — a colour, a text
-             * size and a density are their own preview and cannot be judged from a
-             * label — and reverts with everything else on Cancel. */
-            case PREF_ROW_ACCENT:   scheme_set(v); break;
-            case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
-            case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
-            case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
-
-            case PREF_ROW_MOTION:   g_pref_motion = v; break;
-            case PREF_ROW_RESET:
-                /* Not persisted here: Save commits, like every other control on
-                 * this card. Cancel puts the old values back from the snapshot. */
-                theme_set(OC_THEME_SYSTEM);
-                scheme_set(OC_SCHEME_MIDNIGHT);
-                g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
-                g_pref_notify = NOTIFY_FULL;
-                g_pref_motion = OC_MOTION_SYSTEM;
-                g_pref_flash = FLASH_IDLE;
-                g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
-                g_pref_font = OC_TYPEFACE_DEFAULT;
-                snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
-                quick_rebuild();
-                scale_apply(hwnd);
-                break;
-            case PREF_ROW_NOTIFY + 100:
-                /* The notifications sheet, from here. modal_finish first, so this
-                 * card's snapshot is committed rather than left half-open behind
-                 * another modal. */
-                modal_finish(1);
-                modal_enter(hwnd, &g_notify_open);
-                return 1;
-            }
+            pref_choose(hwnd, g_pref_hits[i].row, g_pref_hits[i].val);
             /* No prefs_save() here. The footer's Save commits (modal_finish ->
              * spec->commit) and Cancel restores the snapshot; persisting on every
              * click is live-apply wearing a Save button, which is how Cancel
@@ -41501,11 +41568,12 @@ static void test_dump_a11y(FILE *f) {
                 a->l, a->t, a->r, a->b);
     }
     /* What each message on the transcript says to a screen reader, under the
-     * person's settings (Preferences > Accessibility): one line each, a line
-     * break in it read as a space. */
+     * person's settings (Preferences > Accessibility), and what each of
+     * Preferences' own items is called: one line each, a line break in it read
+     * as a space. */
     for (int i = 0; i < g_a11y_n; i++) {
         const oc_acc_item *a = &g_acc_items[i];
-        if (a->kind != OC_ACC_MESSAGE) continue;
+        if (a->kind != OC_ACC_MESSAGE && strncmp(a->aid, "prefs.", 6) != 0) continue;
         fprintf(f, "a11yname %s \"", a->aid[0] ? a->aid : "-");
         for (const char *q = a->name; *q; q++) fputc(*q == '\n' || *q == '\r' ? ' ' : *q, f);
         fprintf(f, "\"\n");
@@ -46730,6 +46798,18 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             break;
         case AT_PREFCAT:
             if (g_prefs_open && arg < PC_COUNT) { pref_cat_select((int)arg); invalidate(); }
+            break;
+        case AT_PREFCHOICE:
+            /* Only a choice the shown category has on screen, as a click could
+             * reach it: the token outlives the frame that published it. */
+            if (g_prefs_open)
+                for (int i = 0; i < g_n_pref_hits; i++)
+                    if ((uint64_t)g_pref_hits[i].row * 256u + (uint64_t)g_pref_hits[i].val == arg &&
+                        g_pref_hits[i].r.right > g_pref_hits[i].r.left) {
+                        pref_choose(hwnd, g_pref_hits[i].row, g_pref_hits[i].val);
+                        invalidate();
+                        break;
+                    }
             break;
         case AT_WEBHOOKBTN:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS && (int)arg < g_n_whbtns)

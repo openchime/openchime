@@ -374,6 +374,7 @@ when reading its output.
 | `permalink_w` | win32 | | 9674 | an email's link opened in the client | its header |
 | `polls` | win32 web | | 9770 | polls made, changed and voted in | [Reading the polls harness](#reading-the-polls-harness) |
 | `preview` | win32 web | | 9535 | the composer's Preview | its header |
+| `prefs_a11y` | win32 web | | 9615 | Preferences' choices as assistive technology is given them: ids, names, invoking | its header |
 | `reactions` | win32 web | | 9580 | reacting from the who-reacted pane | [Reading the reactions harness](#reading-the-reactions-harness) |
 | `screenrec` | win32 web | `ffmpeg` | 9530 | screen recording, sent and stored | [Reading the screen-recording harness](#reading-the-screen-recording-harness) |
 | `search_boxes` | win32 web | | 9660 | the six search boxes, one control | [Reading the search-box harness](#reading-the-search-box-harness) |
