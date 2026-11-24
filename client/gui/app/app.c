@@ -1088,6 +1088,10 @@ static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = 
  * link, edit, delete, mark unread and react had no route but a right-click
  * (REQ-264). Drawn lit like a hovered row, so where the keyboard is is visible. */
 static uint64_t g_kb_mid;
+/* The message-menu command the last key press ran as a single key on that
+ * message (0 for none: any other key resets it), for the dump: what a key did
+ * is read back, not inferred. */
+static int g_kb_ran;
 /* The URL under the cursor, and the one the press landed on. Two,
  * not one, because a link opens on RELEASE over the same address it was pressed
  * on: opening on press would make dragging a selection that starts inside a URL
@@ -10486,6 +10490,10 @@ static const struct {
      * depends on what is open. */
     { 0,                  0,          ACC_NONE,  "Ctrl+Up / Ctrl+Down","Move through the messages" },
     { 0,                  0,          ACC_NONE,  "Shift+F10 / Menu",   "Actions for the message you are on, or for this conversation" },
+    /* Single keys on the message you are on (kb_msg_cmd), the same items. */
+    { 0,                  0,          ACC_NONE,  "E / R / T",          "On the message you are on: edit, react, its thread" },
+    { 0,                  0,          ACC_NONE,  "P / F / S",          "...pin or unpin, forward, save for later" },
+    { 0,                  0,          ACC_NONE,  "U / M / L",          "...unread from here, remind me, copy link" },
     { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
     { 0,                  0,          ACC_NONE,  "Tab, Up / Down, Del", "Custom emoji: the search box, the rows, delete the selected one" },
 };
@@ -10512,6 +10520,8 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu i
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
 static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
+static int  kb_msg_cmd(int key);                   /* fwd — a single key's menu command */
+static void kb_msg_key(oc_win *hwnd, int key);     /* fwd — ...run on the focused message */
 static void call_start_here(oc_win *hwnd, uint64_t ch);   /* fwd */
 static void call_cmd(oc_win *hwnd, int cmd);              /* fwd */
 static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y);   /* fwd */
@@ -10654,6 +10664,7 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
         return 1;
     }
     if (up) return 0;
+    g_kb_ran = 0;                        /* the dump's ran= is this press's, or 0 */
     if (VM_UP() && !alt && vm_key(hwnd, key)) { invalidate(); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
@@ -10714,6 +10725,19 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
     if (!alt && !g_menu && !modal_open() &&
         (key == OCK_APPS || (key == OCK_F10 && mod_down(OCK_SHIFT)))) {
         kb_context_menu(hwnd);
+        invalidate();
+        return 1;
+    }
+    /* A letter on the message the keyboard is on acts on it, as the terminal
+     * client's do on a selected message: `e` edits, `r` reacts, `t` the thread,
+     * and the rest of kb_msg_cmd's table. Never with Ctrl or Alt held (those are
+     * the shortcuts below), and never while anything else takes typing: a menu, a
+     * modal, a drawn field (the palette's, the picker's), or an edit in the
+     * composer. A mapped letter is claimed whether or not its item is offered,
+     * so it is never typed into the composer instead. */
+    if (!alt && g_kb_mid && kb_msg_cmd(key) && !mod_down(OCK_CONTROL) && !mod_down(OCK_ALT) &&
+        transcript_shell() && !g_menu && !modal_open() && !g_focus && !g_edit_msg) {
+        kb_msg_key(hwnd, key);
         invalidate();
         return 1;
     }
@@ -33259,6 +33283,9 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
                       : "Unblocked.");
     } else if (cmd == 21) {
         composer_begin_edit(msg);
+        /* The keyboard goes where the typing goes: off the message, so the
+         * letters of the edit are not taken as its single keys (kb_msg_key). */
+        g_kb_mid = 0;
     } else if (cmd == 108) {
         poll_compose_open(hwnd, chan, mid);
     } else if (cmd == 22) {
@@ -33269,6 +33296,7 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         fb_undo("Message deleted.", FBA_UNDO_DELETE);
     } else if (cmd == 100) {
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
+        g_kb_mid = 0;                    /* ...and the keyboard to the reply, as for Edit */
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
     } else if (cmd == 105) {
@@ -40741,6 +40769,56 @@ static void kb_context_menu(oc_win *hwnd) {
     menu_move(1);
 }
 
+/* Single keys on the message the keyboard is on: a letter, the message-menu
+ * command it runs. `e`, `r` and `t` are the terminal client's letters for the
+ * same actions, and `m` is Remind me in both. Upper case is the same key. */
+static const struct { int key; int cmd; } KB_MSG_KEYS[] = {
+    { 'E', 21 },    /* Edit */
+    { 'R', 7 },     /* More reactions: the emoji picker */
+    { 'T', 100 },   /* Open thread / Reply in thread */
+    { 'P', 103 },   /* Pin to channel / Unpin from channel */
+    { 'F', 106 },   /* Forward */
+    { 'S', 104 },   /* Save for later */
+    { 'U', 107 },   /* Unread from here */
+    { 'M', 114 },   /* Remind me... / Reminder... */
+    { 'L', 105 },   /* Copy link */
+};
+
+static int kb_msg_cmd(int key) {
+    for (size_t i = 0; i < sizeof KB_MSG_KEYS / sizeof KB_MSG_KEYS[0]; i++)
+        if (KB_MSG_KEYS[i].key == key) return KB_MSG_KEYS[i].cmd;
+    return 0;
+}
+
+/* Run a single key's command on the focused message, exactly as its menu item
+ * would run. The menu is BUILT (show_msg_menu, anchored where Shift+F10 opens
+ * it) and the command looked up among its items, so a key does only what the
+ * menu offers for this message -- no Edit on someone else's, no Pin in an
+ * encrypted conversation -- and the two cannot drift apart. Built, not shown:
+ * it is closed again before anything is drawn, unless the item opens a menu of
+ * its own (Remind me), which then has its first choice highlighted, as Shift+F10
+ * leaves its menu. A key whose item is not offered does nothing. */
+static void kb_msg_key(oc_win *hwnd, int key) {
+    const oc_model *m = model();
+    int cmd = kb_msg_cmd(key);
+    g_kb_ran = 0;
+    if (!m || !cmd || !g_kb_mid) return;
+    int row = -1;
+    for (int i = 0; i < g_n_msgrows; i++)
+        if (g_msgrows[i].mid == g_kb_mid) { row = i; break; }
+    if (row < 0) return;
+    show_msg_menu(hwnd, m, g_kb_mid, g_msgrows[row].left + UIS(60), g_msgrows[row].top + UIS(20));
+    if (g_menu != MENU_MSG) return;
+    int offered = 0;
+    for (int i = 0; i < g_n_mi; i++)
+        if (g_mi[i].kind == MK_ITEM && g_mi[i].cmd == cmd) { offered = 1; break; }
+    g_menu = MENU_NONE; g_menu_hover = -1;
+    if (!offered) return;
+    g_kb_ran = cmd;
+    msg_menu_run(hwnd, cmd);
+    if (g_menu) menu_move(1);            /* Remind me's choices, ready for Enter */
+}
+
 static void channel_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     uint64_t cid = g_menu_target;
@@ -42610,10 +42688,12 @@ static void test_dump(const char *path) {
     /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
      * be readable for the keyboard route to the context menu to be testable at
      * all (REQ-264). */
-    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d\n",
+    /* ran= is the message-menu command the last key press ran as a single key
+     * (kb_msg_key), 0 when it ran none: each key is tested by what it ran. */
+    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d ran=%d\n",
             (unsigned long long)g_kb_mid, g_menu_hover,
             (g_menu && g_menu_hover >= 0 && g_menu_hover < g_n_mi) ? g_mi[g_menu_hover].cmd : -1,
-            g_sub_hover, g_sub_open);
+            g_sub_hover, g_sub_open, g_kb_ran);
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -42781,6 +42861,7 @@ static void test_dump(const char *path) {
 static void test_poll(oc_win *hwnd);
 /* The hook alone, from inside a native dialog's modal loop (oc_plat_set_modal_tick). */
 static void test_modal_tick(void) { test_poll(g_main); }
+static void on_event(const SDL_Event *e);   /* fwd — the `keychar` verb's events */
 
 static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
@@ -42972,6 +43053,32 @@ static void test_poll(oc_win *hwnd) {
             for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
             test_ack("ok");
         }
+    } else if (!strcmp(verb, "keychar")) {
+        /* One printable key as a person types it: the key going down, the text
+         * the platform sends for that press, and the key coming up, all through
+         * on_event. Only this shows a key a shortcut claims is NOT typed
+         * (g_claimed_text): `key` sends no text and `typekeys` no key. An
+         * upper-case letter is pressed with Shift. */
+        char c = arg[0];
+        if (c > ' ' && c < 0x7f && !arg[1]) {
+            int upper = c >= 'A' && c <= 'Z';
+            SDL_Event e; memset(&e, 0, sizeof e);
+            e.type = SDL_EVENT_KEY_DOWN;
+            e.key.windowID = SDL_GetWindowID(hwnd->sdl);
+            e.key.key = (SDL_Keycode)(upper ? c + 32 : c);
+            e.key.mod = upper ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE;
+            e.key.down = true;
+            on_event(&e);
+            SDL_Event t; memset(&t, 0, sizeof t);
+            t.type = SDL_EVENT_TEXT_INPUT;
+            t.text.windowID = e.key.windowID;
+            t.text.text = arg;
+            on_event(&t);
+            e.type = SDL_EVENT_KEY_UP; e.key.down = false;
+            on_event(&e);
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "dirfind")) {
         /* Drive the People pane's search box (REQ-289). Through the field, so
          * the change hook the user's typing fires is the one under test — the

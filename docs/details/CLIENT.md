@@ -368,7 +368,9 @@ model; translate input to intents }, stop.
   keep-the-open-conversation-read step until focus moves, or the next frame
   would read it again); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
-  composer), `x` (or `d`) delete, `w` who-reacted. On Members, Enter opens a
+  composer), `x` (or `d`) delete, `w` who-reacted, `m` Remind me (the reminder
+  choices the menu's "Remind me..." opens; `m` in the graphical client too),
+  `z` shows a long or muted message whole, and folds it back. On Members, Enter opens a
   member menu (Message / Make admin / Make member / Remove); `n` opens the New
   direct message picker. **Action launcher** (`:` on an empty composer, or Ctrl+K): a
   fuzzy-filtered, sectioned list of every action — New channel, Leave,
@@ -1068,6 +1070,20 @@ focus.
 - **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
+- **The keyboard on a message.** Ctrl+Up / Ctrl+Down put the keyboard on a
+  message, and Shift+F10 (or the Menu key) opens its menu (REQ-264). While a
+  message has the keyboard, a single letter runs that menu's item on it: `e`
+  Edit, `r` react (the emoji picker, as "More reactions"), `t` its thread (open
+  or reply), `p` Pin or Unpin, `f` Forward, `s` Save for later, `u` Unread from
+  here, `m` Remind me (its choices open, the first highlighted) and `l` Copy
+  link. `e`, `r`, `t` and `m` are the terminal client's letters for the same
+  actions. A key looks its item up in the menu built for that message
+  (`kb_msg_key`), so it does only what the menu offers there; a letter whose item
+  is not offered does nothing, and is not typed. Upper case is the same key;
+  with Ctrl or Alt held, or while a menu, a modal, a drawn field or an edit has
+  the keyboard, letters are what they were. Edit and the thread take the
+  keyboard off the message, to the typing. The sheet lists them; the dump's
+  `kbfocus ran=` is the command the last key press ran as one (0 for none).
 - Test with `tools/gui/harness/win32/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
   in place of the keyboard's state), because the shortcuts read the modifiers;
@@ -1684,7 +1700,7 @@ A message longer than **25 lines or 3,000 characters**, as drawn, is
 it is this view's alone — nothing is stored or sent — and lasts until the
 client closes. The rule is the clients', the same in both: the graphical client
 measures lines at the width the message is drawn at; the terminal client counts
-the rows a body wraps to, and `m` shows it whole. A cut message is cut on its
+the rows a body wraps to, and `z` shows it whole. A cut message is cut on its
 prefix, so formatting still applies to what shows.
 
 Both are reachable without a pointer: the message's menu (Ctrl+Up to the

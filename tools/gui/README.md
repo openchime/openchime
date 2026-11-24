@@ -520,6 +520,11 @@ rich-mode typing rules (pending styles, continuation, delimiter handling) run
 exactly as they do for a user. Testing an editor behaviour with `type` proves
 nothing about typing.
 
+**`keychar <c>` is one printable key as a person types it**: the key going
+down, the text the platform sends for that press, and the key coming up, all
+through the client's event loop. It is the only verb that shows a key a
+shortcut claims is *not* typed: `key` sends no text, and `typekeys` no key.
+
 **`key` presses a key down; it does not let it go.** The release is its own verb
 (`keyup`), so a harness can hold a key — push to talk needs exactly that. The cost
 is that a handler which re-arms on the release sees the first press and then
@@ -937,7 +942,19 @@ Esc again taking the keyboard off the row; "Unread from here" on the middle
 message moving the "New" line to it at once (REQ-235), read from the dump's
 `unread_from=`; and Shift+F10 with nothing focused opening the conversation's own
 menu. It reads the dump's `kbfocus mid= menuhover= menuhovercmd= subhover=
-subopen=` line and `menu=`.
+subopen= ran=` line and `menu=`.
+
+**The single keys** (`e r t p f s u m l` on the focused message) are checked one
+by one by what each ran, the dump's `kbfocus ran=` (the message-menu command
+the last key press ran as a single key, 0 when it ran none), and by the composer's text staying empty: each is
+pressed with `keychar`, which sends the key and the text a real press sends, so a
+letter that leaked into the composer would be seen there. Then their effects:
+`l`'s link pasted back and naming the message, `u`'s "New" line, `s`'s notice,
+`m`'s reminder choices open with the first highlighted, `r`'s picker
+(`pickstate open=1`), `f`'s palette (`natives pal=1`), `t`'s thread (the dump's
+`hist thread=`) and `e`'s edit, the message's text in the composer. `P` (upper
+case) is the same key as `p`; Ctrl+K with a message focused is still the
+palette and runs no single key; and with no message focused, `p` is typed.
 
 **Enter is proven by effect, and the effect is read back.** The harness walks to
 "Copy link", presses Enter, then pastes into the composer and requires the

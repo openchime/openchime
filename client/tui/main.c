@@ -381,7 +381,7 @@ static int has_spoilers(const char *body) {
 }
 /* Long messages (CLIENT.md "Long messages"): one this reader folded away shows
  * its first row; one past 25 rows or 3,000 characters its first 10, for
- * everyone. c folds or unfolds (on every device); m shows a long one whole,
+ * everyone. c folds or unfolds (on every device); z shows a long one whole,
  * here only. */
 enum { TUI_COLLAPSE_ROWS = 25, TUI_COLLAPSE_CHARS = 3000, TUI_COLLAPSE_SHOW = 10 };
 static uint64_t g_tui_expanded[128];
@@ -475,9 +475,9 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
             return;
         }
         /* A person this reader muted: one line saying so, its body, files and
-         * reactions folded away until `m` shows this one message. */
+         * reactions folded away until `z` shows this one message. */
         if (oc_model_is_muted_user(mdl, m->author_id) && !tui_expanded(m->message_id)) {
-            static const char MUTED[] = "    Message from a muted person (m to show)";
+            static const char MUTED[] = "    Message from a muted person (z to show)";
             char *d = malloc(sizeof MUTED);
             if (d) { strcpy(d, MUTED); rows_push(r, d, TB_BLACK | TB_BOLD); }
             for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
@@ -510,7 +510,7 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
                 rows_cut(r, body_first, 1, "    \xe2\x80\xa6 collapsed (c to expand)");
             else if (rows > TUI_COLLAPSE_ROWS || chars > TUI_COLLAPSE_CHARS) {
                 char why[96];
-                snprintf(why, sizeof why, "    \xe2\x80\xa6 %zu more lines (m to show)",
+                snprintf(why, sizeof why, "    \xe2\x80\xa6 %zu more lines (z to show)",
                          rows > TUI_COLLAPSE_SHOW ? rows - TUI_COLLAPSE_SHOW : 0);
                 rows_cut(r, body_first, TUI_COLLAPSE_SHOW, why);
             }
@@ -1231,7 +1231,7 @@ static void draw_help(int W, int H) {
         { "Members",    "n  new DM · Enter for message / role / remove" },
         { "New DM",     "type to find a person · Space end-to-end encrypted · Enter opens" },
         { "Encrypted",  "Ctrl+K: accept or decline, trust a new key, end or forget it" },
-        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · m more · D mark a to-do" },
+        { "Messages",   "t thread · r react · e edit · x delete · v spoilers · c collapse · z more · m remind · D mark a to-do" },
         { "Search",     "Ctrl+O newest first · oldest first · best match first" },
         { NULL, NULL },
         { NULL, "Everything else" },
@@ -5467,7 +5467,18 @@ int main(int argc, char **argv) {
                         tui_expand(mid, sel->collapsed);
                         oc_client_set_collapsed(cl, mid, !sel->collapsed);
                     }
-                    else if (ev.ch == 'm') tui_expand(mid, !tui_expanded(mid));
+                    else if (ev.ch == 'z') tui_expand(mid, !tui_expanded(mid));
+                    else if (ev.ch == 'm' && !sel->deleted && !locked) {
+                        /* Remind me (REQ-283): the choices the menu's "Remind
+                         * me..." opens, Clear among them when one is set -- `m`
+                         * in the graphical client too. */
+                        int reminded = sel->saved && sel->remind_at;
+                        menu_build_remind(reminded);
+                        act_cid = cid; act_mid = mid; act_uid = sel->author_id;
+                        act_title = reminded ? "Reminder" : "Remind me";
+                        action_menu.sel = action_menu.top = 0;
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && may_del) oc_client_delete(cl, cid, mid);
                     else if (own && ((ev.ch == 'e' && !may_edit) ||                  /* the window has closed */
