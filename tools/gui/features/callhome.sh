@@ -172,11 +172,15 @@ only_joined() { has b "^callrow id=$ID " && [ "$(grep -c '^callrow ' "$DB")" = 1
 check "Joined shows only the call bob was in" waitfor 10 seen b only_joined
 press b calls.filter.all || gui_abort "the All filter was not there"
 # A short window, so Past is longer than it, and the list asked for afresh: a page.
+# Every call is held by now, so the baseline is the fresh first page once it has
+# landed (`pages` counts the pages applied), not whatever the dump held before.
 act b size 1600 480
+P0="$(f b callhome pages)"
 act b call home
 y0() { f b callhome active_y; }
-waitfor 5 seen b has b '^callhome loaded=1 .* filter=0 ' || gui_abort "the list did not come back"
-AY="$(y0)"; HN="$(f b callhome hist)"
+afresh() { has b '^callhome loaded=1 .* filter=0 ' && gt "$(f b callhome pages)" "${P0:-0}"; }
+waitfor 10 seen b afresh || gui_abort "the list did not come back"
+AY="$(y0)"; HN="$OPENCHIME_DEV_CALL_HISTORY_PAGE"   # the fresh page: one page of calls
 # The wheel in the list, at its middle.
 LX=0; LY=0
 IFS=, read -r l t r bb <<< "$(f b callhome list)"

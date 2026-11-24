@@ -41526,12 +41526,14 @@ static void test_dump(const char *path) {
                     g_call_engine && oc_call_engine_recording_gated(g_call_engine), (unsigned long long)g_rec_ack_id,
                     oc_model_has_capability(m, OC_CAP_CALL_RECORDING));
             fprintf(f, "callhome loaded=%d more=%d hist=%zu rows=%d filter=%d split=%d scroll=%.0f max=%.0f"
-                       " active_y=%.0f missed=%zu missed_mark=%.0f,%.0f,%.0f,%.0f seen=%llu list=%.0f,%.0f,%.0f,%.0f\n",
+                       " active_y=%.0f missed=%zu missed_mark=%.0f,%.0f,%.0f,%.0f seen=%llu list=%.0f,%.0f,%.0f,%.0f"
+                       " pages=%u\n",
                     m->call_hist_loaded, m->call_hist_more, m->n_call_hist, g_n_home, g_home_filter, g_home_split,
                     g_home_scroll, g_home_scroll_max, g_home_active_y, m->n_call_missed,
                     g_calls_missed_mark.left, g_calls_missed_mark.top, g_calls_missed_mark.right,
                     g_calls_missed_mark.bottom, (unsigned long long)g_calls_seen_ms,
-                    g_home_list.left, g_home_list.top, g_home_list.right, g_home_list.bottom);
+                    g_home_list.left, g_home_list.top, g_home_list.right, g_home_list.bottom,
+                    (unsigned)m->call_hist_seq);
             for (int i = 0; i < g_n_home_drawn; i++)
                 fprintf(f, "callrow id=%llu head=\"%s\" rect=%.0f,%.0f,%.0f,%.0f\n",
                         (unsigned long long)g_home_drawn[i].id, g_home_drawn[i].head, g_home_drawn[i].r.left,
