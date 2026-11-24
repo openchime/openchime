@@ -22462,6 +22462,14 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
             if (f->scroll < 0) f->scroll = 0;
             st_metrics m; st_layout_metrics(l, &m);
             f->lines = m.lines < 1 ? 1 : m.lines;
+            /* Never scrolled past what the text can fill: a scroll set while
+             * the box was shorter must not outlive it, or a box that now holds
+             * all the text hides its first lines above empty space. The caret's
+             * bottom counts as the text's end where it sits below the laid-out
+             * text (an empty last line), so it stays in view. */
+            float end = cr.y + cr.h > m.h ? cr.y + cr.h : m.h;
+            float most = end - h > 0 ? end - h : 0;
+            if (f->scroll > most) f->scroll = most;
         }
     }
     gfx_clip_push(rt, gr(box));
