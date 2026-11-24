@@ -1666,6 +1666,16 @@ set. Consequences worth knowing before touching it:
   else the bitmap re-encoded as PNG through WIC, so a screenshot travels at PNG
   size. The bytes stay in memory until Send (`oc_client_post_items`). The New
   message pane pastes text only: the tray belongs to a conversation.
+- **What Enter does is a preference** (Preferences → Messages, "When I press
+  Enter"), kept with the account's other preferences. With "Send the message",
+  the default, Enter sends; with "Start a new line", Enter starts a new line.
+  Ctrl+Enter sends and Shift+Enter starts a new line in both, so neither chord
+  changes meaning with the choice; inside a code block Enter does what the
+  choice says. An open completion list still takes Enter first, saving an
+  edited message is sending it, the New message pane sends to its recipients,
+  and in Preview Enter and Ctrl+Enter both send. The shortcuts sheet names the
+  keys for the chosen mode. The terminal client's input line is one line, where
+  Enter only sends.
 - **Rich mode carries a typing-intent layer** — pending styles and continuation
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor

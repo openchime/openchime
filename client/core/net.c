@@ -2128,17 +2128,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (cst.client_type.len != strlen(ct) ||
                 (cst.client_type.len && memcmp(cst.client_type.ptr, ct, cst.client_type.len) != 0))
                 continue;
-            oc_ev *h = oc_ev_new(OC_EV_SETTINGS_BEGIN);   /* clears the bucket (sync boundary) */
-            if (h) oc_queue_push(to_ui, h);
-            for (uint16_t i = 0; i < cst.count; i++) {
+            /* The entries are made first, so the BEGIN that clears the bucket
+             * can say how many follow it: the UI thread drains its queue while
+             * this one pushes, and may see BEGIN before the entries. */
+            oc_ev *es[CS_CAP];
+            uint16_t ne = 0;
+            for (uint16_t i = 0; i < cst.count && i < CS_CAP; i++) {
                 oc_ev *e = oc_ev_new(OC_EV_SETTING);
                 if (!e) continue;
                 size_t kn = ce[i].key.len < sizeof e->author_name - 1 ? ce[i].key.len : sizeof e->author_name - 1;
                 memcpy(e->author_name, ce[i].key.ptr, kn); e->author_name[kn] = '\0';
                 e->body = malloc(ce[i].value.len + 1);
                 if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
-                oc_queue_push(to_ui, e);
+                es[ne++] = e;
             }
+            oc_ev *h = oc_ev_new(OC_EV_SETTINGS_BEGIN);   /* clears the bucket (sync boundary) */
+            if (h) { h->n_settings = ne; oc_queue_push(to_ui, h); }
+            for (uint16_t i = 0; i < ne; i++) oc_queue_push(to_ui, es[i]);
         } else if (hdr.msg_type == OC_MSG_AUDIT_PAGE) {
             oc_audit_entry ents[OC_AUDIT_PAGE_MAX];
             uint16_t n = 0;

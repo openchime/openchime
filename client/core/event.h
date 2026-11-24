@@ -628,6 +628,9 @@ typedef struct {
      * CHANNEL_LIST entry does not. */
     uint8_t  ch_managers_known;
     uint64_t ch_creator;
+    /* SETTINGS_BEGIN: how many SETTING events follow it, so the model knows
+     * when the snapshot is whole. */
+    uint16_t n_settings;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);

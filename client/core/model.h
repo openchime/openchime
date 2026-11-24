@@ -845,7 +845,8 @@ typedef struct {
      * machine-local file defaults. */
     oc_setting *settings;
     size_t    n_settings, cap_settings;
-    uint8_t   settings_synced;        /* a snapshot has arrived at least once */
+    uint8_t   settings_synced;        /* a whole snapshot has arrived at least once */
+    uint16_t  settings_due;           /* the entries of the snapshot still to come */
 
     /* Storage report (REQ-214). Owner/admin only, so it stays zeroed for a
      * member — the daemon refuses the request rather than sending zeros.

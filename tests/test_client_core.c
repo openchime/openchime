@@ -516,6 +516,37 @@ static void test_emoji_aliases(void) {
     oc_model_free(&m);
 }
 
+/* The settings bucket is synced once its snapshot is whole: read between the
+ * BEGIN and its entries, a stored value would look missing. An empty snapshot
+ * is whole at its BEGIN. */
+static void setting_ev(oc_model *m, const char *key, const char *value) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_SETTING;
+    snprintf(e.author_name, sizeof e.author_name, "%s", key);
+    e.body = strdup(value);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_settings_snapshot_whole(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev b; memset(&b, 0, sizeof b); b.type = OC_EV_SETTINGS_BEGIN; b.n_settings = 2;
+    oc_model_apply(&m, &b);
+    CHECK(!m.settings_synced);
+    setting_ev(&m, "compose.emoticons", "off");
+    CHECK(!m.settings_synced && !oc_model_setting(&m, "prefs"));
+    setting_ev(&m, "prefs", "t:1;N:1");
+    CHECK(m.settings_synced && oc_model_setting(&m, "prefs") &&
+          strcmp(oc_model_setting(&m, "prefs"), "t:1;N:1") == 0);
+    oc_model_free(&m);
+
+    oc_model_init(&m);
+    b.n_settings = 0;
+    oc_model_apply(&m, &b);
+    CHECK(m.settings_synced && !oc_model_setting(&m, "prefs"));
+    oc_model_free(&m);
+}
+
 /* One CALL_STATE as the core turns it into an event: call `id`, started at
  * `at`, with `in` in it and `asked` asked (0 for nobody), or ended. */
 static void call_state_ev(oc_model *m, uint64_t id, uint64_t at, uint64_t in, uint64_t asked, int ended) {
@@ -7152,6 +7183,7 @@ int run_client_core_tests(void) {
     test_unread_counts_what_notifies();
     test_capabilities();
     test_emoji_aliases();
+    test_settings_snapshot_whole();
     test_server_build();
     test_deployment_name();
     test_invitation_text();

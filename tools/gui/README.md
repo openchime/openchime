@@ -352,6 +352,7 @@ when reading its output.
 | `cursor` | win32 web | | 9505 | the mouse cursor's shape, read from the client | [Reading the cursor harness](#reading-the-cursor-harness) |
 | `drafts` | win32 | | 9560 | deleting a draft from Drafts | [Reading the drafts harness](#reading-the-drafts-harness) |
 | `emoji_admin` | win32 web | | 9525 | Admin > Custom emoji | its header |
+| `entersend` | win32 web | | 9606 | what Enter does in the composer, in each mode of its preference | its header |
 | `files` | win32 web | | 9590 | paging the Files view | [Reading the files harness](#reading-the-files-harness) |
 | `groups` | win32 | | 9640 | user groups, two clients | [Reading the calls harness](#reading-the-calls-harness) (its last part) |
 | `jumpdate` | win32 | | 9760 | jump to a date | [Reading the jump-to-date harness](#reading-the-jump-to-date-harness) |

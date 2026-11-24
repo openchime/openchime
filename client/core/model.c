@@ -3412,10 +3412,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         /* A CLIENT_SETTINGS frame start (solicited or a device-sync push): the
          * snapshot replaces the bucket wholesale, so clear it before the entries. */
         m->n_settings = 0;
-        m->settings_synced = 1;
+        /* Synced once the snapshot is whole: its entries follow this event,
+         * and a frontend that read the bucket between them would take a
+         * stored value for a missing one. */
+        m->settings_due = e->n_settings;
+        if (!m->settings_due) m->settings_synced = 1;
         break;
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
+        if (m->settings_due && --m->settings_due == 0) m->settings_synced = 1;
         break;
     case OC_EV_DRAFT:
         draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body, e->topic);

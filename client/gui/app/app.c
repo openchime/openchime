@@ -1200,6 +1200,10 @@ static const char *cursor_kind_name(void) {
 }
 
 static int g_pref_richtext  = 1;
+/* What plain Enter does in the composer: 0 sends (the default), 1 starts a new
+ * line. Ctrl+Enter sends and Shift+Enter starts a new line in both, so neither
+ * chord changes meaning with the preference. */
+static int g_pref_enter_newline = 0;
 /* Typed emoticons become emoji as a space follows them and on send
  * (compose.emoticons, a setting of its own: the terminal client reads it too). */
 static int g_pref_emoticons = 0;
@@ -1209,6 +1213,13 @@ static int g_pref_emoticons = 0;
  * is a plain box. */
 static int composer_toolbar_on(void) { return g_pref_richtext; }
 static int g_prefs_pending;        /* fold the synced values in once they land */
+/* The account's stored preferences have been read (or it has none), so a save
+ * now carries them rather than this build's defaults. Until then prefs_save
+ * writes nothing and notes that it was asked (g_prefs_save_held): the window's
+ * placement settling at start used to write every preference at its default
+ * over the account's before they had arrived. */
+static int g_prefs_read;
+static int g_prefs_save_held;
 /* Window placement, remembered across runs. It rides in the same synced bucket
  * as the other preferences because a client writes no files (ARCH-88) — which
  * does mean it is stored per workspace rather than per machine. Acceptable: the
@@ -10437,6 +10448,8 @@ static const struct {
     uint8_t  action;      /* ACC_* ; ACC_NONE = documentation only */
     const char *keys, *what;
 } SHORTCUTS[] = {
+    /* The composer's two rows. Their keys follow the Enter preference, so the
+     * sheet shows them through compose_key_label(), not from here. */
     { 0,                  0,          ACC_NONE,  "Enter",              "Send the message" },
     { 0,                  0,          ACC_NONE,  "Shift+Enter",        "New line" },
     /* Formatting. Display-only rows: the keys are dispatched inside the
@@ -10821,6 +10834,23 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
     return 0;
 }
 
+/* The key that sends (send = 1) or starts a new line (send = 0) in the
+ * composer, as the Enter preference makes it. The shortcuts sheet and the test
+ * dump both read it, so they cannot disagree. */
+static const char *compose_key_label(int send) {
+    if (send) return g_pref_enter_newline ? "Ctrl+Enter" : "Enter";
+    return g_pref_enter_newline ? "Enter" : "Shift+Enter";
+}
+
+/* A row's keys as the sheet shows them: the composer's two from the preference. */
+static const char *shortcut_keys(int i) {
+    if (SHORTCUTS[i].action == ACC_NONE && SHORTCUTS[i].what) {
+        if (!strcmp(SHORTCUTS[i].what, "Send the message")) return compose_key_label(1);
+        if (!strcmp(SHORTCUTS[i].what, "New line"))         return compose_key_label(0);
+    }
+    return SHORTCUTS[i].keys;
+}
+
 static void draw_keys(gfx *rt, rectf reg) {
     rectf body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_KEYS);
@@ -10832,7 +10862,7 @@ static void draw_keys(gfx *rt, rectf reg) {
     for (int i = 0; i < n; i++) {
         if (!SHORTCUTS[i].keys) continue;        /* the paired row, described above */
         if (y > body.bottom) break;
-        draw_text(rt, SHORTCUTS[i].keys, g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
+        draw_text(rt, shortcut_keys(i), g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
         draw_text(rt, SHORTCUTS[i].what, g_ui, rf(body.left + 210, y, body.right - 24, y + rowh), OC_COL_MUTED);
         y += rowh;
     }
@@ -11813,7 +11843,8 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
-       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS,
+       PREF_ROW_ENTER };
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -11974,6 +12005,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
     static const char *SIZES[4]  = { "Small", "Default", "Large", "Larger" };
     static const char *DENS[2]   = { "Compact", "Cozy" };
     static const char *EDITORS[2] = { "Plain text", "Rich text" };
+    static const char *ENTERS[2]  = { "Send the message", "Start a new line" };
 
     if (g_pref_cat == PC_APPEARANCE) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
@@ -12003,6 +12035,12 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
+        /* The other convention, for people who write long messages: Enter
+         * starts a new line and Ctrl+Enter sends. */
+        y = pref_row(rt, body, y, PREF_ROW_ENTER, "When I press Enter",
+                     "Ctrl+Enter always sends, and Shift+Enter always starts "
+                     "a new line.",
+                     ENTERS, 2, g_pref_enter_newline);
         y = pref_row(rt, body, y, PREF_ROW_EMOTICONS, "Emoticons",
                      "Typed faces such as :) and <3 become emoji when a space "
                      "follows them, and when you send. Never inside code.",
@@ -17663,6 +17701,7 @@ static struct {
     unsigned dpi;
     char quick[160];
     int  richtext;
+    int  enter_newline;
     int  emoticons;
     int  flash;
     int  toastpos;
@@ -17680,6 +17719,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
+    g_prefs_snap.enter_newline = g_pref_enter_newline;
     g_prefs_snap.emoticons = g_pref_emoticons;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
@@ -17704,6 +17744,7 @@ static void prefs_restore(void) {
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
+    g_pref_enter_newline = g_prefs_snap.enter_newline;
     g_pref_emoticons = g_prefs_snap.emoticons;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
@@ -28722,7 +28763,9 @@ static int ed_key(oc_win *hwnd, int vk) {
     }
     if (!g_ed_focus) return 0;
     /* Previewing: Enter sends what is shown, Esc goes back to editing it, and
-     * nothing edits the hidden field -- not a key, not a paste. */
+     * nothing edits the hidden field -- not a key, not a paste. Enter and
+     * Ctrl+Enter both send, whichever key the Enter preference makes the
+     * sending one: there is no line to start here. */
     if (g_preview && g_view != VIEW_NEWMSG) {
         if (vk == OCK_RETURN && !mod_down(OCK_SHIFT)) { composer_send(); invalidate(); return 1; }
         if (vk == OCK_ESCAPE) { preview_set(hwnd, 0); return 1; }
@@ -28805,7 +28848,11 @@ static int ed_key(oc_win *hwnd, int vk) {
         /* The completion popover claims Enter first — that is what makes Tab and
          * Enter interchangeable for accepting one. */
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
-        if (shift) { ed_newline(); changed = 1; break; }
+        /* Shift+Enter is always a new line and Ctrl+Enter always sends; plain
+         * Enter does what the Messages preference says (g_pref_enter_newline).
+         * Editing a sent message saves the way a new one sends: composer_send
+         * is both. */
+        if (shift || (!ctrl && g_pref_enter_newline)) { ed_newline(); changed = 1; break; }
         /* In the New message pane the message goes where the pane says it goes.
          * composer_send() posts to g_sel -- the channel that was open before --
          * so Enter used to file a private message into the last room you read. */
@@ -30655,7 +30702,9 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
 }
 
 
-/* The composer's keys (ed_key): Enter sends, Shift+Enter inserts a newline.
+/* The composer's keys (ed_key): Enter sends and Shift+Enter inserts a newline,
+ * or, with the Enter preference set to a new line, Enter inserts one and
+ * Ctrl+Enter sends.
  * While the autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
@@ -34731,6 +34780,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
                 if (composer_remeasure()) layout_composer(hwnd);
                 break;
+            case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
@@ -37151,7 +37201,7 @@ static void boot_other_workspaces(const char *skip) {
         if (ws_find(b.ws[i]) >= 0) continue;
         if (!have_stored_token(b.ws[i])) continue;
         ws_save_active();
-        g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_n_backfilled = 0;
+        g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_n_backfilled = 0;
         connect_start(b.ws[i], "");
     }
     free(b.ws);
@@ -37187,7 +37237,7 @@ static void reset_session(void) {
         oc_client_stop(g_client);
         g_client = NULL;
     }
-    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE; submenu_close();
     g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
@@ -37538,7 +37588,7 @@ static void signin_poll(oc_win *hwnd) {
          * previous workspace stay live and visible throughout. */
         ws_save_active();
         g_client = g_si_client; g_si_client = NULL;
-        g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+        g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
         g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
         g_si_overlay = 0;
         g_si_connecting = 0;
@@ -37899,7 +37949,7 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
     ws_save_active();          /* keep the current one running */
     close_overlays();
     g_client = NULL;           /* not a stop: the old client lives on in its slot */
-    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
     g_view = VIEW_HOME;
     if (!connect_start(ws, cred ? cred : "")) {
@@ -38196,6 +38246,7 @@ static void open_new_menu(oc_win *hwnd) {
  * so a terminal and a window can keep different sidebar shapes. */
 static void prefs_save(void) {
     if (!g_client) return;
+    if (!g_prefs_read) { g_prefs_save_held = 1; return; }
     char enc[448];   /* within OC_SETTING_VALUE_MAX; the quick reactions alone may take 160 */
     /* Zoom is deliberately absent: it is per window and transient (ARCH-97), so
      * persisting it would make one window's temporary magnification follow the
@@ -38224,6 +38275,9 @@ static void prefs_save(void) {
         /* ...and when the missed calls were last seen (CALLS.md §2). */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";b:%llu;S:%d", (unsigned long long)g_calls_seen_ms, g_selfview);
+        /* ...and what Enter does in the composer. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";N:%d", g_pref_enter_newline);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38235,6 +38289,7 @@ static void prefs_load(const oc_model *m) {
     const char *v = m ? oc_model_setting(m, PREFS_SETTING_KEY) : NULL;
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
+    int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
     /* Tolerant of missing keys and of any order, so a value written by a newer
      * build with extra fields still loads what this one understands. */
     for (const char *p = v; *p; ) {
@@ -38274,6 +38329,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'j') g_cam_h = (uint32_t)strtoul(p + 2, NULL, 10);
             else if (k == 'l') g_call_layout = val ? 1 : 0;
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
+            else if (k == 'N') nl = val ? 1 : 0;
             else if (k == 'b') {
                 /* The missed calls already seen, and the history asked for, so
                  * those missed while away are marked. */
@@ -38295,6 +38351,7 @@ static void prefs_load(const oc_model *m) {
     g_pref_time24  = h ? 1 : 0;
     g_pref_members = mm ? 1 : 0;
     g_pref_daysep  = d ? 1 : 0;
+    g_pref_enter_newline = nl;
     g_show_members = g_pref_members;
     theme_set(t);
     /* After theme_set: the accent pair is resolved per mode, so the mode has to be
@@ -42000,6 +42057,10 @@ static void test_dump(const char *path) {
                 !g_draft_dirty ? 0 : now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS ? 2 : 1,
                 g_preview_h, g_preview_lines, g_preview_tabs,
                 g_preview_btn.left, g_preview_btn.top, g_preview_btn.right, g_preview_btn.bottom);
+        /* What Enter does in the composer, and the key the shortcuts sheet
+         * names for sending. */
+        fprintf(f, "compose enter=%s send_key=\"%s\"\n",
+                g_pref_enter_newline ? "newline" : "send", compose_key_label(1));
     }
     /* The About tab's admin buttons, so a test can click the one it means rather
      * than arithmetic that breaks the next time a button is added between them —
@@ -43691,6 +43752,15 @@ static void test_poll(oc_win *hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
+    } else if (!strcmp(verb, "enter")) {
+        /* `enter send|newline`: the Messages preference "When I press Enter",
+         * saved as its row saves it, so a restart can be asked what it kept. */
+        if (!strcmp(arg, "send") || !strcmp(arg, "newline")) {
+            g_pref_enter_newline = !strcmp(arg, "newline");
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "emoji")) {
         picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
         test_ack("ok");
@@ -45185,9 +45255,19 @@ static int on_tick(oc_win *hwnd) {
                     if (m->audit[i].at_ms && m->audit[i].at_ms < oldest) oldest = m->audit[i].at_ms;
                 g_audit_oldest = oldest;
             }
-            if (g_prefs_pending && oc_model_setting(m, PREFS_SETTING_KEY)) {
+            /* Once the whole bucket is here: the stored preferences if there
+             * are any, and then a save asked for in the meantime, which now
+             * carries them. */
+            if (g_prefs_pending && m->settings_synced && !oc_model_setting(m, PREFS_SETTING_KEY)) {
+                g_prefs_pending = 0;
+                g_prefs_read = 1;
+                if (g_prefs_save_held) { g_prefs_save_held = 0; prefs_save(); }
+            }
+            if (g_prefs_pending && m->settings_synced && oc_model_setting(m, PREFS_SETTING_KEY)) {
                 prefs_load(m);
                 g_prefs_pending = 0;
+                g_prefs_read = 1;
+                if (g_prefs_save_held) { g_prefs_save_held = 0; prefs_save(); }
                 /* Place the window where it was left. The settings arrive after
                  * auth, so the window is created hidden and shown here — moving
                  * a visible window would flash it at the default size first. */
@@ -45242,6 +45322,7 @@ static int on_tick(oc_win *hwnd) {
                 g_post_auth = 1;
                 g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
                 g_prefs_pending = 1;
+                g_prefs_read = 0;        /* this workspace's are still to come */
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
             /* Sign-out is scoped to ONE workspace, not the app. It used to drop
