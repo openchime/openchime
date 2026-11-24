@@ -67,6 +67,7 @@
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
 #include "releasenotes.h"     /* What's new: this build's release notes */
 #include "theme.h"
+#include "typeface.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
@@ -506,23 +507,25 @@ enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 /* Pinned vertical metrics per token (ARCH-108): the app owns the baseline.
  * DirectWrite's natural metrics are per-font-file and fractional, so a label's
  * seat depended on which weight drew it and which letters it contained. Every
- * Segoe format is pinned instead: an integer baseline and line box derived
+ * UI-family format is pinned instead: an integer baseline and line box derived
  * from the token size, identical across weights and styles of that size.
  *
- * The derivation, not a table of constants, so it holds at every text scale:
+ * The derivation, not a table of constants, so it holds at every text scale and
+ * in every family (oc_typeface_pin, typeface.c):
  *   baseline = ceil(ascent)          — the raster has no headroom above line 1,
  *                                      so ink must not rise past the box top;
  *   line_h   = round(2·bl − cap)     — puts the cap-ink centre on the line-box
  *                                      centre, which is what makes a MID-seated
  *                                      label agree with a geometrically centred
  *                                      icon without per-site nudges.
- * Ratios are Segoe UI's (unitsPerEm 2048: ascent 2210, cap 1434). At scale 1
- * this yields display 26/19, title 23/17, ui 22/16, meta 19/14, micro 15/11. */
-#define SEGOE_ASC 1.0791f
-#define SEGOE_CAP 0.7002f
+ * The ascent and cap height are the chosen family's own, read from the font
+ * when the formats are built (fonts_build -> st_family_metrics); Segoe UI's
+ * (unitsPerEm 2048: ascent 2210, cap 1434) are the fallback when they cannot
+ * be read. With Segoe UI's this yields, at scale 1, display 26/19, title 23/17,
+ * ui 22/16, meta 19/14, micro 15/11. */
+static float g_font_asc, g_font_cap;   /* the UI family's figures; 0 = Segoe UI's */
 static void pin_metrics(float size_scaled, float *lh, float *bl) {
-    *bl = ceilf(SEGOE_ASC * size_scaled - 0.02f);
-    *lh = roundf(2.0f * *bl - SEGOE_CAP * size_scaled);
+    oc_typeface_pin(size_scaled, g_font_asc, g_font_cap, lh, bl);
 }
 
 /* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
@@ -3647,15 +3650,44 @@ static float textsize_mult(void) {
     return M[i];
 }
 
+/* The interface font (ARCH-97): a choice from a short fixed list of families
+ * the system ships, Default being the platform's own. Follows the account like
+ * text size, and is its own preview like text size. */
+static int   g_pref_font = OC_TYPEFACE_DEFAULT;
+/* Test-only (`fontfam <name>`): a family asked for by name, outside the list,
+ * so the harness can ask for one no system has. Empty in a shipped client. */
+static char  g_font_test_family[64];
+static const char *g_font_used;        /* the family the formats are built with */
+static int   g_font_missing;           /* the family asked for is not installed */
+
 /* Is a family actually installed? DirectWrite silently substitutes for a
- * missing one, and its substitute for "Segoe UI Variable Text" is not
- * necessarily Segoe UI — so ask rather than hope. */
+ * missing one, and its substitute is not necessarily the default — so ask
+ * rather than hope. */
+static int ui_family_present(void *user, const char *family) {
+    (void)user;
+    return g_st ? st_family_present(g_st, family) : 0;
+}
+
+/* The family asked for: the test override, else the choice from the list. */
+static const char *ui_family_asked(void) {
+    if (g_font_test_family[0]) return g_font_test_family;
+    int i = (g_pref_font < 0 || g_pref_font >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : g_pref_font;
+    return i == OC_TYPEFACE_DEFAULT ? oc_typeface_default(ui_family_present, NULL) : OC_TYPEFACES[i].family;
+}
+
+/* Resolve the family and read its figures: once per fonts_build. */
+static void ui_family_resolve(void) {
+    if (g_font_test_family[0])
+        g_font_used = oc_typeface_resolve_family(g_font_test_family, ui_family_present, NULL, &g_font_missing);
+    else
+        g_font_used = oc_typeface_resolve(g_pref_font, ui_family_present, NULL, &g_font_missing);
+    if (!g_st || !st_family_metrics(g_st, g_font_used, &g_font_asc, &g_font_cap))
+        g_font_asc = g_font_cap = 0.0f;   /* Segoe UI's figures (oc_typeface_pin) */
+}
+
 static const char *ui_family(void) {
-    static const char *cached;
-    if (!cached)
-        cached = st_family_present(g_st, "Segoe UI Variable Text")
-                     ? "Segoe UI Variable Text" : "Segoe UI";
-    return cached;
+    if (!g_font_used) ui_family_resolve();
+    return g_font_used;
 }
 
 static void fmt_release(fmtw **f) {
@@ -3665,6 +3697,9 @@ static void fmt_release(fmtw **f) {
 /* Build (or rebuild) every text format. Safe to call again: releases first, so a
  * text-size change is one call plus a relayout. */
 static void fonts_build(void) {
+    /* The family, and its own ascent and cap height, which every pin below is
+     * derived from (ARCH-108). */
+    ui_family_resolve();
     const char *UI = ui_family();
     const float k = g_text_scale;
     fmtw **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
@@ -3717,8 +3752,10 @@ static void fonts_build(void) {
     /* A snippet's text (REQ-226): the code family, at meta size, one line per
      * draw, coloured span by span. */
     {
+        /* Pinned with Segoe UI's figures whatever the interface font: Consolas
+         * is not the chosen family, and its pair stays the one it always had. */
         float clh, cbl;
-        pin_metrics(FONT_META * k, &clh, &cbl);
+        oc_typeface_pin(FONT_META * k, 0.0f, 0.0f, &clh, &cbl);
         g_code = mk_fmt_s("Consolas", FONT_META * k, REG, L, MID, 0, 0, clh, cbl);
     }
 }
@@ -11885,7 +11922,7 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
        PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS,
-       PREF_ROW_ENTER };
+       PREF_ROW_ENTER, PREF_ROW_FONT };
 /* Accessibility's rows: what each message says to a screen reader. */
 enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
        PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
@@ -12075,6 +12112,13 @@ static void draw_prefs(gfx *rt, rectf reg) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
                      "System follows the Windows theme.", THEMES, 3, oc_theme_mode());
         y = pref_accent_row(rt, body, y);
+        {
+            const char *FONTS[OC_TYPEFACE_COUNT];
+            for (int i = 0; i < OC_TYPEFACE_COUNT; i++) FONTS[i] = OC_TYPEFACES[i].label;
+            y = pref_row(rt, body, y, PREF_ROW_FONT, "Font",
+                         "The whole interface. Code keeps its own.",
+                         FONTS, OC_TYPEFACE_COUNT, g_pref_font);
+        }
         y = pref_row(rt, body, y, PREF_ROW_TEXTSIZE, "Text size",
                      "Follows your account, not this machine.",
                      SIZES, 4, g_pref_textsize);
@@ -17785,7 +17829,7 @@ static void close_overlays(void);                /* fwd */
  * judge a theme from a label — but it reverts with the rest on Cancel. */
 static struct {
     int theme, time24, members, daysep, notify;
-    int accent, textsize, density;
+    int accent, textsize, density, font;
     unsigned dpi;
     char quick[160];
     int  richtext;
@@ -17807,6 +17851,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.toastpos = g_pref_toastpos;
     g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
+    g_prefs_snap.font     = g_pref_font;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
     g_prefs_snap.enter_newline = g_pref_enter_newline;
@@ -17846,8 +17891,9 @@ static void prefs_restore(void) {
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
      * through the one path that knows that — and only when they actually moved. */
     if (g_dpi != g_prefs_snap.dpi) dpi_set(g_main, g_prefs_snap.dpi);
-    if (g_pref_textsize != g_prefs_snap.textsize) {
+    if (g_pref_textsize != g_prefs_snap.textsize || g_pref_font != g_prefs_snap.font) {
         g_pref_textsize = g_prefs_snap.textsize;
+        g_pref_font     = g_prefs_snap.font;
         scale_apply(g_main);
     }
 }
@@ -34930,6 +34976,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
              * label — and reverts with everything else on Cancel. */
             case PREF_ROW_ACCENT:   scheme_set(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
+            case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
             case PREF_ROW_RESET:
@@ -34941,6 +34988,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 g_pref_notify = NOTIFY_FULL;
                 g_pref_flash = FLASH_IDLE;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
+                g_pref_font = OC_TYPEFACE_DEFAULT;
                 snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
                 quick_rebuild();
                 scale_apply(hwnd);
@@ -38415,6 +38463,9 @@ static void prefs_save(void) {
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";R:%u;A:%d", oc_spoken_bits(&g_pref_spoken),
                  g_pref_announce_new);
+        /* ...and the interface font (ARCH-97). */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";F:%d", g_pref_font);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38430,6 +38481,7 @@ static void prefs_load(const oc_model *m) {
     /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
     oc_spoken_opts spk = oc_spoken_defaults();
     int an = 1;
+    int font = OC_TYPEFACE_DEFAULT;   /* no `F:`: the default font */
     /* Tolerant of missing keys and of any order, so a value written by a newer
      * build with extra fields still loads what this one understands. */
     for (const char *p = v; *p; ) {
@@ -38472,6 +38524,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'N') nl = val ? 1 : 0;
             else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
             else if (k == 'A') an = val ? 1 : 0;
+            else if (k == 'F') font = (val < 0 || val >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : val;
             else if (k == 'b') {
                 /* The missed calls already seen, and the history asked for, so
                  * those missed while away are marked. */
@@ -38496,6 +38549,7 @@ static void prefs_load(const oc_model *m) {
     g_pref_enter_newline = nl;
     g_pref_spoken = spk;
     g_pref_announce_new = an;
+    g_pref_font = font;
     g_show_members = g_pref_members;
     theme_set(t);
     /* After theme_set: the accent pair is resolved per mode, so the mode has to be
@@ -42138,10 +42192,16 @@ static void test_dump(const char *path) {
      * another one silently matched twice in the smoke's extractor and produced a
      * two-line "expected" value. Names in this dump are read by grep, so they have to
      * be unambiguous to grep. */
+    /* The interface font: the family asked for (`fontpick`), the one the formats
+     * were built with (`fontfam`), whether the first is missing, and the figures
+     * the pins were derived from (0 = unreadable, Segoe UI's used). */
     fprintf(f, "textsize=%d scale=%.3f dpi=%u density=%d "
-               "scheme=%d railcol=%06X accentcol=%06X\n",
+               "scheme=%d railcol=%06X accentcol=%06X "
+               "font=%d fontpick=\"%s\" fontfam=\"%s\" fontmissing=%d fontasc=%.4f fontcap=%.4f\n",
             g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
-            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
+            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT,
+            g_pref_font, ui_family_asked(), ui_family(), g_font_missing,
+            (double)g_font_asc, (double)g_font_cap);
     /* THE WHOLE PALETTE, by token name. The audit asks two questions this
      * answers and nothing else can: is a colour on screen one the theme
      * actually names (a literal that resolves to no token is a surface that
@@ -43920,6 +43980,20 @@ static void test_poll(oc_win *hwnd) {
             invalidate();
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "font")) {
+        /* `font <n>`: the interface font, by its index in the list (ARCH-97),
+         * applied and saved as the Appearance row and Save do. */
+        int v = atoi(arg);
+        if (arg[0] >= '0' && arg[0] <= '9' && v >= 0 && v < OC_TYPEFACE_COUNT) {
+            g_pref_font = v; scale_apply(hwnd); prefs_save(); test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "fontfam")) {
+        /* `fontfam <family>`, test-only: ask for a family by name, outside the
+         * list, so the harness can ask for one no system has and read that it
+         * fell back. Never saved. `fontfam` alone goes back to the preference. */
+        snprintf(g_font_test_family, sizeof g_font_test_family, "%s", arg);
+        scale_apply(hwnd);
+        test_ack("ok");
     } else if (!strcmp(verb, "prefs")) {
         /* `prefs [category]` — the category by INDEX, because the alternative
          * is clicking a row whose y moves with the DPI and the text size, and

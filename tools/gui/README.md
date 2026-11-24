@@ -41,6 +41,7 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the keyboard-menu harness](#reading-the-keyboard-menu-harness)
 - [Reading the calls harness](#reading-the-calls-harness)
 - [Reading the search-box harness](#reading-the-search-box-harness)
+- [Reading the fonts harness](#reading-the-fonts-harness)
 - [Reading the voice harness](#reading-the-voice-harness)
 - [Reading the cursor harness](#reading-the-cursor-harness)
 - [Reading the caret harness](#reading-the-caret-harness)
@@ -356,6 +357,7 @@ when reading its output.
 | `emoji_admin` | win32 web | | 9525 | Admin > Custom emoji | its header |
 | `entersend` | win32 web | | 9606 | what Enter does in the composer, in each mode of its preference | its header |
 | `files` | win32 web | | 9590 | paging the Files view | [Reading the files harness](#reading-the-files-harness) |
+| `fonts` | win32 web | | 9655 | each interface font, and a family the system lacks | [Reading the fonts harness](#reading-the-fonts-harness) |
 | `groups` | win32 | | 9640 | user groups, two clients | [Reading the calls harness](#reading-the-calls-harness) (its last part) |
 | `jumpdate` | win32 | | 9760 | jump to a date | [Reading the jump-to-date harness](#reading-the-jump-to-date-harness) |
 | `keymenu` | win32 | | 9610 | the keyboard's route to the context menu | [Reading the keyboard-menu harness](#reading-the-keyboard-menu-harness) |
@@ -1092,6 +1094,30 @@ emoji picker — and reads its `searchbox` line from the dump:
 
 The checks were shown to fail with one box put back on the stock font, and with
 the EDIT given a fixed height again.
+
+## Reading the fonts harness
+
+`tools/gui/features/fonts.sh` checks the Appearance preference Font (CLIENT.md,
+"Typography") on a pair of its own (port 9655; only alice is driven). It
+chooses each font in turn with the `font <n>` verb and reads the dump's
+text-size line, where `fontpick` is the family asked for, `fontfam` the one the
+formats were built with, `fontmissing=1` that the first is not installed, and
+`fontasc`/`fontcap` the figures the pins were derived from (0 when they could
+not be read and Segoe UI's were used). For each font:
+
+- the family asked for is the one used, and every search box's `face=` is it;
+- under Default, the `textmetrics` pairs are ARCH-97's: display 26/19, title
+  23/17, ui 22/16, meta 19/14, micro 15/11;
+- `ui_mh_eq=1`, and the find box's EDIT holds a line of the font inside its
+  chrome, centred, as `search_boxes.sh` reads it;
+- at the largest text size the UI line box and the find box's font are larger
+  than at the default, and both still hold.
+
+Then the test-only `fontfam <family>` asks for a family no system has: the
+dump must say `fontmissing=1` with `fontfam` the default family. In a browser
+without Windows' fonts (the harness's Chrome on Linux), Verdana, Calibri and
+Sitka are reported missing and the default is used; that is a pass there,
+since fonts are not part of parity (WEB.md).
 
 ## Reading the voice harness
 

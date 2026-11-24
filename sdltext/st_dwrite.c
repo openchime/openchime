@@ -756,6 +756,48 @@ int st_dwrite_family_present(st_ctx *c, const char *family)
     return ok;
 }
 
+/* The regular face's design metrics, over its units per em. The family is
+ * looked up in the system collection rather than substituted: a family that is
+ * not there has no figures. */
+int st_family_metrics(st_ctx *c, const char *family, float *ascent_em, float *cap_em)
+{
+    *ascent_em = 0.0f;
+    *cap_em = 0.0f;
+    if (!c || !family)
+        return 0;
+    WCHAR *fam = st__wide(family, strlen(family));
+    if (!fam)
+        return 0;
+    int ok = 0;
+    IDWriteFontCollection *fc = NULL;
+    if (SUCCEEDED(IDWriteFactory_GetSystemFontCollection(c->dw, &fc, FALSE)) && fc) {
+        UINT32 ix = 0;
+        BOOL found = FALSE;
+        IDWriteFontFamily *ff = NULL;
+        IDWriteFont *font = NULL;
+        if (SUCCEEDED(IDWriteFontCollection_FindFamilyName(fc, fam, &ix, &found)) && found &&
+            SUCCEEDED(IDWriteFontCollection_GetFontFamily(fc, ix, &ff)) && ff &&
+            SUCCEEDED(IDWriteFontFamily_GetFirstMatchingFont(ff, DWRITE_FONT_WEIGHT_NORMAL,
+                                                             DWRITE_FONT_STRETCH_NORMAL,
+                                                             DWRITE_FONT_STYLE_NORMAL, &font)) && font) {
+            DWRITE_FONT_METRICS fm;
+            IDWriteFont_GetMetrics(font, &fm);
+            if (fm.designUnitsPerEm > 0 && fm.ascent > 0 && fm.capHeight > 0) {
+                *ascent_em = (float)fm.ascent / (float)fm.designUnitsPerEm;
+                *cap_em = (float)fm.capHeight / (float)fm.designUnitsPerEm;
+                ok = 1;
+            }
+        }
+        if (font)
+            IDWriteFont_Release(font);
+        if (ff)
+            IDWriteFontFamily_Release(ff);
+        IDWriteFontCollection_Release(fc);
+    }
+    free(fam);
+    return ok;
+}
+
 void st_dwrite_draw_rt(st_ctx *c, st_layout *l, void *d2d_render_target,
                        float x, float y, uint32_t rgb, float alpha)
 {

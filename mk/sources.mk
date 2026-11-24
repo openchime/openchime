@@ -240,6 +240,9 @@ SDLTEXT_INC    := -Isdltext
 # arithmetic with one Windows call behind an #ifdef, and the contrast guarantee
 # it carries has to be asserted somewhere that RUNS.
 THEME_SRC := client/gui/app/theme.c
+# typeface.c, the same way: the font list, its resolution and ARCH-108's pin
+# are pure, and asserted by `make test` (tests/test_typeface.c).
+TYPEFACE_SRC := client/gui/app/typeface.c
 # The drawing layer (client/gui/gfx): fills, rounded rects, clips, lines,
 # textures and the Lucide stroke tessellator over an SDL3 renderer.
 GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c

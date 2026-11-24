@@ -1316,7 +1316,7 @@ reopens on the pane you left it on.
 
 **Appearance applies live and reverts on Cancel.** A colour, a text size and a
 density are their own preview; you cannot judge any of them from a label. The
-snapshot therefore covers the accent, the text size, the density and the DPI, and
+snapshot therefore covers the accent, the text size, the font, the density and the DPI, and
 `prefs_restore` re-applies each through the one path that knows what it
 costs (`scale_apply` rebuilds every text format and drops the raster caches;
 `dpi_set` lets the next paint's scale pass rebuild them lazily).
@@ -1765,3 +1765,18 @@ formats are built (`fonts_build`); system DPI is applied
 separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
 to change a format's size, so any preference that moves the scale must call
 `fonts_build` and then force a relayout.
+
+**The font is a preference** (Appearance, Font): Default, the platform's UI
+family (Segoe UI Variable Text, else Segoe UI; the browser's own on the web),
+or Verdana, Calibri or Sitka Text, a fixed list in `client/gui/app/typeface.c`.
+`fonts_build` resolves the choice through `st_family_present` and builds every
+format made with the UI family in it; code keeps Consolas and the toolbar's
+decorations keep Georgia. A family the system lacks falls back to the default,
+never to the system's own substitute. Each format's pinned line box and
+baseline are derived from the family's own ascent and cap height, read with
+`st_family_metrics` (ARCH-108), Segoe UI's when they can't be read, so the
+table's pairs are Segoe UI's and another family has its own. The font follows
+the account (`F:` in the preferences value), previews at once and reverts on
+Cancel like text size, and Reset returns it to Default. The test dump's
+text-size line reports the family asked for and the one used (`fontpick=`,
+`fontfam=`, `fontmissing=`) and the figures (`fontasc=`, `fontcap=`).

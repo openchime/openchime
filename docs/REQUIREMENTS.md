@@ -2624,7 +2624,9 @@ choose — which makes each one a per-frontend *obligation*.*
   config file, CLIENT.md §3). (ARCH-92: per-frontend.)
 - **REQ-262.** Every client has offered **theme/appearance selection** — at least
   light, dark, and follow-system — applied in-app. The TUI ships a 256-color theme
-  (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80).
+  (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80). The graphical
+  clients' appearance settings have also offered the interface font, chosen
+  from a short list of families the system already has (ARCH-97).
 
   **A theme's ink has cleared 3:1 against the surface it is drawn on**, which is
   what WCAG asks of non-text UI and the floor below which an element is not dim

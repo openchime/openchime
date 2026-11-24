@@ -110,6 +110,7 @@ int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_sdltext_unicode_tests(void);
 int run_theme_tests(void);
+int run_typeface_tests(void);
 int run_e2e_tests(void);
 int run_pdm_crypto_tests(void);
 int run_call_media_tests(void);
@@ -376,6 +377,7 @@ static const struct suite {
     S(run_sdltext_map_tests,     FAST, PLAIN),
     S(run_sdltext_unicode_tests, FAST, PLAIN),
     S(run_theme_tests,           FAST, PLAIN),
+    S(run_typeface_tests,        FAST, PLAIN),
     S(run_e2e_tests,             FAST, PLAIN),
     S(run_pdm_crypto_tests,      FAST, PLAIN),
     S(run_call_media_tests,      FAST, PLAIN),
