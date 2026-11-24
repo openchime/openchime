@@ -1334,6 +1334,23 @@ and follows the account; DPI belongs to the display. There is no per-window zoom
 `g_text_scale` is the text size's multiplier alone; anything that caches a font
 size of its own is rebuilt by `scale_apply`.
 
+**Reduce motion is Off, On or Follow system (REQ-269).** Follow system is the
+default and asks the platform (`oc_plat_reduce_motion`: Windows' "Show
+animations", `SPI_GETCLIENTAREAANIMATION`; a browser's
+`prefers-reduced-motion`) at start and whenever the window gains focus, so a
+change made in the system's settings is followed without a restart; an
+unknown answer reads as not reduced. Reduced, three things stop moving: the
+jump highlight is held at full strength for its 1.6 s and then removed rather
+than faded; the upload tray's bar shows the real figure at once, its waiting
+track keeps one strength and carries no sweeping light, and the done tick
+appears whole; and the caret of the message box, the drawn fields and the To:
+box is lit for as long as its field has focus instead of blinking. The system
+caret assistive technology follows is unchanged: it is never shown (ARCH-99).
+The arithmetic is `client/gui/app/motion.c`, one function per moving thing, so
+`make test` asserts the reduced case beside the moving one. The choice is kept
+with the other preferences in the account's bucket under `M:` (0 Off, 1 On,
+2 Follow system), reverts on Cancel and returns to Follow system on Reset.
+
 ### About OpenChime: both builds on one screen
 
 The workspace menu's **About OpenChime** (and the palette's) is a small dialog

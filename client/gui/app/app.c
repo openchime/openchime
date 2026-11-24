@@ -68,6 +68,7 @@
 #include "releasenotes.h"     /* What's new: this build's release notes */
 #include "theme.h"
 #include "typeface.h"
+#include "motion.h"           /* Reduce motion (REQ-269) */
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
@@ -1296,7 +1297,7 @@ static int geom_capture(oc_win *hwnd) {
 }
 /* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
  * silently stops recording makes the last control on a pane simply not respond. */
-static struct { rectf r; int row, val; } g_pref_hits[24];
+static struct { rectf r; int row, val; } g_pref_hits[32];
 static int g_n_pref_hits;
 /* The quick-reaction slots in Preferences: the tile that opens the picker for a
  * slot, and the small clear badge on it (empty when it is not offered). */
@@ -3642,6 +3643,16 @@ static fmtw *mk_fmt(const char *family, float size, int wt,
  * number the font table multiplies by. There is no per-window zoom. */
 static int   g_pref_textsize = 1;      /* 0 Small … 3 Largest */
 static int   g_pref_density = 1;       /* 0 compact, 1 cozy */
+/* Reduce motion (REQ-269, motion.h): Off, On, or Follow system, the default.
+ * The system's answer is read at start and whenever the window gains focus;
+ * the harness can stand in for it (`sysmotion`), so the Follow-system branch
+ * is reachable without changing the machine. */
+static int   g_pref_motion = OC_MOTION_SYSTEM;
+static int   g_sys_motion = -1;        /* oc_plat_reduce_motion(): 1, 0, -1 unknown */
+static int   g_sys_motion_test = -1;   /* test-only stand-in for it, 0 or 1; -1 none */
+static void motion_sys_read(void) { g_sys_motion = oc_plat_reduce_motion(); }
+static int  motion_sys(void) { return g_sys_motion_test >= 0 ? g_sys_motion_test : g_sys_motion; }
+static int  motion_reduced(void) { return oc_motion_reduced(g_pref_motion, motion_sys()); }
 
 
 static float textsize_mult(void) {
@@ -8784,7 +8795,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         } else {
             *scroll = total - jump_off - visible * 0.66f;
             g_flash_mid = g_jump_mid;
-            g_flash_until = now_ms() + 1600;
+            g_flash_until = now_ms() + OC_MOTION_FLASH_MS;
         }
         g_jump_mid = 0;
         g_jump_quiet = 0;
@@ -8792,7 +8803,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     if (thr && jump_i >= 0) {
         *scroll = total - jump_off - visible * 0.66f;
         g_flash_mid = g_thr_jump_mid;
-        g_flash_until = now_ms() + 1600;
+        g_flash_until = now_ms() + OC_MOTION_FLASH_MS;
         g_thr_jump_mid = 0;
     }
 
@@ -8972,11 +8983,13 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 gfx_fill(rt, gr(lr), OC_COL_ACCENT, 0.14f);
                 fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
             }
-            /* Jump flash — fades out so it reads as "here it is", not as state. */
+            /* Jump flash — fades out so it reads as "here it is", not as state.
+             * With motion reduced it is held at full strength for its time and
+             * then removed, with no fade. */
             if ((capture || thr) && g_flash_mid == msgs[first + i].message_id) {
                 uint64_t now = now_ms();
                 if (now < g_flash_until) {
-                    float a = (float)(g_flash_until - now) / 1600.0f;
+                    float a = oc_motion_flash_alpha(now, g_flash_until, motion_reduced());
                     rectf fr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(fr), OC_COL_NOTICE, a * 0.30f);
                 } else {
@@ -11881,7 +11894,7 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
         rectf b = rf(bx - w, y + 2, bx, y + 28);
         int on = (i == cur);
         draw_chip_r(rt, b, opts[i], on);
-        if (g_n_pref_hits < 24) {
+        if (g_n_pref_hits < (int)(sizeof g_pref_hits / sizeof g_pref_hits[0])) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
             g_pref_hits[g_n_pref_hits].val = i;
@@ -11926,6 +11939,9 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
 /* Accessibility's rows: what each message says to a screen reader. */
 enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
        PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
+/* Appearance's Reduce motion (REQ-269): a number of its own, so the rows
+ * above keep theirs. */
+enum { PREF_ROW_MOTION = 130 };
 
 /* One of Accessibility's rows set to choice `v`: the one path the rows' clicks
  * and the harness's `spoken` verb both take. 0 when `row` is not one of them.
@@ -11993,7 +12009,7 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
              * invisible, and one in white is invisible on the light swatches. */
                         gfx_ellipse_stroke(rt, cx, cy, 14, 14, 1.6f, OC_COL_TEXT, 1.0f);
         }
-        if (g_n_pref_hits < 24) {
+        if (g_n_pref_hits < (int)(sizeof g_pref_hits / sizeof g_pref_hits[0])) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = PREF_ROW_ACCENT;
             g_pref_hits[g_n_pref_hits].val = i;
@@ -12125,6 +12141,10 @@ static void draw_prefs(gfx *rt, rectf reg) {
         y = pref_row(rt, body, y, PREF_ROW_DENSITY, "Message density",
                      "The space between messages, not the text size.",
                      DENS, 2, g_pref_density);
+        static const char *MOTIONS[3] = { "Off", "On", "Follow system" };
+        y = pref_row(rt, body, y, PREF_ROW_MOTION, "Reduce motion",
+                     "A steady caret, and no fades or moving bars. Follow system uses the system's own setting.",
+                     MOTIONS, 3, g_pref_motion);
         y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
                      "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
         static const char *TPOS[3] = { "Bottom centre", "Bottom right", "Top right" };
@@ -16372,6 +16392,7 @@ static void ftray_taskbar(oc_win *hwnd, uint64_t done, uint64_t total);   /* fwd
 static void ftray_tick(oc_win *hwnd) {
     int moving = 0;
     uint64_t now = now_ms();
+    const int reduced = motion_reduced();
     /* What failed first, since giving a post back changes the chips. */
     for (int i = 0; i < g_n_ftray; i++) {
         ftray_chip *c = &g_ftray[i];
@@ -16385,8 +16406,7 @@ static void ftray_tick(oc_win *hwnd) {
         if (!c->tag) continue;
         float target;
         if (ftray_state(oc_client_model(c->cl), c, &target) == 2 && !c->done_at) c->done_at = now;
-        float d = target - c->shown;
-        c->shown = (d > -0.002f && d < 0.002f) ? target : c->shown + d * 0.22f;
+        c->shown = oc_motion_ease(c->shown, target, reduced);   /* at once when reduced */
         sum_total += c->size;
         sum_done += (uint64_t)((double)c->size * (double)target);
         moving = 1;
@@ -16425,6 +16445,7 @@ static void ftray_fit(const char *s, fmtw *fmt, float w, char *out, size_t cap) 
 static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     const oc_model *m = model();
     uint64_t now = now_ms();
+    const int reduced = motion_reduced();   /* nothing here moves (REQ-269) */
     float x = bx0 + COMPOSER_PAD, y = by0 + (FTRAY_H - FTRAY_CHIP_H) / 2 + UIS(2);
     float right = bx1 - COMPOSER_PAD, gap = UIS(8);
     int shown = 0, total = 0, here = ftray_count();
@@ -16465,7 +16486,7 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
         if (done) {
             /* A green disc with a tick, over the picture. */
             float cx = (pr.left + pr.right) / 2, cy = (pr.top + pr.bottom) / 2, rr = pic * 0.32f;
-            float a = (float)(now - c->done_at) / 150.0f; if (a > 1) a = 1;
+            float a = reduced ? 1.0f : (float)(now - c->done_at) / 150.0f; if (a > 1) a = 1;
             gfx_ellipse(rt, cx, cy, rr, rr, OC_COL_ONLINE, a);
             gfx_line(rt, cx - rr * 0.45f, cy + rr * 0.02f, cx - rr * 0.1f, cy + rr * 0.38f, 2.0f, 0xFFFFFF, a);
             gfx_line(rt, cx - rr * 0.1f, cy + rr * 0.38f, cx + rr * 0.5f, cy - rr * 0.35f, 2.0f, 0xFFFFFF, a);
@@ -16492,16 +16513,18 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
         draw_text(rt, line, g_meta, rf(tx, r.top + UIS(21), r.right - UIS(8), r.top + UIS(38)), subc);
 
         /* The bar: a pill that eases toward the real figure, with a soft light
-         * sweeping along what is filled while the file is moving. */
+         * sweeping along what is filled while the file is moving. With motion
+         * reduced the bar shows the figure at once, the waiting track holds one
+         * strength, and there is no light. */
         if (c->tag) {
             rectf track = rf(tx, r.bottom - UIS(8), r.right - UIS(10), r.bottom - UIS(4));
             float rad = (track.bottom - track.top) / 2;
-            fill_round_a(rt, track, rad, OC_COL_BORDER, st == 0 ? 0.35f + 0.25f * (float)sin((double)now / 300.0) : 1.0f);
+            fill_round_a(rt, track, rad, OC_COL_BORDER, st == 0 ? oc_motion_pulse(now, reduced) : 1.0f);
             float fw = (track.right - track.left) * c->shown;
             if (fw > rad * 2 || (fw > 0 && done)) {
                 rectf fill_r = rf(track.left, track.top, track.left + (fw > rad * 2 ? fw : rad * 2), track.bottom);
                 fill_round(rt, fill_r, rad, done ? OC_COL_ONLINE : OC_COL_ACCENT);
-                if (st == 1 && !done) {
+                if (st == 1 && !done && !reduced) {
                     float span = fill_r.right - fill_r.left, sw = UIS(28);
                     float ph = (float)(now % 1200) / 1200.0f;
                     float sx = fill_r.left - sw + (span + sw) * ph;
@@ -17839,6 +17862,7 @@ static struct {
     int  toastpos;
     oc_spoken_opts spoken;
     int  announce_new;
+    int  motion;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17858,6 +17882,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.emoticons = g_pref_emoticons;
     g_prefs_snap.spoken   = g_pref_spoken;
     g_prefs_snap.announce_new = g_pref_announce_new;
+    g_prefs_snap.motion   = g_pref_motion;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -17885,6 +17910,7 @@ static void prefs_restore(void) {
     g_pref_emoticons = g_prefs_snap.emoticons;
     g_pref_spoken = g_prefs_snap.spoken;
     g_pref_announce_new = g_prefs_snap.announce_new;
+    g_pref_motion = g_prefs_snap.motion;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -22096,7 +22122,7 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
         fill(rt, rf(x0 + wa, box.top + UIS(6), x0 + wb, box.bottom - UIS(6)), OC_COL_SELECT);
     }
     if (t->len) draw_text(rt, t->buf, fmt, rf(x0, box.top, box.right - UIS(12), box.bottom), ink);
-    if (focused && ((now_ms() - g_tgt_blink) / 530) % 2 == 0) {
+    if (focused && oc_motion_caret_lit(now_ms(), g_tgt_blink, motion_reduced())) {   /* steady when reduced */
         memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
         float wc = text_width(tmp, fmt);
         gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
@@ -22465,7 +22491,7 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
             fill(rt, rf(cb.left, cb.top + cr.h - 1, cb.left + cw, cb.top + cr.h), ink);
         }
     }
-    if (focused && l && ((now_ms() - f->blink) / 530) % 2 == 0) {
+    if (focused && l && oc_motion_caret_lit(now_ms(), f->blink, motion_reduced())) {   /* steady when reduced */
         st_rect cr = fld_caret_rect(f, l, f->caret);
         float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
         gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
@@ -29295,11 +29321,12 @@ static void ed_draw(gfx *rt, rectf box) {
     }
 
     /* The caret: 530ms phases, and it does not blink while typing (ed_changed
-     * resets the phase) because a caret that vanishes mid-keystroke reads as lag. */
+     * resets the phase) because a caret that vanishes mid-keystroke reads as lag.
+     * With motion reduced it does not blink at all: lit while the box has focus. */
     if (ed_focused()) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
-            ((now_ms() - g_ed_blink) / 530) % 2 == 0) {
+            oc_motion_caret_lit(now_ms(), g_ed_blink, motion_reduced())) {
             /* Declared transient for the audit: this bar is present in half the
              * frames by design, so any check that asserts two frames are equal
              * has to know not to compare it. Without the tag the consistency
@@ -34979,6 +35006,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
+            case PREF_ROW_MOTION:   g_pref_motion = v; break;
             case PREF_ROW_RESET:
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
@@ -34986,6 +35014,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 scheme_set(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
+                g_pref_motion = OC_MOTION_SYSTEM;
                 g_pref_flash = FLASH_IDLE;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
                 g_pref_font = OC_TYPEFACE_DEFAULT;
@@ -38466,6 +38495,9 @@ static void prefs_save(void) {
         /* ...and the interface font (ARCH-97). */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";F:%d", g_pref_font);
+        /* ...and Reduce motion: Off, On or Follow system. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";M:%d", g_pref_motion);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38478,6 +38510,7 @@ static void prefs_load(const oc_model *m) {
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
     int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
+    int mo = OC_MOTION_SYSTEM;   /* no `M:`: follow the system */
     /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
     oc_spoken_opts spk = oc_spoken_defaults();
     int an = 1;
@@ -38522,6 +38555,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'l') g_call_layout = val ? 1 : 0;
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
             else if (k == 'N') nl = val ? 1 : 0;
+            else if (k == 'M') mo = (val < 0 || val >= OC_MOTION_PREF_COUNT) ? OC_MOTION_SYSTEM : val;
             else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
             else if (k == 'A') an = val ? 1 : 0;
             else if (k == 'F') font = (val < 0 || val >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : val;
@@ -38547,6 +38581,7 @@ static void prefs_load(const oc_model *m) {
     g_pref_members = mm ? 1 : 0;
     g_pref_daysep  = d ? 1 : 0;
     g_pref_enter_newline = nl;
+    g_pref_motion = mo;
     g_pref_spoken = spk;
     g_pref_announce_new = an;
     g_pref_font = font;
@@ -41373,6 +41408,17 @@ static void test_dump_a11y(FILE *f) {
     }
 }
 
+/* Whether the caret of the field with the keys is lit now (Reduce motion):
+ * the message box, New message's To: box, or a drawn field; 0 with none. */
+static int caret_lit_now(void) {
+    const int red = motion_reduced();
+    const uint64_t now = now_ms();
+    if (ed_focused()) return oc_motion_caret_lit(now, g_ed_blink, red);
+    if (g_view == VIEW_NEWMSG && g_nm_to_focus) return oc_motion_caret_lit(now, g_tgt_blink, red);
+    if (g_focus) return oc_motion_caret_lit(now, g_focus->blink, red);
+    return 0;
+}
+
 static void test_dump(const char *path) {
     const oc_model *m = model();
     FILE *f = fopen(path, "wb"); if (!f) return;
@@ -41429,6 +41475,11 @@ static void test_dump(const char *path) {
     fprintf(f, "spoken sender=%d time=%d reactions=%d replies=%d text_first=%d announce_new=%d\n",
             g_pref_spoken.sender, g_pref_spoken.time, g_pref_spoken.reactions,
             g_pref_spoken.replies, g_pref_spoken.text_first, g_pref_announce_new);
+    /* Reduce motion (REQ-269): the preference (0 Off, 1 On, 2 Follow system),
+     * the system's answer as the client takes it (`sysmotion` included), the
+     * setting in force, and whether the focused field's caret is lit now. */
+    fprintf(f, "motion pref=%d sys=%d reduced=%d caretlit=%d\n",
+            g_pref_motion, motion_sys(), motion_reduced(), caret_lit_now());
     /* The system caret (ARCH-99). Reported because it is invisible by design —
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
@@ -44014,6 +44065,25 @@ static void test_poll(oc_win *hwnd) {
         if (!strcmp(arg, "send") || !strcmp(arg, "newline")) {
             g_pref_enter_newline = !strcmp(arg, "newline");
             prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "motion")) {
+        /* `motion 0|1|2`: Reduce motion Off, On or Follow system, saved as the
+         * Appearance row and Save save it. */
+        if (arg[0] >= '0' && arg[0] <= '2' && !arg[1]) {
+            g_pref_motion = arg[0] - '0';
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "sysmotion")) {
+        /* `sysmotion 0|1|-1`, test-only: what the client takes the system's
+         * reduce-motion setting to be, so Follow system can be checked both
+         * ways on any machine. -1 goes back to what the system said. Never
+         * saved. */
+        if (!strcmp(arg, "0") || !strcmp(arg, "1") || !strcmp(arg, "-1")) {
+            g_sys_motion_test = atoi(arg);
             invalidate();
             test_ack("ok");
         } else test_ack("err");
@@ -46672,6 +46742,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
 }
 
 static int on_focus_gained(oc_win *hwnd) {
+        /* The system's reduce-motion setting may have changed while the
+         * window was in the background: asked again (REQ-269). */
+        motion_sys_read();
         /* The window has the keyboard again, so the composer is typeable
          * again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
@@ -47242,6 +47315,7 @@ int main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
+    motion_sys_read();   /* Reduce motion's Follow system (REQ-269) */
     /* The quick reactions from the start, the default set until preferences
      * say otherwise: an account that has never saved any would otherwise have
      * none, and the hover strip and the menu's emoji row with them. */

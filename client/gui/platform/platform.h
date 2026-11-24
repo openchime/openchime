@@ -192,6 +192,11 @@ void  oc_plat_url_scheme_register(const char *scheme);
 void  oc_plat_sound(const char *name);
 /* Milliseconds since the last keyboard or pointer input anywhere; 0 if unknown. */
 uint32_t oc_plat_idle_ms(void);
+/* Whether the person has asked the system for less motion (REQ-269): 1 to
+ * reduce, 0 not to, -1 when the platform cannot say. Windows' "Show
+ * animations", a browser's prefers-reduced-motion. Read at start and whenever
+ * the window gains focus, which is when a change made elsewhere can show. */
+int      oc_plat_reduce_motion(void);
 
 /* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
 

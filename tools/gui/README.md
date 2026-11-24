@@ -46,6 +46,7 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the cursor harness](#reading-the-cursor-harness)
 - [Reading the caret harness](#reading-the-caret-harness)
 - [Reading the announce harness](#reading-the-announce-harness)
+- [Reading the motion harness](#reading-the-motion-harness)
 - [Seeing the whole window](#seeing-the-whole-window)
 - [`clipped=`: text that does not fit its own box](#clipped-text-that-does-not-fit-its-own-box)
 - [Observing the tray balloon](#observing-the-tray-balloon)
@@ -365,6 +366,7 @@ when reading its output.
 | `links` | win32 | | 9650 | links in the transcript | [Reading the links harness](#reading-the-links-harness) |
 | `members` | win32 | | 9690 | scrolling the members pane | [Reading the members harness](#reading-the-members-harness) |
 | `mentions` | win32 web | | 9730 | completing a mention, a channel and a pick from the list | [Reading the mentions harness](#reading-the-mentions-harness) |
+| `motion` | win32 web | | 9645 | Reduce motion: the preference, the system's setting, a steady caret | [Reading the motion harness](#reading-the-motion-harness) |
 | `navhistory` | win32 web | | 9672 | Back and Forward | [Reading the navigation-history harness](#reading-the-navigation-history-harness) |
 | `newmsg` | win32 | | 9520 | the New message pane | [Reading the New message harness](#reading-the-new-message-harness) |
 | `pdm` | win32 web | | 9515 | encrypted DMs, two clients | its header |
@@ -1182,6 +1184,32 @@ sets through the rows' own path and saves), `a11yname <aid> "<name>"` (what each
 message on the transcript says) and `a11y ... announced=`. Not in CI, for the
 smoke's reason. Run it when a change touches a message's accessible name, the
 arrival announcement or the preferences string.
+
+## Reading the motion harness
+
+Appearance's Reduce motion (REQ-269) is Off, On or Follow system, the
+default; Follow system takes Windows' "Show animations" or the browser's
+`prefers-reduced-motion`, read at start and whenever the window gains focus.
+Reduced, the jump highlight holds and then goes without fading, the upload
+tray's bar neither pulses, eases nor carries its light, and the caret does not
+blink. `tools/gui/features/motion.sh` drives the client against its own
+fixture daemon (port 9645) and reads the dump's `motion` line: `pref=` (0 Off,
+1 On, 2 Follow system), `sys=` (the system's answer as the client takes it: 1
+reduce, 0 not, -1 unknown), `reduced=` (the setting in force) and `caretlit=`
+(whether the focused field's caret is lit at that moment). The test-only verb
+`sysmotion 0|1|-1` stands in for the system's answer (-1 goes back to the
+system's own), so both branches of Follow system run on any machine; `motion
+0|1|2` sets the preference and saves it. It asserts that the default is Follow
+system; that Follow system reduces when the system says 1 and not when it says
+0, On reduces with a system that says 0, and Off does not with one that says
+1; that, reduced, the message box's caret reads `caretlit=1` on each of ten
+looks over two seconds, and, not reduced, is seen both lit and dark in that
+time; that Appearance has the row's three choices, one clicked is put back by
+Cancel, and System's Reset returns it to Follow system; and that the choice
+saved is there after the client starts again. The highlight and the tray are
+asserted in `make test` (`tests/test_motion.c`), where their arithmetic is.
+Not in CI, for the smoke's reason. Run it when a change touches something that
+moves on screen, or the preferences string.
 
 ## Seeing the whole window
 

@@ -807,6 +807,14 @@ uint32_t oc_plat_idle_ms(void) {
     return (uint32_t)(GetTickCount() - li.dwTime);
 }
 
+/* "Show animations" (Settings > Accessibility > Visual effects) is
+ * SPI_GETCLIENTAREAANIMATION: on means animate, so reducing is its inverse. */
+int oc_plat_reduce_motion(void) {
+    BOOL on = TRUE;
+    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0)) return -1;
+    return on ? 0 : 1;
+}
+
 /* ---- the clipboard --------------------------------------------------------- */
 
 char *oc_plat_clipboard_files(void) {

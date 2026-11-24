@@ -89,6 +89,7 @@ int run_sock_tests(void);
 int run_speakable_tests(void);
 int run_action_tests(void);
 int run_spoken_tests(void);
+int run_motion_tests(void);
 int run_ttskit_tests(void);
 int run_nnkit_tests(void);
 int run_sumkit_tests(void);
@@ -358,6 +359,7 @@ static const struct suite {
     S(run_speakable_tests,       FAST, PLAIN),
     S(run_action_tests,          FAST, PLAIN),
     S(run_spoken_tests,          FAST, PLAIN),
+    S(run_motion_tests,          FAST, PLAIN),
     S(run_nnkit_tests,           FAST, PLAIN),
     S(run_sumkit_tests,          FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),

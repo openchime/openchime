@@ -506,6 +506,13 @@ void  oc_plat_autostart_set(int on) { (void)on; }
 void  oc_plat_url_scheme_register(const char *scheme) { (void)scheme; }
 void  oc_plat_sound(const char *name) { (void)name; }
 uint32_t oc_plat_idle_ms(void) { return 0; }
+/* The page's prefers-reduced-motion; -1 where the browser cannot be asked. */
+int oc_plat_reduce_motion(void) {
+    return EM_ASM_INT({
+        if (!window.matchMedia) return -1;
+        return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : 0;
+    });
+}
 
 /* ---- the clipboard --------------------------------------------------------- */
 

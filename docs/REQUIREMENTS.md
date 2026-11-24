@@ -2691,6 +2691,15 @@ choose — which makes each one a per-frontend *obligation*.*
   self-drawn UI gets nothing for free here, which is exactly why this is a
   requirement and not an assumption: the cost grows with every pane added.
 
+  **Motion can be reduced.** A graphical client has offered a **Reduce motion**
+  preference — Off, On, or Follow system, the default — and, following the
+  system, has read the platform's own setting (Windows' "Show animations", a
+  browser's `prefers-reduced-motion`). Reduced, nothing on screen has moved for
+  its own sake: the highlight on a message jumped to has held and then gone
+  without fading, the upload tray's bar has shown its figure without pulsing,
+  easing or a moving light, and the caret has been steady (CLIENT.md,
+  Preferences).
+
   **The approach (ARCH-99): accessibility is implemented *for* the custom
   controls, not by retreating from them** — the self-drawn surfaces are the
   product's rendering strategy (ARCH-82/98) and a deliberate choice.

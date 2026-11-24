@@ -236,6 +236,10 @@ UTF8PROC    := third_party/utf8proc/utf8proc.c
 SDLTEXT_COMMON := sdltext/st_common.c $(UTF8PROC)
 SDLTEXT_WIN    := sdltext/st_common.c sdltext/st_dwrite.c $(UTF8PROC)
 SDLTEXT_INC    := -Isdltext
+# motion.c is GUI source compiled into the tests the same way: the arithmetic
+# of what moves on screen, and what "Reduce motion" stills, is asserted by
+# `make test` (tests/test_motion.c).
+MOTION_SRC := client/gui/app/motion.c
 # theme.c is GUI source and is compiled into the tests anyway: it is colour
 # arithmetic with one Windows call behind an #ifdef, and the contrast guarantee
 # it carries has to be asserted somewhere that RUNS.
