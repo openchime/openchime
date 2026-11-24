@@ -188,7 +188,7 @@ static int run_report(fake_central *f, const int *statuses, int n, const char *p
     CHECK(pthread_create(&th, NULL, fake_central_thread, f) == 0);
     /* The enrollment URL's path is not where the report goes: its origin is. */
     char url[96];
-    snprintf(url, sizeof url, "http://127.0.0.1:%d/api/machine/enroll", port);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     oc_invite_mail *m = oc_invite_mail_start_backoff(url, aud, pk, 5);
     CHECK(m != NULL);
     oc_invite_mail_report(m, ID, "lee@partner.example", 1760000000ull);
@@ -213,7 +213,7 @@ static void test_report(void) {
         static const int S[] = { 503, 0, 202 };
         CHECK(run_report(f, S, 3, pk, aud) == 3);
         for (int i = 0; i < 3 && i < f->seen; i++) {
-            CHECK(strcmp(f->path[i], "/api/machine/invite/notify") == 0);
+            CHECK(strcmp(f->path[i], "/v1/workspace/machine/invite/notify") == 0);
             CHECK(strcmp(f->aud[i], aud) == 0);
             CHECK(strcmp(f->body[i], want) == 0);
             CHECK(strcmp(f->ver[i], "2") == 0);
@@ -221,7 +221,7 @@ static void test_report(void) {
         }
         /* A signature is over the body and the endpoint it came with, not any other. */
         CHECK(!signature_holds(pk, f->path[0], aud, f->ts[0], "{\"inviteId\":\"x\"}", f->sig[0]));
-        CHECK(!signature_holds(pk, "/api/machine/push/notify", aud, f->ts[0], f->body[0], f->sig[0]));
+        CHECK(!signature_holds(pk, "/v1/workspace/machine/push/notify", aud, f->ts[0], f->body[0], f->sig[0]));
     }
 
     /* A refusal is final, whichever one: asked again, central says the same. */

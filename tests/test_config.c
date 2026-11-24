@@ -210,7 +210,7 @@ static void test_structured(void) {
     CHECK(oc_config_get()->auth_local == 1 && oc_config_get()->auth_relay == 0);
     refuses("OPENCHIME_AUTH", ",");
     refuses_as("OPENCHIME_AUTH", "relay", OC_CFGF_NEEDS, "OPENCHIME_ENROLL_URL");
-    setenv("OPENCHIME_ENROLL_URL", "http://127.0.0.1:9/api/machine/enroll", 1);
+    setenv("OPENCHIME_ENROLL_URL", "http://127.0.0.1:9", 1);
     accepts("OPENCHIME_AUTH", "local, relay");
     CHECK(oc_config_get()->auth_local == 1 && oc_config_get()->auth_relay == 1);
     CHECK(!strcmp(oc_config_get()->oidc.pubkey, ""));              /* no pinned key: the published ones */
@@ -226,6 +226,12 @@ static void test_cross_rules(void) {
     CHECK(!strcmp(oc_deploy_mode_name(OC_DEPLOY_SELF_HOSTED), "self-hosted"));
     CHECK(!strcmp(oc_deploy_mode_name(OC_DEPLOY_MANAGED), "managed"));
     refuses("OPENCHIME_PUSH_URL", "ftp://x");
+    /* The demo's terms: a full https URL, or empty for no link. */
+    accepts("OPENCHIME_DEMO_TERMS_URL", "https://openchime.io/demo/terms");
+    CHECK(!strcmp(oc_config_get()->demo_terms_url, "https://openchime.io/demo/terms"));
+    accepts("OPENCHIME_DEMO_TERMS_URL", "");
+    refuses("OPENCHIME_DEMO_TERMS_URL", "/demo/terms");
+    refuses("OPENCHIME_DEMO_TERMS_URL", "http://openchime.io/demo/terms");
     /* Push: on at the connection's origin, or where OPENCHIME_PUSH_URL says. */
     unsetenv("OPENCHIME_ENROLL_URL");
     refuses_as("OPENCHIME_PUSH", "on", OC_CFGF_NEEDS, "OPENCHIME_ENROLL_URL");
@@ -473,7 +479,7 @@ static void test_mode(void) {
           oc_config_fault()->kind == OC_CFGF_NEEDS && !strcmp(oc_config_fault()->name, "OPENCHIME_MODE") &&
           !strcmp(oc_config_fault()->other, "OPENCHIME_AUTH"));
     for (size_t m = 0; m < sizeof modes / sizeof *modes; m++) {
-        if (m == 1) { setenv("OPENCHIME_AUTH", "local,relay", 1); setenv("OPENCHIME_ENROLL_URL", "https://central.example/api/machine/enroll", 1); }
+        if (m == 1) { setenv("OPENCHIME_AUTH", "local,relay", 1); setenv("OPENCHIME_ENROLL_URL", "https://central.example", 1); }
         for (size_t i = 0; i < sizeof devs / sizeof *devs; i++) {
             int rc = load_in_mode(modes[m], devs[i][0], devs[i][1], err, sizeof err);
             const oc_cfg_fault *f = oc_config_fault();
@@ -532,7 +538,7 @@ static void test_reload_and_registry(void) {
         else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
         else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 51);     /* OPENCHIME_MODE, the four OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
+    CHECK(operator_rows == 52);     /* OPENCHIME_MODE, OPENCHIME_DEMO_TERMS_URL, the four OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
     CHECK(managed_rows == 7);
     CHECK(dev_rows == 6 + 13);      /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);

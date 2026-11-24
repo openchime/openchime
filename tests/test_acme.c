@@ -581,7 +581,7 @@ static void central_request(int fd, const char *path, const char *head, const ch
              mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, hh, 32, sig, sl) == 0;
     mbedtls_pk_free(&kp);
     if (!ok) { g_fake.central_bad_sigs++; reply(fd, 401, NULL, NULL, NULL); return; }
-    if (!strcmp(path, "/api/machine/tls/names")) {
+    if (!strcmp(path, "/v1/workspace/machine/tls/names")) {
         if (g_fake.central_names_status) { reply(fd, g_fake.central_names_status, NULL, NULL, NULL); return; }
         char js[256];
         snprintf(js, sizeof js, "{\"names\":\"%s\"}", g_fake.central_names ? g_fake.central_names : "acme.workspace.test");
@@ -748,7 +748,7 @@ static void *fake_thread(void *p) {
             char method[8] = "", path[256] = "";
             sscanf(buf, "%7s %255s", method, path);
             *end = '\0';
-            if (!strncmp(path, "/api/machine/", 13)) central_request(fd, path, buf, end + 4);
+            if (!strncmp(path, "/v1/workspace/machine/", 22)) central_request(fd, path, buf, end + 4);
             else acme_request(fd, method, path, end + 4);
         }
         close(fd);
@@ -1191,7 +1191,7 @@ static void test_central(void) {
     CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
     snprintf(g_fake.central_aud, sizeof g_fake.central_aud, "%s", aud);
     snprintf(g_fake.central_pub, sizeof g_fake.central_pub, "%s", pk);
-    char url[128]; snprintf(url, sizeof url, "http://127.0.0.1:%d/api/machine/enroll", g_fake.port);
+    char url[128]; snprintf(url, sizeof url, "http://127.0.0.1:%d", g_fake.port);
     oc_cert_issued got; int retry = 0, final = 0; char err[256] = "";
     /* Still working on it: asked to come back. */
     g_fake.central_pending = 1;

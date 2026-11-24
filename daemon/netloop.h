@@ -108,6 +108,9 @@ void oc_netloop_advance_clock_ms(uint64_t ms);
  * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Safe to
  * call while serving: published as an immutable copy, swapped atomically. */
 void oc_netloop_set_passkey_names(const char *names);
+/* The public demo's terms, linked on its sign-up page (OPENCHIME_DEMO_TERMS_URL);
+ * NULL or "" for none. Set once at boot; the string is copied. */
+void oc_netloop_set_demo_terms(const char *url);
 /* The name a self-hosted daemon adopted from central's certificate as its
  * address (TLS.md, the `central` source), or NULL for none: sent to clients in
  * WORKSPACE_ADDRESS and linked from the landing page, when no
@@ -150,6 +153,10 @@ void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
  * runs; NULL (the default) delivers nothing and refuses creations. */
 struct oc_webhooks_out;
 void oc_netloop_set_webhooks_out(struct oc_webhooks_out *o);
+/* Release notes for the clients (release_notes.h): the worker that asks central,
+ * NULL when this box is not connected to the OpenChime services. */
+struct oc_release_notes_worker;
+void oc_netloop_set_release_notes(struct oc_release_notes_worker *w);
 
 /* The enrollment the address proof signs with (AUTH.md §3.6): set once the
  * binding is active, after which POST /enroll-proof answers central's check of

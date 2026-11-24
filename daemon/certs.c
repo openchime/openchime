@@ -1,4 +1,5 @@
 #include "certs.h"
+#include "central.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -146,7 +147,7 @@ int oc_central_names(const char *central_url, const char *audience, const char *
     char origin[512];
     origin_of(central_url, origin, sizeof origin);
     oc_https_resp r;
-    if (signed_post(origin, "/api/machine/tls/names", audience, enroll_key_pem, "{}", &r, err, errcap) != 0) return -1;
+    if (signed_post(origin, OC_CENTRAL_TLS_NAMES, audience, enroll_key_pem, "{}", &r, err, errcap) != 0) return -1;
     *status = r.status;
     if (r.status == 200 && json_str(r.body, r.body_len, "names", names, cap) != 0 && cap) names[0] = '\0';
     oc_https_resp_free(&r);
@@ -183,7 +184,7 @@ int oc_central_issue(const char *central_url, const char *audience, const char *
     if (body) { oc_base64url_encode(der, dlen, b64); sprintf(body, "{\"csr\":\"%s\"}", b64); }
     free(der); free(b64);
     if (!body) { free(key_pem); snprintf(err, errcap, "out of memory"); return -1; }
-    int rc = signed_post(origin, "/api/machine/tls/certificate", audience, enroll_key_pem, body, &r, err, errcap);
+    int rc = signed_post(origin, OC_CENTRAL_TLS_CERTIFICATE, audience, enroll_key_pem, body, &r, err, errcap);
     free(body);
     if (rc != 0) { free(key_pem); return -1; }
     if (r.status == 202) {

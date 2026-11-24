@@ -5,6 +5,7 @@
  * dedicated read-only connection. */
 
 #include "push.h"
+#include "central.h"
 #include "notify.h"
 #include "config.h"   /* OPENCHIME_DEFAULT_QUIET_HOURS */
 #include "tls.h"
@@ -228,42 +229,54 @@ static long conn_read(push_conn *c, void *buf, size_t cap) {
     return (n < 0) ? -1 : (long)n;
 }
 
-/* POST a signed body to `path` (e.g. /api/machine/push/notify). Adds the three
- * ARCH-85 signature headers. Reads the whole response (Connection: close) and de-chunks a
+/* A signed request to `path` (e.g. OC_CENTRAL_PUSH_NOTIFY): POST with a JSON
+ * body, or GET with none. Adds the three ARCH-85 signature headers. Reads the whole response (Connection: close) and de-chunks a
  * Transfer-Encoding: chunked reply (servers commonly use it for dynamic JSON). */
-static int post_signed(push_ctx *ctx, const char *path, const char *audience, long ts,
-                       const char *sig, const char *body, int *status,
-                       char *resp, size_t resp_cap, size_t *resp_len) {
+static int read_answer(char *raw, size_t total, int *status, char *resp, size_t resp_cap, size_t *resp_len);
+
+static int request_signed(push_ctx *ctx, const char *method, const char *path, const char *audience,
+                          long ts, const char *sig, const char *body, int *status,
+                          char *resp, size_t resp_cap, size_t *resp_len) {
     push_conn c;
     if (conn_open(&c, ctx) != 0) return -1;
 
     char head[1024];
     size_t blen = strlen(body);
+    int get = strcmp(method, "GET") == 0;
     int n = snprintf(head, sizeof head,
-        "POST %s HTTP/1.1\r\nHost: %s\r\n"
-        "Content-Type: application/json\r\n"
+        "%s %s HTTP/1.1\r\nHost: %s\r\n"
+        "%s"
         "X-OpenChime-Audience: %s\r\nX-OpenChime-Timestamp: %ld\r\nX-OpenChime-Signature: %s\r\n"
         OC_MACHINE_SIG_VERSION_HEADER
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        path, ctx->endpoint, audience, ts, sig, blen);
+        method, path, ctx->endpoint, get ? "" : "Content-Type: application/json\r\n", audience, ts, sig, blen);
     if (n < 0 || n >= (int)sizeof head ||
-        conn_write(&c, head, (size_t)n) != 0 || conn_write(&c, body, blen) != 0) {
+        conn_write(&c, head, (size_t)n) != 0 || (blen && conn_write(&c, body, blen) != 0)) {
         conn_close(&c);
         return -1;
     }
 
-    char raw[16384];
+    /* Room for the answer's head and as much body as the caller takes. */
+    size_t rawcap = resp_cap + 8192;
+    char *raw = malloc(rawcap);
+    if (!raw) { conn_close(&c); return -1; }
     size_t total = 0;
     for (;;) {
-        if (total >= sizeof raw - 1) break;
-        long r = conn_read(&c, raw + total, sizeof raw - 1 - total);
-        if (r < 0) { conn_close(&c); return -1; }
+        if (total >= rawcap - 1) break;
+        long r = conn_read(&c, raw + total, rawcap - 1 - total);
+        if (r < 0) { conn_close(&c); free(raw); return -1; }
         if (r == 0) break;
         total += (size_t)r;
     }
     conn_close(&c);
     raw[total] = '\0';
+    int rc = read_answer(raw, total, status, resp, resp_cap, resp_len);
+    free(raw);
+    return rc;
+}
 
+/* An HTTP answer read whole into `raw`: its status, and its body de-chunked. */
+static int read_answer(char *raw, size_t total, int *status, char *resp, size_t resp_cap, size_t *resp_len) {
     char *term = strstr(raw, "\r\n\r\n");
     if (!term || strncmp(raw, "HTTP/1.", 7) != 0) return -1;
     *status = atoi(raw + 9);
@@ -329,7 +342,19 @@ int oc_machine_http_post_read(oc_machine_http *h, const char *path, const char *
     char sig[512];
     if (oc_push_sign(privkey_pem, "POST", path, audience, body, ts, sig, sizeof sig) != 0) return -1;
     size_t rlen = 0;
-    return post_signed(&h->ctx, path, audience, ts, sig, body, status, resp, resp_cap, &rlen);
+    return request_signed(&h->ctx, "POST", path, audience, ts, sig, body, status, resp, resp_cap, &rlen);
+}
+
+int oc_machine_http_get_read(oc_machine_http *h, const char *path, const char *audience,
+                             const char *privkey_pem, int *status, char *resp, size_t resp_cap,
+                             size_t *resp_len) {
+    if (!h || !path || !audience || !privkey_pem || !status || !resp || resp_cap == 0 || !resp_len) return -1;
+    resp[0] = '\0';
+    *resp_len = 0;
+    long ts = (long)time(NULL);
+    char sig[512];
+    if (oc_push_sign(privkey_pem, "GET", path, audience, "", ts, sig, sizeof sig) != 0) return -1;
+    return request_signed(&h->ctx, "GET", path, audience, ts, sig, "", status, resp, resp_cap, resp_len);
 }
 
 int oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
@@ -667,7 +692,7 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
 
     long ts = (long)nowsec;
     char sig[512];
-    if (oc_push_sign(p->privkey, "POST", "/api/machine/push/notify", p->audience, body, ts, sig, sizeof sig) != 0) {
+    if (oc_push_sign(p->privkey, "POST", OC_CENTRAL_PUSH_NOTIFY, p->audience, body, ts, sig, sizeof sig) != 0) {
         free(body);
         return;
     }
@@ -675,7 +700,7 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
     int status = 0;
     char resp[8192];
     size_t rlen = 0;
-    if (post_signed(&p->ctx, "/api/machine/push/notify", p->audience, ts, sig, body,
+    if (request_signed(&p->ctx, "POST", OC_CENTRAL_PUSH_NOTIFY, p->audience, ts, sig, body,
                     &status, resp, sizeof resp, &rlen) == 0 &&
         status == 200) {
         json_stale_tokens(resp, rlen, prune_cb, p);

@@ -1329,14 +1329,14 @@ line, which the web client's GUI test checks in the browser (tools/gui/README.md
 **What's new** is in the workspace menu after About OpenChime, in the palette
 beside it, and a button on the About card. It turns the card into the notes of
 the release this client is: the control plane writes them once from what the
-release shipped, and the client asks for them by its build id,
-`GET https://openchime.io/api/releases/build/<build id>`
-(`client/core/releasenotes.{h,c}`), which answers the release's number, date
-and sections of items, each with its link. The card says "Loading…" while it
-asks -- the window never waits on it: the Windows client fetches on a thread of
-its own, through the client's verifying TLS with the built-in roots only
-(`client/core/https_get.{h,c}`, which the `.well-known` fetch uses too), and
-the web client with the browser's `fetch` -- then "What's new in release N", its
+release shipped, and the client asks its own daemon for them by its build id
+(`oc_client_get_release_notes`, `RELEASE_NOTES_GET`, PROTOCOL.md §5.16r). The
+daemon asks central with its workspace credential, a signed `GET` to
+`<OPENCHIME_ENROLL_URL's origin>/v1/workspace/releases/build/<build id>`, and
+keeps the answer six hours; no client reaches central, and no request crosses
+origins. The notes (`client/core/releasenotes.{h,c}`) are the release's number,
+date and sections of items, each with its link. The card says "Loading…" while
+it asks -- the window never waits on it -- then "What's new in release N", its
 date and each section's items; an item with a link opens it in the browser.
 **Open on openchime.io** opens the same notes as a page,
 `https://openchime.io/releases/build/<build id>`. A build that is not a release

@@ -703,6 +703,10 @@ void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t toke
  * 90 or 365 days, or declined. The connections in force are listed -- one's
  * own, or with `everyone` all of them, an owner's or admin's -- into the
  * model's `my_conns` or `all_conns`, and revoked from either. */
+/* This build's release notes (PROTOCOL.md §5.16r): asked of the daemon, which
+ * asks central. The answer comes as OC_EV_RELEASE_NOTES and is taken with
+ * oc_model_take_release_notes. */
+void oc_client_get_release_notes(oc_client *c, const char *build_id);
 void oc_client_connection_code(oc_client *c, const char *code);
 void oc_client_connection_decide(oc_client *c, const char *code, int approve, uint32_t lifetime_days);
 void oc_client_list_connections(oc_client *c, int everyone);

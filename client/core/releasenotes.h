@@ -2,12 +2,11 @@
  * OpenChime client — what is new in the release it is running.
  *
  * The notes are written once, by the control plane, from what the release
- * shipped, and read here by the client's build id:
- *
- *     GET https://openchime.io/api/releases/build/<build id>
- *
- * which answers `{ release, build_id, published_at, sections: [ { title,
- * items: [ { title, url } ] } ] }`, or 404 for a build that is not a release.
+ * shipped. A client asks its own daemon for them by its build id
+ * (oc_client_get_release_notes, PROTOCOL.md §5.16r), and the daemon asks
+ * central with its workspace credential; the answer is central's,
+ * `{ release, build_id, published_at, sections: [ { title, items: [ { title,
+ * url } ] } ] }`, or 404 for a build that is not a release.
  * The same notes are a page at https://openchime.io/releases/build/<build id>.
  * A source build ("dev") is never a release and is not asked about.
  *
@@ -20,8 +19,6 @@
 
 #include <stddef.h>
 
-#define OC_RN_HOST      "openchime.io"
-#define OC_RN_API_PATH  "/api/releases/build/"
 #define OC_RN_PAGE_URL  "https://openchime.io/releases/build/"
 #define OC_RN_INDEX_URL "https://openchime.io/releases"
 
@@ -55,9 +52,5 @@ int oc_releasenotes_read_response(const char *resp, size_t len, oc_releasenotes 
 
 /* The notes from a status and a body, as a browser's fetch hands them over. */
 int oc_releasenotes_read(int status, const char *body, size_t len, oc_releasenotes *out);
-
-/* Fetch and read the notes for `build_id` (https_get.h: verified, bounded).
- * Blocking: run it off the thread that draws. */
-int oc_releasenotes_fetch(const char *build_id, oc_releasenotes *out);
 
 #endif /* OC_RELEASENOTES_H */

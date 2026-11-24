@@ -2713,6 +2713,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 ve->preview = slice_dup(ti.voices[i].lang);
                 oc_queue_push(to_ui, ve);
             }
+        } else if (hdr.msg_type == OC_MSG_RELEASE_NOTES) {
+            /* A build's release notes, as central gave them to the daemon. */
+            oc_release_notes rn;
+            if (oc_decode_release_notes(&p, &rn) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_RELEASE_NOTES);
+            if (e) {
+                e->size = rn.status;
+                e->body = slice_text(rn.body);
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN) {
             /* A token, shown once: held for the frontend, which takes it. */
             oc_agent_token at;
@@ -3012,6 +3022,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     stt_where(ctx, e->count, e);
                     oc_queue_push(to_ui, e);
                 }
+            } else if (err.code == OC_ERR_RELEASE_NOTES_UNAVAILABLE) {
+                /* The daemon could not get them: the card offers the page. */
+                oc_ev *e = oc_ev_new(OC_EV_RELEASE_NOTES);
+                if (e) { e->size = 0; oc_queue_push(to_ui, e); }
             } else if (ctx && ctx->xfer->mode == 7 &&
                        (err.code == OC_ERR_PREVIEW_MISSING || err.code == OC_ERR_PREVIEW_RUNG)) {
                 /* No preview at that rung (ARCH-137): the original instead,
@@ -4512,6 +4526,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_create_agent m = { oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
                                       oc_slice_str(c->body3 ? c->body3 : "") };
                 if (oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RELEASE_NOTES && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_release_notes_get m = { oc_slice_str(c->body) };
+                if (oc_encode_release_notes_get(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_MINT_AGENT_TOKEN && c->body) {

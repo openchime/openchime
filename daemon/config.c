@@ -615,6 +615,10 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: must be https (plain http is for loopback only)", c->enroll.url);
         return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_ENROLL_URL", NULL);
     }
+    if (c->demo_terms_url && c->demo_terms_url[0] && strncmp(c->demo_terms_url, "https://", 8) != 0) {
+        snprintf(err, errcap, "OPENCHIME_DEMO_TERMS_URL=%s: must be a full https URL", c->demo_terms_url);
+        return fault(OC_CFGF_BAD_VALUE, "OPENCHIME_DEMO_TERMS_URL", NULL);
+    }
     /* Push at the connection's origin, unless OPENCHIME_PUSH_URL says where. */
     if (c->push.on && !c->enroll.url) {
         snprintf(err, errcap, "OPENCHIME_PUSH=on: push goes through the OpenChime services; needs OPENCHIME_ENROLL_URL");

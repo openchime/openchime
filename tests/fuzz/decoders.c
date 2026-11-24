@@ -151,6 +151,8 @@ void oc_fuzz_decode_all(const uint8_t *buf, size_t len, oc_fuzz_bad_fn bad) {
     oc_revoke_agent_token rat; D(oc_decode_revoke_agent_token(&p, &rat));
     oc_create_outgoing_webhook cow; D(oc_decode_create_outgoing_webhook(&p, &cow));
     oc_outgoing_webhook_secret ows; D(oc_decode_outgoing_webhook_secret(&p, &ows));
+    oc_release_notes_get rng; D(oc_decode_release_notes_get(&p, &rng));
+    oc_release_notes rnn; D(oc_decode_release_notes(&p, &rnn));
     oc_set_outgoing_webhook sow; D(oc_decode_set_outgoing_webhook(&p, &sow));
     oc_delete_outgoing_webhook dow; D(oc_decode_delete_outgoing_webhook(&p, &dow));
     { oc_outgoing_webhook_entry we2[2]; uint16_t nc = 0;

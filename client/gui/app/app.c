@@ -2241,8 +2241,8 @@ static int g_notify_open, g_keys_open;
  * off one screen and copy into a report. */
 static int g_about_open;
 /* What's new (CLIENT.md): the About card showing this build's release notes
- * instead of its rows, fetched from the control plane without holding the
- * window (oc_plat_releasenotes_*). The state is the card's, and the dump's. */
+ * instead of its rows, asked of the workspace's daemon without holding the
+ * window (oc_client_get_release_notes). The state is the card's, and the dump's. */
 enum { WN_NONE = 0, WN_LOADING, WN_SHOWN, WN_NOTRELEASE, WN_FAILED };
 static int g_whatsnew;                 /* the About card shows What's new */
 static int g_wn_state;
@@ -10892,7 +10892,7 @@ static void whatsnew_draw(gfx *rt, rectf reg) {
 /* Once a tick: the fetch's answer, when it has come. */
 static void whatsnew_tick(void) {
     if (g_wn_state != WN_LOADING) return;
-    int rc = oc_plat_releasenotes_poll(&g_wn);
+    int rc = g_client ? oc_model_take_release_notes((oc_model *)oc_client_model(g_client), &g_wn) : -1;
     if (rc < 0) return;
     g_wn_state = rc == OC_RN_OK ? WN_SHOWN : rc == OC_RN_NOT_RELEASE ? WN_NOTRELEASE : WN_FAILED;
     invalidate();
@@ -40326,11 +40326,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
     case 89: g_whatsnew = 0; modal_enter(hwnd, &g_about_open); break;
     case ABOUT_CMD_WHATSNEW:
-        /* This build's notes, asked of the control plane by its build id; a
-         * source build is not a release and is not asked about. */
+        /* This build's notes, asked of the workspace's daemon by its build id,
+         * which asks central (PROTOCOL.md §5.16r); a source build is not a
+         * release and is not asked about. */
         g_whatsnew = 1;
         if (!oc_releasenotes_askable(OC_BUILD_ID)) g_wn_state = WN_NOTRELEASE;
-        else { g_wn_state = WN_LOADING; oc_plat_releasenotes_start(OC_BUILD_ID); }
+        else if (!g_client) g_wn_state = WN_FAILED;
+        else { g_wn_state = WN_LOADING; oc_client_get_release_notes(g_client, OC_BUILD_ID); }
         if (!g_about_open) modal_enter(hwnd, &g_about_open);
         invalidate();
         break;

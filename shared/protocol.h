@@ -744,6 +744,11 @@ typedef enum {
     OC_MSG_OUTGOING_WEBHOOK_LIST   = 0x0157, /* S->C, the list: never a secret */
     OC_MSG_SET_OUTGOING_WEBHOOK    = 0x0158, /* C->S, enable or disable one */
     OC_MSG_DELETE_OUTGOING_WEBHOOK = 0x0159, /* C->S, delete one */
+    /* A build's release notes, asked of the client's own daemon, which asks
+     * central with its workspace credential (CLIENT.md, "What's new"). New
+     * frames, so no version bump. */
+    OC_MSG_RELEASE_NOTES_GET       = 0x015A, /* C->S, the notes of a build id */
+    OC_MSG_RELEASE_NOTES           = 0x015B, /* S->C, central's answer: its status and body */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -878,6 +883,7 @@ typedef enum {
     OC_ERR_WEBHOOK_URL         = 3085, /* an outgoing webhook's URL is not https (docs/details/WEBHOOKS.md) */
     OC_ERR_WEBHOOK_EVENT       = 3086, /* an outgoing webhook named an event it may not select */
     OC_ERR_WEBHOOK_UNVERIFIED  = 3087, /* the endpoint did not answer the url_verification challenge */
+    OC_ERR_RELEASE_NOTES_UNAVAILABLE = 3088, /* the box is not connected to the OpenChime services, or central did not answer */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -2181,6 +2187,13 @@ typedef struct { uint64_t attachment_id; uint8_t rung; } oc_preview_end;
 typedef struct { oc_slice url; oc_slice events; uint16_t n_channels; uint64_t channels[OC_OUTWH_MAX_CHANNELS]; }
     oc_create_outgoing_webhook;
 typedef struct { uint64_t webhook_id; oc_slice secret; } oc_outgoing_webhook_secret;
+/* RELEASE_NOTES_GET: a build id (CLIENT.md). RELEASE_NOTES: that build id,
+ * central's HTTP status (200 notes, 404 not a release) and its body, at most
+ * OC_RELEASE_NOTES_MAX bytes. */
+#define OC_RELEASE_NOTES_MAX   60000u
+#define OC_BUILD_ID_MAX        64u
+typedef struct { oc_slice build_id; } oc_release_notes_get;
+typedef struct { oc_slice build_id; uint16_t status; oc_slice body; } oc_release_notes;
 typedef struct { uint64_t webhook_id; oc_slice url; oc_slice events; uint8_t enabled; oc_slice disabled_reason;
                  uint64_t created_by; uint64_t created_at_ms; uint16_t n_channels;
                  uint64_t channels[OC_OUTWH_MAX_CHANNELS]; } oc_outgoing_webhook_entry;
@@ -2701,6 +2714,8 @@ oc_result oc_encode_connection_list(oc_wbuf *w, uint16_t version, const oc_conne
 oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_revoke_connection *m);
 oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m);
 oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m);
+oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m);
+oc_result oc_encode_release_notes(oc_wbuf *w, uint16_t version, const oc_release_notes *m);
 oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m);
 oc_result oc_encode_set_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_set_outgoing_webhook *m);
@@ -2976,6 +2991,8 @@ oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
 /* More than OC_OUTWH_MAX_CHANNELS channels is MALFORMED. */
 oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m);
 oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m);
+oc_result oc_decode_release_notes_get(oc_rbuf *p, oc_release_notes_get *m);
+oc_result oc_decode_release_notes(oc_rbuf *p, oc_release_notes *m);
 /* Entries past `cap` are read and dropped; *out_count is the frame's count. */
 oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,
                                           uint16_t *out_count);

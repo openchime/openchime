@@ -204,7 +204,7 @@ static int run_report(fake_central *f, const int *statuses, int n, const char *b
     CHECK(pthread_create(&th, NULL, fake_central_thread, f) == 0);
     /* The enrollment URL's path is not where the report goes: its origin is. */
     char url[96];
-    snprintf(url, sizeof url, "http://127.0.0.1:%d/api/machine/enroll", port);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     oc_address_report *r = oc_address_report_start(url, aud, pk, body, &FAST_T, NULL, NULL);
     CHECK(r != NULL);
     pthread_join(th, NULL);

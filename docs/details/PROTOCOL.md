@@ -3795,6 +3795,31 @@ times with its clock. While it is in force a client marks the person "Out of
 office until <date>" wherever they appear, and someone writing them a DM or
 mentioning them is told so, with the message, before sending.
 
+### 5.16r Release notes (CLIENT.md, "What's new")
+
+A client asks its own daemon for a build's release notes, and the daemon asks
+central for them with its workspace credential (AUTH.md §3): no client reaches
+central, and no request crosses origins.
+
+```
+RELEASE_NOTES_GET (0x015A), C → S
+  build_id  str     the build whose notes: 1–64 bytes of [A-Za-z0-9._-]
+
+RELEASE_NOTES (0x015B), S → C
+  build_id  str     as asked
+  status    u16     central's answer: 200 with the notes, 404 when the build is no release
+  body      bytes   central's body as it gave it, at most 60 000 bytes
+```
+
+Only a signed-in connection may ask; a build id that is not a plain token is
+refused as `MALFORMED`. The daemon fetches with a signed `GET` to
+`<OPENCHIME_ENROLL_URL's origin>/v1/workspace/releases/build/<build id>` off the
+event loop, one fetch per build id at a time, and keeps an answer 6 hours, a
+failure 5 minutes, and at most 32 build ids. A box not connected to the
+OpenChime services, or one central did not answer, gets
+**`RELEASE_NOTES_UNAVAILABLE` 3088**; the client then offers the notes page.
+New frames: no version bump.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -4050,6 +4075,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3085` | `WEBHOOK_URL` | admin | no    | An outgoing webhook's URL is not `https` (§5.15a). |
 | `3086` | `WEBHOOK_EVENT` | admin | no    | An outgoing webhook named an event it may not select (§5.15a). |
 | `3087` | `WEBHOOK_UNVERIFIED` | admin | no    | The endpoint did not answer the `url_verification` check (§5.15a). |
+| `3088` | `RELEASE_NOTES_UNAVAILABLE` | client | no | The box is not connected to the OpenChime services, or central did not answer (§5.16r). |
 | `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
@@ -4376,6 +4402,8 @@ this table cannot silently gain a shared value.
 | `0x0157` | `OUTGOING_WEBHOOK_LIST` | S → C | the list, never a secret (§5.15a) |
 | `0x0158` | `SET_OUTGOING_WEBHOOK` | C → S | enable or disable one (§5.15a) |
 | `0x0159` | `DELETE_OUTGOING_WEBHOOK` | C → S | delete one (§5.15a) |
+| `0x015A` | `RELEASE_NOTES_GET` | C → S | a build's release notes (§5.16r) |
+| `0x015B` | `RELEASE_NOTES` | S → C | central's answer: status and body (§5.16r) |
 
 ## 10. Connection state machine
 

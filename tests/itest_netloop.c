@@ -34,6 +34,7 @@
 #include "json.h"          /* a summary's document, parsed */
 #include "export_render.h" /* the export's stub codecs (ARCH-135) */
 #include "export_worker.h" /* where a copy is stored */
+#include "release_notes.h" /* the clients' release notes (PROTOCOL.md §5.16r) */
 #include "blobstore.h"
 #include "oc_mp4.h"
 #include <poll.h>
@@ -4398,6 +4399,7 @@ static void test_demo_signup(void) {
     snprintf(pay, sizeof pay, "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu,\"jti\":\"it-1\",\"role\":\"member\"}",
              ISS, AUD, now - 5, now + 895);
     CHECK(oc_issuer_mint(&is, hdr, pay, inv) > 0);
+    oc_netloop_set_demo_terms("https://openchime.example/demo/terms");
     struct loop_arg arg2;
     pthread_t th2;
     int port = start_loop(&arg2, &th2, &srv2, dbw2, 0);
@@ -4412,7 +4414,14 @@ static void test_demo_signup(void) {
     /* contract: the page's markup -- one field, no password, the terms and the time left */
     CHECK(strstr(resp, "name=\"name\"") != NULL && strstr(resp, "type=\"password\"") == NULL);
     CHECK(strstr(resp, "name=\"username\"") == NULL);
-    CHECK(strstr(resp, "href=\"https://central.example/demo/terms\"") != NULL);
+    CHECK(strstr(resp, "href=\"https://openchime.example/demo/terms\"") != NULL);   /* OPENCHIME_DEMO_TERMS_URL, not central's origin */
+    /* With no OPENCHIME_DEMO_TERMS_URL, the terms are named without a link. */
+    oc_netloop_set_demo_terms(NULL);
+    {
+        static char r2[16384];
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, r2, sizeof r2) == 200);
+        CHECK(strstr(r2, "data-oc-demo-terms") != NULL && strstr(r2, "/demo/terms") == NULL);
+    }
     CHECK(strstr(resp, "data-oc-demo-terms") != NULL);
     CHECK(strstr(resp, "00:00 UTC (in ") != NULL);   /* contract: the time left, which the page computes */
     CHECK(strstr(resp, "rel=\"prefetch\" href=\"/app/openchime.wasm\"") != NULL);   /* contract: HTML */
@@ -10376,7 +10385,7 @@ static void test_auth_begin(void) {
     char url[2048];
     /* The whole URL is the daemon's, with everything it was given escaped. */
     CHECK(auth_begin(&c, "relay", "http://127.0.0.1:53111/cb?x=1&y=2", CH, url, sizeof url) == 0);
-    CHECK(strcmp(url, "https://central.example/oidc/authorize?workspace=ws_7f3a%209c%2F21"
+    CHECK(strcmp(url, "https://central.example/v1/workspace/oidc/authorize?workspace=ws_7f3a%209c%2F21"
                       "&redirect_uri=http%3A%2F%2F127.0.0.1%3A53111%2Fcb%3Fx%3D1%26y%3D2"
                       "&nonce=JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0") == 0);
     CHECK(auth_begin(&c, "relay", "http://localhost/cb", CH, url, sizeof url) == 0);
@@ -10566,6 +10575,84 @@ static void test_allowed_networks(void) {
     oc_tls_server_free(&srv2);
 }
 
+/* A stand-in for central's release notes: answers one request with a 200. */
+static void *rn_central(void *arg) {
+    int lfd = *(int *)arg;
+    int c = accept(lfd, NULL, NULL);
+    if (c < 0) return NULL;
+    char buf[2048];
+    ssize_t n = read(c, buf, sizeof buf - 1);
+    (void)n;
+    static const char R[] = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"release\":9}";
+    ssize_t wr = write(c, R, sizeof R - 1);
+    (void)wr;
+    close(c);
+    return NULL;
+}
+
+static int rn_get(client *c, const char *id) {
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_release_notes_get g = { oc_slice_str(id) };
+    if (oc_encode_release_notes_get(&w, OC_PROTOCOL_VERSION, &g) == OC_OK) return send_frame(c, buf, w.len);
+    /* A malformed id: the frame written by hand, as a client that does not
+     * check would -- length, version, type, then the string. */
+    size_t n = strlen(id);
+    uint32_t len = (uint32_t)(4 + 2 + n);
+    uint8_t f[128] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len,
+                       (uint8_t)(OC_PROTOCOL_VERSION >> 8), (uint8_t)OC_PROTOCOL_VERSION,
+                       (uint8_t)(OC_MSG_RELEASE_NOTES_GET >> 8), (uint8_t)OC_MSG_RELEASE_NOTES_GET,
+                       (uint8_t)(n >> 8), (uint8_t)n };
+    if (n > sizeof f - 10) return -1;
+    memcpy(f + 10, id, n);
+    return send_frame(c, f, 10 + n);
+}
+
+/* Release notes over the wire (PROTOCOL.md §5.16r): refused before sign-in;
+ * after it, RELEASE_NOTES_UNAVAILABLE on a box with no connection to central, a
+ * malformed build id refused, and the notes central gives, through the worker. */
+static void test_release_notes_wire(int port, const uint8_t *pin) {
+    oc_header hdr; oc_rbuf p; oc_error e;
+    {
+        client a;
+        CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+        CHECK(rn_get(&a, "rel9") == 0);
+        int rc = read_frame_raw(&a, &hdr, &p);
+        CHECK(rc != 0 || hdr.msg_type != OC_MSG_RELEASE_NOTES);
+        client_close(&a);
+    }
+    client a;
+    CHECK(signed_in(&a, port, pin, "alice", "pw-alice") == 0);
+    CHECK(rn_get(&a, "rel9") == 0 && read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0 &&
+          oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_RELEASE_NOTES_UNAVAILABLE);
+    CHECK(rn_get(&a, "../x") == 0 && read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0 &&
+          oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_MALFORMED_FRAME);
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 4) == 0);
+    socklen_t sl = sizeof sa;
+    getsockname(lfd, (struct sockaddr *)&sa, &sl);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, rn_central, &lfd) == 0);
+    char url[64], pk[1024], aud[128];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", ntohs(sa.sin_port));
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    oc_release_notes_worker *rn = oc_release_notes_start(url, aud, pk, NULL, NULL);
+    CHECK(rn != NULL);
+    oc_netloop_set_release_notes(rn);
+    /* Asked once the worker is there: fetched from central and answered. */
+    CHECK(rn_get(&a, "rel9") == 0);
+    oc_release_notes m;
+    CHECK(read_type(&a, OC_MSG_RELEASE_NOTES, &hdr, &p) == 0 && oc_decode_release_notes(&p, &m) == OC_OK &&
+          m.status == 200 && m.body.len == 13 && !memcmp(m.body.ptr, "{\"release\":9}", 13));
+    pthread_join(th, NULL);
+    oc_netloop_set_release_notes(NULL);
+    oc_release_notes_stop(rn);
+    close(lfd);
+    client_close(&a);
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
@@ -10685,6 +10772,7 @@ int run_netloop_tests(void) {
         test_webhook_vertical(arg.port, pin);
         test_agent_vertical(arg.port, pin);
         test_mcp_off(arg.port, pin);
+        test_release_notes_wire(arg.port, pin);
         test_mcp_wire();
         test_oauth_wire();
         test_address_proof_route(arg.port, pin);

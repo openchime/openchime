@@ -3,6 +3,7 @@
  */
 
 #include "model.h"
+#include "releasenotes.h"
 #include "richtext.h"
 #include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
 #include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
@@ -221,6 +222,16 @@ int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *web
     for (volatile char *z = m->outwh_secret; z < m->outwh_secret + sizeof m->outwh_secret; z++) *z = 0;
     m->outwh_secret_id = 0;
     return 1;
+}
+
+int oc_model_take_release_notes(oc_model *m, void *out) {
+    if (!m || !m->rn_ready || !out) return -1;
+    const char *b = m->rn_body ? m->rn_body : "";
+    int rc = oc_releasenotes_read(m->rn_status, b, strlen(b), (oc_releasenotes *)out);
+    free(m->rn_body);
+    m->rn_body = NULL;
+    m->rn_ready = 0;
+    return rc;
 }
 
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
@@ -502,6 +513,7 @@ int oc_model_receipts_on(const oc_model *m) {
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->rn_body); m->rn_body = NULL; m->rn_ready = 0;
     free(m->my_conns); m->my_conns = NULL; m->n_my_conns = 0;
     free(m->all_conns); m->all_conns = NULL; m->n_all_conns = 0;
     free(m->call_hist);
@@ -3606,6 +3618,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_RELEASE_NOTES:
+        free(m->rn_body);
+        m->rn_body = e->body ? strdup(e->body) : NULL;
+        m->rn_status = (int)e->size;
+        m->rn_ready = 1;
         break;
     case OC_EV_AGENT_TOKEN:
         snprintf(m->agent_token, sizeof m->agent_token, "%s", e->body ? e->body : "");

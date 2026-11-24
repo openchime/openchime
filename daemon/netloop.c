@@ -2,6 +2,7 @@
  * OpenChime network event loop. See netloop.h, dbwriter.h, tls.h, framebuf.h.
  */
 
+#include "central.h"
 #include "netloop.h"
 #include "notify.h"
 #include "audio.h"
@@ -12,6 +13,7 @@
 #include "push.h"
 #include "invite_mail.h"
 #include "webhooks_out.h"
+#include "release_notes.h"
 #include "enroll.h"    /* the address proof (AUTH.md §3.6) */
 #include "json.h"
 #include "unfurl.h"
@@ -1417,6 +1419,33 @@ void oc_netloop_set_webhooks_out(struct oc_webhooks_out *o) {
     __atomic_store_n(&g_owh, o, __ATOMIC_RELEASE);
 }
 
+/* Release notes for the clients (release_notes.h, PROTOCOL.md §5.16r), NULL =
+ * this box is not connected to the OpenChime services. Published like push. */
+static oc_release_notes_worker *g_rn;
+static __thread int g_rn_fd = -1;
+
+void oc_netloop_set_release_notes(struct oc_release_notes_worker *w) {
+    __atomic_store_n(&g_rn, w, __ATOMIC_RELEASE);
+}
+
+/* An answer as its frame: the notes, or RELEASE_NOTES_UNAVAILABLE. 0 with the
+ * frame in g_enc and its length in *len. */
+static int rn_frame(const oc_rn_answer *a, size_t *len) {
+    oc_wbuf w;
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    if (a->ok) {
+        oc_release_notes m = { oc_slice_str(a->build_id), (uint16_t)a->status,
+                               { (const uint8_t *)a->body, a->body ? a->body_len : 0 } };
+        if (oc_encode_release_notes(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
+    } else {
+        oc_error e = { OC_ERR_RELEASE_NOTES_UNAVAILABLE, 0, { NULL, 0 },
+                       oc_slice_str("the release notes could not be fetched") };
+        if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) != OC_OK) return -1;
+    }
+    *len = w.len;
+    return 0;
+}
+
 /* A creation waiting on its endpoint check: what the writer checked, and who
  * asked. The webhook is saved only when the check comes back good. */
 typedef struct owh_wait {
@@ -2674,7 +2703,7 @@ static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw)
         return;
     }
     char url[2048];
-    size_t o = (size_t)snprintf(url, sizeof url, "%s/oidc/authorize?workspace=", origin);
+    size_t o = (size_t)snprintf(url, sizeof url, "%s" OC_CENTRAL_OIDC "/authorize?workspace=", origin);
     if (o >= sizeof url ||
         pct_append(url, sizeof url, &o, aud, strlen(aud)) != 0) goto too_long;
     if (o + 14 >= sizeof url) goto too_long;
@@ -5546,6 +5575,36 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             c->xfer.attachment_id = db.attachment_id;
             continue;
         }
+        /* A build's release notes (PROTOCOL.md §5.16r): from the cache at once,
+         * or fetched from central by the worker and answered when it lands. */
+        if (hdr.msg_type == OC_MSG_RELEASE_NOTES_GET) {
+            oc_release_notes_get g;
+            oc_rn_answer a;
+            memset(&a, 0, sizeof a);
+            if (oc_decode_release_notes_get(&p, &g) != OC_OK) {
+                uint8_t ebuf[160]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+                oc_error err = { OC_ERR_MALFORMED_FRAME, 0, { NULL, 0 }, oc_slice_str("not a build id") };
+                if (oc_encode_error(&ew, c->version, &err) == OC_OK && out_append(c, ebuf, ew.len) != 0) return -1;
+                continue;
+            }
+            oc_release_notes_worker *rn = __atomic_load_n(&g_rn, __ATOMIC_ACQUIRE);
+            int now = 1;
+            if (rn) {
+                char id[OC_BUILD_ID_MAX + 1];
+                memcpy(id, g.build_id.ptr, g.build_id.len);
+                id[g.build_id.len] = '\0';
+                now = oc_release_notes_ask(rn, id, c->conn_id, &a);
+            } else {
+                memcpy(a.build_id, g.build_id.ptr, g.build_id.len);
+            }
+            if (now == 1) {
+                size_t len = 0;
+                int rc = rn_frame(&a, &len) == 0 ? out_append(c, g_enc, len) : -1;
+                oc_rn_answer_free(&a);
+                if (rc != 0) return -1;
+            }
+            continue;
+        }
         /* An image preview (ARCH-137): the download's gate, then the rung. */
         if (hdr.msg_type == OC_MSG_PREVIEW_BEGIN) {
             oc_preview_begin pb;
@@ -6229,13 +6288,19 @@ static int demo_username(const char *name, char *out, size_t cap) {
     return n > 0 && (size_t)n < cap ? 0 : -1;
 }
 
-/* What the demo's sign-up page says beside the form: the terms, on the
- * issuer's site (central, whose invite brought the visitor), and the minutes
+/* What the demo's sign-up page says beside the form: the terms, where
+ * OPENCHIME_DEMO_TERMS_URL says (none: named without a link), and the minutes
  * to the nightly erase at 00:00 UTC, rounded up. */
+static const char *g_demo_terms;   /* OPENCHIME_DEMO_TERMS_URL, published once at boot */
+void oc_netloop_set_demo_terms(const char *url) {
+    const char *copy = url && *url ? strdup(url) : NULL;
+    __atomic_store_n(&g_demo_terms, copy, __ATOMIC_RELEASE);
+}
+
 static void demo_page_facts(oc_dbwriter *dbw, char *terms, size_t cap, unsigned *left_min) {
-    const char *origin = oc_dbwriter_relay_origin(dbw);
-    if (origin && origin[0]) snprintf(terms, cap, "%s/demo/terms", origin);
-    else terms[0] = '\0';
+    (void)dbw;
+    const char *url = __atomic_load_n(&g_demo_terms, __ATOMIC_ACQUIRE);
+    snprintf(terms, cap, "%s", url ? url : "");
     time_t now = time(NULL);
     unsigned left_s = (unsigned)(86400 - (unsigned long)(now % 86400));
     *left_min = (left_s + 59) / 60;
@@ -11459,6 +11524,32 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     oc_dbwriter_submit(dbw, j);
 }
 
+/* Release notes fetched by the worker, each to the connection that asked, if it
+ * is still here. */
+static void deliver_release_notes(int ep, conn **conns) {
+    oc_release_notes_worker *rn = __atomic_load_n(&g_rn, __ATOMIC_ACQUIRE);
+    /* A worker set after the loop started (or taken away) is watched from the
+     * next turn: its eventfd joins the loop's. */
+    int fd = oc_release_notes_eventfd(rn);
+    if (fd != g_rn_fd) {
+        if (g_rn_fd >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, g_rn_fd, NULL);
+        g_rn_fd = fd;
+        if (fd >= 0) {
+            struct epoll_event rev;
+            memset(&rev, 0, sizeof rev);
+            rev.events = EPOLLIN; rev.data.fd = fd;
+            epoll_ctl(ep, EPOLL_CTL_ADD, fd, &rev);
+        }
+    }
+    oc_rn_answer a;
+    while (rn && oc_release_notes_next(rn, &a)) {
+        conn *c = find_by_id(conns, a.conn_id);
+        size_t len = 0;
+        if (c && c->authed && rn_frame(&a, &len) == 0) send_bytes(ep, conns, c->fd, g_enc, len);
+        oc_rn_answer_free(&a);
+    }
+}
+
 /* Outgoing webhooks, each turn: what the worker finished goes to the writer
  * -- a delivery's outcome, or a checked creation to save -- and, once a second
  * while the worker has room, the deliveries due are asked for. */
@@ -12256,6 +12347,13 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     callrec_ensure(ep, dbw);
     /* The outgoing webhooks' worker wakes the loop when it finishes one. */
     g_owh_taking = 0; g_owh_last_take = 0;
+    g_rn_fd = oc_release_notes_eventfd(__atomic_load_n(&g_rn, __ATOMIC_ACQUIRE));
+    if (g_rn_fd >= 0) {
+        struct epoll_event rev;
+        memset(&rev, 0, sizeof rev);
+        rev.events = EPOLLIN; rev.data.fd = g_rn_fd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_rn_fd, &rev);
+    }
     g_owh_fd = oc_webhooks_out_eventfd(__atomic_load_n(&g_owh, __ATOMIC_ACQUIRE));
     if (g_owh_fd >= 0) {
         struct epoll_event oev;
@@ -12465,6 +12563,7 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         pdm_expire(ep, conns);
         call_recorders_tick();
         owh_tick(ep, conns, dbw);
+        deliver_release_notes(ep, conns);
         if (__atomic_exchange_n(&g_sum_failed_pending, 0, __ATOMIC_ACQ_REL)) {
             oc_job *j = oc_job_new(OC_JOB_SUMMARY_FAIL, 0);
             if (j) oc_dbwriter_submit(dbw, j);
@@ -12518,6 +12617,12 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 #endif
+            if (g_rn_fd >= 0 && fd == g_rn_fd) {
+                uint64_t cnt;
+                while (read(g_rn_fd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                deliver_release_notes(ep, conns);
+                continue;
+            }
             if (g_owh_fd >= 0 && fd == g_owh_fd) {
                 uint64_t cnt;
                 while (read(g_owh_fd, &cnt, sizeof cnt) > 0) { /* drain: owh_tick reads the results */ }
@@ -12613,6 +12718,8 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_callrec_worker_stop(g_callrec);
     g_callrec = NULL;
     g_callrec_fd = -1;
+    if (g_rn_fd >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, g_rn_fd, NULL);
+    g_rn_fd = -1;
     if (g_owh_fd >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, g_owh_fd, NULL);
     g_owh_fd = -1;
     for (owh_wait *x = g_owh_waits, *next; x; x = next) { next = x->next; owh_wait_free(x); }

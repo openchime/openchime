@@ -16,7 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* A relay that serves /oidc/jwks: `status` and `body` as the test sets them. */
+/* A relay that serves /v1/workspace/oidc/jwks: `status` and `body` as the test sets them. */
 typedef struct {
     int  fd, port, stop, hits, status;
     char body[4096];
@@ -41,7 +41,7 @@ static void *relay_thread(void *arg) {
         }
         pthread_mutex_lock(&f->mu);
         if (f->stop) { pthread_mutex_unlock(&f->mu); close(c); break; }
-        int ours = strncmp(req, "GET /oidc/jwks ", 15) == 0;
+        int ours = strncmp(req, "GET /v1/workspace/oidc/jwks ", 27) == 0;
         if (ours) f->hits++;
         char resp[4400];
         int st = ours ? f->status : 404;
@@ -142,7 +142,7 @@ int run_relaykeys_tests(void) {
     CHECK(w != NULL);
     CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", a.pem, "") == 0);
     char url[96];
-    snprintf(url, sizeof url, "http://127.0.0.1:%d/oidc/jwks", f.port);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1/workspace/oidc/jwks", f.port);
     oc_relaykeys *rk = oc_relaykeys_start(url, w);
     CHECK(rk != NULL);
     /* Waits bound a hang, not a speed: each event is asserted after. */

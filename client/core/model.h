@@ -797,6 +797,11 @@ typedef struct {
     /* Agents (docs/details/MCP.md §3.1): the token just minted, held until a
      * frontend takes it (oc_model_take_agent_token), and the agent whose token
      * list is held. */
+    /* A build's release notes as they came (PROTOCOL.md §5.16r), held until
+     * a frontend takes them (oc_model_take_release_notes): central's status, 0
+     * when they could not be fetched, and its body (heap). */
+    int       rn_ready, rn_status;
+    char     *rn_body;
     char      agent_token[96];
     char      agent_token_scopes[512];
     uint64_t  agent_token_agent, agent_token_id;
@@ -1315,6 +1320,10 @@ int oc_model_user_is_agent(const oc_model *m, uint64_t user_id);
 /* A new outgoing webhook's secret, once: 1 with it in `out` (and the webhook's
  * id), the model's copy wiped; 0 when there is none. */
 int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id);
+/* The release notes asked for with oc_client_get_release_notes, once they
+ * came: an OC_RN_* result with `out` (an oc_releasenotes) filled, or -1 while
+ * they have not. Taken once. */
+int oc_model_take_release_notes(oc_model *m, void *out);
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
                               char *scopes, size_t scopes_cap);
 

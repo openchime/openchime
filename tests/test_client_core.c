@@ -18,6 +18,8 @@
 #include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
+#include "release_notes.h"  /* the daemon's side of What's new */
+#include "enroll.h"
 #include "config.h"
 #include "dbwriter.h"
 #include "auth.h"       /* oc_sha256: an approval code stored as the daemon stores it */
@@ -6552,7 +6554,7 @@ static void test_browser_signin(void) {
         CHECK(c != NULL);
         CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
         const oc_model *m = oc_client_model(c);
-        CHECK(strncmp(m->signin_url, "https://central.example/oidc/authorize?workspace=ws_browser_test&", 65) == 0);
+        CHECK(strncmp(m->signin_url, "https://central.example/v1/workspace/oidc/authorize?workspace=ws_browser_test&", 78) == 0);
         CHECK(m->signin_seq == 1 && !m->authed);
         CHECK(browser_complete(m, &is, "https://accounts.google.com|dana", "b1", DANA, NULL) == 0);
         /* The tab was answered after the daemon accepted the token, not before:
@@ -6916,6 +6918,81 @@ static void test_action_pairing(void) {
  * with "-compatible", byte for byte what the daemon stored. With export off it
  * is not offered, a request is refused with the plain sentence, and the
  * download queued behind it still completes. Its own daemon each time. */
+/* A stand-in for central's release notes: one request, answered with notes. */
+static void *rn_central_once(void *arg) {
+    int lfd = *(int *)arg;
+    int c = accept(lfd, NULL, NULL);
+    if (c < 0) return NULL;
+    char buf[2048];
+    ssize_t n = read(c, buf, sizeof buf - 1);
+    (void)n;
+    static const char B[] = "{\"release\":21,\"build_id\":\"abc1234\",\"published_at\":\"2026-11-24T00:00:00Z\","
+                            "\"sections\":[{\"title\":\"New\",\"items\":[{\"title\":\"Webhooks\",\"url\":\"https://x/1\"}]}]}";
+    char resp[1024];
+    int rn = snprintf(resp, sizeof resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                      "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof B - 1, B);
+    ssize_t wr = write(c, resp, (size_t)rn);
+    (void)wr;
+    close(c);
+    return NULL;
+}
+
+/* What's new (PROTOCOL.md §5.16r): a client asks its own daemon, which asks
+ * central, and the notes arrive in the model, read as before. */
+static void test_release_notes_client(void) {
+    char db[sizeof g_dir + 40];
+    snprintf(db, sizeof db, "%s/release_notes.db", g_dir);
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    oc_dbwriter *dbw = oc_dbwriter_start(db);
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER, 2048) != 0);
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 4) == 0);
+    socklen_t sl = sizeof sa;
+    getsockname(lfd, (struct sockaddr *)&sa, &sl);
+    pthread_t cth;
+    CHECK(pthread_create(&cth, NULL, rn_central_once, &lfd) == 0);
+    char url[64], pk[1024], aud[128];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", ntohs(sa.sin_port));
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    oc_release_notes_worker *rn = oc_release_notes_start(url, aud, pk, NULL, NULL);
+    CHECK(rn != NULL);
+    oc_netloop_set_release_notes(rn);
+
+    struct core_loop_arg arg;
+    memset(&arg, 0, sizeof arg);
+    arg.srv = &srv; arg.dbw = dbw;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+    oc_client *a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+    CHECK(a != NULL);
+    if (a) {
+        CHECK(WAIT_FOR(a, m->authed));
+        oc_client_get_release_notes(a, "abc1234");
+        CHECK(WAIT_FOR(a, m->rn_ready));
+        static oc_releasenotes notes;
+        CHECK(oc_model_take_release_notes((oc_model *)oc_client_model(a), &notes) == OC_RN_OK);
+        CHECK(notes.release == 21 && notes.n_sections == 1 && notes.sections[0].n_items == 1 &&
+              !strcmp(notes.sections[0].items[0].title, "Webhooks"));   /* contract: the notes as central gave them */
+        CHECK(oc_model_take_release_notes((oc_model *)oc_client_model(a), &notes) == -1);   /* taken once */
+        oc_client_stop(a);
+    }
+    pthread_join(cth, NULL);
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_netloop_set_release_notes(NULL);
+    oc_release_notes_stop(rn);
+    close(lfd);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+}
+
 static void test_export_client(int on) {
     char data[sizeof g_dir + 40], db[sizeof g_dir + 40];
     snprintf(data, sizeof data, "%s/export_data_%d", g_dir, on);
@@ -8641,6 +8718,7 @@ int run_client_core_tests(void) {
     test_out_of_office();
     test_local_browser();
     test_device_client();
+    test_release_notes_client();
     test_export_client(1);
     test_export_client(0);
     oc_test_rmtree(g_dir);

@@ -63,6 +63,13 @@ int  oc_machine_http_post(oc_machine_http *h, const char *path, const char *audi
 int  oc_machine_http_post_read(oc_machine_http *h, const char *path, const char *audience,
                                const char *privkey_pem, const char *body, int *status,
                                char *resp, size_t resp_cap);
+/* GET `path`, signed over the method, the path and an empty body. The answer's
+ * body, de-chunked, is in `resp` with its length in *resp_len (at most
+ * resp_cap - 1 bytes, NUL-terminated); a longer one is cut at that and
+ * *resp_len is resp_cap - 1, so a caller can tell. */
+int  oc_machine_http_get_read(oc_machine_http *h, const char *path, const char *audience,
+                              const char *privkey_pem, int *status, char *resp, size_t resp_cap,
+                              size_t *resp_len);
 void oc_machine_http_close(oc_machine_http *h);
 
 /* ---- exposed for testing ---- */

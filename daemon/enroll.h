@@ -11,6 +11,7 @@
 #define OPENCHIME_ENROLL_H
 
 #include <stddef.h>
+#include "central.h"
 
 /* Generate a fresh ECDSA P-256 keypair and an opaque audience id ("ws_" + base64url
  * of >=128 random bits). Writes the private key as PEM into privkey_pem and the
@@ -39,7 +40,7 @@ int oc_enroll_sign_proof(const char *privkey_pem, const char *audience, const ch
  * (ASN.1 DER ECDSA, base64), so central knows the server there holds the key. */
 #define OC_ADDRESS_PROOF_PREFIX "openchime-address-proof-v1"
 #define OC_ADDRESS_PROOF_PATH   "/enroll-proof"
-#define OC_ADDRESS_REPORT_PATH  "/api/machine/address"
+#define OC_ADDRESS_REPORT_PATH  OC_CENTRAL_ADDRESS
 #define OC_ADDRESS_NONCE_LEN    43u   /* base64url, no padding, of 32 bytes */
 int oc_enroll_sign_address_proof(const char *privkey_pem, const char *audience, const char *nonce,
                                  char *sig_b64, size_t sig_cap);
