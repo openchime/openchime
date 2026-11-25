@@ -70,12 +70,16 @@ const char *oc_theme_scheme_name(int scheme);
 uint32_t oc_theme_scheme_accent(int scheme);
 uint32_t oc_theme_scheme_rail(int scheme);
 
-/* Apply a mode. OC_THEME_SYSTEM follows the Windows apps-use-light-theme
- * setting, resolving to dark when it cannot be read. */
+/* Where OC_THEME_SYSTEM asks the desktop: the platform's oc_plat_prefers_light,
+ * handed in by the application at start (1 light, 0 dark, -1 cannot say). Until
+ * then, and whenever it answers anything but 1, SYSTEM resolves to dark. */
+void oc_theme_set_system_query(int (*prefers_light)(void));
+/* Apply a mode. OC_THEME_SYSTEM follows the desktop's light-or-dark preference,
+ * resolving to dark when it cannot be read. */
 void oc_theme_apply(int mode);
 /* Is the palette in force the LIGHT one? Not the same question as the mode: SYSTEM
  * resolves to either. Anything outside theme.c that has to match the shell — the
- * window caption, for one — asks this rather than re-reading the registry. */
+ * window caption, for one — asks this rather than asking the desktop again. */
 int  oc_theme_is_light(void);
 int  oc_theme_mode(void);            /* the mode last applied (not the resolved one) */
 const char *oc_theme_mode_name(int mode);

@@ -4,6 +4,7 @@
 #   make build-all    the full build: everything a release ships (CI only)
 #   make test-all     the full suite, once per release-candidate (CI only)
 #   make run          a dev daemon on 127.0.0.1:8443, alice/bob, and the Linux TUI
+#   make linux-gui    the Linux GUI, build/openchime-gui (needs development packages: mk/linux.mk)
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
 # The two suites, what each runs and where, are docs/details/TESTING.md; each test is
@@ -34,10 +35,11 @@
 #
 # Tool binaries are built by their path (make build/demo_client,
 # build/bench_load, build/tts_pack, build/s3_smoke, build/e2e_client,
-# build/fuzz/<harness>, build/fuzz/seeds). The rules live in
+# build/fuzz/<harness>, build/fuzz/seeds, build/sdltext_test,
+# build/sdltext_test.exe, build/linux_gui_test). The rules live in
 # mk/, one file per concern; scripts/test/fast/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
-PUBLIC   := build test build-all test-all run clean distclean
+PUBLIC   := build test build-all test-all run linux-gui clean distclean
 INTERNAL := daemon fast-build fast-test build-dir linux windows web FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
 
 # --- One build at a time (docs/details/TESTING.md, "One build at a time") --------------

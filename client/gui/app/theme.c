@@ -1,22 +1,11 @@
 /*
- * OpenChime Win32 GUI — the two palettes and the switch between them (REQ-262). See theme.h.
+ * OpenChime GUI — the two palettes and the switch between them (REQ-262). See theme.h.
  */
 
 #include "theme.h"
 #include "protocol.h"   /* OC_PRESENCE_* */
 
 #include <math.h>
-
-/* Windows only for the one registry read below. Everything else here is colour
- * arithmetic, and it is compiled into the test binary on Linux so the contrast
- * guarantee can be asserted by `make test` rather than only by an audit somebody
- * remembers to run on a Windows box. */
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#endif
 
 /* Dark: a deep-blue accent on a dark neutral shell, with real elevation steps
  * (darkest rail -> lightest canvas) so the panes read as distinct layers. */
@@ -162,26 +151,18 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
     return (r << 16) | (g << 8) | bl;
 }
 
-/* The user's app theme, from the same registry value the shell reads. Anything
- * unreadable means dark: this app was designed dark, so that is the safe miss. */
-#ifndef _WIN32
-/* Off Windows there is no shell preference to read. Dark is the documented safe
- * miss, and the tests drive LIGHT and DARK explicitly rather than through
- * SYSTEM, so this never decides anything they assert. */
-static int system_prefers_light(void) { return 0; }
-#else
-static int system_prefers_light(void) {
-    HKEY k;
-    DWORD v = 0, sz = sizeof v, type = 0;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return 0;
-    LONG rc = RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&v, &sz);
-    RegCloseKey(k);
-    return (rc == ERROR_SUCCESS && type == REG_DWORD && v == 1);
-}
-#endif  /* _WIN32 */
+/* The desktop's light-or-dark preference, asked through the function the
+ * application hands in (oc_plat_prefers_light) rather than called by name:
+ * this file is compiled into the test binary, which has no platform layer, and
+ * the tests drive LIGHT and DARK explicitly rather than through SYSTEM. Asked
+ * on every resolution, so a change made in the desktop's settings shows the
+ * next time the theme is resolved. Anything but 1 means dark: this app was
+ * designed dark, so that is the safe miss. */
+static int (*g_prefers_light)(void);
+
+void oc_theme_set_system_query(int (*prefers_light)(void)) { g_prefers_light = prefers_light; }
+
+static int system_prefers_light(void) { return g_prefers_light && g_prefers_light() == 1; }
 
 /* --- the contrast guarantee (REQ-262) --------------------------------------
  *

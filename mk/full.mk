@@ -12,14 +12,17 @@
 # plain then threads in test-all.yml's one job, packages, image and windows in
 # release-candidate.yml's `stage`. Unset, every part in turn:
 #
-#   plain     the daemon with every feature, the Linux TUI, the web client, the
-#             test binary, the e2e and demo clients and the fuzzing harnesses;
-#             then the source checks, actionlint, the suites that start no
-#             thread, and media, plainly with their timing judged, the
-#             static-link check, the end-to-end run, the speech round trip,
-#             the web client's objects' header dependencies, and each fuzzing
-#             harness for its fixed inputs, one at a time, inside FUZZ_SECONDS
-#             (20) in all
+#   plain     the daemon with every feature, the Linux TUI, the Linux GUI, the
+#             web client, the test binary, the e2e and demo clients, the
+#             fuzzing harnesses, and sdltext's and the Linux GUI's test
+#             programs; then
+#             the source checks, actionlint, the suites that start no thread,
+#             and media, plainly with their timing judged, the static-link
+#             check, the end-to-end run, the speech round trip, sdltext on
+#             FreeType, the Linux GUI's test program on a session bus of its
+#             own, the web client's objects' header dependencies, and each
+#             fuzzing harness for its fixed inputs, one at a time, inside
+#             FUZZ_SECONDS (20) in all
 #   threads   the test binary under ThreadSanitizer; then the suites that start
 #             threads, under it, their one run in the full suite
 #   packages  the release's daemon for ARCH (gcc 12, glibc 2.35) with its
@@ -56,9 +59,13 @@ test-all:
 	$(FULL_PARTS_RUN)
 
 # --- plain --------------------------------------------------------------------
+# The Linux GUI and its test programs need system development packages
+# (mk/linux.mk), which test-all.yml installs; built here, in the full build
+# only, since `make build` must succeed on a host without them.
 build-all-plain:
-	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) daemon linux $(WEB_DIR)/openchime.js \
-	    $(TEST_BIN) build/e2e_client build/demo_client $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES))
+	+@$(MAKE) --no-print-directory $(FULL_SWITCHES) daemon linux linux-gui $(WEB_DIR)/openchime.js \
+	    $(TEST_BIN) build/e2e_client build/demo_client $(patsubst %,build/fuzz/%,$(FUZZ_HARNESSES)) \
+	    build/sdltext_test build/linux_gui_test
 test-all-plain:
 	scripts/test/fast/source.sh
 	scripts/test/fast/actionlint.sh
@@ -66,6 +73,8 @@ test-all-plain:
 	scripts/test/full/static_link.sh $(BIN)
 	scripts/test/full/e2e.sh
 	scripts/test/full/speech.sh ./$(BIN)
+	scripts/test/full/sdltext.sh
+	scripts/test/full/linux_gui.sh
 	+MAKE="$(MAKE) $(FULL_SWITCHES)" scripts/test/full/web_deps.sh
 	FUZZ_HARNESSES="$(foreach h,$(FUZZ_HARNESSES),$(h):$(FUZZ_DICT_$(h)):$(FUZZ_RUNS_$(h)))" scripts/test/full/fuzz.sh
 

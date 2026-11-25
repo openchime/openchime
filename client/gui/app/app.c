@@ -1522,8 +1522,16 @@ static void toast_action_perform(char *payload);   /* fwd — defined with the
  *
  * `reply` is what the user typed into the toast, and this is the only route by
  * which it can arrive: an <input>'s text reaches a COM activator and nothing
- * else. Protocol activation, which carries the toast body's own click, cannot. */
+ * else. Protocol activation, which carries the toast body's own click, cannot.
+ *
+ * Where the platform hands back the click itself (the freedesktop server's
+ * "default" action), its argument is the notification's openchime:// link,
+ * and it is followed as the same click arriving by protocol would be. */
 static void toast_action_cb(const char *arg, const char *reply) {
+    if (arg && !strncmp(arg, "openchime://", 12)) {
+        oc_plat_handoff("url", arg);
+        return;
+    }
     char payload[1200];
     snprintf(payload, sizeof payload, "%s\n%s", arg ? arg : "", reply ? reply : "");
     oc_plat_handoff("action", payload);
@@ -43382,6 +43390,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* SYSTEM by default: match the desktop unless the user says otherwise. */
+    oc_theme_set_system_query(oc_plat_prefers_light);
     oc_theme_apply(OC_THEME_SYSTEM);
     char startup_err[sizeof g_si_err] = "";
     if (direct && !connect_start(aws, acred)) {

@@ -484,6 +484,9 @@ int oc_plat_high_contrast(void) {
         return window.matchMedia('(prefers-contrast: more)').matches ? 1 : 0;
     });
 }
+/* The page follows its own palette, not the browser's prefers-color-scheme:
+ * -1, and the SYSTEM theme resolves to dark, the safe miss. */
+int oc_plat_prefers_light(void) { return -1; }
 
 /* ---- the clipboard --------------------------------------------------------- */
 

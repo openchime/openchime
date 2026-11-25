@@ -50,6 +50,40 @@ $(eval $(call oc_obj_rules,$(OBJ_DIR)/tsan,TSAN_CC,$(CC_STAMP),$(TEST_VENDOR)))
 $(TSAN_BIN): $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(TEST_VENDOR) $(CC_STAMP) | build-dir
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TSAN_OBJS) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(EXPORT_TEST_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
+# --- Test programs built by path ------------------------------------------------
+# sdltext's one test program (sdltext/st_test.c), here on the FreeType backend;
+# mk/windows.mk builds the same program against DirectWrite. Its exit code is
+# its failure count. It needs FreeType, HarfBuzz and fontconfig (FT_PKGS), so
+# neither `make build` nor `make test` builds it.
+SDLTEXT_TEST_SRC := sdltext/st_test.c $(SDLTEXT_FT)
+build/sdltext_test: $(SDLTEXT_TEST_SRC) $(wildcard sdltext/*.h) | build-dir
+	$(call oc_need_pkgs,$@,$(FT_PKGS))
+	$(CC) $(CFLAGS) -std=c11 -O0 -g $(SDLTEXT_INC) -DUTF8PROC_STATIC $(FT_CFLAGS) $(SDLTEXT_TEST_SRC) $(FT_LIBS) -lm -o $@
+# The Linux GUI's test program (tests/linux_gui_test.c): the platform, the
+# AT-SPI provider, notifications and portal capture, against stand-in D-Bus
+# services it serves itself on the session bus `dbus-run-session` gives it. Its
+# exit code is its failure count. It links the GUI's own objects (mk/linux.mk),
+# compiled as the GUI compiles them, and none of the application layer, so it
+# needs the GUI's development packages (LINUX_GUI_PKGS), and neither `make
+# build` nor `make test` builds it. Its own object comes first, so the
+# packages are checked, naming any missing, before anything else is built.
+# malloc is wrapped so the image checks can see what a decode allocates.
+LINUX_GUI_TEST_SRC  := client/gui/platform/linux/plat_linux.c client/gui/platform/linux/a11y_atspi.c \
+                       client/shared/osnotify_linux.c client/shared/icons.c $(THEME_SRC) $(GFX_SRC) $(SDLTEXT_FT) \
+                       client/core/media/cap_portal.c client/core/media/capture.c client/core/media/i420.c \
+                       client/core/env.c
+LINUX_GUI_TEST_OBJS := $(OBJ_DIR)/linux-gui-test/tests/linux_gui_test.o \
+                       $(call oc_objs,$(OBJ_DIR)/linux-gui,$(LINUX_GUI_TEST_SRC))
+LINUX_GUI_TEST_PKGS_OK := build/.linux_gui_test_pkgs
+$(LINUX_GUI_TEST_PKGS_OK): FORCE
+	$(call oc_need_pkgs,build/linux_gui_test,$(LINUX_GUI_PKGS))
+LINUX_GUI_TEST_CC = $(LINUX_GUI_CC) -Itests
+$(eval $(call oc_obj_rules,$(OBJ_DIR)/linux-gui-test,LINUX_GUI_TEST_CC,$(CC_STAMP),$(LINUX_GUI_TEST_PKGS_OK) $(LINUX_GUI_A)))
+-include $(OBJ_DIR)/linux-gui-test/tests/linux_gui_test.d
+build/linux_gui_test: $(LINUX_GUI_TEST_OBJS) $(PREVIEW_A) $(SDL3_LINUX_LIB) | build-dir
+	$(CC) $(CFLAGS) -std=c11 -g $(LINUX_GUI_TEST_OBJS) -Wl,--wrap=malloc $(PREVIEW_LIBS) $(SDL3_LINUX_LIB) \
+	    $(LINUX_GUI_PKG_LIBS) -lpthread -ldl -lm -o $@
+
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client the full suite drives against a natively-run daemon
 # (scripts/test/full/e2e.sh, docs/details/TESTING.md §3); links only the shared wire

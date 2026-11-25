@@ -13,8 +13,11 @@
  *
  *   Windows   the Notification Center toast, then the tray balloon
  *             (client/shared/osnotify_win.c over client/gui/win32/wintoast.c)
- *   others    unavailable for now (client/shared/osnotify_null.c): nothing is
- *             raised, and the frontend's fallback and the badges carry on
+ *   Linux     the desktop's notification server, org.freedesktop.Notifications,
+ *             over GDBus (client/shared/osnotify_linux.c)
+ *   browser   the Notification API (client/shared/osnotify_web.c)
+ *   others    unavailable (client/shared/osnotify_null.c): nothing is raised,
+ *             and the frontend's fallback and the badges carry on
  *
  * Every entry point fails soft: no platform guarantees a notification can be
  * raised (no identity, a denied permission, a missing service).

@@ -54,11 +54,12 @@ done
 ok "mbedTLS $tree is built from $tree_dir, by the makefiles and its three scripts, with nothing downloaded"
 
 # SDL3: its version is written in four places that must agree: the tree's own
-# include/SDL3/SDL_version.h (three numbers), the build directory the makefile
-# names (SDL3_VERSION and SDL3_WIN in mk/windows.mk) and the two scripts that
-# build it. Neither script may download.
+# include/SDL3/SDL_version.h (three numbers), the build directories the
+# makefiles name (SDL3_VERSION in mk/sources.mk, SDL3_WIN in mk/windows.mk and
+# SDL3_LINUX in mk/linux.mk) and the three scripts that build it. No script may
+# download.
 sdl_dir=third_party/SDL3
-sdl_scripts=(scripts/build/sdl3_windows.sh scripts/build/sdl3_wasm.sh)
+sdl_scripts=(scripts/build/sdl3_windows.sh scripts/build/sdl3_wasm.sh scripts/build/sdl3_linux.sh)
 sdl_header_version() { sed -n 's/^#define SDL_\(MAJOR\|MINOR\|MICRO\)_VERSION  *\([0-9]*\)$/\2/p' "$@" | paste -sd.; }
 sdl_script_version() { sed -n 's/^SDL3_VERSION=\([0-9][0-9.]*\)$/\1/p' "$@"; }
 
@@ -76,6 +77,8 @@ got=$(sed -n 's/^SDL3_VERSION := //p' <<<"$vars" | head -1)
 [ "$got" = "$sdl" ] || { error "SDL3_VERSION is '$got' and the committed SDL3 is $sdl"; bad=1; }
 got=$(sed -n 's/^SDL3_WIN := //p' <<<"$vars" | head -1)
 [ "$got" = "third_party/sdl3-$sdl-win" ] || { error "SDL3_WIN is '$got' and the committed SDL3 is $sdl: it should be third_party/sdl3-$sdl-win"; bad=1; }
+got=$(sed -n 's/^SDL3_LINUX := //p' <<<"$vars" | head -1)
+[ "$got" = "third_party/sdl3-$sdl" ] || { error "SDL3_LINUX is '$got' and the committed SDL3 is $sdl: it should be third_party/sdl3-$sdl"; bad=1; }
 for s in "${sdl_scripts[@]}"; do
     got=$(sdl_script_version "$s")
     [ "$got" = "$sdl" ] || { error "$s builds SDL3 '$got' and the committed tree is $sdl"; bad=1; }
@@ -83,4 +86,4 @@ for s in "${sdl_scripts[@]}"; do
     [ -z "$hit" ] || { error "$s downloads, and SDL3 is built from $sdl_dir alone: $hit"; bad=1; }
 done
 [ "$bad" = 0 ] || exit 1
-ok "SDL3 $sdl is built from $sdl_dir, by the makefile and its two scripts, with nothing downloaded"
+ok "SDL3 $sdl is built from $sdl_dir, by the makefiles and its three scripts, with nothing downloaded"

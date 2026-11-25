@@ -8,7 +8,7 @@
  *
  *   win32/   Windows: the reference implementation
  *   web/     the browser, under Emscripten
- *   linux/   (next) FreeType/fontconfig text, AT-SPI, libsecret, portals
+ *   linux/   Linux: FreeType text, AT-SPI, libsecret, the desktop portals
  *   mac/     (next) Core Text, NSAccessibility, the Keychain
  *
  * A function a platform cannot provide answers "not available" (0, NULL, an
@@ -183,6 +183,12 @@ int      oc_plat_reduce_motion(void);
  * (SPI_GETHIGHCONTRAST), a browser's prefers-contrast: more. Read at start,
  * whenever the window gains focus and when the system's theme changes. */
 int      oc_plat_high_contrast(void);
+/* Whether the person has asked the system for light apps rather than dark: 1
+ * light, 0 dark, -1 when the platform cannot say. Windows' "Choose your app
+ * mode" (AppsUseLightTheme), the desktop portal's color-scheme on Linux; a
+ * browser answers -1. Read whenever the SYSTEM theme is resolved (theme.c), so
+ * a change made elsewhere shows with the next repaint that resolves it. */
+int      oc_plat_prefers_light(void);
 
 /* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
 

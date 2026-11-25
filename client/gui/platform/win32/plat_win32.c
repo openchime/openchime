@@ -750,6 +750,21 @@ int oc_plat_high_contrast(void) {
     return (hc.dwFlags & HCF_HIGHCONTRASTON) ? 1 : 0;
 }
 
+/* Settings > Personalization > Colors, "Choose your app mode": the same
+ * registry value the shell reads, AppsUseLightTheme, 1 for light. */
+int oc_plat_prefers_light(void) {
+    HKEY k;
+    DWORD v = 0, sz = sizeof v, type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return -1;
+    LONG rc = RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&v, &sz);
+    RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return -1;
+    return v == 1 ? 1 : 0;
+}
+
 /* ---- the clipboard --------------------------------------------------------- */
 
 char *oc_plat_clipboard_files(void) {

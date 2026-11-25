@@ -4,7 +4,8 @@
 # scripts/test/fast/source.sh with the other source checks. `--write` regenerates what is generated.
 #
 #   a. getenv() is called in daemon/ only by config.c, and in client/ only by
-#      client/core/env.c and the platform path lookups (HOME, APPDATA, ...).
+#      client/core/env.c and the platform path lookups (HOME, APPDATA, the XDG
+#      base directories, the accessibility bus's address, ...).
 #   b. Every OPENCHIME_* name in code, tests, scripts, workflows, packaging and
 #      docs is a row (or a pattern row) of the registry or a name it lists as
 #      no longer read; and every row's name appears in CONFIG.md.
@@ -20,7 +21,7 @@ say() { echo "config: $*" >&2; }
 # a. getenv
 bad=$(grep -rn 'getenv("' daemon --include=*.c --include=*.h | grep -v '^daemon/config.c:' || true)
 [ -z "$bad" ] && bad=$(grep -rn 'getenv("' client shared --include=*.c --include=*.h | grep -v '^client/core/env.c:' \
-    | grep -vE 'getenv\("(HOME|APPDATA|LOCALAPPDATA|XDG_CONFIG_HOME|TEMP|TMP|TMPDIR|PATH)"\)' || true)
+    | grep -vE 'getenv\("(HOME|APPDATA|LOCALAPPDATA|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_RUNTIME_DIR|AT_SPI_BUS_ADDRESS|TEMP|TMP|TMPDIR|PATH)"\)' || true)
 if [ -n "$bad" ]; then say "getenv outside the loader:"; echo "$bad" | sed 's/^/  /' >&2; fail=1; fi
 
 # b. names

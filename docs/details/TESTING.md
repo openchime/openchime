@@ -55,12 +55,14 @@ build-all` builds: everything a release ships. `PART=` splits both into the
 steps CI runs one after another (`mk/full.mk`):
 
 - `plain` — the daemon with every feature and the web client in it, the
-  Linux TUI, the e2e client and the fuzzing harnesses; then the fast suite's
+  Linux TUI and GUI, the e2e client, the fuzzing harnesses, and sdltext's and
+  the Linux GUI's test programs; then the fast suite's
   source checks and actionlint; every suite that starts no thread, the `FULL`
   ones included, and `media`, plainly with timing judged (§2.4); the
   static-link check; the end-to-end run against a natively-run daemon (§3.2);
-  the speech round trip; the web client's objects' header dependencies (§3.4);
-  and each fuzzing harness
+  the speech round trip; sdltext on FreeType and the Linux GUI's test program
+  on a session bus of its own (§2.2c); the web client's objects' header
+  dependencies (§3.4); and each fuzzing harness
   for its fixed inputs, one at a time, inside 20 seconds in all (§2.2b);
 - `threads` — the suites that start threads, under ThreadSanitizer, their one
   run in the full suite (§2.4), in one process, one after another, nothing
@@ -152,7 +154,11 @@ SYN). `gdb` is optional and makes a crash print every thread's stack.
 else. What they need is installed by the workflows: `cmake` 3.28+ for SDL3's own
 builds, `setarch` for the
 ThreadSanitizer part, a clang with libFuzzer for the fuzzing harnesses,
-`ffmpeg`, and for the release's artifacts
+`ffmpeg`; for the Linux GUI and its test programs (§2.2c) the development
+packages of FreeType, HarfBuzz, fontconfig, GLib, libsecret and libpipewire,
+the X11, Wayland, xkbcommon, EGL, OpenGL and libdecor headers SDL3's Linux
+build needs, the DejaVu fonts, `dbus-run-session`, `pipewire` and
+`wireplumber` (DEVELOPMENT.md, "The Linux GUI", names the Ubuntu packages); and for the release's artifacts
 `podman`, `buildah`, `rpm`, `cpio`, `nsis`, `python3-pefile`, and clang and
 the pinned CMake `scripts/build/makemsix.sh` fetches.
 
@@ -670,6 +676,75 @@ minimized input in under `tests/fuzz/crashes/<harness>/`:
 reproducer file through its harness in both suites, so the crash fails there
 until it is fixed, and stays a regression test afterwards. A missing
 `crashes/` directory counts as no files.
+
+### 2.2c The Linux GUI's test programs
+
+The Linux GUI's own code cannot be in `build/tests`: it compiles against
+system development packages (FreeType, HarfBuzz, fontconfig, GLib's GIO,
+libsecret, libpipewire) that `make build` and `make test` must not need, so a
+host without them still runs the fast suite. Its tests are two programs of
+their own, built by path, each with its failure count as its exit code, and
+run by the full suite's `plain` part, where `test-all.yml` installs the
+packages (§1, "Prerequisites"). Built without the packages, each stops before
+compiling, naming the ones `pkg-config` cannot find.
+
+- **`build/sdltext_test`** (`sdltext/st_test.c`) is sdltext's one test
+  program for every backend; here it runs on FreeType, HarfBuzz and
+  fontconfig (`sdltext/st_ft.c`), and `make build/sdltext_test.exe` builds the
+  same program against DirectWrite for Windows. It covers measurement and
+  wrapping, range styling over multibyte text, the three hit tests, inline
+  boxes, line metrics, a uniform line height across weights, a right-to-left
+  run hit-testing to cluster boundaries, a code point the primary family lacks
+  still drawn from fontconfig's fallback, and the pixels a memory sink
+  receives. Every assertion is a relation the API promises whatever the font,
+  except a few bounds on measured widths and line heights, which are DejaVu
+  Sans's on Linux (`fonts-dejavu-core`) and Segoe UI's on Windows.
+  `scripts/test/full/sdltext.sh` runs it, and fails at once if fontconfig
+  finds no DejaVu Sans.
+- **`build/linux_gui_test`** (`tests/linux_gui_test.c`) covers the Linux
+  platform (`client/gui/platform/linux/`), desktop notifications
+  (`client/shared/osnotify_linux.c`) and capture through the portals
+  (`client/core/media/cap_portal.c`), linked from the GUI's own objects and
+  none of the application layer, in seven groups: **platform** (the data
+  directory, the crash ring's mapping, a URL handed over from a second
+  process, the autostart and URL-scheme `.desktop` files, all in temporary XDG
+  directories), **image** (each format decoded to known pixels, and a header
+  over the pixel cap refused before anything is allocated), **notify**
+  (`Notify`'s arguments, replacing, withdrawing, a click, a button and a
+  typed reply reaching the callback, and no server), **a11y** (the AT-SPI tree
+  read back over the bus, the composer's text and caret, and `DoAction`
+  posting the item's token), **capture** (the portal's requests granted,
+  refused and dismissed, no portal, and the frame conversion from synthetic
+  buffers in every format it accepts), **stream** (the PipeWire stream
+  itself: a source the program publishes, BGRx with a crop region as a
+  screen and NV12 as a camera, with a frame counter in its pattern, captured
+  through the backends -- the format agreed, each frame converted to the
+  expected I420 and the crop honoured, a screen's frame reported only when
+  the picture changed and not for a buffer that carries none, the camera in
+  the list by its node, and the source going away ending the capture,
+  `OC_CAP_GONE` for a screen) and **settings** (colour scheme,
+  contrast and animations from the Settings portal, and each absent one
+  answering -1). The desktop it talks to is its own: a notification server,
+  an accessibility bus and registry, and a portal, served in C over GDBus on
+  a session bus the run starts for itself, `dbus-run-session`, so nothing on
+  the machine's own bus is touched; and for the stream group a real
+  `pipewire` and `wireplumber`, started as the program's children with
+  runtime, configuration and state directories under its temporary directory
+  (no device monitors, so no camera or sound card of the machine's is seen),
+  waited for by their socket and WirePlumber's metadata appearing, and
+  stopped at its end. The stand-in portal's `OpenPipeWireRemote` answers with
+  a connection to that PipeWire, and `Start` with the source's node.
+  `scripts/test/full/linux_gui.sh` runs it, and needs `pipewire` and
+  `wireplumber` installed as it needs `dbus-run-session`; run by hand
+  without them, the stream group is a `SKIP`.
+  A check that would need the bus to have no real server, where the bus
+  would start one, is a `SKIP`, and so a failure in CI.
+
+To run them locally, with the packages installed (DEVELOPMENT.md, "The Linux
+GUI"):
+
+    make build/sdltext_test && build/sdltext_test
+    make build/linux_gui_test && dbus-run-session build/linux_gui_test
 
 ### 2.3 Determinism rules
 
@@ -1262,7 +1337,10 @@ The tests run on `ubuntu-24.04`; the release builds on `ubuntu-22.04`
 (`stage`), whose glibc 2.35 is the release binary's floor. The native build,
 the tests use the runner's gcc, the release Ubuntu 22.04's gcc 12 and the
 arm64 release its gcc 12 cross compiler, installed from the runner's packages; Emscripten and llvm-mingw are
-fetched pinned by make (VENDORS.md §2, "Toolchains"). Everything runs non-interactively and
+fetched pinned by make (VENDORS.md §2, "Toolchains"). The Linux GUI's
+system development packages, and the headers SDL3's Linux build needs, come
+from the runner's packages too, installed by `test-all.yml` beside the
+tools it lacks (§2.2c). Everything runs non-interactively and
 communicates pass/fail purely through exit codes.
 
 **Audio.** `tests/test_audio.c` covers the **call relay** (`daemon/relay.c`),

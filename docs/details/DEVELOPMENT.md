@@ -11,6 +11,7 @@ every push — is [CONTRIBUTING.md](./CONTRIBUTING.md); the suites are
 make build      # the fast build (a bare `make`): the daemon alone, and the Windows clients
 make test       # the fast suite, before every push (TESTING.md)
 make run TTS=1 STT=1 SUM=1 WEB=1   # every feature: read-aloud, voice input, summaries, the web client
+make linux-gui  # the Linux GUI, build/openchime-gui (its packages: "The Linux GUI", below)
 ```
 
 Requires a C toolchain, Python 3, and curl with network access on the first
@@ -113,7 +114,52 @@ and link-unfurl cards all run end to end with their daemon halves.
 Every desktop shares one portable self-rendered application layer over SDL3 and
 sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are
 ports of that layer rather than GTK and AppKit rewrites, as the web client
-already is. Mobile has frontends of its own over the same core.
+already is. Linux is (below); macOS is next. Mobile has frontends of its own
+over the same core.
+
+### The Linux GUI
+
+The **Linux GUI** is that application over `client/gui/platform/linux/`
+(CLIENT.md §3): text through sdltext's FreeType, HarfBuzz and fontconfig
+backend, D-Bus through GLib's GIO for notifications, accessibility (AT-SPI)
+and the desktop portals, the session token in the keyring through libsecret,
+and the camera and the screen through the portals and PipeWire. `make
+linux-gui` builds it as `build/openchime-gui`; `make build` does not, because
+it needs system development packages a machine that only builds the daemon
+need not have. Run it from a desktop session, Wayland or X11.
+
+On Ubuntu or Debian it needs:
+
+```sh
+sudo apt install cmake pkg-config \
+  libfreetype-dev libharfbuzz-dev libfontconfig-dev libglib2.0-dev libsecret-1-dev libpipewire-0.3-dev \
+  libx11-dev libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxrandr-dev libxss-dev \
+  libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libdecor-0-dev \
+  fonts-dejavu-core dbus pipewire wireplumber
+```
+
+The first line of packages is what the GUI compiles and links against, each
+found through `pkg-config` and only by the targets that need it; one missing
+stops the build before anything compiles, naming the `pkg-config` names it
+could not find. The next two are the headers of SDL3's two video backends: the
+first `make linux-gui` builds SDL3 for Linux once from the committed tree
+(`scripts/build/sdl3_linux.sh`, a few minutes, into
+`third_party/sdl3-3.4.14/`), with both X11 and Wayland, and stops, naming the
+backend, if SDL could not find the headers for either. Neither library of a
+backend is linked: SDL opens the one the session offers when it starts. The
+DejaVu fonts, `dbus`, `pipewire` and `wireplumber` are for the two test
+programs (TESTING.md §2.2c); the GUI's test starts a PipeWire and a
+WirePlumber of its own for its stream group, under its own temporary
+directory, and stops them, so one already running for the desktop is neither
+used nor disturbed:
+
+```sh
+make build/sdltext_test && build/sdltext_test
+make build/linux_gui_test && dbus-run-session build/linux_gui_test
+```
+
+Each exits with its failure count. Neither `make test` nor `make build` builds
+them; the full suite runs both.
 
 ## Local development environment
 
