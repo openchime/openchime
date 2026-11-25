@@ -57,7 +57,7 @@ measures and rasterizes runs, the backend lays out lines, styles ranges,
 places inline boxes and hit-tests on the byte map `st_common.c` keeps, and
 pixels leave through the same sink as DirectWrite's; measurements are cached
 by font and text, and a layout keeps its last raster, so a frame of the
-conversation view costs about ten milliseconds in a headless Chromium. The
+conversation view costs about ten milliseconds in Chromium. The
 text fields are drawn by the application on every platform (CLIENT.md, "The
 text fields are drawn"), so the sign-in field, the search boxes and a form's
 fields are the same code here. Signed in with a password, it

@@ -2717,25 +2717,18 @@ choose — which makes each one a per-frontend *obligation*.*
   equivalent on each other platform — that does not change with layout, wording,
   window size, theme, language or the element's position in a list.
 
-  **This is a testability requirement, not a second accessibility one.** REQ-269
-  is about what assistive technology can *convey*; this is about what an automated
-  test can *address*. The two share the UIA provider (ARCH-99) and are otherwise
-  different obligations: a control can be perfectly legible to a screen reader and
-  still be impossible to locate reliably from a test.
+  **Why it is a requirement of its own.** REQ-269 is about what assistive
+  technology can *convey*; this is about what it can *address and press*.
+  Screen readers, voice control and switch access locate a control by its id
+  and act on it through UI Automation, and they cannot do that reliably by
+  coordinates, visible text or tree position: coordinates move whenever a pane
+  is re-laid out, visible text moves when wording or locale changes, and tree
+  position moves when a list gains a row.
 
-  **Why it is a requirement at all.** The supported way to drive a Windows
-  application is UI Automation, and the discipline that makes it reliable is
-  locating elements by id rather than by coordinates, visible text or tree
-  position. Coordinates move whenever a pane is re-laid out; visible text moves
-  when wording or locale changes; tree position moves when a list gains a row.
-  A harness that drives by coordinates produces failures that need
-  interpretation — a click that lands two pixels outside a
-  chip is indistinguishable from a feature that does not work.
-
-  **The identifier is part of the control, not of the test.** It is assigned where
-  the control is defined, is reviewed like any other name, and does not change to
-  suit a test that has broken — a renamed id is a breaking change to the automation
-  surface in the same way a renamed wire field is to the protocol.
+  **The identifier is part of the control.** It is assigned where the control
+  is defined, is reviewed like any other name, and does not change casually — a
+  renamed id is a breaking change to the accessibility tree in the same way a
+  renamed wire field is to the protocol.
 
   **Dynamic elements get composed ids**: a per-conversation row is
   `conv.<channel_id>`, not `conv.3`, because the third row is a different
@@ -2751,8 +2744,8 @@ choose — which makes each one a per-frontend *obligation*.*
   **Invokes are marshalled, not executed where they arrive.** UIA calls come in on
   an RPC thread; the app posts the element's token to its own window and runs it
   there, because every rect, menu and model pointer it touches belongs to the UI
-  thread. Each token ends in the same call the mouse path makes — an automation
-  route that reimplemented the action would be testing a second implementation.
+  thread. Each token ends in the same call the mouse path makes, so an invoke and
+  a click cannot do different things.
 
 ---
 

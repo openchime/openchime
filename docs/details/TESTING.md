@@ -1256,8 +1256,7 @@ threads, under the sanitizer, which judges races and not speed (§2.4);
 the release compiles with the same gcc as the fast build, so there is no
 second release-compiler pass, and the daemon's release compile is `stage`'s
 alone; and the end-to-end run (§3.2) is the one thing the in-process suites cannot
-show, since they link the daemon's code without its `main()`. No GUI or
-browser test runs in either suite or in CI.
+show, since they link the daemon's code without its `main()`.
 
 The tests run on `ubuntu-24.04`; the release builds on `ubuntu-22.04`
 (`stage`), whose glibc 2.35 is the release binary's floor. The native build,

@@ -2486,9 +2486,8 @@ static int g_n_moreflyrows;
  * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
 /* MENU_MSG..MENU_THUMB are the CONTEXT menus (ARCH-98). They were native
  * TrackPopupMenu popups, which meant: OS-themed rather than ours, a modal message
- * loop that froze our tick and blocked the message-loop shortcuts, and — the part
- * that mattered most — completely undrivable and unscreenshottable by the harness,
- * so every context action was unverifiable except by hand.
+ * loop that froze our tick and blocked the message-loop shortcuts, and our own
+ * accessibility tree could not publish their items.
  *
  * They keep their OWN command numbers, dispatched per kind, because the dropdown
  * menus' `menu_dispatch` space is already crowded (1-8, 20-22, 40s, 70s, 100+,
@@ -10126,14 +10125,7 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
  * `GetFocus()` returns NULL for our thread, and the composer's auto-focus — which
  * is gated on exactly that — never fires. Every keystroke is dropped until the
  * user clicks, which is what the idle-focus comment further down describes and
- * what this closes properly.
- *
- * It also fixed the thing that had been reported as a flaky smoke failure three
- * times: the suite launches a client while it is still killing the previous one
- * through a PowerShell interop process, and that contention is precisely the case
- * where the show does not activate. A clean launch with nothing competing
- * activated every time, which is why the A/B against an older build looked like a
- * regression and then refused to reproduce. */
+ * what this closes properly. */
 static void show_and_focus(oc_win *hwnd) {
     if (!hwnd || !hwnd->sdl) return;
     /* Whatever brought the window back -- the tray icon, a permalink -- it is no
@@ -12046,9 +12038,8 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Sign in and start receiving messages when you sign in.",
                      ONOFF2, 2, startup_enabled() ? 1 : 0);
         /* Reset ends the category it belongs to. "Advanced" held this and a DPI
-         * override and nothing else; the override was a harness affordance that
-         * had no business being a user-facing setting, and one button is not a
-         * category. The app manages DPI from what Windows reports (ARCH-97). */
+         * override and nothing else; the override had no business being a
+         * user-facing setting, and one button is not a category. The app manages DPI from what Windows reports (ARCH-97). */
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
@@ -16645,9 +16636,7 @@ static rectf g_modal_card;
 /* ---- confirm() : a themed confirmation on the modal frame ----------
  *
  * Replaces MessageBoxW. Native message boxes cannot be themed, look foreign beside
- * the rest of the app, and — the reason this moved up the list — **cannot be driven
- * by the harness**, so every destructive action was unverifiable. Rotating a webhook
- * and revoking an invite both landed unverified for exactly that reason.
+ * the rest of the app, and sit outside our own accessibility tree.
  *
  * The pending action is an id plus a target rather than a function pointer, so the
  * modal frame's generic dispatch can run it without a per-confirmation callback.
@@ -19512,8 +19501,7 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * the command palette and the emoji picker each claim EVERY click while open
      * (on_click returns early for them), and layout_natives hides their boxes
      * whenever something covers the window — so a palette left open behind a modal
-     * was INVISIBLE and ate every click meant for the card. Found by the smoke,
-     * whose preamble happened to leave the palette open; a user reaches it by
+     * was INVISIBLE and ate every click meant for the card. A user reaches it by
      * opening Preferences with the palette up. close_overlays() cannot do this
      * itself: it has no window handle, and these three need one to restore focus
      * and repaint. */
@@ -19596,26 +19584,15 @@ static void modal_finish(int save) {
 
 /* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
  * consumed the click. */
-/* The last click the frame saw, and what became of it. Kept because two of this
- * work's three bugs were "the click went somewhere else" and no screenshot can
- * show that. */
-static char g_modal_lastclick[128] = "";
 
 static int modal_frame_click(oc_win *hwnd, int x, int y) {
     (void)hwnd;
     if (!modal_open()) return 0;
-    snprintf(g_modal_lastclick, sizeof g_modal_lastclick,
-             "pt=%d,%d card=%.0f,%.0f,%.0f,%.0f", x, y,
-             g_modal_card.left, g_modal_card.top, g_modal_card.right, g_modal_card.bottom);
     /* Nothing is dismissible until the frame has been PAINTED once: the card rect
      * is measured during paint, and an unset one made every click "outside", so a
      * modal opened from a menu or a keystroke and clicked before the next repaint
-     * dismissed itself. Found by driving it, not by reading it. */
-    if (g_modal_card.right <= g_modal_card.left) {
-        strncat(g_modal_lastclick, " SWALLOWED-unpainted",
-                sizeof g_modal_lastclick - strlen(g_modal_lastclick) - 1);
-        return 1;
-    }
+     * dismissed itself. */
+    if (g_modal_card.right <= g_modal_card.left) return 1;
     if (in_rect(g_modal_close_btn, x, y)) { modal_finish(0); return 1; }
     for (int i = 0; i < g_n_modal_btns; i++)
         if (in_rect(g_modal_btns[i].r, x, y)) {
@@ -23444,8 +23421,7 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
     /* The search field's CHROME — the rounded container and the glyph — with the
      * field drawn inside it, exactly as the Files search is built. Reserving the
      * space without painting the box once left an unframed field on a white
-     * pane: reported visible by the harness and invisible to a person, which is
-     * the worst of both. */
+     * pane, invisible to a person. */
     g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
     search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
     if (g_dir_edit) field_draw(rt, g_dir_edit, search_text_box(g_dir_search_box), OC_COL_TEXT);
@@ -28964,8 +28940,7 @@ static void ed_mouse_up(void) {
 /* ---- double-click word selection --------------------------------
  * A native EDIT does this for free, which is why nothing here did it after
  * ARCH-98 replaced the RichEdit with a self-drawn field: the behaviour
- * left with the control and no test missed it, because the harness could not
- * express a gesture at all until `drag` was added alongside this.
+ * left with the control.
  *
  * Two things were needed. The window class never set CS_DBLCLKS, so Windows was
  * not sending WM_LBUTTONDBLCLK in the first place — a second click arrived as
@@ -29031,7 +29006,7 @@ static void ed_draw(gfx *rt, rectf box) {
     st_layout *tl = ed_layout(box.right - box.left);
     if (!tl) return;
 
-    /* An empty field shows the cue — in the SCENE, so a screenshot has it. */
+    /* An empty field shows the cue, drawn in the scene like the text. */
     if (!g_ed_len && !g_ed_comp_len) {
         char cue[160];
         composer_cue(model(), cue, sizeof cue);
@@ -29211,7 +29186,7 @@ static void sched_menu_open(float x, float y) {
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
-/* --- the automation surface's identifiers (REQ-290) ----------------
+/* --- the accessibility tree's identifiers (REQ-290) ----------------
  *
  * An invoke token is what a press TURNS INTO, carried opaquely through a11y.c
  * and posted back to this thread. The high byte is the kind and the rest is its
@@ -31530,7 +31505,7 @@ static void bar_paint(oc_win *w, const char *line, const bar_btn *btns, int n) {
     gfx_end(w->g);
     g_txt_target = prev;
     /* The same line and buttons, as the bar window's own accessibility tree
-     * (REQ-269, REQ-290): what a screen reader reads and a test presses. A
+     * (REQ-269, REQ-290): what a screen reader reads and presses. A
      * switched-off button goes without its token. */
     oc_acc_item items[2];
     memset(items, 0, sizeof items);
@@ -37638,8 +37613,8 @@ static void signin_poll(oc_win *hwnd) {
  * reasoning was that the platform's focus, tab order and IME handling were worth
  * more than matching the palette. None of it held: sixteen call sites meant
  * sixteen grey Windows-95 boxes in the middle of a themed app, none of them
- * dismissible the way every other sheet is, none of them screenshot-comparable,
- * none of them reachable by the harness.
+ * dismissible the way every other sheet is, none of them in our own
+ * accessibility tree.
  *
  * So the frame is ours, and so are the fields: every one is drawn (field_init
  * in form_dialog for text, the painter for checks, choices and selects).
@@ -37660,8 +37635,8 @@ static void signin_poll(oc_win *hwnd) {
  * rule all come from the same place as every other modal. */
 /* Esc and Enter belong to the FRAME, but the focused text field gets the key
  * first. So each form field's `key` hook (this function) answers them, the way
- * the composer's key handling does. This was found by the smoke: Esc and Enter
- * were dead in the one modal where you are always typing. */
+ * the composer's key handling does. Without it Esc and Enter were dead in the
+ * one modal where you are always typing. */
 /* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
  * submitting moves to Ctrl+Enter there, as it does in every editor that has
  * both. Esc still cancels from anywhere. */
@@ -41990,12 +41965,8 @@ static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) 
          * below claim the wheel on shell state that survives underneath an open
          * modal — the sidebar claims an x range a card is drawn over, and an open
          * thread claims it everywhere — so the wheel scrolled the shell BEHIND
-         * the modal while the modal's own content sat unreachable below the fold.
-         *
-         * Found by the smoke rather than by hand, and only because the suite
-         * opens a thread earlier in the run: scrolling the notifications card
-         * worked in every interactive session I tried and failed in the suite,
-         * which is the difference between the two. */
+         * the modal while the modal's own content sat unreachable below the fold,
+         * whenever a thread had been opened before the card. */
         /* The table editor's grid scrolls itself, across with Shift. */
         if (g_te_open && in_rect(g_te_view, (float)wpt.x, (float)wpt.y)) {
             if (mod_down(OCK_SHIFT)) g_te_sx -= dy; else g_te_sy -= dy;
