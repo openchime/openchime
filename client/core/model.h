@@ -797,6 +797,11 @@ typedef struct {
     /* Agents (docs/details/MCP.md §3.1): the token just minted, held until a
      * frontend takes it (oc_model_take_agent_token), and the agent whose token
      * list is held. */
+    /* A build's release notes as they came (PROTOCOL.md §5.16r), held until
+     * a frontend takes them (oc_model_take_release_notes): central's status, 0
+     * when they could not be fetched, and its body (heap). */
+    int       rn_ready, rn_status;
+    char     *rn_body;
     char      agent_token[96];
     char      agent_token_scopes[512];
     uint64_t  agent_token_agent, agent_token_id;
@@ -840,7 +845,8 @@ typedef struct {
      * machine-local file defaults. */
     oc_setting *settings;
     size_t    n_settings, cap_settings;
-    uint8_t   settings_synced;        /* a snapshot has arrived at least once */
+    uint8_t   settings_synced;        /* a whole snapshot has arrived at least once */
+    uint16_t  settings_due;           /* the entries of the snapshot still to come */
 
     /* Storage report (REQ-214). Owner/admin only, so it stays zeroed for a
      * member — the daemon refuses the request rather than sending zeros.
@@ -1315,6 +1321,10 @@ int oc_model_user_is_agent(const oc_model *m, uint64_t user_id);
 /* A new outgoing webhook's secret, once: 1 with it in `out` (and the webhook's
  * id), the model's copy wiped; 0 when there is none. */
 int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *webhook_id);
+/* The release notes asked for with oc_client_get_release_notes, once they
+ * came: an OC_RN_* result with `out` (an oc_releasenotes) filled, or -1 while
+ * they have not. Taken once. */
+int oc_model_take_release_notes(oc_model *m, void *out);
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
                               char *scopes, size_t scopes_cap);
 
@@ -1474,6 +1484,17 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
  * to the workspace rather than the channel. */
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max);
+
+/* Which message does "react to the newest message" act on?
+ *
+ * The conversation's newest message that can take a reaction: it walks the
+ * channel's scroll from the newest and returns the first that is not
+ * tombstoned (REQ-052: nothing left to react to), is an ordinary message
+ * rather than a call event (OC_MSG_KIND_*: a line of history, not something
+ * said, REQ-304), and has a `message_id` (a reaction names the message by it).
+ * NULL when there is none, or no channel. Thread replies are not in the scroll
+ * (REQ-060), so the answer is always the main transcript's. */
+const oc_msg *oc_model_last_reactable(const oc_channel *c);
 
 /* The latest notice for transfer `tag`, or NULL once it has aged out of the
  * table (the oldest go first, finished ones before any still running). */

@@ -1693,6 +1693,8 @@ const char *oc_error_text(uint16_t code) {
         return "a webhook can only be sent the events listed";
     case OC_ERR_WEBHOOK_UNVERIFIED:
         return "that address did not answer the check, so the webhook was not saved";
+    case OC_ERR_RELEASE_NOTES_UNAVAILABLE:
+        return "the release notes could not be fetched: see the notes page instead";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -3182,6 +3184,21 @@ oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const 
     uint16_t n = m->n_channels > OC_OUTWH_MAX_CHANNELS ? OC_OUTWH_MAX_CHANNELS : m->n_channels;
     oc_w_u16(w, n);
     for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->channels[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_RELEASE_NOTES_GET);
+    oc_w_str(w, m->build_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_release_notes(oc_wbuf *w, uint16_t version, const oc_release_notes *m) {
+    if (m->body.len > OC_RELEASE_NOTES_MAX) return OC_E_TOO_LARGE;
+    size_t off = oc_frame_begin(w, version, OC_MSG_RELEASE_NOTES);
+    oc_w_str(w, m->build_id);
+    oc_w_u16(w, m->status);
+    oc_w_bytes(w, m->body);
     return oc_frame_end(w, off);
 }
 
@@ -4727,6 +4744,26 @@ oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webho
     m->n_channels = oc_r_u16(p);
     if (m->n_channels > OC_OUTWH_MAX_CHANNELS) return OC_E_MALFORMED;
     for (uint16_t i = 0; i < m->n_channels; i++) m->channels[i] = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_release_notes_get(oc_rbuf *p, oc_release_notes_get *m) {
+    m->build_id = oc_r_str(p);
+    if (m->build_id.len == 0 || m->build_id.len > OC_BUILD_ID_MAX) return OC_E_MALFORMED;
+    for (size_t i = 0; i < m->build_id.len; i++) {
+        uint8_t ch = m->build_id.ptr[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+              ch == '.' || ch == '-' || ch == '_'))
+            return OC_E_MALFORMED;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_release_notes(oc_rbuf *p, oc_release_notes *m) {
+    m->build_id = oc_r_str(p);
+    m->status = oc_r_u16(p);
+    m->body = oc_r_bytes(p);
+    if (m->body.len > OC_RELEASE_NOTES_MAX) return OC_E_MALFORMED;
     return r_done(p);
 }
 

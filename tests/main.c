@@ -79,6 +79,7 @@ int run_push_tests(void);
 int run_invite_mail_tests(void);
 int run_webhooks_out_tests(void);
 int run_address_report_tests(void);
+int run_release_notes_tests(void);
 int run_mention_tests(void);
 int run_searchq_tests(void);
 int run_richtext_tests(void);
@@ -87,6 +88,8 @@ int run_url_tests(void);
 int run_sock_tests(void);
 int run_speakable_tests(void);
 int run_action_tests(void);
+int run_spoken_tests(void);
+int run_motion_tests(void);
 int run_ttskit_tests(void);
 int run_nnkit_tests(void);
 int run_sumkit_tests(void);
@@ -108,6 +111,7 @@ int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_sdltext_unicode_tests(void);
 int run_theme_tests(void);
+int run_typeface_tests(void);
 int run_e2e_tests(void);
 int run_pdm_crypto_tests(void);
 int run_call_media_tests(void);
@@ -345,6 +349,7 @@ static const struct suite {
     S(run_invite_mail_tests,     FAST, THREADS),
     S(run_webhooks_out_tests,    FAST, THREADS),
     S(run_address_report_tests,  FAST, THREADS),
+    S(run_release_notes_tests,   FAST, THREADS),
     S(run_mention_tests,         FAST, PLAIN),
     S(run_searchq_tests,         FAST, PLAIN),
     S(run_richtext_tests,        FAST, PLAIN),
@@ -353,6 +358,8 @@ static const struct suite {
     S(run_sock_tests,            FAST, PLAIN),
     S(run_speakable_tests,       FAST, PLAIN),
     S(run_action_tests,          FAST, PLAIN),
+    S(run_spoken_tests,          FAST, PLAIN),
+    S(run_motion_tests,          FAST, PLAIN),
     S(run_nnkit_tests,           FAST, PLAIN),
     S(run_sumkit_tests,          FAST, PLAIN),
     S(run_ttskit_tests,          FAST, PLAIN),
@@ -372,6 +379,7 @@ static const struct suite {
     S(run_sdltext_map_tests,     FAST, PLAIN),
     S(run_sdltext_unicode_tests, FAST, PLAIN),
     S(run_theme_tests,           FAST, PLAIN),
+    S(run_typeface_tests,        FAST, PLAIN),
     S(run_e2e_tests,             FAST, PLAIN),
     S(run_pdm_crypto_tests,      FAST, PLAIN),
     S(run_call_media_tests,      FAST, PLAIN),

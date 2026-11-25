@@ -118,6 +118,15 @@ void  oc_plat_window_attach(SDL_Window *w);
  * platform's hidden input element moves there, since the browser's IME
  * composes into an element, not a canvas (plat_web.c). */
 void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r);
+/* The system caret, which screen readers and magnifiers follow (REQ-269,
+ * ARCH-99): placed at `r` (window pixels, `r->h` tall) wherever the drawn
+ * caret is, and removed with `r` NULL. Never shown -- the application draws
+ * the caret people see. A platform whose caret is the text input area itself
+ * (a browser's hidden input element) does nothing more here. */
+void  oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r);
+/* Where the platform's own caret is, read back from the platform (the dump
+ * reports it): 1 with its rect in `out`, 0 when there is none. */
+int   oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out);
 /* Bring the window forward and give it the keyboard, however the platform
  * lets a process that does not own the foreground do that. */
 void  oc_plat_window_front(SDL_Window *w);
@@ -167,13 +176,6 @@ int   oc_plat_picker_open(void);
 /* Answer the open file picker as a person would: `path` into its file name box
  * and OK, or, NULL, its Cancel. 1 when there was one to answer, else 0. */
 int   oc_plat_picker_answer(const char *path);
-/* This build's release notes (releasenotes.h), fetched without holding the
- * window: started once, then polled each tick. The Windows client fetches on a
- * thread of its own through the client's verifying TLS; the browser, with its
- * own fetch. Poll returns -1 while waiting, else an OC_RN_* result with `out`
- * filled; a start while one is running is ignored. */
-void  oc_plat_releasenotes_start(const char *build_id);
-int   oc_plat_releasenotes_poll(void *out /* oc_releasenotes */);
 /* A save-as picker; `suggested` is the file name offered. 1 with the path in `out`. */
 int   oc_plat_pick_save(SDL_Window *owner, const char *suggested, char *out, size_t cap);
 /* The application has finished writing the file a save-as picker named: a
@@ -190,6 +192,11 @@ void  oc_plat_url_scheme_register(const char *scheme);
 void  oc_plat_sound(const char *name);
 /* Milliseconds since the last keyboard or pointer input anywhere; 0 if unknown. */
 uint32_t oc_plat_idle_ms(void);
+/* Whether the person has asked the system for less motion (REQ-269): 1 to
+ * reduce, 0 not to, -1 when the platform cannot say. Windows' "Show
+ * animations", a browser's prefers-reduced-motion. Read at start and whenever
+ * the window gains focus, which is when a change made elsewhere can show. */
+int      oc_plat_reduce_motion(void);
 
 /* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
 

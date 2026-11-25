@@ -115,6 +115,7 @@ typedef struct {
     oc_mode        mode;                /* OPENCHIME_MODE */
     oc_deploy_mode deployment_mode;     /* derived (above) */
     const char *workspace_name;         /* "" ⇒ a client derives one from the host */
+    const char *demo_terms_url;         /* OPENCHIME_DEMO_TERMS_URL: the demo's terms, "" ⇒ no link */
     int broadcast_mentions;             /* OPENCHIME_BROADCAST_MENTIONS: 0 everyone, 1 admins (and owners), 2 nobody */
     int broadcast_large;                /* OPENCHIME_BROADCAST_LARGE: members from which the rule applies; 0 every channel */
     const char *welcome_message;        /* OPENCHIME_WELCOME_MESSAGE: "" ⇒ none is sent */

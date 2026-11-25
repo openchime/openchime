@@ -1887,6 +1887,14 @@ void oc_client_revoke_agent_token(oc_client *c, uint64_t agent_id, uint64_t toke
     if (token_id) agent_cmd(c, OC_CMD_REVOKE_AGENT_TOKEN, agent_id, token_id);
 }
 
+void oc_client_get_release_notes(oc_client *c, const char *build_id) {
+    if (!c || !build_id || !build_id[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RELEASE_NOTES);
+    if (!cmd) return;
+    cmd->body = strdup(build_id);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_connection_code(oc_client *c, const char *code) {
     if (!c || !code || !code[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CONNECTION_CODE);

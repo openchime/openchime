@@ -10,7 +10,7 @@
 #   { "release": N, "build_id": "...", "published_at": "<UTC>",
 #     "issues": [ { "number": N, "title": "...", "type": "bug" } ] }
 #
-# is posted to $CONTROL_PLANE_URL/api/releases/intake with the job's GitHub
+# is posted to $CONTROL_PLANE_URL/v1/hooks/releases with the job's GitHub
 # OIDC token (audience $CONTROL_PLANE_URL), so no secret is shared with the
 # control plane. The issues are read from openchime/openchime (ISSUES_REPO
 # overrides it) with GH_TOKEN; GH names the gh to run (a test's fixture).
@@ -85,7 +85,7 @@ fi
 out=$(mktemp); trap 'rm -f "$out"' EXIT
 status=$(curl -sS -o "$out" -w '%{http_code}' -X POST \
   -H "Authorization: Bearer ${oidc}" -H "Content-Type: application/json" \
-  --data "$payload" "${url}/api/releases/intake" 2>/dev/null || true)
+  --data "$payload" "${url}/v1/hooks/releases" 2>/dev/null || true)
 case "$status" in
   2??) echo "sent release ${n}'s notes ($(jq '.issues | length' <<<"$payload") issues): ${status}" ;;
   *)   warn "the control plane did not take release ${n}'s notes: ${status:-no answer} $(head -c 300 "$out" 2>/dev/null)" ;;

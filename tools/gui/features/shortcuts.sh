@@ -12,6 +12,11 @@
 #     bare Esc still closes what is open rather than marking anything;
 #   - Ctrl+<digit> goes to that workspace, counting from 1 in the rail's order,
 #     and a digit past the last one does nothing.
+#   - Up in an empty message box opens your newest message for editing, as its
+#     Edit does; with text in the box, or with Ctrl held, it does what it did,
+#     and where you have said nothing it does nothing.
+#   - Ctrl+Shift+\ opens the emoji picker for the newest message, and a pick
+#     reacts to it; outside a conversation (the Files view) it opens nothing.
 #
 # Two clients over tools/gui/harness/win32/pair.sh, so there is something unread to mark: bob says
 # things in a conversation alice is not looking at.
@@ -71,6 +76,63 @@ step "and it says so"
 said() { gui_snap a; grep -qE '^toast\[[0-9]\] .*[Mm]arked' "$DA"; }
 check "a toast reports what it did" waitfor 5 said
 
+step "Up edits your last message"
+# In #quiet, where only alice speaks. The ed line's edit= is the message the box
+# is editing, 0 for none; the message's id is its row's mid=, the newest row.
+ed_f()     { gui_snap a; field "$DA" '^ed ' "$1"; }
+newest_mid() { gui_snap a; grep '^  msgrow ' "$DA" | tail -1 | grep -o 'mid=[0-9]*' | cut -d= -f2; }
+TYPO="the meeting is at noon tomorow"
+FIXED="the meeting is at noon tomorrow"
+"$PAIR" a channel 2 >/dev/null || gui_abort "alice did not open #quiet"
+waitfor 5 in_quiet || gui_abort "alice's client is not showing #quiet"
+"$PAIR" a send "$TYPO" >/dev/null || gui_abort "alice's client did not take the message"
+sent() { newest_is a 2 "$TYPO"; }
+waitfor 10 sent || gui_abort "alice's message never arrived in #quiet"
+# The row is drawn on the next frame, after the message is in the model.
+row_drawn() { [ -n "$(newest_mid)" ] && [ "$(newest_mid)" != 0 ]; }
+waitfor 5 row_drawn || gui_abort "alice's message has no row"
+MID="$(newest_mid)"
+box_empty() { [ "$(ed_f len)" = 0 ] && [ "$(ed_f edit)" = 0 ]; }
+check "the box is empty and edits nothing" box_empty
+check "...and has the keys" [ "$(ed_f focus)" = 1 ]
+"$PAIR" a key up >/dev/null
+editing() { [ "$(ed_f edit)" = "$MID" ]; }
+check "Up opens alice's newest message for editing (edit=$MID)" waitfor 5 editing
+check "...its text in the box" grep -qF "text=\"$TYPO\"" <(grep -m1 '^ed ' "$DA")
+check "...the caret at its end" [ "$(ed_f caret)" = "${#TYPO}" ]
+"$PAIR" a shot shortcuts_up_edit >/dev/null
+"$PAIR" a key esc >/dev/null
+check "Esc cancels it, leaving the box empty" waitfor 5 box_empty
+"$PAIR" a key up >/dev/null
+check "Up again opens it again" waitfor 5 editing
+"$PAIR" a type "$FIXED" >/dev/null
+"$PAIR" a key enter >/dev/null
+check "Enter saves the edit: the box is empty and edits nothing" waitfor 5 box_empty
+fixed() { newest_is a 2 "$FIXED"; }
+check "...and #quiet's newest message reads as fixed" waitfor 10 fixed
+
+step "Up does what it did everywhere else"
+"$PAIR" a type "half a thought" >/dev/null
+"$PAIR" a key up >/dev/null
+# paced: an absence -- the time Up would have taken to open an edit
+sleep 0.5
+check "with text in the box, Up edits nothing" [ "$(ed_f edit)" = 0 ]
+check "...and the text is as it was" grep -qF 'text="half a thought"' <(grep -m1 '^ed ' "$DA")
+"$PAIR" a type "" >/dev/null
+"$PAIR" a key ctrl+up >/dev/null
+# paced: an absence, as above
+sleep 0.5
+check "Ctrl+Up, in an empty box, edits nothing" [ "$(ed_f edit)" = 0 ]
+"$PAIR" a key esc >/dev/null
+"$PAIR" a channel 1 >/dev/null || gui_abort "alice did not open #general"
+in_general() { gui_snap a; grep -q '^  ch 1 .* \*$' "$DA"; }
+waitfor 5 in_general || gui_abort "alice's client is not showing #general"
+check "...where the box has the keys" [ "$(ed_f focus)" = 1 ]
+"$PAIR" a key up >/dev/null
+# paced: an absence, as above
+sleep 0.5
+check "in #general, where only bob has spoken, Up edits nothing" box_empty
+
 step "Ctrl+<digit> switches workspace"
 # A SECOND daemon, so there is a second workspace to switch to: a client keys a
 # workspace by its address, so signing in twice to one address is one workspace.
@@ -117,4 +179,41 @@ start_at 0 on_first
 # paced: an absence -- the time Ctrl+9 would have taken to switch, were it going to
 sleep 0.5
 check "Ctrl+9, with two signed in, leaves it where it was" on_first
+
+step "Ctrl+Shift+\ reacts to the newest message"
+# Wide enough, at 96 dpi, for the context pane the who-reacted list lives in
+# (tools/gui/features/reactions.sh says why).
+"$PAIR" a size 1200 820 >/dev/null || gui_abort "alice's window did not take its size"
+"$PAIR" a dpi 96 >/dev/null || gui_abort "alice's client did not take 96 dpi"
+"$PAIR" a channel 1 >/dev/null || gui_abort "alice did not open #general"
+"$PAIR" b send "react to me" >/dev/null || gui_abort "bob's client did not take the message"
+waitfor 10 newest_is a 1 "react to me" || gui_abort "bob's message did not reach alice"
+pick()  { gui_snap a; field "$DA" '^pickstate ' "$1"; }
+closed() { [ "$(pick open)" = 0 ]; }
+waitfor 5 closed || gui_abort "the picker was open before the key"
+"$PAIR" a key ctrl+shift+backslash >/dev/null
+for_msg() { [ "$(pick open)" = 1 ] && [ "$(pick target)" = 1 ] && [ "$(pick mid)" -gt 0 ] 2>/dev/null; }
+check "the picker opens to react to a message" waitfor 5 for_msg
+"$PAIR" a shot shortcuts_react >/dev/null
+PICKED="$(pick mid)"
+cell0() { gui_snap a; field "$DA" '^  pickcell 0 ' r; }
+check "its first emoji can be picked" click_rect a "$(cell0)"
+check "...and the picker closes" waitfor 5 closed
+# The newest message's who-reacted pane: one chip, alice's.
+"$PAIR" a reactors 0 >/dev/null
+chip() { gui_snap a; field "$DA" '^  rxnchip 0 ' "$1"; }
+pane() { gui_snap a; field "$DA" '^reactors ' "$1"; }
+reacted() { [ "$(pane open)" = 1 ] && [ "$(pane msg)" = "$PICKED" ] &&
+            [ "$(pane chips)" = 1 ] && [ "$(chip mine)" = 1 ]; }
+check "the newest message, the one picked for, carries one reaction, alice's" waitfor 10 reacted
+
+step "...and outside a conversation it opens nothing"
+"$PAIR" a view files >/dev/null || gui_abort "alice's client did not open Files"
+in_files() { gui_snap a; grep -q '^view=3 ' "$DA"; }
+waitfor 5 in_files || gui_abort "alice's client is not showing Files"
+waitfor 5 closed || gui_abort "the picker was open before the key"
+"$PAIR" a key ctrl+shift+backslash >/dev/null
+# paced: an absence -- the time the key would have taken to open the picker
+sleep 0.5
+check "in the Files view the key opens no picker" closed
 gui_end

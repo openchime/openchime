@@ -3,6 +3,7 @@
  * queue, the body and the retry policy. */
 
 #include "invite_mail.h"
+#include "central.h"
 #include "push.h"
 
 #include <pthread.h>
@@ -12,7 +13,7 @@
 #include <time.h>
 
 #define OC_INVITE_MAIL_MAX_QUEUE 1024
-#define OC_INVITE_MAIL_PATH      "/api/machine/invite/notify"
+#define OC_INVITE_MAIL_PATH      OC_CENTRAL_INVITE_NOTIFY
 #define OC_INVITE_MAIL_EMAIL_MAX 256   /* an address is at most 254 bytes */
 
 typedef struct inode {

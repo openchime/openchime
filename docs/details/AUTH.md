@@ -192,7 +192,7 @@ would have to be handed over to be of any use, and there would be nothing to han
 it over on.
 
 ```
-  ┌────────┐  1. GET central /oidc/authorize        ┌───────────────┐
+  ┌────────┐  1. GET central <issuer>/authorize     ┌───────────────┐
   │ client │─────(workspace, redirect_uri)─────────▶│    central    │
   │ (app)  │                                        │    service    │
   └───┬────┘                                        └───────┬───────┘
@@ -221,7 +221,9 @@ it over on.
   └────────────────┘
 ```
 
-1. The client opens a browser at **central's** `/oidc/authorize`, naming the
+1. The client opens a browser at **central's** `<issuer>/authorize` — the relay's
+   issuer is `<origin of OPENCHIME_ENROLL_URL>/v1/workspace/oidc`, the OpenChime
+   API's (`https://api.openchime.io/v1/workspace/oidc`), never the bare origin — naming the
    target **workspace** and its own `redirect_uri` — a loopback `127.0.0.1` URI
    on desktop (RFC 8252), or `[::1]` on a host with no IPv4 loopback, or a configured `https` destination.
 2. **Central validates that `redirect_uri` before the user authenticates**,
@@ -320,7 +322,7 @@ targets the high-frequency message path, not the auth bootstrap.)
   §8.7). A self-hoster enabling relay-OIDC enrolls their workspace with central
   once, after which central will mint tokens for that audience.
 - **An enrolled box follows a rotation by itself.** It reads
-  `<enroll origin>/oidc/jwks` at boot and daily (`daemon/relaykeys.c`) — every minute while it gets no
+  `<enroll origin>/v1/workspace/oidc/jwks` at boot and daily (`daemon/relaykeys.c`) — every minute while it gets no
   good answer — over HTTPS verified with the built-in roots and any
   `OPENCHIME_EXTRA_CA`, and trusts the ES256
   P-256 signing keys there, beside a managed box's pinned one
@@ -364,7 +366,7 @@ The central service + relay are a **separate system** — a web service, not the
 daemon. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
-- mint ES256 JWTs (§3.3) signed by one of the keys it publishes at `/oidc/jwks`,
+- mint ES256 JWTs (§3.3), `iss` the relay's issuer `<origin>/v1/workspace/oidc`, signed by one of the keys it publishes at `/v1/workspace/oidc/jwks`,
   audience-scoped to the requesting workspace;
 - maintain the workspace registry (which `audience` ids are valid), binding each
   workspace's opaque id at enrollment (§3.3) and minting a token only for a
@@ -393,7 +395,7 @@ workspace answers at, so it can mail the workspace's invitations and open it
 from a link in a notification email, and records it only once the server there
 has shown it holds the enrollment key. Once the binding is active and the
 daemon is serving, it reports the address in a signed machine request (§8.7's
-scheme), `POST /api/machine/address` `{"address": "<host>[:<port>]"}`. The
+scheme), `POST /v1/workspace/machine/address` `{"address": "<host>[:<port>]"}`. The
 address is `OPENCHIME_MANAGED_ADDRESS` when set, otherwise the first name in
 `OPENCHIME_TLS=acme:<names>`, lower-cased, with `:<port>` unless the daemon
 serves on 443. A server with neither, one reached only at a public IP address,
@@ -636,7 +638,7 @@ other relying party of that tenant.
 
 **Keys** and their rotation are §3.4; the key is chosen by `kid` (§3.3).
 
-**Which provider.** `/oidc/authorize` takes `workspace`, `redirect_uri` and
+**Which provider.** `/v1/workspace/oidc/authorize` takes `workspace`, `redirect_uri` and
 `nonce`. Central sends the person straight to the workspace's provider when it has
 one, and asks when it has several; which providers a workspace offers is a fact in
 central's registry, because it configures central's page and not the box. A new
@@ -859,7 +861,7 @@ adopts that audience, generates its own key as it always does, and claims the
 binding: the ticket, its public key, and a signature over
 `openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`,
 the key hashed as its SubjectPublicKeyInfo DER, posted to
-`/api/machine/enroll/claim` at the enrollment origin as
+`/v1/workspace/machine/enroll/claim` at the enrollment origin as
 `{audienceId, ticket, publicKey, signature}` — the ticket base64url, the key and the
 DER signature base64. The claim is made once the daemon is serving — its protocol
 listener bound and its loop about to serve — so an activated binding always names
@@ -903,9 +905,9 @@ holds that DNS zone and so completes an ACME DNS-01 challenge on the daemon's
 behalf; the daemon needs no inbound access and no DNS of its own (ARCH-10). Both
 requests are machine requests, signed as §8.7 says, to the enrollment origin:
 
-- `POST /api/machine/tls/names` with body `{}` answers `200 {"names":"<a,b>"}`:
+- `POST /v1/workspace/machine/tls/names` with body `{}` answers `200 {"names":"<a,b>"}`:
   the names this workspace may have, which are central's to say.
-- `POST /api/machine/tls/certificate` with body `{"csr":"<base64url DER>"}` — a
+- `POST /v1/workspace/machine/tls/certificate` with body `{"csr":"<base64url DER>"}` — a
   CSR for those names over a key the daemon has just made, which never leaves it
   — answers `200 {"names":"<a,b>","chain_pem":"<leaf then intermediates>"}`;
   `202` with `Retry-After` (seconds) while central is still completing the
@@ -1086,8 +1088,8 @@ bounded. It needs `OPENCHIME_AUTH=local,relay`: visitors make local accounts,
 and the relay's keys are what vouch for them.
 
 - **Getting in.** Central mints an invite and sends the browser to `https://<demo>/app/?invite=<invite>`. The
-  invite is a JWS signed with the relay's keys (`/oidc/jwks`, §3.3), header
-  `typ` `oc-demo-invite+jwt`, claims `iss` (central's origin), `aud`
+  invite is a JWS signed with the relay's keys (`/v1/workspace/oidc/jwks`, §3.3), header
+  `typ` `oc-demo-invite+jwt`, claims `iss` (the relay's issuer, `<origin>/v1/workspace/oidc`), `aud`
   (the workspace's audience), `iat`, `exp` (fifteen minutes at most), `jti`
   and `role` `member`. The web client passes it to the sign-up page like any
   invitation, and only in demo mode does the page take one: the writer checks
@@ -1098,8 +1100,8 @@ and the relay's keys are what vouch for them.
 - **One field.** With central's invite the sign-up page asks for the visitor's
   name and nothing else, and says under its one button that the demo is
   public, is erased every night at 00:00 UTC (with the time left), takes no
-  personal information, and that entering agrees to the demo terms, at
-  `/demo/terms` on central's origin. The name is trimmed and must be 1 to 40
+  personal information, and that entering agrees to the demo terms, linked
+  where `OPENCHIME_DEMO_TERMS_URL` says (named without a link when it is empty). The name is trimmed and must be 1 to 40
   characters, with no control or format character, and not "OpenChime",
   "OpenChime Demo" or an owner's or admin's display name, ignoring case; a
   refused name spends nothing. The username is made from it (its ASCII letters

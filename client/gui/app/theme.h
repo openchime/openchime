@@ -135,6 +135,25 @@ const char *oc_theme_mode_name(int mode);
 #define OC_COL_ONLINE      oc_theme[TH_ONLINE]
 #define OC_COL_AWAY        oc_theme[TH_AWAY]
 
+/* --- the presence marker's shape (REQ-122) ---------------------------------
+ *
+ * Presence is never told by colour alone. Online and away were a green and an
+ * amber dot, the pair red-green colour blindness confuses, so each state has a
+ * SHAPE of its own and the colour only repeats it: online a filled disc, away a
+ * half-filled disc (the left half, inside a ring), offline a ring, and
+ * do-not-disturb a crescent. Do-not-disturb is a second axis, not a presence
+ * value (REQ-122), but it replaces the shape whatever the presence under it,
+ * as it always has.
+ *
+ * Decided here, once, so every place a dot is drawn shows the same shape and
+ * the test can assert the four are distinct without rendering anything. */
+enum { OC_PMARK_ONLINE = 0, OC_PMARK_AWAY, OC_PMARK_OFFLINE, OC_PMARK_DND,
+       OC_PMARK_COUNT };
+
+/* `presence` is the wire value (OC_PRESENCE_* in shared/protocol.h); anything
+ * it does not name is offline. */
+int oc_presence_mark(uint8_t presence, int dnd);
+
 /* --- ink against the surface under it (REQ-262) ----------------------------
  *
  * WCAG asks 3:1 of non-text UI and more of text. Below 3:1 an element is not

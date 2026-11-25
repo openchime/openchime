@@ -4,6 +4,7 @@
  * parsed with the vendored jsmn (a self-contained static copy in this TU). */
 
 #include "enroll.h"
+#include "central.h"
 #include "tls.h"
 
 #include <mbedtls/base64.h>
@@ -535,7 +536,7 @@ oc_enroll_result oc_enroll_claim(const char *central_url, const char *audience,
     int status = 0;
     char resp[1024];
     size_t rlen = 0;
-    if (post_json(&ctx, "/api/machine/enroll/claim", body, &status, resp, sizeof resp, &rlen) != 0) {
+    if (post_json(&ctx, OC_CENTRAL_ENROLL_CLAIM, body, &status, resp, sizeof resp, &rlen) != 0) {
         result = OC_ENROLL_PENDING;          /* unreachable: worth another try */
         goto done;
     }
@@ -563,7 +564,7 @@ oc_enroll_result oc_enroll_activate(const char *central_url, const char *audienc
     int status = 0;
     char resp[2048];
     size_t rlen = 0;
-    if (post_json(&ctx, "/api/machine/enroll/challenge", body, &status, resp, sizeof resp, &rlen) != 0) goto done;
+    if (post_json(&ctx, OC_CENTRAL_ENROLL_CHALLENGE, body, &status, resp, sizeof resp, &rlen) != 0) goto done;
     if (status == 404) { result = OC_ENROLL_PENDING; goto done; }
     if (status != 200) goto done;
 
@@ -581,7 +582,7 @@ oc_enroll_result oc_enroll_activate(const char *central_url, const char *audienc
     int status2 = 0;
     char resp2[1024];
     size_t rlen2 = 0;
-    if (post_json(&ctx, "/api/machine/enroll/confirm", body2, &status2, resp2, sizeof resp2, &rlen2) != 0) goto done;
+    if (post_json(&ctx, OC_CENTRAL_ENROLL_CONFIRM, body2, &status2, resp2, sizeof resp2, &rlen2) != 0) goto done;
     result = (status2 == 200) ? OC_ENROLL_ACTIVE : OC_ENROLL_FAILED;
 
 done:

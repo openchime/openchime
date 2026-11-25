@@ -3,7 +3,7 @@
  */
 
 #include "releasenotes.h"
-#include "https_get.h"
+#include "https_get.h"   /* oc_http_response_status: a whole response read */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -191,18 +191,4 @@ int oc_releasenotes_read_response(const char *resp, size_t len, oc_releasenotes 
     int st = oc_http_response_status(resp, len, &body);
     if (st == 200 && !body) { if (out) memset(out, 0, sizeof *out); return OC_RN_FAILED; }
     return oc_releasenotes_read(st, body, body ? len - (size_t)(body - resp) : 0, out);
-}
-
-int oc_releasenotes_fetch(const char *build_id, oc_releasenotes *out) {
-    if (out) memset(out, 0, sizeof *out);
-    if (!out) return OC_RN_FAILED;
-    if (!oc_releasenotes_askable(build_id)) return OC_RN_NOT_RELEASE;
-    char path[160];
-    snprintf(path, sizeof path, "%s%s", OC_RN_API_PATH, build_id);
-    char *buf = malloc(OC_RN_MAX_BODY + 4096);
-    if (!buf) return OC_RN_FAILED;
-    long n = oc_https_get(OC_RN_HOST, path, "application/json", 8000, buf, OC_RN_MAX_BODY + 4096);
-    int rc = n > 0 ? oc_releasenotes_read_response(buf, (size_t)n, out) : OC_RN_FAILED;
-    free(buf);
-    return rc;
 }

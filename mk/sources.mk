@@ -9,7 +9,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c shared/scopes.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c shared/noise_xx.c shared/ratchet.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/webhooks_out.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c daemon/callrec.c daemon/callrec_render.c daemon/callrec_worker.c daemon/preview.c daemon/mcp.c daemon/oauth.c client/core/call/share.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c daemon/demolimits.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/webhooks_out.c daemon/release_notes.c daemon/address_report.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c daemon/voice_pack.c daemon/recognizer_pack.c daemon/summary_pack.c daemon/export_render.c daemon/export_worker.c daemon/callrec.c daemon/callrec_render.c daemon/callrec_worker.c daemon/preview.c daemon/mcp.c daemon/oauth.c client/core/call/share.c
 # Where generated sources and the objects go. A build of its own -- the host
 # daemon a cross build writes its manifests with (mk/daemon.mk) -- passes its
 # own of both, so two builds at once never write each other's files.
@@ -236,10 +236,17 @@ UTF8PROC    := third_party/utf8proc/utf8proc.c
 SDLTEXT_COMMON := sdltext/st_common.c $(UTF8PROC)
 SDLTEXT_WIN    := sdltext/st_common.c sdltext/st_dwrite.c $(UTF8PROC)
 SDLTEXT_INC    := -Isdltext
+# motion.c is GUI source compiled into the tests the same way: the arithmetic
+# of what moves on screen, and what "Reduce motion" stills, is asserted by
+# `make test` (tests/test_motion.c).
+MOTION_SRC := client/gui/app/motion.c
 # theme.c is GUI source and is compiled into the tests anyway: it is colour
 # arithmetic with one Windows call behind an #ifdef, and the contrast guarantee
 # it carries has to be asserted somewhere that RUNS.
 THEME_SRC := client/gui/app/theme.c
+# typeface.c, the same way: the font list, its resolution and ARCH-108's pin
+# are pure, and asserted by `make test` (tests/test_typeface.c).
+TYPEFACE_SRC := client/gui/app/typeface.c
 # The drawing layer (client/gui/gfx): fills, rounded rects, clips, lines,
 # textures and the Lucide stroke tessellator over an SDL3 renderer.
 GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c

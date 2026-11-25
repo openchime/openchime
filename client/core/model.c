@@ -3,6 +3,7 @@
  */
 
 #include "model.h"
+#include "releasenotes.h"
 #include "richtext.h"
 #include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
 #include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
@@ -221,6 +222,16 @@ int oc_model_take_outwh_secret(oc_model *m, char *out, size_t cap, uint64_t *web
     for (volatile char *z = m->outwh_secret; z < m->outwh_secret + sizeof m->outwh_secret; z++) *z = 0;
     m->outwh_secret_id = 0;
     return 1;
+}
+
+int oc_model_take_release_notes(oc_model *m, void *out) {
+    if (!m || !m->rn_ready || !out) return -1;
+    const char *b = m->rn_body ? m->rn_body : "";
+    int rc = oc_releasenotes_read(m->rn_status, b, strlen(b), (oc_releasenotes *)out);
+    free(m->rn_body);
+    m->rn_body = NULL;
+    m->rn_ready = 0;
+    return rc;
 }
 
 int oc_model_take_agent_token(oc_model *m, char *out, size_t cap, uint64_t *agent_id, uint64_t *token_id,
@@ -502,6 +513,7 @@ int oc_model_receipts_on(const oc_model *m) {
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->rn_body); m->rn_body = NULL; m->rn_ready = 0;
     free(m->my_conns); m->my_conns = NULL; m->n_my_conns = 0;
     free(m->all_conns); m->all_conns = NULL; m->n_all_conns = 0;
     free(m->call_hist);
@@ -2070,6 +2082,16 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     }
 }
 
+const oc_msg *oc_model_last_reactable(const oc_channel *c) {
+    if (!c) return NULL;
+    for (size_t i = c->n_msgs; i-- > 0;) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->deleted || msg->kind != OC_MSG_KIND_MESSAGE || !msg->message_id) continue;
+        return msg;
+    }
+    return NULL;
+}
+
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max) {
     if (!m) return 0;
@@ -3193,6 +3215,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     msg_clear_unfurls(&c->msgs[i]);
                     /* And the action it may now be, or no longer is (REQ-058). */
                     msg_set_action(&c->msgs[i], e);
+                    /* The conversation's newest, by the preview's author: the
+                     * preview the sidebar reads takes the new text, by the
+                     * rule an action on its own frame uses. An older message's
+                     * edit leaves it as it was. */
+                    oc_msg *msg = &c->msgs[i];
+                    if (i + 1 == c->n_msgs && msg->body && c->preview_author == msg->author_id) {
+                        preview_set(m, c->preview, sizeof c->preview,
+                                    msg->action.present ? msg->body + msg->action.start : msg->body);
+                        c->preview_action = msg->action.present;
+                    }
                     break;
                 }
             }
@@ -3400,10 +3432,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         /* A CLIENT_SETTINGS frame start (solicited or a device-sync push): the
          * snapshot replaces the bucket wholesale, so clear it before the entries. */
         m->n_settings = 0;
-        m->settings_synced = 1;
+        /* Synced once the snapshot is whole: its entries follow this event,
+         * and a frontend that read the bucket between them would take a
+         * stored value for a missing one. */
+        m->settings_due = e->n_settings;
+        if (!m->settings_due) m->settings_synced = 1;
         break;
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
+        if (m->settings_due && --m->settings_due == 0) m->settings_synced = 1;
         break;
     case OC_EV_DRAFT:
         draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body, e->topic);
@@ -3606,6 +3643,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_RELEASE_NOTES:
+        free(m->rn_body);
+        m->rn_body = e->body ? strdup(e->body) : NULL;
+        m->rn_status = (int)e->size;
+        m->rn_ready = 1;
         break;
     case OC_EV_AGENT_TOKEN:
         snprintf(m->agent_token, sizeof m->agent_token, "%s", e->body ? e->body : "");

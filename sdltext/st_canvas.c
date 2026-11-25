@@ -70,6 +70,16 @@ EM_JS(void, stc_font_metrics, (const char *font, float *asc, float *desc), {
     if (!(a > 0)) { a = m.actualBoundingBoxAscent * 1.15; d = m.actualBoundingBoxDescent * 1.3; }
     HEAPF32[asc >> 2] = a; HEAPF32[desc >> 2] = d;
 });
+/* A font's ascent (the font's own, as the browser reports it) and a capital's
+ * ink ascent, in CSS px: the figures a family's pinned line box is derived
+ * from. 0 when the browser gives no font ascent. */
+EM_JS(void, stc_family_figures, (const char *font, float *asc, float *cap), {
+    var ctx = Module.stc.ctx;
+    ctx.font = UTF8ToString(font);
+    var m = ctx.measureText('H');
+    var a = m.fontBoundingBoxAscent, c = m.actualBoundingBoxAscent;
+    HEAPF32[asc >> 2] = (a > 0) ? a : 0; HEAPF32[cap >> 2] = (c > 0) ? c : 0;
+});
 EM_JS(void, stc_begin, (int w, int h), {
     var s = Module.stc;
     if (s.w !== w || s.h !== h) { s.canvas.width = w; s.canvas.height = h; s.w = w; s.h = h; s.ctx = s.canvas.getContext('2d', { willReadFrequently: true }); }
@@ -103,8 +113,20 @@ EM_JS(void, stc_end, (int w, int h, unsigned char *out), {
         HEAPU8[out + i * 4 + 3] = a;
     }
 });
+/* Whether the browser has the family. document.fonts.check() cannot say: it
+ * answers true for any family no @font-face names, installed or not. So the
+ * family is measured against each generic family it would otherwise fall back
+ * to; a family the browser lacks measures exactly as the generic does. */
 EM_JS(int, stc_family_present, (const char *family), {
-    try { return document.fonts.check('12px "' + UTF8ToString(family) + '"') ? 1 : 0; } catch (e) { return 0; }
+    var ctx = Module.stc.ctx, f = UTF8ToString(family), s = 'mmmmmmmmmmlli WQ@#';
+    var gen = ['monospace', 'serif', 'sans-serif'];
+    for (var i = 0; i < gen.length; i++) {
+        ctx.font = '100px ' + gen[i];
+        var w0 = ctx.measureText(s).width;
+        ctx.font = '100px "' + f + '", ' + gen[i];
+        if (ctx.measureText(s).width !== w0) return 1;
+    }
+    return 0;
 });
 
 /* Counts since the last reading, for the shim's performance line. */
@@ -210,6 +232,22 @@ void st_ctx_destroy(st_ctx *c) { free(c); }
 void st_ctx_set_scale(st_ctx *c, float scale) { if (c && scale > 0) c->scale = scale; }
 float st_ctx_scale(const st_ctx *c) { return c ? c->scale : 1.0f; }
 int st_family_present(st_ctx *c, const char *family) { (void)c; return family ? stc_family_present(family) : 0; }
+
+/* Measured at 100 px, so the fractions of the em carry two good digits. */
+int st_family_metrics(st_ctx *c, const char *family, float *ascent_em, float *cap_em) {
+    (void)c;
+    *ascent_em = 0.0f; *cap_em = 0.0f;
+    /* A family the browser lacks has no figures of its own: what it would
+     * measure is whichever fallback the stack reached. */
+    if (!family || !family[0] || !stc_family_present(family)) return 0;
+    char font[192];
+    font_string(font, sizeof font, family, 100.0f, 400, 0);
+    float a = 0, k = 0;
+    stc_family_figures(font, &a, &k);
+    if (!(a > 0) || !(k > 0)) return 0;
+    *ascent_em = a / 100.0f; *cap_em = k / 100.0f;
+    return 1;
+}
 
 st_format *st_format_create(st_ctx *c, const st_format_desc *d) {
     st_format *f = calloc(1, sizeof *f);

@@ -41,8 +41,12 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the keyboard-menu harness](#reading-the-keyboard-menu-harness)
 - [Reading the calls harness](#reading-the-calls-harness)
 - [Reading the search-box harness](#reading-the-search-box-harness)
+- [Reading the fonts harness](#reading-the-fonts-harness)
 - [Reading the voice harness](#reading-the-voice-harness)
 - [Reading the cursor harness](#reading-the-cursor-harness)
+- [Reading the caret harness](#reading-the-caret-harness)
+- [Reading the announce harness](#reading-the-announce-harness)
+- [Reading the motion harness](#reading-the-motion-harness)
 - [Seeing the whole window](#seeing-the-whole-window)
 - [`clipped=`: text that does not fit its own box](#clipped-text-that-does-not-fit-its-own-box)
 - [Observing the tray balloon](#observing-the-tray-balloon)
@@ -340,17 +344,22 @@ when reading its output.
 | Test | Platforms | Needs | Port | What it checks | Notes |
 |---|---|---|---|---|---|
 | `admin_rows` | win32 | | 9565 | the audit log's rows: a menu each, by right-click and from the keyboard | its header |
+| `announce` | win32 | | 9605 | what each message says to a screen reader, and whether a new one is announced | [Reading the announce harness](#reading-the-announce-harness) |
 | `balloon` | win32 | | 9786 | the tray balloon is drawn on the desktop | [Observing the tray balloon](#observing-the-tray-balloon) |
 | `calls` | win32 web | | 9620 | a call between two clients, its sound both ways, sharing a screen | [Reading the calls harness](#reading-the-calls-harness) |
 | `calls_tcp` | win32 web | | 9670 | a call when UDP cannot reach the relay | [Reading the calls harness](#reading-the-calls-harness) |
 | `camera` | win32 web | | 9676 | cameras in the call view, both ways | [Reading the calls harness](#reading-the-calls-harness) |
+| `caret` | win32 | | 9600 | the system caret assistive technology follows, at the drawn one | [Reading the caret harness](#reading-the-caret-harness) |
 | `chords` | web | | 9750 | a shortcut pressed quickly in the browser is still the shortcut | [Driving the web client](#driving-the-web-client) |
 | `collapse` | win32 web | | 9700 | long messages collapsed by the reader | its header |
 | `composer` | win32 | | 9540 | the composer's layout | [Reading the composer harness](#reading-the-composer-harness) |
 | `cursor` | win32 web | | 9505 | the mouse cursor's shape, read from the client | [Reading the cursor harness](#reading-the-cursor-harness) |
 | `drafts` | win32 | | 9560 | deleting a draft from Drafts | [Reading the drafts harness](#reading-the-drafts-harness) |
 | `emoji_admin` | win32 web | | 9525 | Admin > Custom emoji | its header |
+| `entersend` | win32 web | | 9606 | what Enter does in the composer, in each mode of its preference | its header |
 | `files` | win32 web | | 9590 | paging the Files view | [Reading the files harness](#reading-the-files-harness) |
+| `fonts` | win32 web | | 9655 | each interface font, and a family the system lacks | [Reading the fonts harness](#reading-the-fonts-harness) |
+| `form_scroll` | win32 | | 9635 | Edit profile's rows: measured as drawn, and scrolled when they do not fit | its header |
 | `groups` | win32 | | 9640 | user groups, two clients | [Reading the calls harness](#reading-the-calls-harness) (its last part) |
 | `jumpdate` | win32 | | 9760 | jump to a date | [Reading the jump-to-date harness](#reading-the-jump-to-date-harness) |
 | `keymenu` | win32 | | 9610 | the keyboard's route to the context menu | [Reading the keyboard-menu harness](#reading-the-keyboard-menu-harness) |
@@ -358,6 +367,7 @@ when reading its output.
 | `links` | win32 | | 9650 | links in the transcript | [Reading the links harness](#reading-the-links-harness) |
 | `members` | win32 | | 9690 | scrolling the members pane | [Reading the members harness](#reading-the-members-harness) |
 | `mentions` | win32 web | | 9730 | completing a mention, a channel and a pick from the list | [Reading the mentions harness](#reading-the-mentions-harness) |
+| `motion` | win32 web | | 9645 | Reduce motion: the preference, the system's setting, a steady caret | [Reading the motion harness](#reading-the-motion-harness) |
 | `navhistory` | win32 web | | 9672 | Back and Forward | [Reading the navigation-history harness](#reading-the-navigation-history-harness) |
 | `newmsg` | win32 | | 9520 | the New message pane | [Reading the New message harness](#reading-the-new-message-harness) |
 | `pdm` | win32 web | | 9515 | encrypted DMs, two clients | its header |
@@ -517,6 +527,11 @@ for a camera test, copy it to a Windows directory and start it from there —
 rich-mode typing rules (pending styles, continuation, delimiter handling) run
 exactly as they do for a user. Testing an editor behaviour with `type` proves
 nothing about typing.
+
+**`keychar <c>` is one printable key as a person types it**: the key going
+down, the text the platform sends for that press, and the key coming up, all
+through the client's event loop. It is the only verb that shows a key a
+shortcut claims is *not* typed: `key` sends no text, and `typekeys` no key.
 
 **`key` presses a key down; it does not let it go.** The release is its own verb
 (`keyup`), so a harness can hold a key — push to talk needs exactly that. The cost
@@ -803,8 +818,21 @@ past the last one doing nothing. The workspace half starts a **second daemon** o
 the next port, because a client keys a workspace by its address and signing in
 twice to one address is one workspace; and it sets the starting point through the
 switcher's own path before each key, so a check cannot begin where it means to
-end. It reads the dump's `marks ch … unread=`, `toast[n]` and
-`workspaces=/active=` lines. Not in CI, for the smoke's reason.
+end. It also covers Up in an empty message box, which opens your newest message
+for editing as its Edit does: in a channel only alice speaks in, Up after her
+message puts its text in the box with the caret at the end, Esc cancels, and
+Enter after fixing it saves the edit; with text in the box Up edits nothing,
+nor does Ctrl+Up, which walks the transcript; and in a channel where only bob
+has spoken, Up leaves the box empty. It reads the dump's `marks ch … unread=`,
+`toast[n]`, `workspaces=/active=` and `ed` lines, `edit=` there being the
+message the box is editing (0 for none) and the message's id its newest
+`msgrow`'s `mid=`. Then `Ctrl+Shift+\`: with bob's message newest in
+#general, the key opens the emoji picker to react to a message (`pickstate`
+`open=1 target=1` and a nonzero `mid=`); picking its first cell (`pickcell 0`)
+closes it, and the who-reacted pane on the newest message (the `reactors 0`
+verb) is for that `mid=` and shows one chip, alice's (`reactors … msg= chips=`,
+`rxnchip 0 … mine=1`); in the Files view (`view=3`) the key opens no picker.
+Not in CI, for the smoke's reason.
 
 ## Reading the composer harness
 
@@ -911,7 +939,10 @@ cuts none of its items (the dump's `menurow … cut=` says whether a label was w
 than its row as drawn); and that switching channel puts the pane back at its own
 top. It reads the dump's
 `members n= rows= scroll= max=` line and the `memrow uid= r=` lines, and drives
-the `wheel` verb in detents of 120. Last, the owner's "Reset password…" on a
+the `wheel` verb in detents of 120. Each `memrow` carries `mark=`, the shape the
+row's presence dot is drawn as (`online`, `away`, `offline` or `dnd`, from
+`oc_presence_mark()`, REQ-122): alice, the one signed in, is `mark=online`, and
+`member01`, who never has been, is `mark=offline`. Last, the owner's "Reset password…" on a
 member opens the reset to send with all of it shown: the dump's `formlines` line
 is the field's own wrapped line count against the lines its box shows, and the
 first one visible.
@@ -935,7 +966,19 @@ Esc again taking the keyboard off the row; "Unread from here" on the middle
 message moving the "New" line to it at once (REQ-235), read from the dump's
 `unread_from=`; and Shift+F10 with nothing focused opening the conversation's own
 menu. It reads the dump's `kbfocus mid= menuhover= menuhovercmd= subhover=
-subopen=` line and `menu=`.
+subopen= ran=` line and `menu=`.
+
+**The single keys** (`e r t p f s u m l` on the focused message) are checked one
+by one by what each ran, the dump's `kbfocus ran=` (the message-menu command
+the last key press ran as a single key, 0 when it ran none), and by the composer's text staying empty: each is
+pressed with `keychar`, which sends the key and the text a real press sends, so a
+letter that leaked into the composer would be seen there. Then their effects:
+`l`'s link pasted back and naming the message, `u`'s "New" line, `s`'s notice,
+`m`'s reminder choices open with the first highlighted, `r`'s picker
+(`pickstate open=1`), `f`'s palette (`natives pal=1`), `t`'s thread (the dump's
+`hist thread=`) and `e`'s edit, the message's text in the composer. `P` (upper
+case) is the same key as `p`; Ctrl+K with a message focused is still the
+palette and runs no single key; and with no message focused, `p` is typed.
 
 **Enter is proven by effect, and the effect is read back.** The harness walks to
 "Copy link", presses Enter, then pastes into the composer and requires the
@@ -1055,6 +1098,30 @@ emoji picker — and reads its `searchbox` line from the dump:
 The checks were shown to fail with one box put back on the stock font, and with
 the EDIT given a fixed height again.
 
+## Reading the fonts harness
+
+`tools/gui/features/fonts.sh` checks the Appearance preference Font (CLIENT.md,
+"Typography") on a pair of its own (port 9655; only alice is driven). It
+chooses each font in turn with the `font <n>` verb and reads the dump's
+text-size line, where `fontpick` is the family asked for, `fontfam` the one the
+formats were built with, `fontmissing=1` that the first is not installed, and
+`fontasc`/`fontcap` the figures the pins were derived from (0 when they could
+not be read and Segoe UI's were used). For each font:
+
+- the family asked for is the one used, and every search box's `face=` is it;
+- under Default, the `textmetrics` pairs are ARCH-97's: display 26/19, title
+  23/17, ui 22/16, meta 19/14, micro 15/11;
+- `ui_mh_eq=1`, and the find box's EDIT holds a line of the font inside its
+  chrome, centred, as `search_boxes.sh` reads it;
+- at the largest text size the UI line box and the find box's font are larger
+  than at the default, and both still hold.
+
+Then the test-only `fontfam <family>` asks for a family no system has: the
+dump must say `fontmissing=1` with `fontfam` the default family. In a browser
+without Windows' fonts (the harness's Chrome on Linux), Verdana, Calibri and
+Sitka are reported missing and the default is used; that is a pass there,
+since fonts are not part of parity (WEB.md).
+
 ## Reading the voice harness
 
 `tools/gui/features/voice.sh` drives voice input in the Win32 client end to end against
@@ -1079,6 +1146,71 @@ the signed-in dump and the signed-out one alike, is the shape it last set
 (`none` before any). `tools/gui/features/cursor.sh` (Windows and the web) sends a
 message with a link, then hovers the composer's text, the link and empty space
 with `move`, and asserts `ibeam`, `hand` and `arrow` in turn.
+
+## Reading the caret harness
+
+The client draws its own caret, and screen readers and magnifiers follow the
+system caret instead (REQ-269, ARCH-99), so the client creates one wherever a
+drawn field puts its caret, and never shows it. Being invisible by design, it
+is read from the dump's `caret` line: `owned= x= y=` is the client's record of
+where it put it, `sys= sx= sy= sh=` what Windows says the thread's caret is
+(`GetGUIThreadInfo`, `GetCaretPos`), `sys=0` when there is none.
+`tools/gui/features/caret.sh` drives the Win32 client against its own fixture
+daemon (port 9600) and asserts that, with the message box focused, there is a
+system caret at the drawn one (`sx`/`sy` equal to `x`/`y`); that it follows the
+caret as text is typed, and as Left and Right move it; that it moves into the
+search box (its `searchbox srch edit=` rect) when that takes focus, and back to
+the message box when Escape leaves the search box; and that it is gone,
+`owned=0 sys=0`, in the Files view, where no field has focus. Not in CI, for the smoke's reason. Run it when a change touches a
+drawn field, focus, or the platform's text input.
+
+## Reading the announce harness
+
+Preferences > Accessibility chooses what a screen reader is given for each
+message -- the sender, the time, the reactions, the replies, and whether the
+text comes first -- and whether a message from someone else is read out as it
+arrives (REQ-269, ARCH-99). `tools/gui/features/announce.sh` drives two Win32
+clients against its own fixture daemon (port 9605): bob writes, alice listens.
+It asserts that Accessibility is the sixth category, after the others, with its
+six rows, and that a choice clicked there is put back by Cancel; that with the
+defaults a message's accessible name is `<who>, <when>: <text>`, as it always
+was; that with everything on, once the message has a reaction and a reply, the
+text comes first and the name carries `reactions:` and `1 reply`; that with
+every part off it is the text alone; that with announcing off a message
+arriving from bob leaves the announcement count where it was, and with it on
+adds one; and that the settings last chosen are there again after both clients
+start again. It reads the dump's `spoken` line (the six settings, which the
+`spoken <sender> <time> <reactions> <replies> <text_first> <announce_new>` verb
+sets through the rows' own path and saves), `a11yname <aid> "<name>"` (what each
+message on the transcript says) and `a11y ... announced=`. Not in CI, for the
+smoke's reason. Run it when a change touches a message's accessible name, the
+arrival announcement or the preferences string.
+
+## Reading the motion harness
+
+Appearance's Reduce motion (REQ-269) is Off, On or Follow system, the
+default; Follow system takes Windows' "Show animations" or the browser's
+`prefers-reduced-motion`, read at start and whenever the window gains focus.
+Reduced, the jump highlight holds and then goes without fading, the upload
+tray's bar neither pulses, eases nor carries its light, and the caret does not
+blink. `tools/gui/features/motion.sh` drives the client against its own
+fixture daemon (port 9645) and reads the dump's `motion` line: `pref=` (0 Off,
+1 On, 2 Follow system), `sys=` (the system's answer as the client takes it: 1
+reduce, 0 not, -1 unknown), `reduced=` (the setting in force) and `caretlit=`
+(whether the focused field's caret is lit at that moment). The test-only verb
+`sysmotion 0|1|-1` stands in for the system's answer (-1 goes back to the
+system's own), so both branches of Follow system run on any machine; `motion
+0|1|2` sets the preference and saves it. It asserts that the default is Follow
+system; that Follow system reduces when the system says 1 and not when it says
+0, On reduces with a system that says 0, and Off does not with one that says
+1; that, reduced, the message box's caret reads `caretlit=1` on each of ten
+looks over two seconds, and, not reduced, is seen both lit and dark in that
+time; that Appearance has the row's three choices, one clicked is put back by
+Cancel, and System's Reset returns it to Follow system; and that the choice
+saved is there after the client starts again. The highlight and the tray are
+asserted in `make test` (`tests/test_motion.c`), where their arithmetic is.
+Not in CI, for the smoke's reason. Run it when a change touches something that
+moves on screen, or the preferences string.
 
 ## Seeing the whole window
 

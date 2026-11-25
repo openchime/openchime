@@ -165,6 +165,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_NOTICE_CHANNEL_CHANGES` | `off` | Whether the workspace posts in a channel when its name, description, visibility or archived state changes, naming who changed it. `on` or `off`. |
 | `OPENCHIME_DEFAULT_QUIET_HOURS` | *(empty)* | The quiet hours a member follows until they set their own (REQ-136): `everyday` or `weekdays`, a space, and the hours notifications are allowed, `HH:MM-HH:MM` in each member's own time, as in `weekdays 09:00-18:00`. Empty: none, and a member without their own is never quiet. Clients are told it, read-only, as `default_quiet_hours`. |
 | `OPENCHIME_READ_RECEIPTS` | `on` | Whether members see who has read a message (seen-by, REQ-090): `on`, or `off`, when no member's read position reaches anyone else. Each member may also stop sharing their own. Turned back on, reads from while it was off are never shown. One of `on`, `off`. Clients are told it, read-only, as `read_receipts`. |
+| `OPENCHIME_DEMO_TERMS_URL` | *(empty)* | The public demo's terms, linked beside its sign-up form (AUTH.md §8.12): a full https URL. Empty: the page names the terms without a link. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. Clients are told it, read-only, as `workspace_name`. |
 | `OPENCHIME_CUSTOM_EMOJI_ADD` | `everyone` | Who may add a custom emoji (REQ-072): `everyone`, or `admins` (owners and admins). Deleting stays the emoji's creator's, an admin's or an owner's. One of `everyone`, `admins`. Clients are told it, read-only, as `custom_emoji_add`. |
 | `OPENCHIME_EDIT_WINDOW` | *(empty)* | How long an author may edit their own message (REQ-051): `never`, or seconds after sending, 1 to 31536000. Empty: always. Clients are told it, read-only, as `edit_window`. |
@@ -208,7 +209,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_CALL_RECORDING_MAX_MB` | `0` | The most space, in megabytes, the calls' recordings may take together; 0 is no cap. At the cap a recording cannot be started. Integer 0..100000000. |
 | `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
 | `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
-| `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin (ARCH-84); each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
+| `OPENCHIME_ENROLL_URL` | *(unset)* | Connects this box to the OpenChime services at this origin, the OpenChime API's (`https://api.openchime.io` for the OpenChime services; ARCH-84); the daemon's paths are under `/v1/workspace/`, which it adds itself. Each service is then turned on by its own setting. https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
 | `OPENCHIME_PUSH` | `off` | Whether mobile push (ARCH-16/85), contentless, goes through the OpenChime services at the connection's origin; needs OPENCHIME_ENROLL_URL. One of `off`, `on`. |
 | `OPENCHIME_PUSH_URL` | *(unset)* | Where push goes instead of the connection's origin; set alone, it turns push on. https, or http to loopback for a test. |
 | `OPENCHIME_INVITE_MAIL` | `off` | Whether invitations bound to an address are reported to central for it to mail (REQ-280); needs an active enrollment. One of `off`, `on`. |
@@ -281,7 +282,7 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_SESSION_IDLE_DAYS` | a constant: no idle limit |
 | `OPENCHIME_LOCAL_MFA` | renamed OPENCHIME_MFA |
 | `OPENCHIME_AUTH_MODE` | renamed OPENCHIME_AUTH |
-| `OPENCHIME_OIDC_ISSUER` | the relay is central: its issuer is OPENCHIME_ENROLL_URL's origin |
+| `OPENCHIME_OIDC_ISSUER` | the relay is central: its issuer is OPENCHIME_ENROLL_URL's origin followed by /v1/workspace/oidc |
 | `OPENCHIME_OIDC_AUDIENCE` | an enrolled box's audience is its enrollment's; a managed box is started with OPENCHIME_MANAGED_AUDIENCE |
 | `OPENCHIME_OIDC_PUBKEY` | the relay's keys are the ones it publishes; a managed box may pin one with OPENCHIME_MANAGED_RELAY_KEY |
 | `OPENCHIME_OIDC_PUBKEY_FILE` | the relay's keys are the ones it publishes |
@@ -419,7 +420,7 @@ no ticket refuses to start, naming this section. What the rows carry, beyond the
   and claims the binding. A database holding a different audience stops the
   boot rather than becoming two workspaces.
 - **`OPENCHIME_MANAGED_RELAY_KEY`** is optional; the keys the relay publishes at
-  `<enroll origin>/oidc/jwks` alone are the ordinary case.
+  `<enroll origin>/v1/workspace/oidc/jwks` alone are the ordinary case.
 - **`OPENCHIME_MANAGED_ADDRESS`** is how a moved workspace is re-filed by clients
   (PROTOCOL.md §4.3b); during the move, the certificate through central is
   asked for both names (AUTH.md §8.9).

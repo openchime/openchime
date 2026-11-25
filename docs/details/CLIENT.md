@@ -368,7 +368,9 @@ model; translate input to intents }, stop.
   keep-the-open-conversation-read step until focus moves, or the next frame
   would read it again); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
-  composer), `x` (or `d`) delete, `w` who-reacted. On Members, Enter opens a
+  composer), `x` (or `d`) delete, `w` who-reacted, `m` Remind me (the reminder
+  choices the menu's "Remind me..." opens; `m` in the graphical client too),
+  `z` shows a long or muted message whole, and folds it back. On Members, Enter opens a
   member menu (Message / Make admin / Make member / Remove); `n` opens the New
   direct message picker. **Action launcher** (`:` on an empty composer, or Ctrl+K): a
   fuzzy-filtered, sectioned list of every action — New channel, Leave,
@@ -708,7 +710,14 @@ surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
 `InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/harness/win32/uia_probe.ps1`. The recording and sharing bars are
+the process by `tools/gui/harness/win32/uia_probe.ps1`. What a message says to a screen reader
+is the person's to choose, in Preferences > Accessibility: the sender, the time,
+the reactions and the replies, each on or off, the text before or after the
+sender and the time, and whether a new message from someone else is read out
+as it arrives. One function builds every message's name from those settings
+(`client/core/spoken.c`); the defaults read as the client always has, "<who>,
+<when>: <text>", with arrivals announced. The settings are synced with the other
+preferences. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
 `sharebar`: the line as Text, the buttons invokable), read and pressed by
 `tools/gui/harness/win32/uia_recbar.ps1`. Rich text and its toolbar
@@ -1068,6 +1077,20 @@ focus.
 - **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
+- **The keyboard on a message.** Ctrl+Up / Ctrl+Down put the keyboard on a
+  message, and Shift+F10 (or the Menu key) opens its menu (REQ-264). While a
+  message has the keyboard, a single letter runs that menu's item on it: `e`
+  Edit, `r` react (the emoji picker, as "More reactions"), `t` its thread (open
+  or reply), `p` Pin or Unpin, `f` Forward, `s` Save for later, `u` Unread from
+  here, `m` Remind me (its choices open, the first highlighted) and `l` Copy
+  link. `e`, `r`, `t` and `m` are the terminal client's letters for the same
+  actions. A key looks its item up in the menu built for that message
+  (`kb_msg_key`), so it does only what the menu offers there; a letter whose item
+  is not offered does nothing, and is not typed. Upper case is the same key;
+  with Ctrl or Alt held, or while a menu, a modal, a drawn field or an edit has
+  the keyboard, letters are what they were. Edit and the thread take the
+  keyboard off the message, to the typing. The sheet lists them; the dump's
+  `kbfocus ran=` is the command the last key press ran as one (0 for none).
 - Test with `tools/gui/harness/win32/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
   in place of the keyboard's state), because the shortcuts read the modifiers;
@@ -1198,6 +1221,9 @@ picker the status dialog uses, floating over the card that owns it
 never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
+`Ctrl+Shift+\` opens the emoji picker to react to the conversation's newest
+message (`oc_model_last_reactable`: not a deleted one, not a call event), as
+the reference client binds it.
 
 **A time is never typed either.** Pause notifications' custom end time is a
 select of the day's half-hour slots, in the user's 12- or 24-hour format. The
@@ -1290,7 +1316,7 @@ reopens on the pane you left it on.
 
 **Appearance applies live and reverts on Cancel.** A colour, a text size and a
 density are their own preview; you cannot judge any of them from a label. The
-snapshot therefore covers the accent, the text size, the density and the DPI, and
+snapshot therefore covers the accent, the text size, the font, the density and the DPI, and
 `prefs_restore` re-applies each through the one path that knows what it
 costs (`scale_apply` rebuilds every text format and drops the raster caches;
 `dpi_set` lets the next paint's scale pass rebuild them lazily).
@@ -1307,6 +1333,23 @@ own foreground set and a second contrast problem to keep solved.
 and follows the account; DPI belongs to the display. There is no per-window zoom.
 `g_text_scale` is the text size's multiplier alone; anything that caches a font
 size of its own is rebuilt by `scale_apply`.
+
+**Reduce motion is Off, On or Follow system (REQ-269).** Follow system is the
+default and asks the platform (`oc_plat_reduce_motion`: Windows' "Show
+animations", `SPI_GETCLIENTAREAANIMATION`; a browser's
+`prefers-reduced-motion`) at start and whenever the window gains focus, so a
+change made in the system's settings is followed without a restart; an
+unknown answer reads as not reduced. Reduced, three things stop moving: the
+jump highlight is held at full strength for its 1.6 s and then removed rather
+than faded; the upload tray's bar shows the real figure at once, its waiting
+track keeps one strength and carries no sweeping light, and the done tick
+appears whole; and the caret of the message box, the drawn fields and the To:
+box is lit for as long as its field has focus instead of blinking. The system
+caret assistive technology follows is unchanged: it is never shown (ARCH-99).
+The arithmetic is `client/gui/app/motion.c`, one function per moving thing, so
+`make test` asserts the reduced case beside the moving one. The choice is kept
+with the other preferences in the account's bucket under `M:` (0 Off, 1 On,
+2 Follow system), reverts on Cancel and returns to Follow system on Reset.
 
 ### About OpenChime: both builds on one screen
 
@@ -1329,14 +1372,14 @@ line, which the web client's GUI test checks in the browser (tools/gui/README.md
 **What's new** is in the workspace menu after About OpenChime, in the palette
 beside it, and a button on the About card. It turns the card into the notes of
 the release this client is: the control plane writes them once from what the
-release shipped, and the client asks for them by its build id,
-`GET https://openchime.io/api/releases/build/<build id>`
-(`client/core/releasenotes.{h,c}`), which answers the release's number, date
-and sections of items, each with its link. The card says "Loading…" while it
-asks -- the window never waits on it: the Windows client fetches on a thread of
-its own, through the client's verifying TLS with the built-in roots only
-(`client/core/https_get.{h,c}`, which the `.well-known` fetch uses too), and
-the web client with the browser's `fetch` -- then "What's new in release N", its
+release shipped, and the client asks its own daemon for them by its build id
+(`oc_client_get_release_notes`, `RELEASE_NOTES_GET`, PROTOCOL.md §5.16r). The
+daemon asks central with its workspace credential, a signed `GET` to
+`<OPENCHIME_ENROLL_URL's origin>/v1/workspace/releases/build/<build id>`, and
+keeps the answer six hours; no client reaches central, and no request crosses
+origins. The notes (`client/core/releasenotes.{h,c}`) are the release's number,
+date and sections of items, each with its link. The card says "Loading…" while
+it asks -- the window never waits on it -- then "What's new in release N", its
 date and each section's items; an item with a link opens it in the browser.
 **Open on openchime.io** opens the same notes as a page,
 `https://openchime.io/releases/build/<build id>`. A build that is not a release
@@ -1574,7 +1617,14 @@ from a bounding box is not a point on a circle. `draw_avatar_presence()` takes
 the tile and nothing else — size is a fraction of it, the ring scales with the
 dot, and the seat is where the bottom-right diagonal crosses the edge. A call
 site cannot pass an inset, so no call site can get one wrong, and a new avatar
-size is right on the day it is added.
+size is right on the day it is added. **The marker's shape says the state, not
+only its colour** (REQ-122): online is a filled disc, away a half-filled disc
+(the left half filled, inside a ring of the away colour), offline a ring, and
+do-not-disturb a crescent, whatever the presence under it. Green against amber
+is the pair red-green colour blindness confuses, so the colour only repeats
+what the shape already says. `oc_presence_mark()` (`theme.c`) decides the
+shape in one place and `draw_presence_dot_dnd()` draws whatever it returns, so
+the sidebar, the members pane, avatars, menus and the profile all agree.
 
 **A person is a rounded square, everywhere.** The reference product draws every
 person that way — message authors, DM rows, the profile pane, the popover and the
@@ -1650,6 +1700,16 @@ set. Consequences worth knowing before touching it:
   else the bitmap re-encoded as PNG through WIC, so a screenshot travels at PNG
   size. The bytes stay in memory until Send (`oc_client_post_items`). The New
   message pane pastes text only: the tray belongs to a conversation.
+- **What Enter does is a preference** (Preferences → Messages, "When I press
+  Enter"), kept with the account's other preferences. With "Send the message",
+  the default, Enter sends; with "Start a new line", Enter starts a new line.
+  Ctrl+Enter sends and Shift+Enter starts a new line in both, so neither chord
+  changes meaning with the choice; inside a code block Enter does what the
+  choice says. An open completion list still takes Enter first, saving an
+  edited message is sending it, the New message pane sends to its recipients,
+  and in Preview Enter and Ctrl+Enter both send. The shortcuts sheet names the
+  keys for the chosen mode. The terminal client's input line is one line, where
+  Enter only sends.
 - **Rich mode carries a typing-intent layer** — pending styles and continuation
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
@@ -1684,7 +1744,7 @@ A message longer than **25 lines or 3,000 characters**, as drawn, is
 it is this view's alone — nothing is stored or sent — and lasts until the
 client closes. The rule is the clients', the same in both: the graphical client
 measures lines at the width the message is drawn at; the terminal client counts
-the rows a body wraps to, and `m` shows it whole. A cut message is cut on its
+the rows a body wraps to, and `z` shows it whole. A cut message is cut on its
 prefix, so formatting still applies to what shows.
 
 Both are reachable without a pointer: the message's menu (Ctrl+Up to the
@@ -1722,3 +1782,18 @@ formats are built (`fonts_build`); system DPI is applied
 separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
 to change a format's size, so any preference that moves the scale must call
 `fonts_build` and then force a relayout.
+
+**The font is a preference** (Appearance, Font): Default, the platform's UI
+family (Segoe UI Variable Text, else Segoe UI; the browser's own on the web),
+or Verdana, Calibri or Sitka Text, a fixed list in `client/gui/app/typeface.c`.
+`fonts_build` resolves the choice through `st_family_present` and builds every
+format made with the UI family in it; code keeps Consolas and the toolbar's
+decorations keep Georgia. A family the system lacks falls back to the default,
+never to the system's own substitute. Each format's pinned line box and
+baseline are derived from the family's own ascent and cap height, read with
+`st_family_metrics` (ARCH-108), Segoe UI's when they can't be read, so the
+table's pairs are Segoe UI's and another family has its own. The font follows
+the account (`F:` in the preferences value), previews at once and reverts on
+Cancel like text size, and Reset returns it to Default. The test dump's
+text-size line reports the family asked for and the one used (`fontpick=`,
+`fontfam=`, `fontmissing=`) and the figures (`fontasc=`, `fontcap=`).

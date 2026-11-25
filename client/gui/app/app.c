@@ -67,6 +67,8 @@
 #include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
 #include "releasenotes.h"     /* What's new: this build's release notes */
 #include "theme.h"
+#include "typeface.h"
+#include "motion.h"           /* Reduce motion (REQ-269) */
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
@@ -81,6 +83,7 @@
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
 #include "env.h"            /* the development inputs */
 #include "emoticon.h"       /* typed emoticons (compose.emoticons) */
+#include "spoken.h"         /* what a message says to a screen reader (REQ-269) */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -505,23 +508,25 @@ enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 /* Pinned vertical metrics per token (ARCH-108): the app owns the baseline.
  * DirectWrite's natural metrics are per-font-file and fractional, so a label's
  * seat depended on which weight drew it and which letters it contained. Every
- * Segoe format is pinned instead: an integer baseline and line box derived
+ * UI-family format is pinned instead: an integer baseline and line box derived
  * from the token size, identical across weights and styles of that size.
  *
- * The derivation, not a table of constants, so it holds at every text scale:
+ * The derivation, not a table of constants, so it holds at every text scale and
+ * in every family (oc_typeface_pin, typeface.c):
  *   baseline = ceil(ascent)          — the raster has no headroom above line 1,
  *                                      so ink must not rise past the box top;
  *   line_h   = round(2·bl − cap)     — puts the cap-ink centre on the line-box
  *                                      centre, which is what makes a MID-seated
  *                                      label agree with a geometrically centred
  *                                      icon without per-site nudges.
- * Ratios are Segoe UI's (unitsPerEm 2048: ascent 2210, cap 1434). At scale 1
- * this yields display 26/19, title 23/17, ui 22/16, meta 19/14, micro 15/11. */
-#define SEGOE_ASC 1.0791f
-#define SEGOE_CAP 0.7002f
+ * The ascent and cap height are the chosen family's own, read from the font
+ * when the formats are built (fonts_build -> st_family_metrics); Segoe UI's
+ * (unitsPerEm 2048: ascent 2210, cap 1434) are the fallback when they cannot
+ * be read. With Segoe UI's this yields, at scale 1, display 26/19, title 23/17,
+ * ui 22/16, meta 19/14, micro 15/11. */
+static float g_font_asc, g_font_cap;   /* the UI family's figures; 0 = Segoe UI's */
 static void pin_metrics(float size_scaled, float *lh, float *bl) {
-    *bl = ceilf(SEGOE_ASC * size_scaled - 0.02f);
-    *lh = roundf(2.0f * *bl - SEGOE_CAP * size_scaled);
+    oc_typeface_pin(size_scaled, g_font_asc, g_font_cap, lh, bl);
 }
 
 /* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
@@ -564,28 +569,46 @@ static void draw_conn_dot(gfx *rt, float cx, float cy, float r, int live) {
 /* `dnd` is do-not-disturb (REQ-122/278) and is deliberately NOT a third presence
  * value: somebody can be online and paused, so it is drawn as a crescent carved
  * out of the same dot rather than as a colour that would have to replace one.
- * Slack shows a moon for exactly this reason. */
+ * Slack shows a moon for exactly this reason.
+ *
+ * WHICH shape is oc_presence_mark()'s (theme.c), not this function's: presence
+ * is never told by colour alone (REQ-122), so each state is a shape and the
+ * colour repeats it. This draws whatever mark it is handed and does no presence
+ * branching of its own, so no caller can show a state the test has not seen. */
 static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
                                   uint8_t presence, uint32_t surface, int dnd,
                                   float ring) {
-    uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
-               : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+    int mark = oc_presence_mark(presence, dnd);
+    uint32_t c = mark == OC_PMARK_ONLINE ? OC_COL_ONLINE
+               : mark == OC_PMARK_AWAY   ? OC_COL_AWAY
+               : mark == OC_PMARK_DND    ? OC_COL_MUTED : OC_COL_FAINT;
     /* A ring in the surface colour, as Slack's has: the dot sits ON the
      * avatar, and without a ring it reads as a speck stuck to the edge. The
      * WIDTH is the caller's, because a ring that stays 2 DIP while the dot
      * scales with its tile is most of a small marker. */
-        gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
-        gfx_ellipse(rt, cx, cy, r, r, dnd ? OC_COL_MUTED : c, 1.0f);
+    gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
+    if (mark == OC_PMARK_AWAY) {
+        /* Half filled, as the terminal client's away glyph is: a ring of the
+         * away colour with its left half solid. The ring's width is a fraction
+         * of the dot for the same reason the offline hole is, and it sits
+         * inside the dot's radius so away is no larger than online. */
+        float w = r * 0.3f;
+        if (w < 1.0f) w = 1.0f;
+        gfx_ellipse_stroke(rt, cx, cy, r - w / 2.0f, r - w / 2.0f, w, c, 1.0f);
+        gfx_clip_push(rt, (gfx_rect){ cx - r - 1.0f, cy - r - 1.0f, r + 1.0f, 2.0f * r + 2.0f });
+        gfx_ellipse(rt, cx, cy, r, r, c, 1.0f);
+        gfx_clip_pop(rt);
+        return;
+    }
+    gfx_ellipse(rt, cx, cy, r, r, c, 1.0f);
     /* Offline reads as an outline, so "not here" is not just a dim fill. The
      * hole is a fraction of the dot for the same reason the ring is: a fixed
      * 1.3 DIP hole in a small dot is a filled dot, and in a large one it is a
      * hairline. */
-    if (!dnd && presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
-                gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
-    }
-    if (dnd) {   /* carve the crescent with the surface colour */
-                gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
-    }
+    if (mark == OC_PMARK_OFFLINE)
+        gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
+    if (mark == OC_PMARK_DND)   /* carve the crescent with the surface colour */
+        gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
 }
 
 /* ONE presence marker on an avatar, sized and seated BY THE TILE.
@@ -711,6 +734,12 @@ static oc_field  *g_form_f;                           /* the CALLER's array */
 static int        g_form_n;
 static field     *g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD / FF_MULTILINE only */
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
+/* The body the rows were last drawn in (Tab scrolls to a row in it), and, for
+ * the harness, each row's drawn extent (its label's top to its hint's or its
+ * box's bottom; 0,0 for a row not drawn), so "drawn within the height measured
+ * for it" is checkable. */
+static rectf g_form_body;
+static float g_form_row_top[FORM_MAX_FIELDS], g_form_row_bot[FORM_MAX_FIELDS];
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
 /* An optional photo column beside the fields (REQ-240: identity includes the
@@ -1088,6 +1117,10 @@ static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = 
  * link, edit, delete, mark unread and react had no route but a right-click
  * (REQ-264). Drawn lit like a hovered row, so where the keyboard is is visible. */
 static uint64_t g_kb_mid;
+/* The message-menu command the last key press ran as a single key on that
+ * message (0 for none: any other key resets it), for the dump: what a key did
+ * is read back, not inferred. */
+static int g_kb_ran;
 /* The URL under the cursor, and the one the press landed on. Two,
  * not one, because a link opens on RELEASE over the same address it was pressed
  * on: opening on press would make dragging a selection that starts inside a URL
@@ -1196,15 +1229,33 @@ static const char *cursor_kind_name(void) {
 }
 
 static int g_pref_richtext  = 1;
+/* What plain Enter does in the composer: 0 sends (the default), 1 starts a new
+ * line. Ctrl+Enter sends and Shift+Enter starts a new line in both, so neither
+ * chord changes meaning with the preference. */
+static int g_pref_enter_newline = 0;
 /* Typed emoticons become emoji as a space follows them and on send
  * (compose.emoticons, a setting of its own: the terminal client reads it too). */
 static int g_pref_emoticons = 0;
 #define EMOTICONS_SETTING_KEY "compose.emoticons"
+/* What each message says to a screen reader (REQ-269, ARCH-99): which of its
+ * parts are read and in what order (client/core/spoken.h), and whether a new
+ * message from someone else is announced as it arrives. The defaults are how
+ * the client has always read, so nobody's screen reader changes until they
+ * choose to change it. */
+static oc_spoken_opts g_pref_spoken = { 1, 1, 0, 0, 0 };   /* oc_spoken_defaults() */
+static int g_pref_announce_new = 1;
 /* The formatting toolbar belongs to the rich editor. In plain text it would
  * offer buttons for markup already on screen, and the honest shape of that mode
  * is a plain box. */
 static int composer_toolbar_on(void) { return g_pref_richtext; }
 static int g_prefs_pending;        /* fold the synced values in once they land */
+/* The account's stored preferences have been read (or it has none), so a save
+ * now carries them rather than this build's defaults. Until then prefs_save
+ * writes nothing and notes that it was asked (g_prefs_save_held): the window's
+ * placement settling at start used to write every preference at its default
+ * over the account's before they had arrived. */
+static int g_prefs_read;
+static int g_prefs_save_held;
 /* Window placement, remembered across runs. It rides in the same synced bucket
  * as the other preferences because a client writes no files (ARCH-88) — which
  * does mean it is stored per workspace rather than per machine. Acceptable: the
@@ -1252,7 +1303,7 @@ static int geom_capture(oc_win *hwnd) {
 }
 /* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
  * silently stops recording makes the last control on a pane simply not respond. */
-static struct { rectf r; int row, val; } g_pref_hits[24];
+static struct { rectf r; int row, val; } g_pref_hits[32];
 static int g_n_pref_hits;
 /* The quick-reaction slots in Preferences: the tile that opens the picker for a
  * slot, and the small clear badge on it (empty when it is not offered). */
@@ -2241,8 +2292,8 @@ static int g_notify_open, g_keys_open;
  * off one screen and copy into a report. */
 static int g_about_open;
 /* What's new (CLIENT.md): the About card showing this build's release notes
- * instead of its rows, fetched from the control plane without holding the
- * window (oc_plat_releasenotes_*). The state is the card's, and the dump's. */
+ * instead of its rows, asked of the workspace's daemon without holding the
+ * window (oc_client_get_release_notes). The state is the card's, and the dump's. */
 enum { WN_NONE = 0, WN_LOADING, WN_SHOWN, WN_NOTRELEASE, WN_FAILED };
 static int g_whatsnew;                 /* the About card shows What's new */
 static int g_wn_state;
@@ -3598,6 +3649,16 @@ static fmtw *mk_fmt(const char *family, float size, int wt,
  * number the font table multiplies by. There is no per-window zoom. */
 static int   g_pref_textsize = 1;      /* 0 Small … 3 Largest */
 static int   g_pref_density = 1;       /* 0 compact, 1 cozy */
+/* Reduce motion (REQ-269, motion.h): Off, On, or Follow system, the default.
+ * The system's answer is read at start and whenever the window gains focus;
+ * the harness can stand in for it (`sysmotion`), so the Follow-system branch
+ * is reachable without changing the machine. */
+static int   g_pref_motion = OC_MOTION_SYSTEM;
+static int   g_sys_motion = -1;        /* oc_plat_reduce_motion(): 1, 0, -1 unknown */
+static int   g_sys_motion_test = -1;   /* test-only stand-in for it, 0 or 1; -1 none */
+static void motion_sys_read(void) { g_sys_motion = oc_plat_reduce_motion(); }
+static int  motion_sys(void) { return g_sys_motion_test >= 0 ? g_sys_motion_test : g_sys_motion; }
+static int  motion_reduced(void) { return oc_motion_reduced(g_pref_motion, motion_sys()); }
 
 
 static float textsize_mult(void) {
@@ -3606,15 +3667,44 @@ static float textsize_mult(void) {
     return M[i];
 }
 
+/* The interface font (ARCH-97): a choice from a short fixed list of families
+ * the system ships, Default being the platform's own. Follows the account like
+ * text size, and is its own preview like text size. */
+static int   g_pref_font = OC_TYPEFACE_DEFAULT;
+/* Test-only (`fontfam <name>`): a family asked for by name, outside the list,
+ * so the harness can ask for one no system has. Empty in a shipped client. */
+static char  g_font_test_family[64];
+static const char *g_font_used;        /* the family the formats are built with */
+static int   g_font_missing;           /* the family asked for is not installed */
+
 /* Is a family actually installed? DirectWrite silently substitutes for a
- * missing one, and its substitute for "Segoe UI Variable Text" is not
- * necessarily Segoe UI — so ask rather than hope. */
+ * missing one, and its substitute is not necessarily the default — so ask
+ * rather than hope. */
+static int ui_family_present(void *user, const char *family) {
+    (void)user;
+    return g_st ? st_family_present(g_st, family) : 0;
+}
+
+/* The family asked for: the test override, else the choice from the list. */
+static const char *ui_family_asked(void) {
+    if (g_font_test_family[0]) return g_font_test_family;
+    int i = (g_pref_font < 0 || g_pref_font >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : g_pref_font;
+    return i == OC_TYPEFACE_DEFAULT ? oc_typeface_default(ui_family_present, NULL) : OC_TYPEFACES[i].family;
+}
+
+/* Resolve the family and read its figures: once per fonts_build. */
+static void ui_family_resolve(void) {
+    if (g_font_test_family[0])
+        g_font_used = oc_typeface_resolve_family(g_font_test_family, ui_family_present, NULL, &g_font_missing);
+    else
+        g_font_used = oc_typeface_resolve(g_pref_font, ui_family_present, NULL, &g_font_missing);
+    if (!g_st || !st_family_metrics(g_st, g_font_used, &g_font_asc, &g_font_cap))
+        g_font_asc = g_font_cap = 0.0f;   /* Segoe UI's figures (oc_typeface_pin) */
+}
+
 static const char *ui_family(void) {
-    static const char *cached;
-    if (!cached)
-        cached = st_family_present(g_st, "Segoe UI Variable Text")
-                     ? "Segoe UI Variable Text" : "Segoe UI";
-    return cached;
+    if (!g_font_used) ui_family_resolve();
+    return g_font_used;
 }
 
 static void fmt_release(fmtw **f) {
@@ -3624,6 +3714,9 @@ static void fmt_release(fmtw **f) {
 /* Build (or rebuild) every text format. Safe to call again: releases first, so a
  * text-size change is one call plus a relayout. */
 static void fonts_build(void) {
+    /* The family, and its own ascent and cap height, which every pin below is
+     * derived from (ARCH-108). */
+    ui_family_resolve();
     const char *UI = ui_family();
     const float k = g_text_scale;
     fmtw **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
@@ -3676,8 +3769,10 @@ static void fonts_build(void) {
     /* A snippet's text (REQ-226): the code family, at meta size, one line per
      * draw, coloured span by span. */
     {
+        /* Pinned with Segoe UI's figures whatever the interface font: Consolas
+         * is not the chosen family, and its pair stays the one it always had. */
         float clh, cbl;
-        pin_metrics(FONT_META * k, &clh, &cbl);
+        oc_typeface_pin(FONT_META * k, 0.0f, 0.0f, &clh, &cbl);
         g_code = mk_fmt_s("Consolas", FONT_META * k, REG, L, MID, 0, 0, clh, cbl);
     }
 }
@@ -4316,7 +4411,8 @@ static int g_n_sbsel;
 static int ws_unread_elsewhere(void);   /* fwd */
 static int main_is_conversation(void); /* fwd — the sidebar's selection asks it too */
 static void ed_caret_kill(void);       /* fwd — the paint pass owns the caret's life */
-static int  g_caret_placed;            /* set by ed_caret_sync, cleared each paint */
+static void caret_place(SDL_Rect area); /* fwd — the system caret, for every drawn field */
+static int  g_caret_placed;            /* set by caret_place, cleared each paint */
 
 static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
@@ -8705,7 +8801,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         } else {
             *scroll = total - jump_off - visible * 0.66f;
             g_flash_mid = g_jump_mid;
-            g_flash_until = now_ms() + 1600;
+            g_flash_until = now_ms() + OC_MOTION_FLASH_MS;
         }
         g_jump_mid = 0;
         g_jump_quiet = 0;
@@ -8713,7 +8809,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     if (thr && jump_i >= 0) {
         *scroll = total - jump_off - visible * 0.66f;
         g_flash_mid = g_thr_jump_mid;
-        g_flash_until = now_ms() + 1600;
+        g_flash_until = now_ms() + OC_MOTION_FLASH_MS;
         g_thr_jump_mid = 0;
     }
 
@@ -8893,11 +8989,13 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 gfx_fill(rt, gr(lr), OC_COL_ACCENT, 0.14f);
                 fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
             }
-            /* Jump flash — fades out so it reads as "here it is", not as state. */
+            /* Jump flash — fades out so it reads as "here it is", not as state.
+             * With motion reduced it is held at full strength for its time and
+             * then removed, with no fade. */
             if ((capture || thr) && g_flash_mid == msgs[first + i].message_id) {
                 uint64_t now = now_ms();
                 if (now < g_flash_until) {
-                    float a = (float)(g_flash_until - now) / 1600.0f;
+                    float a = oc_motion_flash_alpha(now, g_flash_until, motion_reduced());
                     rectf fr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(fr), OC_COL_NOTICE, a * 0.30f);
                 } else {
@@ -10421,7 +10519,7 @@ enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
        ACC_MARK_ALL_READ, ACC_TOAST_ACTION, ACC_HIST_BACK, ACC_HIST_FWD, ACC_PREVIEW, ACC_JUMP_DATE,
-       ACC_NEW_CALL };
+       ACC_NEW_CALL, ACC_REACT_LAST };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -10432,6 +10530,8 @@ static const struct {
     uint8_t  action;      /* ACC_* ; ACC_NONE = documentation only */
     const char *keys, *what;
 } SHORTCUTS[] = {
+    /* The composer's two rows. Their keys follow the Enter preference, so the
+     * sheet shows them through compose_key_label(), not from here. */
     { 0,                  0,          ACC_NONE,  "Enter",              "Send the message" },
     { 0,                  0,          ACC_NONE,  "Shift+Enter",        "New line" },
     /* Formatting. Display-only rows: the keys are dispatched inside the
@@ -10443,6 +10543,7 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Esc",                "Close the open pane, popover or picker" },
     { 0,                  0,          ACC_NONE,  "Tab",                "Insert the highlighted completion" },
     { 0,                  0,          ACC_NONE,  "Up / Down",          "Move through completions" },
+    { 0,                  0,          ACC_NONE,  "Up (in an empty message box)", "Edit your last message" },
     { AM_ALT,             OCK_UP,      ACC_NAV_PREV,        "Alt+Up / Alt+Down",   "Previous / next conversation" },
     { AM_ALT,             OCK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
     { AM_ALT | AM_SHIFT,  OCK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
@@ -10472,6 +10573,10 @@ static const struct {
     { AM_CTRL | AM_SHIFT, 'P',        ACC_PREVIEW, "Ctrl+Shift+P",     "Preview the message you are writing, or go back to editing it" },
     { AM_CTRL | AM_SHIFT, 'J',        ACC_JUMP_DATE, "Ctrl+Shift+J",   "Jump to a date in this conversation" },
     { AM_CTRL | AM_SHIFT, 'L',        ACC_NEW_CALL,  "Ctrl+Shift+L",   "New call: from this conversation, its people asked" },
+    /* Ctrl+Shift+\, as the reference client binds it: the picker, so the
+     * reaction is still the person's choice, for the main transcript's newest
+     * message that can take one (REQ-070). */
+    { AM_CTRL | AM_SHIFT, OCK_BACKSLASH, ACC_REACT_LAST, "Ctrl+Shift+\\", "React to the newest message" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -10485,6 +10590,10 @@ static const struct {
      * depends on what is open. */
     { 0,                  0,          ACC_NONE,  "Ctrl+Up / Ctrl+Down","Move through the messages" },
     { 0,                  0,          ACC_NONE,  "Shift+F10 / Menu",   "Actions for the message you are on, or for this conversation" },
+    /* Single keys on the message you are on (kb_msg_cmd), the same items. */
+    { 0,                  0,          ACC_NONE,  "E / R / T",          "On the message you are on: edit, react, its thread" },
+    { 0,                  0,          ACC_NONE,  "P / F / S",          "...pin or unpin, forward, save for later" },
+    { 0,                  0,          ACC_NONE,  "U / M / L",          "...unread from here, remind me, copy link" },
     { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
     { 0,                  0,          ACC_NONE,  "Tab, Up / Down, Del", "Custom emoji: the search box, the rows, delete the selected one" },
 };
@@ -10511,6 +10620,9 @@ static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu i
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
 static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
 static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
+static int  kb_msg_cmd(int key);                   /* fwd — a single key's menu command */
+static void kb_msg_key(oc_win *hwnd, int key);     /* fwd — ...run on the focused message */
+static void picker_open(oc_win *hwnd, uint64_t mid);   /* fwd — Ctrl+Shift+\ */
 static void call_start_here(oc_win *hwnd, uint64_t ch);   /* fwd */
 static void call_cmd(oc_win *hwnd, int cmd);              /* fwd */
 static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x, float y);   /* fwd */
@@ -10551,6 +10663,15 @@ static void accel_run(oc_win *hwnd, int action) {
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_PREVIEW:
         if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) preview_set(hwnd, !g_preview);
+        break;
+    case ACC_REACT_LAST:
+        /* The same picker the hover strip's kebab and the message menu open, so
+         * a pick reacts, or takes back one already yours, by the one path. */
+        if (main_is_conversation() && g_view != VIEW_NEWMSG && g_sel) {
+            const oc_model *rm = model();
+            const oc_msg *last = rm ? oc_model_last_reactable(oc_model_channel((oc_model *)rm, g_sel)) : NULL;
+            if (last) picker_open(hwnd, last->message_id);
+        }
         break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
@@ -10653,6 +10774,7 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
         return 1;
     }
     if (up) return 0;
+    g_kb_ran = 0;                        /* the dump's ran= is this press's, or 0 */
     if (VM_UP() && !alt && vm_key(hwnd, key)) { invalidate(); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
@@ -10713,6 +10835,19 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
     if (!alt && !g_menu && !modal_open() &&
         (key == OCK_APPS || (key == OCK_F10 && mod_down(OCK_SHIFT)))) {
         kb_context_menu(hwnd);
+        invalidate();
+        return 1;
+    }
+    /* A letter on the message the keyboard is on acts on it, as the terminal
+     * client's do on a selected message: `e` edits, `r` reacts, `t` the thread,
+     * and the rest of kb_msg_cmd's table. Never with Ctrl or Alt held (those are
+     * the shortcuts below), and never while anything else takes typing: a menu, a
+     * modal, a drawn field (the palette's, the picker's), or an edit in the
+     * composer. A mapped letter is claimed whether or not its item is offered,
+     * so it is never typed into the composer instead. */
+    if (!alt && g_kb_mid && kb_msg_cmd(key) && !mod_down(OCK_CONTROL) && !mod_down(OCK_ALT) &&
+        transcript_shell() && !g_menu && !modal_open() && !g_focus && !g_edit_msg) {
+        kb_msg_key(hwnd, key);
         invalidate();
         return 1;
     }
@@ -10796,6 +10931,23 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
     return 0;
 }
 
+/* The key that sends (send = 1) or starts a new line (send = 0) in the
+ * composer, as the Enter preference makes it. The shortcuts sheet and the test
+ * dump both read it, so they cannot disagree. */
+static const char *compose_key_label(int send) {
+    if (send) return g_pref_enter_newline ? "Ctrl+Enter" : "Enter";
+    return g_pref_enter_newline ? "Enter" : "Shift+Enter";
+}
+
+/* A row's keys as the sheet shows them: the composer's two from the preference. */
+static const char *shortcut_keys(int i) {
+    if (SHORTCUTS[i].action == ACC_NONE && SHORTCUTS[i].what) {
+        if (!strcmp(SHORTCUTS[i].what, "Send the message")) return compose_key_label(1);
+        if (!strcmp(SHORTCUTS[i].what, "New line"))         return compose_key_label(0);
+    }
+    return SHORTCUTS[i].keys;
+}
+
 static void draw_keys(gfx *rt, rectf reg) {
     rectf body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_KEYS);
@@ -10807,7 +10959,7 @@ static void draw_keys(gfx *rt, rectf reg) {
     for (int i = 0; i < n; i++) {
         if (!SHORTCUTS[i].keys) continue;        /* the paired row, described above */
         if (y > body.bottom) break;
-        draw_text(rt, SHORTCUTS[i].keys, g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
+        draw_text(rt, shortcut_keys(i), g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
         draw_text(rt, SHORTCUTS[i].what, g_ui, rf(body.left + 210, y, body.right - 24, y + rowh), OC_COL_MUTED);
         y += rowh;
     }
@@ -10891,7 +11043,7 @@ static void whatsnew_draw(gfx *rt, rectf reg) {
 /* Once a tick: the fetch's answer, when it has come. */
 static void whatsnew_tick(void) {
     if (g_wn_state != WN_LOADING) return;
-    int rc = oc_plat_releasenotes_poll(&g_wn);
+    int rc = g_client ? oc_model_take_release_notes((oc_model *)oc_client_model(g_client), &g_wn) : -1;
     if (rc < 0) return;
     g_wn_state = rc == OC_RN_OK ? WN_SHOWN : rc == OC_RN_NOT_RELEASE ? WN_NOTRELEASE : WN_FAILED;
     invalidate();
@@ -11748,7 +11900,7 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
         rectf b = rf(bx - w, y + 2, bx, y + 28);
         int on = (i == cur);
         draw_chip_r(rt, b, opts[i], on);
-        if (g_n_pref_hits < 24) {
+        if (g_n_pref_hits < (int)(sizeof g_pref_hits / sizeof g_pref_hits[0])) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
             g_pref_hits[g_n_pref_hits].val = i;
@@ -11788,7 +11940,31 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
-       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS, PREF_ROW_EMOTICONS,
+       PREF_ROW_ENTER, PREF_ROW_FONT };
+/* Accessibility's rows: what each message says to a screen reader. */
+enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
+       PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
+/* Appearance's Reduce motion (REQ-269): a number of its own, so the rows
+ * above keep theirs. */
+enum { PREF_ROW_MOTION = 130 };
+
+/* One of Accessibility's rows set to choice `v`: the one path the rows' clicks
+ * and the harness's `spoken` verb both take. 0 when `row` is not one of them.
+ * Saved by the caller (Save, or the verb), as every other row is. */
+static int spoken_pref_set(int row, int v) {
+    v = v ? 1 : 0;
+    switch (row) {
+    case PREF_ROW_SAY_SENDER:    g_pref_spoken.sender = v; break;
+    case PREF_ROW_SAY_TIME:      g_pref_spoken.time = v; break;
+    case PREF_ROW_SAY_REACTIONS: g_pref_spoken.reactions = v; break;
+    case PREF_ROW_SAY_REPLIES:   g_pref_spoken.replies = v; break;
+    case PREF_ROW_SAY_ORDER:     g_pref_spoken.text_first = v; break;
+    case PREF_ROW_ANNOUNCE_NEW:  g_pref_announce_new = v; break;
+    default: return 0;
+    }
+    return 1;
+}
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -11798,7 +11974,10 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS, PC_COUNT };
+/* ACCESSIBILITY comes last, after the categories that were here before it, so
+ * each of theirs keeps its index (`prefs <index>` in the harness). */
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS,
+       PC_ACCESSIBILITY, PC_COUNT };
 /* SYSTEM is where the application behaves as an application rather than as a
  * chat surface: what the close button does, whether it starts with Windows.
  * Those had no home, which is why closing to the tray shipped with no way to
@@ -11807,7 +11986,7 @@ enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS
  * they let act as them is theirs, so it lives with their other settings. It is
  * not part of Save and Cancel: approving and revoking act at once. */
 static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications",
-                                         "System", "AI clients" };
+                                         "System", "AI clients", "Accessibility" };
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
@@ -11836,7 +12015,7 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
              * invisible, and one in white is invisible on the light swatches. */
                         gfx_ellipse_stroke(rt, cx, cy, 14, 14, 1.6f, OC_COL_TEXT, 1.0f);
         }
-        if (g_n_pref_hits < 24) {
+        if (g_n_pref_hits < (int)(sizeof g_pref_hits / sizeof g_pref_hits[0])) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = PREF_ROW_ACCENT;
             g_pref_hits[g_n_pref_hits].val = i;
@@ -11949,17 +12128,29 @@ static void draw_prefs(gfx *rt, rectf reg) {
     static const char *SIZES[4]  = { "Small", "Default", "Large", "Larger" };
     static const char *DENS[2]   = { "Compact", "Cozy" };
     static const char *EDITORS[2] = { "Plain text", "Rich text" };
+    static const char *ENTERS[2]  = { "Send the message", "Start a new line" };
 
     if (g_pref_cat == PC_APPEARANCE) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
                      "System follows the Windows theme.", THEMES, 3, oc_theme_mode());
         y = pref_accent_row(rt, body, y);
+        {
+            const char *FONTS[OC_TYPEFACE_COUNT];
+            for (int i = 0; i < OC_TYPEFACE_COUNT; i++) FONTS[i] = OC_TYPEFACES[i].label;
+            y = pref_row(rt, body, y, PREF_ROW_FONT, "Font",
+                         "The whole interface. Code keeps its own.",
+                         FONTS, OC_TYPEFACE_COUNT, g_pref_font);
+        }
         y = pref_row(rt, body, y, PREF_ROW_TEXTSIZE, "Text size",
                      "Follows your account, not this machine.",
                      SIZES, 4, g_pref_textsize);
         y = pref_row(rt, body, y, PREF_ROW_DENSITY, "Message density",
                      "The space between messages, not the text size.",
                      DENS, 2, g_pref_density);
+        static const char *MOTIONS[3] = { "Off", "On", "Follow system" };
+        y = pref_row(rt, body, y, PREF_ROW_MOTION, "Reduce motion",
+                     "A steady caret, and no fades or moving bars. Follow system uses the system's own setting.",
+                     MOTIONS, 3, g_pref_motion);
         y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
                      "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
         static const char *TPOS[3] = { "Bottom centre", "Bottom right", "Top right" };
@@ -11978,6 +12169,12 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
+        /* The other convention, for people who write long messages: Enter
+         * starts a new line and Ctrl+Enter sends. */
+        y = pref_row(rt, body, y, PREF_ROW_ENTER, "When I press Enter",
+                     "Ctrl+Enter always sends, and Shift+Enter always starts "
+                     "a new line.",
+                     ENTERS, 2, g_pref_enter_newline);
         y = pref_row(rt, body, y, PREF_ROW_EMOTICONS, "Emoticons",
                      "Typed faces such as :) and <3 become emoji when a space "
                      "follows them, and when you send. Never inside code.",
@@ -12084,6 +12281,30 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
     } else if (g_pref_cat == PC_AICLIENTS) {
         y = draw_my_connections(rt, model(), body, y);
+    } else if (g_pref_cat == PC_ACCESSIBILITY) {
+        /* What a screen reader says for each message (REQ-269). The defaults
+         * are how the client has always read: the sender, the time, the text,
+         * and a new message read out as it arrives. */
+        static const char *ORDER[2] = { "Sender first", "Text first" };
+        y = pref_row(rt, body, y, PREF_ROW_SAY_SENDER, "Say the sender",
+                     "Each message is read with the name of who sent it.",
+                     ONOFF, 2, g_pref_spoken.sender);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_TIME, "Say the time",
+                     "And when it was sent, as the transcript shows it.",
+                     ONOFF, 2, g_pref_spoken.time);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_REACTIONS, "Say reactions",
+                     "Each reaction on the message, with how many people chose it.",
+                     ONOFF, 2, g_pref_spoken.reactions);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_REPLIES, "Say replies",
+                     "How many replies its thread has.",
+                     ONOFF, 2, g_pref_spoken.replies);
+        y = pref_row(rt, body, y, PREF_ROW_SAY_ORDER, "Order",
+                     "Text first reads what was said before who said it and when.",
+                     ORDER, 2, g_pref_spoken.text_first);
+        y = pref_row(rt, body, y, PREF_ROW_ANNOUNCE_NEW, "Announce new messages",
+                     "A message from someone else is read out as it arrives, unless "
+                     "its conversation is muted.",
+                     ONOFF, 2, g_pref_announce_new);
     }
 
     g_prefs_content_h = y - rows_top;
@@ -16177,6 +16398,7 @@ static void ftray_taskbar(oc_win *hwnd, uint64_t done, uint64_t total);   /* fwd
 static void ftray_tick(oc_win *hwnd) {
     int moving = 0;
     uint64_t now = now_ms();
+    const int reduced = motion_reduced();
     /* What failed first, since giving a post back changes the chips. */
     for (int i = 0; i < g_n_ftray; i++) {
         ftray_chip *c = &g_ftray[i];
@@ -16190,8 +16412,7 @@ static void ftray_tick(oc_win *hwnd) {
         if (!c->tag) continue;
         float target;
         if (ftray_state(oc_client_model(c->cl), c, &target) == 2 && !c->done_at) c->done_at = now;
-        float d = target - c->shown;
-        c->shown = (d > -0.002f && d < 0.002f) ? target : c->shown + d * 0.22f;
+        c->shown = oc_motion_ease(c->shown, target, reduced);   /* at once when reduced */
         sum_total += c->size;
         sum_done += (uint64_t)((double)c->size * (double)target);
         moving = 1;
@@ -16230,6 +16451,7 @@ static void ftray_fit(const char *s, fmtw *fmt, float w, char *out, size_t cap) 
 static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     const oc_model *m = model();
     uint64_t now = now_ms();
+    const int reduced = motion_reduced();   /* nothing here moves (REQ-269) */
     float x = bx0 + COMPOSER_PAD, y = by0 + (FTRAY_H - FTRAY_CHIP_H) / 2 + UIS(2);
     float right = bx1 - COMPOSER_PAD, gap = UIS(8);
     int shown = 0, total = 0, here = ftray_count();
@@ -16270,7 +16492,7 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
         if (done) {
             /* A green disc with a tick, over the picture. */
             float cx = (pr.left + pr.right) / 2, cy = (pr.top + pr.bottom) / 2, rr = pic * 0.32f;
-            float a = (float)(now - c->done_at) / 150.0f; if (a > 1) a = 1;
+            float a = reduced ? 1.0f : (float)(now - c->done_at) / 150.0f; if (a > 1) a = 1;
             gfx_ellipse(rt, cx, cy, rr, rr, OC_COL_ONLINE, a);
             gfx_line(rt, cx - rr * 0.45f, cy + rr * 0.02f, cx - rr * 0.1f, cy + rr * 0.38f, 2.0f, 0xFFFFFF, a);
             gfx_line(rt, cx - rr * 0.1f, cy + rr * 0.38f, cx + rr * 0.5f, cy - rr * 0.35f, 2.0f, 0xFFFFFF, a);
@@ -16297,16 +16519,18 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
         draw_text(rt, line, g_meta, rf(tx, r.top + UIS(21), r.right - UIS(8), r.top + UIS(38)), subc);
 
         /* The bar: a pill that eases toward the real figure, with a soft light
-         * sweeping along what is filled while the file is moving. */
+         * sweeping along what is filled while the file is moving. With motion
+         * reduced the bar shows the figure at once, the waiting track holds one
+         * strength, and there is no light. */
         if (c->tag) {
             rectf track = rf(tx, r.bottom - UIS(8), r.right - UIS(10), r.bottom - UIS(4));
             float rad = (track.bottom - track.top) / 2;
-            fill_round_a(rt, track, rad, OC_COL_BORDER, st == 0 ? 0.35f + 0.25f * (float)sin((double)now / 300.0) : 1.0f);
+            fill_round_a(rt, track, rad, OC_COL_BORDER, st == 0 ? oc_motion_pulse(now, reduced) : 1.0f);
             float fw = (track.right - track.left) * c->shown;
             if (fw > rad * 2 || (fw > 0 && done)) {
                 rectf fill_r = rf(track.left, track.top, track.left + (fw > rad * 2 ? fw : rad * 2), track.bottom);
                 fill_round(rt, fill_r, rad, done ? OC_COL_ONLINE : OC_COL_ACCENT);
-                if (st == 1 && !done) {
+                if (st == 1 && !done && !reduced) {
                     float span = fill_r.right - fill_r.left, sw = UIS(28);
                     float ph = (float)(now % 1200) / 1200.0f;
                     float sx = fill_r.left - sw + (span + sw) * ph;
@@ -17170,8 +17394,46 @@ static float form_hint_h(const char *hint, float w) {
     return h > UIS(20.0f) ? h : UIS(20.0f);
 }
 
+/* A form row's geometry, named once and scaled with the text (UIS), so the
+ * row form_rowh measures and the row draw_form paints are the same row. When
+ * the painter placed its label, box and hint at fixed pixels while the measure
+ * scaled, Small text measured Edit profile's rows shorter than they were drawn:
+ * the card believed they fitted, gave no scroll, and its last row was drawn
+ * half under the edge. Every vertical offset in a row comes from here. */
+#define FORM_LABEL_H     UIS(20.0f)   /* the label's line, at the row's top */
+#define FORM_BOX_TOP     UIS(22.0f)   /* a box's top: the label and the gap under it */
+#define FORM_BOX_H       UIS(28.0f)   /* a single-line box, a select, a chip, a check's target */
+#define FORM_BOX_PAD_Y   UIS(5.0f)    /* the text inside a box, from its top and bottom */
+#define FORM_HINT_GAP    UIS(3.0f)    /* a box's bottom to its hint */
+#define FORM_ROW_GAP     UIS(4.0f)    /* below a single-line or select row */
+#define FORM_MULTI_GAP   UIS(6.0f)    /* below a multi-line row */
+#define FORM_CHECK_BOX   UIS(20.0f)   /* a check's square, centred in its target */
+#define FORM_CHECK_LBL_X UIS(30.0f)   /* a check's label, from the row's left */
+#define FORM_CHECK_GAP   UIS(6.0f)    /* below a check row */
+#define FORM_CHIP_TOP    UIS(24.0f)   /* a choice's first line of chips, below the row's top */
+#define FORM_CHIP_PITCH  UIS(34.0f)   /* one line of chips to the next */
+#define FORM_CHIP_PAD_X  UIS(24.0f)   /* a chip's width beyond its text */
+#define FORM_CHIP_GAP_X  UIS(8.0f)    /* between chips on a line */
+#define FORM_CHOICE_GAP  UIS(8.0f)    /* below a choice row's last chip */
+#define FORM_SEL_TEXT_Y  UIS(4.0f)    /* a select's value, from its box's top */
+#define FORM_SEL_CHEV_Y  UIS(5.0f)    /* its chevron, from the box's top */
+#define FORM_SEL_CHEV_L  UIS(22.0f)   /* the chevron's left, in from the box's right */
+#define FORM_SEL_CHEV_R  UIS(6.0f)    /* its right, in from the box's right */
+#define FORM_SEL_TEXT_R  UIS(26.0f)   /* the value stops short of the chevron */
+/* A text box's text, in from its sides. Not scaled: it is the inset the
+ * multi-line field's line count is taken at (form_multi_h, form_dialog), and a
+ * field narrower than it was counted at could wrap a line its box has no room
+ * for. Horizontal, so no row's height depends on it. */
+#define FORM_TEXT_X      9.0f
+
+/* The width a choice chip takes: one measure for form_rowh's wrap and the
+ * painter's. */
+static float form_chip_w(const char *opt) {
+    return text_width(opt, g_meta) + FORM_CHIP_PAD_X;
+}
+
 static float form_rowh(const oc_field *f, float w) {
-    if (f->kind == FF_CHECK)  return UIS(34);
+    if (f->kind == FF_CHECK)  return FORM_BOX_H + FORM_CHECK_GAP;
     if (f->kind == FF_CHOICE) {
         /* Measured, and wrapped like the painter wraps: a five-option row at
          * Large text does not fit one line, and a height that ignores that is
@@ -17185,23 +17447,32 @@ static float form_rowh(const oc_field *f, float w) {
             while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
             opt[oi] = '\0';
             if (*p2 == '|') p2++;
-            float bw = text_width(opt, g_meta) + 24;
+            float bw = form_chip_w(opt);
             if (bx > 0 && bx + bw > w) { rows++; bx = 0; }
-            bx += bw + 8;
+            bx += bw + FORM_CHIP_GAP_X;
             k++;
         }
-        return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
+        return FORM_CHIP_TOP + (float)(rows - 1) * FORM_CHIP_PITCH + FORM_BOX_H + FORM_CHOICE_GAP;
     }
     /* A select's `hint` is its options, not a line under it: measured as one,
      * the time zone list wrapped to a row two hundred pixels tall and pushed
      * the read-aloud voice off the bottom of Edit profile. */
-    if (f->kind == FF_SELECT) return UIS(54.0f);
+    if (f->kind == FF_SELECT) return FORM_BOX_TOP + FORM_BOX_H + FORM_ROW_GAP;
     /* A hint wraps, and its row grows by the lines it takes: one cut to a
      * single line lost the half of a sentence that said what to do. */
     float hint = (f->hint && f->hint[0]) ? form_hint_h(f->hint, w) : 0;
     if (f->kind == FF_MULTILINE)
-        return UIS(22.0f) + form_multi_h(f, w) + (hint > 0 ? hint + UIS(6.0f) : UIS(6.0f));
-    return UIS(54.0f) + hint;
+        return FORM_BOX_TOP + form_multi_h(f, w) + hint + FORM_MULTI_GAP;
+    return FORM_BOX_TOP + FORM_BOX_H + hint + FORM_ROW_GAP;
+}
+
+/* Each row's top below the body's, and the rows' whole height, as draw_form
+ * lays them out in a body `w` wide: one count for the painter and for Tab's
+ * scroll to a row out of sight. */
+static float form_row_tops(float w, float *tops) {
+    float total = 4;
+    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], w); }
+    return total;
 }
 
 static void draw_form(gfx *rt, rectf body) {
@@ -17214,9 +17485,13 @@ static void draw_form(gfx *rt, rectf body) {
      * A row is drawn whole or not at all, so a text field is never half
      * under the edge with its keyboard still in it; and when the keyboard
      * moves to a row out of sight, the rows move to show it. */
-    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
-    float tops[FORM_MAX_FIELDS], total = 4, view = body.bottom - body.top;
-    for (int i = 0; i < g_form_n; i++) { tops[i] = total; total += form_rowh(&g_form_f[i], body.right - body.left); }
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) {
+        g_form_erect[i] = rf(0, 0, 0, 0);
+        g_form_row_top[i] = g_form_row_bot[i] = 0;
+    }
+    g_form_body = body;
+    float tops[FORM_MAX_FIELDS], view = body.bottom - body.top;
+    float total = form_row_tops(body.right - body.left, tops);
     g_form_scroll_max = total > view ? total - view : 0;
     {
         int fk = -1;
@@ -17235,9 +17510,13 @@ static void draw_form(gfx *rt, rectf body) {
     for (int i = 0; i < g_form_n; i++) {
         const oc_field *f = &g_form_f[i];
         float rh = form_rowh(f, body.right - body.left);
-        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 4.5f)) { y += rh; continue; }
+        /* Whole or not at all: a row whose measured bottom crosses the body's is
+         * skipped (half a pixel for rounding), and the measure is the drawn row. */
+        if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 0.5f)) { y += rh; continue; }
+        float drawn_bot = y;
         if (f->kind == FF_CHECK) {
-            rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
+            float cy0 = y + (FORM_BOX_H - FORM_CHECK_BOX) / 2;
+            rectf box = rf(body.left, cy0, body.left + FORM_CHECK_BOX, cy0 + FORM_CHECK_BOX);
             int on = atoi(f->value) != 0;
             fill_round(rt, box, OC_R_CONTROL, on ? OC_COL_ACCENT : OC_COL_INPUT);
             /* The ring says where the keyboard is, on a drawn field exactly as on
@@ -17251,29 +17530,30 @@ static void draw_form(gfx *rt, rectf body) {
                 draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
                 g_meta->align = ST_ALIGN_LEFT;
             }
-            draw_text(rt, f->label, g_ui, rf(body.left + 30, y + 2, body.right, y + 26), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui, rf(body.left + FORM_CHECK_LBL_X, y, body.right, y + FORM_BOX_H), OC_COL_TEXT);
             if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
                 /* The label is part of the target: a 20px box is not a click. */
-                g_form_hits[g_n_form_hits].r = rf(body.left, y, body.right, y + 28);
+                g_form_hits[g_n_form_hits].r = rf(body.left, y, body.right, y + FORM_BOX_H);
                 g_form_hits[g_n_form_hits].field = i;
                 g_form_hits[g_n_form_hits].val = !on;
                 g_n_form_hits++;
             }
+            drawn_bot = y + FORM_BOX_H;
         } else if (f->kind == FF_CHOICE) {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             int cur = atoi(f->value), k = 0;
-            float bx = body.left, cy = y + 24;
+            float bx = body.left, cy = y + FORM_CHIP_TOP;
             const char *p2 = f->hint ? f->hint : "";
             while (*p2 && k < 8) {
                 char opt[48]; int oi = 0;
                 while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
                 opt[oi] = '\0';
                 if (*p2 == '|') p2++;
-                float bw = text_width(opt, g_meta) + 24;
+                float bw = form_chip_w(opt);
                 /* Wrap, exactly as form_rowh counted: a chip that would cross
                  * the body edge starts a new line instead of vanishing. */
-                if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += UIS(34.0f); }
-                rectf b = rf(bx, cy, bx + bw, cy + 28);
+                if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += FORM_CHIP_PITCH; }
+                rectf b = rf(bx, cy, bx + bw, cy + FORM_BOX_H);
                 int on = (k == cur);
                 draw_chip_r(rt, b, opt, on);
                 /* The chosen chip wears the ring when the row has the keyboard,
@@ -17286,17 +17566,18 @@ static void draw_form(gfx *rt, rectf body) {
                     g_form_hits[g_n_form_hits].val = k;
                     g_n_form_hits++;
                 }
-                bx = b.right + 8;
+                bx = b.right + FORM_CHIP_GAP_X;
                 k++;
             }
+            drawn_bot = cy + FORM_BOX_H;
         } else if (f->kind == FF_SELECT) {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             float action_w = 0;
             if (i == g_form_action_field && g_form_on_action) {
                 const char *lbl = g_form_action_busy ? g_form_action_busy_label : g_form_action_label;
                 action_w = text_width(lbl, g_ui) + UIS(28);
-                g_form_action_btn = rf(body.right - FORM_BOX_INSET - action_w, y + 22,
-                                       body.right - FORM_BOX_INSET, y + 50);
+                g_form_action_btn = rf(body.right - FORM_BOX_INSET - action_w, y + FORM_BOX_TOP,
+                                       body.right - FORM_BOX_INSET, y + FORM_BOX_TOP + FORM_BOX_H);
                 int hot = !g_form_action_busy && in_rect(g_form_action_btn, g_mouse_x, g_mouse_y);
                 fill_round(rt, g_form_action_btn, OC_R_CONTROL,
                            g_form_action_busy ? OC_COL_INPUT : hot ? OC_COL_HOVER : OC_COL_INPUT);
@@ -17310,8 +17591,8 @@ static void draw_form(gfx *rt, rectf body) {
                 g_ui->align = ST_ALIGN_LEFT;
                 action_w += UIS(8);
             }
-            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET - action_w, y + 50);
+            rectf box = rf(body.left + FORM_BOX_INSET, y + FORM_BOX_TOP,
+                           body.right - FORM_BOX_INSET - action_w, y + FORM_BOX_TOP + FORM_BOX_H);
             int open = (g_form_sel_field == i) || (g_form_focus == i && !g_form_focus_btn);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The accent ring while the list is open, matching what a focused
@@ -17321,17 +17602,20 @@ static void draw_form(gfx *rt, rectf body) {
             g_form_sel_box[i] = box;
             char cur[96];
             if (!sel_opt(f->hint, atoi(f->value), cur, sizeof cur)) cur[0] = '\0';
-            draw_text(rt, cur, g_ui, rf(box.left + 9, box.top + 4, box.right - 26, box.bottom),
+            draw_text(rt, cur, g_ui, rf(box.left + FORM_TEXT_X, box.top + FORM_SEL_TEXT_Y,
+                                        box.right - FORM_SEL_TEXT_R, box.bottom),
                       cur[0] ? OC_COL_TEXT : OC_COL_FAINT);
             /* A chevron, so the field reads as one that opens rather than one
              * you type into — the only thing distinguishing the two shapes. */
             draw_text(rt, open ? "▴" : "▾", g_meta,
-                      rf(box.right - 22, box.top + 5, box.right - 6, box.bottom), OC_COL_FAINT);
+                      rf(box.right - FORM_SEL_CHEV_L, box.top + FORM_SEL_CHEV_Y,
+                         box.right - FORM_SEL_CHEV_R, box.bottom), OC_COL_FAINT);
+            drawn_bot = box.bottom;
         } else {
-            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
-            float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : 28.0f;
-            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET, y + 22 + bh);
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
+            float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : FORM_BOX_H;
+            rectf box = rf(body.left + FORM_BOX_INSET, y + FORM_BOX_TOP,
+                           body.right - FORM_BOX_INSET, y + FORM_BOX_TOP + bh);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
              * field itself draws no border. */
@@ -17347,13 +17631,18 @@ static void draw_form(gfx *rt, rectf body) {
                          i == g_form_err_field ? OC_COL_DANGER : focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (g_form_edit[i])
-                field_draw(rt, g_form_edit[i], rf(box.left + 9, box.top + 5, box.right - 9, box.bottom - 5), OC_COL_TEXT);
-            if (f->hint && f->hint[0])
+                field_draw(rt, g_form_edit[i], rf(box.left + FORM_TEXT_X, box.top + FORM_BOX_PAD_Y,
+                                                  box.right - FORM_TEXT_X, box.bottom - FORM_BOX_PAD_Y), OC_COL_TEXT);
+            drawn_bot = box.bottom;
+            if (f->hint && f->hint[0]) {
+                drawn_bot = box.bottom + FORM_HINT_GAP + form_hint_h(f->hint, body.right - body.left);
                 draw_text(rt, f->hint, g_meta_w,
-                          rf(body.left, box.bottom + 3, body.right,
-                             box.bottom + 3 + form_hint_h(f->hint, body.right - body.left)),
+                          rf(body.left, box.bottom + FORM_HINT_GAP, body.right, drawn_bot),
                           i == g_form_err_field ? OC_COL_DANGER : OC_COL_FAINT);
+            }
         }
+        g_form_row_top[i] = y;
+        g_form_row_bot[i] = drawn_bot;
         y += rh;
     }
     /* Where the rows are, when there are more than fit: a thin bar on the
@@ -17634,13 +17923,17 @@ static void close_overlays(void);                /* fwd */
  * judge a theme from a label — but it reverts with the rest on Cancel. */
 static struct {
     int theme, time24, members, daysep, notify;
-    int accent, textsize, density;
+    int accent, textsize, density, font;
     unsigned dpi;
     char quick[160];
     int  richtext;
+    int  enter_newline;
     int  emoticons;
     int  flash;
     int  toastpos;
+    oc_spoken_opts spoken;
+    int  announce_new;
+    int  motion;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17653,9 +17946,14 @@ static void prefs_snapshot(void) {
     g_prefs_snap.toastpos = g_pref_toastpos;
     g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
+    g_prefs_snap.font     = g_pref_font;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
+    g_prefs_snap.enter_newline = g_pref_enter_newline;
     g_prefs_snap.emoticons = g_pref_emoticons;
+    g_prefs_snap.spoken   = g_pref_spoken;
+    g_prefs_snap.announce_new = g_pref_announce_new;
+    g_prefs_snap.motion   = g_pref_motion;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -17679,15 +17977,20 @@ static void prefs_restore(void) {
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
+    g_pref_enter_newline = g_prefs_snap.enter_newline;
     g_pref_emoticons = g_prefs_snap.emoticons;
+    g_pref_spoken = g_prefs_snap.spoken;
+    g_pref_announce_new = g_prefs_snap.announce_new;
+    g_pref_motion = g_prefs_snap.motion;
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
      * through the one path that knows that — and only when they actually moved. */
     if (g_dpi != g_prefs_snap.dpi) dpi_set(g_main, g_prefs_snap.dpi);
-    if (g_pref_textsize != g_prefs_snap.textsize) {
+    if (g_pref_textsize != g_prefs_snap.textsize || g_pref_font != g_prefs_snap.font) {
         g_pref_textsize = g_prefs_snap.textsize;
+        g_pref_font     = g_prefs_snap.font;
         scale_apply(g_main);
     }
 }
@@ -19602,6 +19905,24 @@ static int form_field_is_drawn(int i) {
 /* Tab and Shift+Tab across every stop in the form: each field, plus the action
  * button beside one of them. Text fields take focus through focus_set; checks,
  * choices and selects hold it here, which is what makes them reachable at all. */
+/* Scroll the form so row `i` is in view, in the body last drawn. A text field
+ * in a row out of sight is hidden, and focus_set refuses a hidden field: Tab
+ * onto one dropped the keyboard instead of moving it, and the rows never
+ * scrolled to it. So the row is brought into view first, as draw_form's
+ * keep-in-view rule would, and its field shown; the next paint places it. */
+static void form_scroll_to_row(int i) {
+    float w = g_form_body.right - g_form_body.left, view = g_form_body.bottom - g_form_body.top;
+    if (i < 0 || i >= g_form_n || w <= 0 || view <= 0) return;
+    float tops[FORM_MAX_FIELDS];
+    float total = form_row_tops(w, tops);
+    float max = total > view ? total - view : 0;
+    float rb = (i + 1 < g_form_n ? tops[i + 1] : total);
+    if (tops[i] - 4 < g_form_scroll) g_form_scroll = tops[i] - 4;
+    else if (rb > g_form_scroll + view) g_form_scroll = rb - view;
+    if (g_form_scroll > max) g_form_scroll = max;
+    if (g_form_scroll < 0) g_form_scroll = 0;
+}
+
 static void form_focus_step(oc_win *owner, int dir) {
     (void)owner;
     if (!g_form_open || g_form_n <= 0) return;
@@ -19627,6 +19948,8 @@ static void form_focus_step(oc_win *owner, int dir) {
         }
         if (g_form_edit[at]) {
             g_form_focus = -1;
+            form_scroll_to_row(at);
+            field_show(g_form_edit[at], 1);
             focus_set(g_form_edit[at]);
             field_select_all(g_form_edit[at]);
             return;
@@ -21890,7 +22213,7 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
         fill(rt, rf(x0 + wa, box.top + UIS(6), x0 + wb, box.bottom - UIS(6)), OC_COL_SELECT);
     }
     if (t->len) draw_text(rt, t->buf, fmt, rf(x0, box.top, box.right - UIS(12), box.bottom), ink);
-    if (focused && ((now_ms() - g_tgt_blink) / 530) % 2 == 0) {
+    if (focused && oc_motion_caret_lit(now_ms(), g_tgt_blink, motion_reduced())) {   /* steady when reduced */
         memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
         float wc = text_width(tmp, fmt);
         gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
@@ -22227,9 +22550,22 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
             float h = box.bottom - box.top;
             if (cr.y + cr.h - f->scroll > h) f->scroll = cr.y + cr.h - h;
             if (cr.y - f->scroll < 0) f->scroll = cr.y;
-            if (f->scroll < 0) f->scroll = 0;
             st_metrics m; st_layout_metrics(l, &m);
+            /* Never scrolled past the text: a field that was shorter when it
+             * last scrolled (a form's first paint, before its fields are sized
+             * to their lines) and has grown shows its text from the top again. */
+            float over = m.h - h;
+            if (f->scroll > over) f->scroll = over;
+            if (f->scroll < 0) f->scroll = 0;
             f->lines = m.lines < 1 ? 1 : m.lines;
+            /* Never scrolled past what the text can fill: a scroll set while
+             * the box was shorter must not outlive it, or a box that now holds
+             * all the text hides its first lines above empty space. The caret's
+             * bottom counts as the text's end where it sits below the laid-out
+             * text (an empty last line), so it stays in view. */
+            float end = cr.y + cr.h > m.h ? cr.y + cr.h : m.h;
+            float most = end - h > 0 ? end - h : 0;
+            if (f->scroll > most) f->scroll = most;
         }
     }
     gfx_clip_push(rt, gr(box));
@@ -22259,15 +22595,22 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
             fill(rt, rf(cb.left, cb.top + cr.h - 1, cb.left + cw, cb.top + cr.h), ink);
         }
     }
-    if (focused && l && ((now_ms() - f->blink) / 530) % 2 == 0) {
+    if (focused && l && oc_motion_caret_lit(now_ms(), f->blink, motion_reduced())) {   /* steady when reduced */
         st_rect cr = fld_caret_rect(f, l, f->caret);
         float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
         gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(cx, oy + cr.y + 1, cx + 1.0f, oy + cr.y + cr.h - 1), OC_COL_TEXT);
         gfx_tag(rt, NULL);
-        /* Where an IME should put its candidates (and what a magnifier follows). */
+    }
+    /* Where an IME should put its candidates, and the system caret screen
+     * readers and magnifiers follow (REQ-269, ARCH-99): every frame the field
+     * has focus, not only in the blink's lit phase, or the system caret would
+     * come and go with it. */
+    if (focused && l) {
+        st_rect cr = fld_caret_rect(f, l, f->caret);
+        float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
         SDL_Rect area = { PX(cx), PX(oy + cr.y), 1, PX(cr.h) };
-        oc_plat_text_input_area(g_win, &area);
+        caret_place(area);
     }
     gfx_clip_pop(rt);
     if (l) st_layout_destroy(l);
@@ -27333,38 +27676,53 @@ static int ed_lines(float w) {
 
 /* The caret's rect, in the coordinate space of `box`. */
 /* ---- the system caret (REQ-269, ARCH-99) ----------------------------------
- * A self-drawn text field still has to tell Windows where the caret is. The
- * system caret is what screen readers and magnifiers track, and what a
- * `WM_GETOBJECT`-less app has never had here. ed_caret_sync tells the platform
- * through oc_plat_text_input_area; `g_caret_owned` and `g_caret_at` are our own
- * record of having done so and where, so an unchanged caret is not re-sent. */
+ * A self-drawn text field still has to give the platform a caret where it
+ * draws one. The system caret is what screen readers and magnifiers track;
+ * without it they cannot follow typing at all. caret_place tells the platform
+ * twice over, with the same rect: oc_plat_text_input_area (where an IME puts
+ * its candidates) and oc_plat_text_caret (the system caret, created and moved
+ * but never shown -- the drawn caret is the one people see). The composer
+ * comes through ed_caret_sync, every other drawn field through field_draw.
+ * `g_caret_owned`, `g_caret_at` and `g_caret_h` are our own record of having
+ * done so and where, so an unchanged caret is not re-sent; the dump reports
+ * it beside what the platform says it has (oc_plat_text_caret_at). */
 /* g_caret_placed (declared above, with the paint pass that clears it): a caret
  * nobody placed this frame belongs to a field that is no longer on screen, and
  * ed_caret_kill forgets it -- otherwise it would stay wherever it was last put.
  * That is the bar once left sitting at the bottom of the Drafts pane. */
 static int    g_caret_owned;
 static ipoint g_caret_at = { -32768, -32768 };
+static int    g_caret_h;
 
 static void ed_caret_kill(void) {
     if (!g_caret_owned) return;
     g_caret_owned = 0;
     g_caret_at.x = g_caret_at.y = -32768;
+    g_caret_h = 0;
+    oc_plat_text_caret(g_win, NULL);
 }
 
-/* `cr` is the caret rect in DIPs, as the field draws it. Told to the platform
- * as the text input area: what an IME puts its candidates by and what a
- * magnifier follows. */
-static void ed_caret_sync(rectf cr) {
-    if (!ed_focused()) { ed_caret_kill(); return; }
+/* `area` is the caret in window pixels, as a field draws it. Placed this
+ * frame, so the paint pass keeps it; re-sent only when it moved or changed
+ * height. */
+static void caret_place(SDL_Rect area) {
     g_caret_placed = 1;
-    int h = PX(cr.bottom - cr.top);
-    if (h < 1) h = 1;
+    if (area.h < 1) area.h = 1;
     g_caret_owned = 1;
-    ipoint p = { PX(cr.left), PX(cr.top) };
-    if (p.x == g_caret_at.x && p.y == g_caret_at.y) return;   /* no event churn */
-    g_caret_at = p;
-    SDL_Rect area = { p.x, p.y, 1, h };
+    if (area.x == g_caret_at.x && area.y == g_caret_at.y && area.h == g_caret_h)
+        return;   /* no event churn */
+    g_caret_at.x = area.x; g_caret_at.y = area.y; g_caret_h = area.h;
     oc_plat_text_input_area(g_win, &area);
+    oc_plat_text_caret(g_win, &area);
+}
+
+/* `cr` is the composer's caret rect in DIPs, as it draws it. Not focused, it
+ * places nothing: another drawn field may hold the caret this frame, and a
+ * caret nobody placed is removed at the end of the paint (g_caret_placed). */
+static void ed_caret_sync(rectf cr) {
+    if (!ed_focused()) return;
+    SDL_Rect area = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
+    caret_place(area);
 }
 
 static int ed_caret_rect(rectf box, rectf *out) {
@@ -28450,6 +28808,8 @@ static rectf te_control_rect(uint64_t a) {
 
 static void composer_send(void);            /* fwd */
 static void composer_cancel_edit(void);     /* fwd */
+static void composer_begin_edit(const oc_msg *msg);   /* fwd */
+static const oc_msg *newest_editable(const oc_model *m);   /* fwd: Up in an empty box edits it */
 static int  composer_remeasure(void);       /* fwd */
 static void ac_rebuild(void);               /* fwd */
 static void ac_close(void);                 /* fwd */
@@ -28675,7 +29035,9 @@ static int ed_key(oc_win *hwnd, int vk) {
     }
     if (!g_ed_focus) return 0;
     /* Previewing: Enter sends what is shown, Esc goes back to editing it, and
-     * nothing edits the hidden field -- not a key, not a paste. */
+     * nothing edits the hidden field -- not a key, not a paste. Enter and
+     * Ctrl+Enter both send, whichever key the Enter preference makes the
+     * sending one: there is no line to start here. */
     if (g_preview && g_view != VIEW_NEWMSG) {
         if (vk == OCK_RETURN && !mod_down(OCK_SHIFT)) { composer_send(); invalidate(); return 1; }
         if (vk == OCK_ESCAPE) { preview_set(hwnd, 0); return 1; }
@@ -28702,6 +29064,15 @@ static int ed_key(oc_win *hwnd, int vk) {
             g_ac_sel = (g_ac_sel + (vk == OCK_DOWN ? 1 : g_n_ac - 1)) % g_n_ac;
             invalidate();
             return 1;
+        }
+        /* Up with no modifier in an empty box opens your newest message for
+         * editing, as its Edit does -- the habit of fixing what you just sent.
+         * Empty means nothing at all waits here: no text, no composition, no
+         * files, no edit already open. Otherwise Up moves the caret. */
+        if (vk == OCK_UP && !ctrl && !shift && !mod_down(OCK_ALT) && !g_edit_msg &&
+            g_view != VIEW_NEWMSG && ed_len() == 0 && !g_ed_comp_len && !ftray_waiting()) {
+            const oc_msg *em = newest_editable(model());
+            if (em) { composer_begin_edit(em); invalidate(); return 1; }
         }
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
          * "the line above" is a question only the sdltext layout can answer. */
@@ -28758,7 +29129,11 @@ static int ed_key(oc_win *hwnd, int vk) {
         /* The completion popover claims Enter first — that is what makes Tab and
          * Enter interchangeable for accepting one. */
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
-        if (shift) { ed_newline(); changed = 1; break; }
+        /* Shift+Enter is always a new line and Ctrl+Enter always sends; plain
+         * Enter does what the Messages preference says (g_pref_enter_newline).
+         * Editing a sent message saves the way a new one sends: composer_send
+         * is both. */
+        if (shift || (!ctrl && g_pref_enter_newline)) { ed_newline(); changed = 1; break; }
         /* In the New message pane the message goes where the pane says it goes.
          * composer_send() posts to g_sel -- the channel that was open before --
          * so Enter used to file a private message into the last room you read. */
@@ -28939,10 +29314,7 @@ static int ed_select_word(oc_win *hwnd, float x, float y) {
 static void ed_ime_place(oc_win *hwnd) {
     (void)hwnd;
     rectf cr;
-    if (ed_caret_rect(g_ed_box, &cr)) {
-        SDL_Rect a = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
-        oc_plat_text_input_area(g_win, &a);
-    }
+    if (ed_caret_rect(g_ed_box, &cr)) ed_caret_sync(cr);
 }
 
 /* An IME composition in progress (SDL_EVENT_TEXT_EDITING): `comp` is the text
@@ -29053,11 +29425,12 @@ static void ed_draw(gfx *rt, rectf box) {
     }
 
     /* The caret: 530ms phases, and it does not blink while typing (ed_changed
-     * resets the phase) because a caret that vanishes mid-keystroke reads as lag. */
+     * resets the phase) because a caret that vanishes mid-keystroke reads as lag.
+     * With motion reduced it does not blink at all: lit while the box has focus. */
     if (ed_focused()) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
-            ((now_ms() - g_ed_blink) / 530) % 2 == 0) {
+            oc_motion_caret_lit(now_ms(), g_ed_blink, motion_reduced())) {
             /* Declared transient for the audit: this bar is present in half the
              * frames by design, so any check that asserts two frames are equal
              * has to know not to compare it. Without the tag the consistency
@@ -29415,15 +29788,11 @@ static void a11y_publish_scene(const oc_model *m) {
         const char *who = msg->author_name[0] ? msg->author_name
                                               : oc_model_user_name(m, msg->author_id);
         char when[24]; rel_time(msg->server_time, when, sizeof when);
-        if (msg->deleted)
-            snprintf(it->name, sizeof it->name, "%s, %s, message deleted",
-                     who ? who : "someone", when);
-        else {
-            char said[1024];   /* an action is read as "<name> <text>" (REQ-058) */
-            oc_model_msg_preview(m, msg, said, sizeof said);
-            snprintf(it->name, sizeof it->name, "%s, %s: %s",
-                     who ? who : "someone", when, said);
-        }
+        /* Read the way the person chose (Preferences > Accessibility). */
+        char said[1024] = "";   /* an action is read as "<name> <text>" (REQ-058) */
+        if (!msg->deleted) oc_model_msg_preview(m, msg, said, sizeof said);
+        oc_spoken_msg(&g_pref_spoken, who, when, said, msg->reactions, msg->n_reactions,
+                      msg->reply_count, msg->deleted, it->name, sizeof it->name);
     }
 
     /* The tables in those messages (MARKDOWN.md §1a): the grid, named for its
@@ -30256,7 +30625,7 @@ modal_items:
             for (int i = 0; i < PC_COUNT && n < OC_ACC_MAX; i++)
                 if (g_pref_cats[i].right > g_pref_cats[i].left) {
                     static const char *const CATAID[PC_COUNT] = { "appearance", "messages", "notifications",
-                                                                  "system", "aiclients" };
+                                                                  "system", "aiclients", "accessibility" };
                     char aid[OC_ACC_AID_MAX];
                     snprintf(aid, sizeof aid, "prefs.cat.%s", CATAID[i]);
                     acc_push(items, &n, OC_ACC_BUTTON, aid, PC_NAME[i], g_pref_cats[i], ATOK(AT_PREFCAT, (uint64_t)i));
@@ -30611,7 +30980,9 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
 }
 
 
-/* The composer's keys (ed_key): Enter sends, Shift+Enter inserts a newline.
+/* The composer's keys (ed_key): Enter sends and Shift+Enter inserts a newline,
+ * or, with the Enter preference set to a new line, Enter inserts one and
+ * Ctrl+Enter sends.
  * While the autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
@@ -32942,6 +33313,33 @@ static void upload_file(oc_win *hwnd) {
     for (int i = 0; i < n; i++, p += strlen(p) + 1) ftray_add(hwnd, p);
 }
 
+/* Whether a message may be edited from here, the one test both the message
+ * menu's Edit and Up in an empty message box ask: your own, not deleted, not a
+ * poll (it has Edit poll) or a to-do list (a list is not edited), inside the
+ * workspace's edit window (REQ-051), and not in an ended encrypted DM, which
+ * stands as it is. */
+static int msg_may_edit(const oc_model *m, const oc_msg *msg) {
+    if (!m || !msg || msg->author_id != m->user_id) return 0;
+    if (msg->deleted || msg->poll || msg->todo || conv_e2e_locked()) return 0;
+    return oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
+}
+
+/* Your newest message that may be edited, where the message box posts: the open
+ * thread's replies while one is open, the conversation's messages otherwise.
+ * NULL when there is none. */
+static const oc_msg *newest_editable(const oc_model *m) {
+    if (!m) return NULL;
+    if (m->thread_open) {
+        for (size_t i = m->n_thread_msgs; i > 0; i--)
+            if (msg_may_edit(m, &m->thread_msgs[i - 1])) return &m->thread_msgs[i - 1];
+        return NULL;
+    }
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    for (size_t i = c ? c->n_msgs : 0; i > 0; i--)
+        if (msg_may_edit(m, &c->msgs[i - 1])) return &c->msgs[i - 1];
+    return NULL;
+}
+
 /* The message context menu. Built into the app's own floating menu — see
  * the MENU_* comment for why it stopped being a TrackPopupMenu.
  *
@@ -33049,7 +33447,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     int may_edit = own && oc_model_may_change_own(m, msg->server_time, 1, wall_ms());
     int may_del = own ? oc_model_may_change_own(m, msg->server_time, 0, wall_ms()) : canmod;
     if ((may_edit || may_del || (own && msg->poll)) && !msg->deleted && !locked) mi_sep();
-    if (may_edit && !msg->deleted && !locked && !msg->todo) mi_item(21, "Edit");   /* a list is not edited */
+    if (msg_may_edit(m, msg)) mi_item(21, "Edit");
     if (own && msg->poll && !msg->deleted && !locked) mi_item(108, "Edit poll");   /* REQ-225 */
     if (may_del && !msg->deleted && !locked) mi_item_d(22, "Delete");
     /* Move (REQ-053): an author's own, or anything for an admin or owner, out
@@ -33239,6 +33637,9 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
                       : "Unblocked.");
     } else if (cmd == 21) {
         composer_begin_edit(msg);
+        /* The keyboard goes where the typing goes: off the message, so the
+         * letters of the edit are not taken as its single keys (kb_msg_key). */
+        g_kb_mid = 0;
     } else if (cmd == 108) {
         poll_compose_open(hwnd, chan, mid);
     } else if (cmd == 22) {
@@ -33249,6 +33650,7 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         fb_undo("Message deleted.", FBA_UNDO_DELETE);
     } else if (cmd == 100) {
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
+        g_kb_mid = 0;                    /* ...and the keyboard to the reply, as for Edit */
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
     } else if (cmd == 105) {
@@ -34683,10 +35085,15 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
                 if (composer_remeasure()) layout_composer(hwnd);
                 break;
+            case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
             case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
+            case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
+            case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
+                spoken_pref_set(g_pref_hits[i].row, v);
+                break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
             case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
             case PREF_ROW_CLOSE:   g_pref_close = v; break;
@@ -34700,8 +35107,10 @@ static int on_click(oc_win *hwnd, int x, int y) {
              * label — and reverts with everything else on Cancel. */
             case PREF_ROW_ACCENT:   scheme_set(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
+            case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
+            case PREF_ROW_MOTION:   g_pref_motion = v; break;
             case PREF_ROW_RESET:
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
@@ -34709,8 +35118,10 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 scheme_set(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
+                g_pref_motion = OC_MOTION_SYSTEM;
                 g_pref_flash = FLASH_IDLE;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
+                g_pref_font = OC_TYPEFACE_DEFAULT;
                 snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
                 quick_rebuild();
                 scale_apply(hwnd);
@@ -37103,7 +37514,7 @@ static void boot_other_workspaces(const char *skip) {
         if (ws_find(b.ws[i]) >= 0) continue;
         if (!have_stored_token(b.ws[i])) continue;
         ws_save_active();
-        g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_n_backfilled = 0;
+        g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_n_backfilled = 0;
         connect_start(b.ws[i], "");
     }
     free(b.ws);
@@ -37139,7 +37550,7 @@ static void reset_session(void) {
         oc_client_stop(g_client);
         g_client = NULL;
     }
-    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE; submenu_close();
     g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
@@ -37490,7 +37901,7 @@ static void signin_poll(oc_win *hwnd) {
          * previous workspace stay live and visible throughout. */
         ws_save_active();
         g_client = g_si_client; g_si_client = NULL;
-        g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+        g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
         g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
         g_si_overlay = 0;
         g_si_connecting = 0;
@@ -37851,7 +38262,7 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
     ws_save_active();          /* keep the current one running */
     close_overlays();
     g_client = NULL;           /* not a stop: the old client lives on in its slot */
-    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
     g_view = VIEW_HOME;
     if (!connect_start(ws, cred ? cred : "")) {
@@ -38148,6 +38559,7 @@ static void open_new_menu(oc_win *hwnd) {
  * so a terminal and a window can keep different sidebar shapes. */
 static void prefs_save(void) {
     if (!g_client) return;
+    if (!g_prefs_read) { g_prefs_save_held = 1; return; }
     char enc[448];   /* within OC_SETTING_VALUE_MAX; the quick reactions alone may take 160 */
     /* Zoom is deliberately absent: it is per window and transient (ARCH-97), so
      * persisting it would make one window's temporary magnification follow the
@@ -38176,6 +38588,20 @@ static void prefs_save(void) {
         /* ...and when the missed calls were last seen (CALLS.md §2). */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";b:%llu;S:%d", (unsigned long long)g_calls_seen_ms, g_selfview);
+        /* ...and what Enter does in the composer. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";N:%d", g_pref_enter_newline);
+        /* ...and what a message says to a screen reader: its parts as bits
+         * (oc_spoken_bits), and whether arrivals are announced. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";R:%u;A:%d", oc_spoken_bits(&g_pref_spoken),
+                 g_pref_announce_new);
+        /* ...and the interface font (ARCH-97). */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";F:%d", g_pref_font);
+        /* ...and Reduce motion: Off, On or Follow system. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";M:%d", g_pref_motion);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38187,6 +38613,12 @@ static void prefs_load(const oc_model *m) {
     const char *v = m ? oc_model_setting(m, PREFS_SETTING_KEY) : NULL;
     if (!v || !v[0]) return;
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
+    int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
+    int mo = OC_MOTION_SYSTEM;   /* no `M:`: follow the system */
+    /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
+    oc_spoken_opts spk = oc_spoken_defaults();
+    int an = 1;
+    int font = OC_TYPEFACE_DEFAULT;   /* no `F:`: the default font */
     /* Tolerant of missing keys and of any order, so a value written by a newer
      * build with extra fields still loads what this one understands. */
     for (const char *p = v; *p; ) {
@@ -38226,6 +38658,11 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'j') g_cam_h = (uint32_t)strtoul(p + 2, NULL, 10);
             else if (k == 'l') g_call_layout = val ? 1 : 0;
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
+            else if (k == 'N') nl = val ? 1 : 0;
+            else if (k == 'M') mo = (val < 0 || val >= OC_MOTION_PREF_COUNT) ? OC_MOTION_SYSTEM : val;
+            else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
+            else if (k == 'A') an = val ? 1 : 0;
+            else if (k == 'F') font = (val < 0 || val >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : val;
             else if (k == 'b') {
                 /* The missed calls already seen, and the history asked for, so
                  * those missed while away are marked. */
@@ -38247,6 +38684,11 @@ static void prefs_load(const oc_model *m) {
     g_pref_time24  = h ? 1 : 0;
     g_pref_members = mm ? 1 : 0;
     g_pref_daysep  = d ? 1 : 0;
+    g_pref_enter_newline = nl;
+    g_pref_motion = mo;
+    g_pref_spoken = spk;
+    g_pref_announce_new = an;
+    g_pref_font = font;
     g_show_members = g_pref_members;
     theme_set(t);
     /* After theme_set: the accent pair is resolved per mode, so the mode has to be
@@ -40306,11 +40748,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
     case 89: g_whatsnew = 0; modal_enter(hwnd, &g_about_open); break;
     case ABOUT_CMD_WHATSNEW:
-        /* This build's notes, asked of the control plane by its build id; a
-         * source build is not a release and is not asked about. */
+        /* This build's notes, asked of the workspace's daemon by its build id,
+         * which asks central (PROTOCOL.md §5.16r); a source build is not a
+         * release and is not asked about. */
         g_whatsnew = 1;
         if (!oc_releasenotes_askable(OC_BUILD_ID)) g_wn_state = WN_NOTRELEASE;
-        else { g_wn_state = WN_LOADING; oc_plat_releasenotes_start(OC_BUILD_ID); }
+        else if (!g_client) g_wn_state = WN_FAILED;
+        else { g_wn_state = WN_LOADING; oc_client_get_release_notes(g_client, OC_BUILD_ID); }
         if (!g_about_open) modal_enter(hwnd, &g_about_open);
         invalidate();
         break;
@@ -40719,6 +41163,56 @@ static void kb_context_menu(oc_win *hwnd) {
     menu_move(1);
 }
 
+/* Single keys on the message the keyboard is on: a letter, the message-menu
+ * command it runs. `e`, `r` and `t` are the terminal client's letters for the
+ * same actions, and `m` is Remind me in both. Upper case is the same key. */
+static const struct { int key; int cmd; } KB_MSG_KEYS[] = {
+    { 'E', 21 },    /* Edit */
+    { 'R', 7 },     /* More reactions: the emoji picker */
+    { 'T', 100 },   /* Open thread / Reply in thread */
+    { 'P', 103 },   /* Pin to channel / Unpin from channel */
+    { 'F', 106 },   /* Forward */
+    { 'S', 104 },   /* Save for later */
+    { 'U', 107 },   /* Unread from here */
+    { 'M', 114 },   /* Remind me... / Reminder... */
+    { 'L', 105 },   /* Copy link */
+};
+
+static int kb_msg_cmd(int key) {
+    for (size_t i = 0; i < sizeof KB_MSG_KEYS / sizeof KB_MSG_KEYS[0]; i++)
+        if (KB_MSG_KEYS[i].key == key) return KB_MSG_KEYS[i].cmd;
+    return 0;
+}
+
+/* Run a single key's command on the focused message, exactly as its menu item
+ * would run. The menu is BUILT (show_msg_menu, anchored where Shift+F10 opens
+ * it) and the command looked up among its items, so a key does only what the
+ * menu offers for this message -- no Edit on someone else's, no Pin in an
+ * encrypted conversation -- and the two cannot drift apart. Built, not shown:
+ * it is closed again before anything is drawn, unless the item opens a menu of
+ * its own (Remind me), which then has its first choice highlighted, as Shift+F10
+ * leaves its menu. A key whose item is not offered does nothing. */
+static void kb_msg_key(oc_win *hwnd, int key) {
+    const oc_model *m = model();
+    int cmd = kb_msg_cmd(key);
+    g_kb_ran = 0;
+    if (!m || !cmd || !g_kb_mid) return;
+    int row = -1;
+    for (int i = 0; i < g_n_msgrows; i++)
+        if (g_msgrows[i].mid == g_kb_mid) { row = i; break; }
+    if (row < 0) return;
+    show_msg_menu(hwnd, m, g_kb_mid, g_msgrows[row].left + UIS(60), g_msgrows[row].top + UIS(20));
+    if (g_menu != MENU_MSG) return;
+    int offered = 0;
+    for (int i = 0; i < g_n_mi; i++)
+        if (g_mi[i].kind == MK_ITEM && g_mi[i].cmd == cmd) { offered = 1; break; }
+    g_menu = MENU_NONE; g_menu_hover = -1;
+    if (!offered) return;
+    g_kb_ran = cmd;
+    msg_menu_run(hwnd, cmd);
+    if (g_menu) menu_move(1);            /* Remind me's choices, ready for Enter */
+}
+
 static void channel_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     uint64_t cid = g_menu_target;
@@ -41006,6 +41500,27 @@ static void test_dump_a11y(FILE *f) {
         fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
                 a->l, a->t, a->r, a->b);
     }
+    /* What each message on the transcript says to a screen reader, under the
+     * person's settings (Preferences > Accessibility): one line each, a line
+     * break in it read as a space. */
+    for (int i = 0; i < g_a11y_n; i++) {
+        const oc_acc_item *a = &g_acc_items[i];
+        if (a->kind != OC_ACC_MESSAGE) continue;
+        fprintf(f, "a11yname %s \"", a->aid[0] ? a->aid : "-");
+        for (const char *q = a->name; *q; q++) fputc(*q == '\n' || *q == '\r' ? ' ' : *q, f);
+        fprintf(f, "\"\n");
+    }
+}
+
+/* Whether the caret of the field with the keys is lit now (Reduce motion):
+ * the message box, New message's To: box, or a drawn field; 0 with none. */
+static int caret_lit_now(void) {
+    const int red = motion_reduced();
+    const uint64_t now = now_ms();
+    if (ed_focused()) return oc_motion_caret_lit(now, g_ed_blink, red);
+    if (g_view == VIEW_NEWMSG && g_nm_to_focus) return oc_motion_caret_lit(now, g_tgt_blink, red);
+    if (g_focus) return oc_motion_caret_lit(now, g_focus->blink, red);
+    return 0;
 }
 
 static void test_dump(const char *path) {
@@ -41060,11 +41575,26 @@ static void test_dump(const char *path) {
             m->unresolved.can_add, m->unresolved.is_private, m->unresolved.names);
     fprintf(f, "a11y avail=%d items=%d announced=%u\n",
             oc_a11y_available(), g_a11y_n, oc_a11y_announced());
+    /* What a message says to a screen reader, as chosen (REQ-269). */
+    fprintf(f, "spoken sender=%d time=%d reactions=%d replies=%d text_first=%d announce_new=%d\n",
+            g_pref_spoken.sender, g_pref_spoken.time, g_pref_spoken.reactions,
+            g_pref_spoken.replies, g_pref_spoken.text_first, g_pref_announce_new);
+    /* Reduce motion (REQ-269): the preference (0 Off, 1 On, 2 Follow system),
+     * the system's answer as the client takes it (`sysmotion` included), the
+     * setting in force, and whether the focused field's caret is lit now. */
+    fprintf(f, "motion pref=%d sys=%d reduced=%d caretlit=%d\n",
+            g_pref_motion, motion_sys(), motion_reduced(), caret_lit_now());
     /* The system caret (ARCH-99). Reported because it is invisible by design —
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
     {
-        fprintf(f, "caret owned=%d x=%ld y=%ld\n", g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y);
+        /* `sys=` and after: what the platform says it has, read back from it
+         * (on Windows, the thread's caret), not our record of having asked. */
+        SDL_Rect sr = { 0, 0, 0, 0 };
+        int sys = oc_plat_text_caret_at(g_win, &sr);
+        fprintf(f, "caret owned=%d x=%ld y=%ld sys=%d sx=%d sy=%d sh=%d\n",
+                g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y,
+                sys, sys ? sr.x : 0, sys ? sr.y : 0, sys ? sr.h : 0);
     }
     /* The last error the core reported, and its monotonic sequence. Without this
      * a failed intent is indistinguishable from an intent that was never sent —
@@ -41703,18 +42233,26 @@ static void test_dump(const char *path) {
                 g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
                 g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
     /* The members pane's rows, so a row can be pointed at by who it is. */
+    static const char *const PMARK_NAME[OC_PMARK_COUNT] = {
+        [OC_PMARK_ONLINE] = "online", [OC_PMARK_AWAY] = "away",
+        [OC_PMARK_OFFLINE] = "offline", [OC_PMARK_DND] = "dnd" };
     /* The roster, and how far through it the pane is looking: rows= is what is
      * DRAWN, n= what the channel has, so a harness can tell "the rest is below"
      * from "the rest is not there". */
     fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
             m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f via=%d agent=%d\n",
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f mark=%s via=%d agent=%d\n",
                 (unsigned long long)g_memrows[i].uid,
                 g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
                 m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
                     ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
                 g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
+                /* The shape the row's dot is drawn as (REQ-122), from the same
+                 * oc_presence_mark() the drawing asks. */
+                PMARK_NAME[m ? oc_presence_mark(oc_model_presence_of(m, g_memrows[i].uid),
+                                                oc_model_dnd_of(m, g_memrows[i].uid))
+                             : OC_PMARK_OFFLINE],
                 g_memrows[i].via, m ? oc_model_user_is_agent(m, g_memrows[i].uid) : 0);
     /* Agents (docs/details/MCP.md §7): the members pane's label over its
      * agents, and the tags each surface drew in the last frame. */
@@ -41809,10 +42347,16 @@ static void test_dump(const char *path) {
      * another one silently matched twice in the smoke's extractor and produced a
      * two-line "expected" value. Names in this dump are read by grep, so they have to
      * be unambiguous to grep. */
+    /* The interface font: the family asked for (`fontpick`), the one the formats
+     * were built with (`fontfam`), whether the first is missing, and the figures
+     * the pins were derived from (0 = unreadable, Segoe UI's used). */
     fprintf(f, "textsize=%d scale=%.3f dpi=%u density=%d "
-               "scheme=%d railcol=%06X accentcol=%06X\n",
+               "scheme=%d railcol=%06X accentcol=%06X "
+               "font=%d fontpick=\"%s\" fontfam=\"%s\" fontmissing=%d fontasc=%.4f fontcap=%.4f\n",
             g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
-            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
+            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT,
+            g_pref_font, ui_family_asked(), ui_family(), g_font_missing,
+            (double)g_font_asc, (double)g_font_cap);
     /* THE WHOLE PALETTE, by token name. The audit asks two questions this
      * answers and nothing else can: is a colour on screen one the theme
      * actually names (a literal that resolves to no token is a surface that
@@ -41879,11 +42423,12 @@ static void test_dump(const char *path) {
          * a box sized for fewer lines than its text has clips the text. */
         float box_w = g_ed_box.right - g_ed_box.left;
         fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d composer_h=%.0f"
-                   " lines=%d fit_lines=%d text=\"%s\"\n",
+                   " lines=%d fit_lines=%d edit=%llu text=\"%s\"\n",
                 ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
                 g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
-                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0, ed8);
+                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0,
+                (unsigned long long)g_edit_msg, ed8);
         /* The composer's Preview: whether it is shown, what the renderer made of
          * the draft, and where its button is. */
         /* frames: what this process has written, which previewing must not move.
@@ -41894,6 +42439,10 @@ static void test_dump(const char *path) {
                 !g_draft_dirty ? 0 : now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS ? 2 : 1,
                 g_preview_h, g_preview_lines, g_preview_tabs,
                 g_preview_btn.left, g_preview_btn.top, g_preview_btn.right, g_preview_btn.bottom);
+        /* What Enter does in the composer, and the key the shortcuts sheet
+         * names for sending. */
+        fprintf(f, "compose enter=%s send_key=\"%s\"\n",
+                g_pref_enter_newline ? "newline" : "send", compose_key_label(1));
     }
     /* The About tab's admin buttons, so a test can click the one it means rather
      * than arithmetic that breaks the next time a button is added between them —
@@ -42021,10 +42570,20 @@ static void test_dump(const char *path) {
             float lh = g_meta_w && g_meta_w->f ? st_line_height(g_st, g_meta_w->f) : UIS(18.0f);
             fprintf(f, "  formlines %d lines=%d shown=%d first=%d\n", i,
                     g_form_edit[i]->lines,
-                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 10) / (lh > 0 ? lh : 1)),
+                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 2 * FORM_BOX_PAD_Y) / (lh > 0 ? lh : 1)),
                     (int)(g_form_edit[i]->scroll / (lh > 0 ? lh : 1)));
         }
     }
+    /* The rows against the body they scroll in: each row's drawn extent beside
+     * the height form_rowh gives it, so "measured as drawn" is checkable, and
+     * the scroll, so a row left undrawn is seen to be reachable. Unrounded: a
+     * pixel's rounding is the size of what is being checked. */
+    fprintf(f, "formscroll scroll=%.2f max=%.2f body=%.2f,%.2f,%.2f,%.2f\n",
+            g_form_open ? g_form_scroll : 0, g_form_open ? g_form_scroll_max : 0,
+            g_form_body.left, g_form_body.top, g_form_body.right, g_form_body.bottom);
+    for (int i = 0; i < g_form_n && g_form_f && g_form_open; i++)
+        fprintf(f, "  formrow %d top=%.2f bottom=%.2f h=%.2f\n", i, g_form_row_top[i], g_form_row_bot[i],
+                form_rowh(&g_form_f[i], g_form_body.right - g_form_body.left));
     fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
             g_form_sel_field >= 0, g_form_sel_field, g_form_sel_scroll, g_n_form_sel_rows,
             g_form_sel_panel.left, g_form_sel_panel.top,
@@ -42052,8 +42611,8 @@ static void test_dump(const char *path) {
             fprintf(f, "  statuschip %d r=%.0f,%.0f,%.0f,%.0f\n", k,
                     g_status_chip_hits[k].left, g_status_chip_hits[k].top,
                     g_status_chip_hits[k].right, g_status_chip_hits[k].bottom);
-        fprintf(f, "pickstate open=%d target=%d slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
-                g_pick_open, g_pick_target, g_pick_quick_slot,
+        fprintf(f, "pickstate open=%d target=%d mid=%llu slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
+                g_pick_open, g_pick_target, (unsigned long long)g_pick_mid, g_pick_quick_slot,
                 g_pick_panel.left, g_pick_panel.top,
                 g_pick_panel.right, g_pick_panel.bottom);
         /* The first cells, so a driven pick can click a real one and a
@@ -42582,10 +43141,12 @@ static void test_dump(const char *path) {
     /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
      * be readable for the keyboard route to the context menu to be testable at
      * all (REQ-264). */
-    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d\n",
+    /* ran= is the message-menu command the last key press ran as a single key
+     * (kb_msg_key), 0 when it ran none: each key is tested by what it ran. */
+    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d ran=%d\n",
             (unsigned long long)g_kb_mid, g_menu_hover,
             (g_menu && g_menu_hover >= 0 && g_menu_hover < g_n_mi) ? g_mi[g_menu_hover].cmd : -1,
-            g_sub_hover, g_sub_open);
+            g_sub_hover, g_sub_open, g_kb_ran);
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -42753,6 +43314,7 @@ static void test_dump(const char *path) {
 static void test_poll(oc_win *hwnd);
 /* The hook alone, from inside a native dialog's modal loop (oc_plat_set_modal_tick). */
 static void test_modal_tick(void) { test_poll(g_main); }
+static void on_event(const SDL_Event *e);   /* fwd — the `keychar` verb's events */
 
 static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
@@ -42944,6 +43506,32 @@ static void test_poll(oc_win *hwnd) {
             for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
             test_ack("ok");
         }
+    } else if (!strcmp(verb, "keychar")) {
+        /* One printable key as a person types it: the key going down, the text
+         * the platform sends for that press, and the key coming up, all through
+         * on_event. Only this shows a key a shortcut claims is NOT typed
+         * (g_claimed_text): `key` sends no text and `typekeys` no key. An
+         * upper-case letter is pressed with Shift. */
+        char c = arg[0];
+        if (c > ' ' && c < 0x7f && !arg[1]) {
+            int upper = c >= 'A' && c <= 'Z';
+            SDL_Event e; memset(&e, 0, sizeof e);
+            e.type = SDL_EVENT_KEY_DOWN;
+            e.key.windowID = SDL_GetWindowID(hwnd->sdl);
+            e.key.key = (SDL_Keycode)(upper ? c + 32 : c);
+            e.key.mod = upper ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE;
+            e.key.down = true;
+            on_event(&e);
+            SDL_Event t; memset(&t, 0, sizeof t);
+            t.type = SDL_EVENT_TEXT_INPUT;
+            t.text.windowID = e.key.windowID;
+            t.text.text = arg;
+            on_event(&t);
+            e.type = SDL_EVENT_KEY_UP; e.key.down = false;
+            on_event(&e);
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "dirfind")) {
         /* Drive the People pane's search box (REQ-289). Through the field, so
          * the change hook the user's typing fires is the one under test — the
@@ -43542,6 +44130,35 @@ static void test_poll(oc_win *hwnd) {
         int v = atoi(arg);
         if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "spoken")) {
+        /* `spoken <sender> <time> <reactions> <replies> <text_first>
+         * <announce_new>`, each 0 or 1: Accessibility's six rows, set through
+         * the path their clicks take, and saved as Save saves them. */
+        int v[6];
+        static const int ROWS[6] = { PREF_ROW_SAY_SENDER, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
+                                     PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
+        int ok = sscanf(arg, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6;
+        for (int i = 0; ok && i < 6; i++) if (v[i] != 0 && v[i] != 1) ok = 0;
+        if (ok) {
+            for (int i = 0; i < 6; i++) spoken_pref_set(ROWS[i], v[i]);
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "font")) {
+        /* `font <n>`: the interface font, by its index in the list (ARCH-97),
+         * applied and saved as the Appearance row and Save do. */
+        int v = atoi(arg);
+        if (arg[0] >= '0' && arg[0] <= '9' && v >= 0 && v < OC_TYPEFACE_COUNT) {
+            g_pref_font = v; scale_apply(hwnd); prefs_save(); test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "fontfam")) {
+        /* `fontfam <family>`, test-only: ask for a family by name, outside the
+         * list, so the harness can ask for one no system has and read that it
+         * fell back. Never saved. `fontfam` alone goes back to the preference. */
+        snprintf(g_font_test_family, sizeof g_font_test_family, "%s", arg);
+        scale_apply(hwnd);
+        test_ack("ok");
     } else if (!strcmp(verb, "prefs")) {
         /* `prefs [category]` — the category by INDEX, because the alternative
          * is clicking a row whose y moves with the DPI and the text size, and
@@ -43556,6 +44173,34 @@ static void test_poll(oc_win *hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
+    } else if (!strcmp(verb, "enter")) {
+        /* `enter send|newline`: the Messages preference "When I press Enter",
+         * saved as its row saves it, so a restart can be asked what it kept. */
+        if (!strcmp(arg, "send") || !strcmp(arg, "newline")) {
+            g_pref_enter_newline = !strcmp(arg, "newline");
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "motion")) {
+        /* `motion 0|1|2`: Reduce motion Off, On or Follow system, saved as the
+         * Appearance row and Save save it. */
+        if (arg[0] >= '0' && arg[0] <= '2' && !arg[1]) {
+            g_pref_motion = arg[0] - '0';
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "sysmotion")) {
+        /* `sysmotion 0|1|-1`, test-only: what the client takes the system's
+         * reduce-motion setting to be, so Follow system can be checked both
+         * ways on any machine. -1 goes back to what the system said. Never
+         * saved. */
+        if (!strcmp(arg, "0") || !strcmp(arg, "1") || !strcmp(arg, "-1")) {
+            g_sys_motion_test = atoi(arg);
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "emoji")) {
         picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
         test_ack("ok");
@@ -44703,7 +45348,9 @@ static int on_tick(oc_win *hwnd) {
                      * Muted conversations still say nothing: mute means "do not
                      * interrupt me about this", which is a statement about
                      * attention, not about eyesight. */
-                    if (g_pref_notify != NOTIFY_OFF &&
+                    /* And not at all when the person has turned arrivals off
+                     * (Preferences > Accessibility, "Announce new messages"). */
+                    if (g_pref_notify != NOTIFY_OFF && g_pref_announce_new &&
                         is_active && !c->muted && oc_a11y_available()) {
                         const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
                         /* Not your own — you just sent it, and being read your
@@ -45050,9 +45697,19 @@ static int on_tick(oc_win *hwnd) {
                     if (m->audit[i].at_ms && m->audit[i].at_ms < oldest) oldest = m->audit[i].at_ms;
                 g_audit_oldest = oldest;
             }
-            if (g_prefs_pending && oc_model_setting(m, PREFS_SETTING_KEY)) {
+            /* Once the whole bucket is here: the stored preferences if there
+             * are any, and then a save asked for in the meantime, which now
+             * carries them. */
+            if (g_prefs_pending && m->settings_synced && !oc_model_setting(m, PREFS_SETTING_KEY)) {
+                g_prefs_pending = 0;
+                g_prefs_read = 1;
+                if (g_prefs_save_held) { g_prefs_save_held = 0; prefs_save(); }
+            }
+            if (g_prefs_pending && m->settings_synced && oc_model_setting(m, PREFS_SETTING_KEY)) {
                 prefs_load(m);
                 g_prefs_pending = 0;
+                g_prefs_read = 1;
+                if (g_prefs_save_held) { g_prefs_save_held = 0; prefs_save(); }
                 /* Place the window where it was left. The settings arrive after
                  * auth, so the window is created hidden and shown here — moving
                  * a visible window would flash it at the default size first. */
@@ -45107,6 +45764,7 @@ static int on_tick(oc_win *hwnd) {
                 g_post_auth = 1;
                 g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
                 g_prefs_pending = 1;
+                g_prefs_read = 0;        /* this workspace's are still to come */
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
             /* Sign-out is scoped to ONE workspace, not the app. It used to drop
@@ -45841,8 +46499,12 @@ static int on_key_down(oc_win *hwnd, int wp) {
         if (g_lightbox && (wp == OCK_LEFT || wp == OCK_RIGHT)) { lb_step(wp == OCK_LEFT ? -1 : +1); return 0; }
         if (g_lightbox && wp == OCK_RETURN) { lb_play(hwnd); invalidate(); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
-         * the middle column's overlays — the pane is what you just opened. */
-        if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS) {
+         * the middle column's overlays — the pane is what you just opened. Not
+         * under a modal: the card is over the pane, and Esc is the card's
+         * (modal_key, below). With a form's select or check holding the
+         * keyboard, no field claims Esc first, and it popped the profile pane
+         * behind Edit profile while the card stayed open. */
+        if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS && !modal_open()) {
             rp_pop(); invalidate(); return 0;
         }
         if (wp == OCK_ESCAPE && g_sub_open) { submenu_close(); invalidate(); return 0; }
@@ -46198,6 +46860,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
 }
 
 static int on_focus_gained(oc_win *hwnd) {
+        /* The system's reduce-motion setting may have changed while the
+         * window was in the background: asked again (REQ-269). */
+        motion_sys_read();
         /* The window has the keyboard again, so the composer is typeable
          * again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
@@ -46768,6 +47433,7 @@ int main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
+    motion_sys_read();   /* Reduce motion's Follow system (REQ-269) */
     /* The quick reactions from the start, the default set until preferences
      * say otherwise: an account that has never saved any would otherwise have
      * none, and the hover strip and the menu's emoji row with them. */

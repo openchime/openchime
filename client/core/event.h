@@ -441,6 +441,9 @@ enum {
     OC_EV_AGENT_TOKEN,
     OC_EV_AGENT_TOKENS_BEGIN,
     OC_EV_AGENT_TOKEN_ROW,
+    /* A build's release notes (PROTOCOL.md §5.16r): `size` central's status
+     * (200, 404), or 0 when they could not be fetched; `body` its body. */
+    OC_EV_RELEASE_NOTES,
     /* A person's AI clients (AUTH.md §8.13). CONNECTION_REQUEST: what a code
      * names -- `preview` the code, `body` the client's name, `topic` where it
      * returns. CONNECTION_DECIDED: `status` 1 approved, 0 declined, `body` the
@@ -625,6 +628,9 @@ typedef struct {
      * CHANNEL_LIST entry does not. */
     uint8_t  ch_managers_known;
     uint64_t ch_creator;
+    /* SETTINGS_BEGIN: how many SETTING events follow it, so the model knows
+     * when the snapshot is whole. */
+    uint16_t n_settings;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -862,6 +868,8 @@ enum {
     OC_CMD_REMOVE_AGENT,
     OC_CMD_LIST_AGENT_TOKENS,
     OC_CMD_REVOKE_AGENT_TOKEN,
+    /* RELEASE_NOTES: body = the build id (PROTOCOL.md §5.16r). */
+    OC_CMD_RELEASE_NOTES,
     /* A person's AI clients: CONNECTION_CODE body = the code; CONNECTION_DECIDE
      * body = the code, op = approve, message_id = the lifetime in days;
      * LIST_CONNECTIONS op = everyone's; REVOKE_CONNECTION message_id = the

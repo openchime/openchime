@@ -873,6 +873,45 @@ static void test_mentions_stored(void) {
 /* OIDC-mode auth: a test issuer stands in for the central service (AUTH.md
  * §3.6). Proves the wiring — configure -> JWT verify -> JIT-provision -> session
  * -> reconnect — on top of the crypto that test_jwt covers in isolation. */
+/* The relay's issuer is a path under central's origin (AUTH.md §3): a token
+ * whose `iss` is the bare origin is not the relay's, and is refused; one
+ * issued as the full issuer is taken. */
+static int oidc_try(oc_dbwriter *w, oc_issuer *is, const char *iss, const char *jti, uint32_t id) {
+    char hdr[160], payload[1024], token[4096];
+    oc_issuer_header(is, hdr, sizeof hdr);
+    unsigned long long now = (unsigned long long)time(NULL);
+    oc_issuer_payload(payload, sizeof payload, iss, "acme.example", "google|7", jti, now - 5, now + 290,
+                      "\"email\":\"r@acme.example\",\"email_verified\":true,\"idp\":\"google\"");
+    size_t tlen = oc_issuer_mint(is, hdr, payload, token);
+    oc_job *j = oc_job_new(OC_JOB_AUTH, id);
+    j->method = OC_AUTH_OIDC;
+    oc_job_set_token(j, token, tlen);
+    oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    int t = r ? (int)r->type : -1;
+    oc_dbres_free(r);
+    return t;
+}
+
+static void test_oidc_issuer_path(void) {
+    const char *path = tdb("oidc_iss.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-oidc-iss") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://central.example/v1/workspace/oidc", "acme.example", is.pem,
+                                     "https://central.example") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "domain:acme.example", why, sizeof why) == 0);
+    CHECK(oidc_try(w, &is, "https://central.example", "jti-bare", 31) == OC_RES_AUTH_ERR);
+    CHECK(oidc_try(w, &is, "https://central.example/v1/workspace/oidc", "jti-full", 32) == OC_RES_AUTH_OK);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_oidc_auth(void) {
     const char *path = tdb("oidc.db");
     cleanup_db(path);
@@ -14208,6 +14247,7 @@ int run_dbwriter_tests(void) {
     test_welcome_general();
     test_auth_and_send();
     test_oidc_auth();
+    test_oidc_issuer_path();
     test_demo_mode();
     test_e2e_dms();
     test_oidc_join_rules();

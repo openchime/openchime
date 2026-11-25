@@ -287,7 +287,7 @@ static oc_enroll_result claim_at(int status, struct canned *c, const char *pk, c
     pthread_t th;
     pthread_create(&th, NULL, canned_central, c);
     char url[96];
-    snprintf(url, sizeof url, v6 ? "http://[::1]:%u/api/machine/enroll" : "http://127.0.0.1:%u/api/machine/enroll", port);
+    snprintf(url, sizeof url, v6 ? "http://[::1]:%u" : "http://127.0.0.1:%u", port);
     oc_enroll_result r = oc_enroll_claim(url, aud, pk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
     pthread_join(th, NULL);
     close(c->listen_fd);
@@ -304,7 +304,7 @@ static void test_claim_answers(void) {
     struct canned c;
 
     CHECK(claim_against(200, &c, pk, aud) == OC_ENROLL_ACTIVE);
-    CHECK(strstr(c.seen, "POST /api/machine/enroll/claim ") == c.seen);   /* contract: central's HTTP route */
+    CHECK(strstr(c.seen, "POST /v1/workspace/machine/enroll/claim ") == c.seen);   /* contract: central's HTTP route */
     CHECK(strstr(c.seen, "\"audienceId\":\"ws_") != NULL);
     CHECK(strstr(c.seen, "\"ticket\":\"BwcHBwcH") != NULL);
     CHECK(strstr(c.seen, "\"publicKey\":\"") != NULL && strstr(c.seen, "\"signature\":\"") != NULL);
@@ -323,7 +323,7 @@ static void test_claim_answers(void) {
         CHECK(strstr(c.seen, "Host: [::1]:") != NULL);              /* contract: HTTP's Host header */
     }
     /* Nobody there at all. */
-    CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", aud, pk,
+    CHECK(oc_enroll_claim("http://127.0.0.1:1", aud, pk,
                           "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc") == OC_ENROLL_PENDING);
 }
 
@@ -367,7 +367,7 @@ static void test_plain_http_refused(void) {
     CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&sa, sl) == 0 && listen(lfd, 4) == 0);
     getsockname(lfd, (struct sockaddr *)&sa, &sl);
     char url[64];
-    snprintf(url, sizeof url, "http://127.0.0.2:%d/api/machine/enroll", ntohs(sa.sin_port));
+    snprintf(url, sizeof url, "http://127.0.0.2:%d", ntohs(sa.sin_port));
     char pk[1024], aud[128];
     CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
     CHECK(oc_enroll_activate(url, aud, pk) == OC_ENROLL_FAILED);

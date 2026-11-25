@@ -458,6 +458,8 @@ int main(int argc, char **argv) {
     { static oc_revoke_connection m; FRAME("revoke_connection", oc_encode_revoke_connection(&w, V, &m)); }
     { static oc_create_outgoing_webhook m; FRAME("create_outgoing_webhook", oc_encode_create_outgoing_webhook(&w, V, &m)); }
     { static oc_outgoing_webhook_secret m; FRAME("outgoing_webhook_secret", oc_encode_outgoing_webhook_secret(&w, V, &m)); }
+    { static oc_release_notes_get m = { { (const uint8_t *)"0eb632b", 7 } }; FRAME("release_notes_get", oc_encode_release_notes_get(&w, V, &m)); }
+    { static oc_release_notes m; FRAME("release_notes", oc_encode_release_notes(&w, V, &m)); }
     FRAME("list_outgoing_webhooks", oc_encode_list_outgoing_webhooks(&w, V));
     { static oc_outgoing_webhook_list m; FRAME("outgoing_webhook_list", oc_encode_outgoing_webhook_list(&w, V, &m)); }
     { static oc_set_outgoing_webhook m; FRAME("set_outgoing_webhook", oc_encode_set_outgoing_webhook(&w, V, &m)); }

@@ -3,6 +3,7 @@
  */
 
 #include "theme.h"
+#include "protocol.h"   /* OC_PRESENCE_* */
 
 #include <math.h>
 
@@ -252,4 +253,13 @@ int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_SYSTEM : g_mode; }
 const char *oc_theme_mode_name(int mode) {
     return mode == OC_THEME_LIGHT ? "Light"
          : mode == OC_THEME_SYSTEM ? "Match system" : "Dark";
+}
+
+/* The marker's shape (REQ-122): see theme.h. Do-not-disturb wins, because it is
+ * the one a colleague most needs to see before writing. */
+int oc_presence_mark(uint8_t presence, int dnd) {
+    if (dnd) return OC_PMARK_DND;
+    if (presence == OC_PRESENCE_ONLINE) return OC_PMARK_ONLINE;
+    if (presence == OC_PRESENCE_AWAY)   return OC_PMARK_AWAY;
+    return OC_PMARK_OFFLINE;
 }

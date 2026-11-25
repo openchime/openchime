@@ -11,6 +11,8 @@
  * OPENCHIME_DEMO_USERS.
  */
 
+#include "central.h"
+#include "release_notes.h"
 #include "audio.h"
 #include "build_id.h"   /* OC_BUILD_ID */
 #include "certs.h"
@@ -148,6 +150,7 @@ typedef struct {
     oc_address_report *addr;              /* the address report (AUTH.md §3.6) */
     oc_push        *push;
     oc_invite_mail *invite_mail;
+    oc_release_notes_worker *release_notes;   /* the clients' release notes (PROTOCOL.md §5.16r) */
     /* The CA-issued certificate (TLS.md, "Certificates"): its worker, the TLS
      * state it presents into, what the database kept, and whether the binding
      * central needs is active. */
@@ -313,6 +316,11 @@ static void start_services(services *f) {
             fprintf(stderr, "openchimed: push emitter failed to start\n");
         }
     }
+    /* Release notes (PROTOCOL.md §5.16r): a client asks its daemon, and this
+     * worker asks central with the enrollment key. */
+    f->release_notes = oc_release_notes_start(cfg->enroll.url, f->audience, f->privkey, NULL, NULL);
+    if (f->release_notes) oc_netloop_set_release_notes(f->release_notes);
+    else fprintf(stderr, "openchimed: the release notes worker failed to start\n");
     /* Invitation mail (REQ-280): each invite bound to an address is reported to
      * central at the origin the box enrolled with. */
     if (cfg->invite_mail) {
@@ -709,6 +717,7 @@ int main(int argc, char **argv) {
      * sample content -- before the welcome, so #general says what the demo is. */
     if (cfg->mode == OC_MODE_DEMO) {
         oc_dbwriter_set_demo(db, 1);
+        oc_netloop_set_demo_terms(cfg->demo_terms_url);
         if (oc_dbwriter_seed_demo(db, cfg->workspace_name))
             fprintf(stderr, "openchimed: demo mode: the sample channels and messages written\n");
     }
@@ -815,8 +824,10 @@ int main(int argc, char **argv) {
 
     /* The relay source (AUTH.md §3): the central service this box is enrolled
      * with. Its issuer is the origin it enrolled at, its audience the
-     * enrollment's, and its keys the ones it publishes at /oidc/jwks, read at
-     * boot and daily (§3.3); a managed box may hold one pinned beneath them. */
+     * enrollment's, and its keys the ones it publishes at <issuer>/jwks, read at
+     * boot and daily (§3.3); a managed box may hold one pinned beneath them.
+     * The issuer is a path under the origin (central.h); the origin itself
+     * stays the relay's address, for the authorize URL and the demo's terms. */
     oc_relaykeys *relay_keys = NULL;
     if (want_relay) {
         char origin[256] = "";
@@ -831,7 +842,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "openchimed: OPENCHIME_AUTH=relay: this box has no enrollment to sign in through\n");
             oc_dbwriter_stop(db); return 1;
         }
-        if (oc_dbwriter_configure_oidc(db, origin, aud, cfg->oidc.pubkey, origin) != 0) {
+        char issuer[300];
+        snprintf(issuer, sizeof issuer, "%s" OC_CENTRAL_OIDC, origin);
+        if (oc_dbwriter_configure_oidc(db, issuer, aud, cfg->oidc.pubkey, origin) != 0) {
             fprintf(stderr, "openchimed: OIDC configuration failed\n");
             oc_dbwriter_stop(db); return 1;
         }
@@ -844,9 +857,9 @@ int main(int argc, char **argv) {
         if (!cfg->oidc.allow || !cfg->oidc.allow[0])
             fprintf(stderr, "openchimed: OPENCHIME_JOIN is unset: nobody new may join "
                             "by signing in except through an invite\n");
-        fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", origin, aud);
-        char url[300];
-        snprintf(url, sizeof url, "%s/oidc/jwks", origin);
+        fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", issuer, aud);
+        char url[320];
+        snprintf(url, sizeof url, "%s/jwks", issuer);
         relay_keys = oc_relaykeys_start(url, db);
         if (!relay_keys) fprintf(stderr, "openchimed: the relay's published keys will not be read\n");
     }
@@ -1061,6 +1074,8 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&svc.adopt_mu);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
+    oc_netloop_set_release_notes(NULL);
+    oc_release_notes_stop(svc.release_notes);
     oc_netloop_set_webhooks_out(NULL);
     oc_webhooks_out_stop(owh);
     oc_push_stop(svc.push);

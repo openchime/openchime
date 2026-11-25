@@ -732,9 +732,10 @@ where one exists.
 - **REQ-122.** A user's **do-not-disturb and custom status** (REQ-136/278/241)
   has been surfaced to other users alongside their presence (REQ-120) — a
   distinct indicator on the presence dot plus a status line in the roster — so a
-  colleague has known someone was unavailable before messaging them. This has
-  been display only: it has not changed delivery, which the schedule and the
-  pause govern separately.
+  colleague has known someone was unavailable before messaging them. Presence
+  has never been shown by colour alone: each state, and do-not-disturb, has had
+  a marker shape of its own. This has been display only: it has not changed
+  delivery, which the schedule and the pause govern separately.
   **Being away for days has an out-of-office of its own**, apart from the
   custom status, which shows beside it: a start, an end and an optional message.
   It is in force between the two and ends by itself, so there is nothing to
@@ -2623,7 +2624,9 @@ choose — which makes each one a per-frontend *obligation*.*
   config file, CLIENT.md §3). (ARCH-92: per-frontend.)
 - **REQ-262.** Every client has offered **theme/appearance selection** — at least
   light, dark, and follow-system — applied in-app. The TUI ships a 256-color theme
-  (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80).
+  (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80). The graphical
+  clients' appearance settings have also offered the interface font, chosen
+  from a short list of families the system already has (ARCH-97).
 
   **A theme's ink has cleared 3:1 against the surface it is drawn on**, which is
   what WCAG asks of non-text UI and the floor below which an element is not dim
@@ -2687,6 +2690,15 @@ choose — which makes each one a per-frontend *obligation*.*
   Delete (CLIENT.md). A
   self-drawn UI gets nothing for free here, which is exactly why this is a
   requirement and not an assumption: the cost grows with every pane added.
+
+  **Motion can be reduced.** A graphical client has offered a **Reduce motion**
+  preference — Off, On, or Follow system, the default — and, following the
+  system, has read the platform's own setting (Windows' "Show animations", a
+  browser's `prefers-reduced-motion`). Reduced, nothing on screen has moved for
+  its own sake: the highlight on a message jumped to has held and then gone
+  without fading, the upload tray's bar has shown its figure without pulsing,
+  easing or a moving light, and the caret has been steady (CLIENT.md,
+  Preferences).
 
   **The approach (ARCH-99): accessibility is implemented *for* the custom
   controls, not by retreating from them** — the self-drawn surfaces are the

@@ -86,6 +86,29 @@ connection's origin (`OPENCHIME_ENROLL_URL`), like the other services
 `OPENCHIME_PUSH_URL` needs no change: set alone it still turns push on, and
 beside `OPENCHIME_PUSH=on` it names where push goes.
 
+## The OpenChime services have their own address
+
+A box connected to the OpenChime services reaches them at the OpenChime API's
+origin, and every request it makes is under `/v1/workspace/` there: enrollment,
+the address report, invitation mail, push, certificates through central, the
+sign-in relay (whose issuer is now `<origin>/v1/workspace/oidc`) and release
+notes. Set
+
+    OPENCHIME_ENROLL_URL=https://api.openchime.io
+
+before restarting on this release. A box still naming `https://openchime.io`
+cannot reach the services: nothing answers the old paths there. A box that is
+not connected (no `OPENCHIME_ENROLL_URL`) needs no change; its clients' What's
+new offers the release's page instead of the notes.
+
+The package repositories have moved with the services, to
+`https://api.openchime.io/v1/public/releases/dist/`; nothing is served at
+`https://openchime.io/dist/` any more. On Debian and Ubuntu, change the `deb`
+line in `/etc/apt/sources.list.d/openchime.list` to
+`https://api.openchime.io/v1/public/releases/dist/apt stable main`; on RHEL and
+Fedora, fetch `openchime.repo` again from the new address
+(INSTALLING.md). The signing key is the same.
+
 ## Nothing that ships runs in development mode
 
 There is one build, and the tests run the binary that ships; what keeps a

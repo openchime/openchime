@@ -17,6 +17,10 @@
 #     puts a link to THAT message on the clipboard, pasted back to be read;
 #   - Esc closes the menu, and Esc again takes the keyboard off the row;
 #   - with no message focused, Shift+F10 opens the conversation's own menu;
+#   - with a message focused, the single keys e r t p f s u m l each run their
+#     menu item on it (`kbfocus ran=`) and are never typed into the composer,
+#     each read back by its effect; with Ctrl held a letter is its shortcut, and
+#     with no message focused it is typed;
 #   - "Unread from here" moves the "New" line to that message at once (REQ-235),
 #     without the conversation having to be opened again.
 #
@@ -32,6 +36,7 @@ MENU_MSG=6            # the enum's value, as the dump prints it
 MENU_CHANNEL=8
 CMD_COPY_LINK=105     # "Copy link" -- its effect can be read back
 CMD_UNREAD=107        # "Unread from here"
+CMD_REMIND_FIRST=115  # "In 20 minutes", the first of Remind me's choices
 
 # Every key press, with its ACK CHECKED. gui_drive exits non-zero when the client
 # did not answer within ten seconds, and a dropped verb that nobody notices
@@ -135,6 +140,100 @@ check "Esc closes it" waitfor 5 closed
 check "the keyboard is still on the message" focused
 k esc
 check "Esc again takes it off the row" waitfor 5 nofocus
+
+step "single keys act on the message the keyboard is on"
+# Each letter runs its menu item on the focused message, read back from the
+# dump's `kbfocus ran=` (the command it ran), and is never typed: `keychar`
+# sends the key AND the text the platform sends for it, as a person's press
+# does, so a letter that leaked into the composer would show in its text.
+ran()    { [ "$(kb ran)" = "$1" ]; }
+edtext() { gui_snap; fieldq "$D" '^ed ' text; }
+untyped() { [ "$(edtext)" = "" ]; }
+# On the newest message again, from wherever the last key left the keyboard.
+on_newest() {
+  local i
+  for i in 1 2 3; do [ "$(kb mid)" = 0 ] && break; k esc; done
+  k ctrl+down
+  waitfor 5 back
+}
+# press <letter> <command>: on the newest message, the letter runs <command>
+# and leaves the composer as it was.
+press1() {
+  act keychar "$1"
+  check "'$1' runs its item ($2)" waitfor 5 ran "$2"
+  check "...and is not typed into the composer" untyped
+}
+check "the composer is empty to begin with" untyped
+need "the keyboard is on the newest message" on_newest
+press1 p 103
+press1 s 104
+saved() { gui_snap; grep -qi 'toast\[[0-9]\].*[Ss]aved to Later' "$D"; }
+check "'s' saves it for later" waitfor 5 saved
+press1 u 107
+unread_newest() { [ "$(top unread_from)" = "$older" ]; }
+check "'u' moves the \"New\" line to this message" waitfor 5 unread_newest
+press1 l 105
+# What it copied is read back: a link to THIS message, pasted into the composer.
+k ctrl+v
+check "'l' puts this message's link on the clipboard" waitfor 5 pasted
+k ctrl+a
+k delete
+check "the composer is emptied again" waitfor 5 untyped
+press1 P 103
+check "upper case is the same key: 'P' unpins it again" focused
+press1 m 114
+remind_open() { [ "$(menu)" = "$MENU_MSG" ] && [ "$(kb menuhovercmd)" = "$CMD_REMIND_FIRST" ]; }
+check "'m' opens the reminder choices, the first highlighted" waitfor 5 remind_open
+k esc
+check "Esc closes them" waitfor 5 closed
+press1 r 7
+picker_up() { gui_snap; [ "$(field "$D" '^pickstate ' open)" = 1 ]; }
+check "'r' opens the emoji picker" waitfor 5 picker_up
+picker_down() { gui_snap; [ "$(field "$D" '^pickstate ' open)" = 0 ]; }
+for _ in 1 2 3; do picker_down && break; k esc; done
+check "Esc closes the picker" waitfor 5 picker_down
+need "the keyboard is back on the newest message" on_newest
+press1 f 106
+pal_up() { gui_snap; [ "$(field "$D" '^natives ' pal)" = 1 ]; }
+pal_down() { gui_snap; [ "$(field "$D" '^natives ' pal)" = 0 ]; }
+# Esc takes the keyboard off the message and dismisses each notice the keys
+# above raised before it reaches the palette, so it is pressed until it does.
+check "'f' opens the palette to pick where it goes" waitfor 5 pal_up
+for _ in $(seq 1 8); do pal_down && break; k esc; done
+check "Esc closes the palette" waitfor 5 pal_down
+need "the keyboard is back on the newest message" on_newest
+act keychar t
+check "'t' runs its item (100)" waitfor 5 ran 100
+thread_open() { gui_snap; [ "$(field "$D" '^hist ' thread)" = "$newest" ]; }
+check "...and opens this message's thread" waitfor 10 thread_open
+check "...and leaves the keyboard to the reply" nofocus
+check "...with nothing typed" untyped
+k esc
+thread_shut() { gui_snap; [ "$(field "$D" '^hist ' thread)" = 0 ]; }
+check "Esc closes the thread" waitfor 5 thread_shut
+need "the keyboard is back on the newest message" on_newest
+act keychar e
+check "'e' runs its item (21)" waitfor 5 ran 21
+editing() { [ "$(edtext)" = "message number 3" ]; }
+check "...and the composer holds the message to edit, and no 'e'" waitfor 5 editing
+check "...and leaves the keyboard to the edit" nofocus
+k esc
+check "Esc cancels the edit" waitfor 5 untyped
+need "the keyboard is back on the newest message" on_newest
+k ctrl+k
+check "with Ctrl held, a letter is still its shortcut (Ctrl+K)" waitfor 5 pal_up
+check "...and runs no single key" ran 0
+for _ in $(seq 1 8); do pal_down && break; k esc; done
+check "Esc closes the palette" waitfor 5 pal_down
+for _ in 1 2 3; do nofocus && break; k esc; done
+check "the keyboard is off the messages" nofocus
+act keychar p
+typed() { [ "$(edtext)" = "p" ]; }
+check "with no message focused, 'p' is typed into the composer" waitfor 5 typed
+k ctrl+a
+k delete
+check "...and taken out again" waitfor 5 untyped
+"$DRIVE" shot keymenu_keys >/dev/null
 
 step "\"Unread from here\" shows where reading resumes"
 k ctrl+down

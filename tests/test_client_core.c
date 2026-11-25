@@ -18,6 +18,8 @@
 #include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
+#include "release_notes.h"  /* the daemon's side of What's new */
+#include "enroll.h"
 #include "config.h"
 #include "dbwriter.h"
 #include "auth.h"       /* oc_sha256: an approval code stored as the daemon stores it */
@@ -514,6 +516,37 @@ static void test_emoji_aliases(void) {
     oc_model_free(&m);
 }
 
+/* The settings bucket is synced once its snapshot is whole: read between the
+ * BEGIN and its entries, a stored value would look missing. An empty snapshot
+ * is whole at its BEGIN. */
+static void setting_ev(oc_model *m, const char *key, const char *value) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_SETTING;
+    snprintf(e.author_name, sizeof e.author_name, "%s", key);
+    e.body = strdup(value);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_settings_snapshot_whole(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev b; memset(&b, 0, sizeof b); b.type = OC_EV_SETTINGS_BEGIN; b.n_settings = 2;
+    oc_model_apply(&m, &b);
+    CHECK(!m.settings_synced);
+    setting_ev(&m, "compose.emoticons", "off");
+    CHECK(!m.settings_synced && !oc_model_setting(&m, "prefs"));
+    setting_ev(&m, "prefs", "t:1;N:1");
+    CHECK(m.settings_synced && oc_model_setting(&m, "prefs") &&
+          strcmp(oc_model_setting(&m, "prefs"), "t:1;N:1") == 0);
+    oc_model_free(&m);
+
+    oc_model_init(&m);
+    b.n_settings = 0;
+    oc_model_apply(&m, &b);
+    CHECK(m.settings_synced && !oc_model_setting(&m, "prefs"));
+    oc_model_free(&m);
+}
+
 /* One CALL_STATE as the core turns it into an event: call `id`, started at
  * `at`, with `in` in it and `asked` asked (0 for nobody), or ended. */
 static void call_state_ev(oc_model *m, uint64_t id, uint64_t at, uint64_t in, uint64_t asked, int ended) {
@@ -559,6 +592,48 @@ static void test_missed_calls_model(void) {
     }
     oc_ev_free(e);
     CHECK(m.n_call_missed == 1 && m.call_missed[0] == 9);
+    oc_model_free(&m);
+}
+
+/* The message a "react to the newest" shortcut acts on (REQ-070): the newest that
+ * can take a reaction, past a newer tombstone and a newer call event. */
+static void lr_msg(oc_model *m, uint64_t ch, uint64_t id, uint8_t kind) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = ch; e.message_id = id; e.author_id = 2;
+    e.server_time = 1000 + id; e.msg_kind = kind; e.body = strdup("said");
+    oc_model_apply(m, &e);
+}
+static void lr_delete(oc_model *m, uint64_t ch, uint64_t id) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = ch; e.message_id = id;
+    oc_model_apply(m, &e);
+}
+
+static void test_last_reactable(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 5;
+    lr_msg(&m, 10, 1, OC_MSG_KIND_MESSAGE);     /* an ordinary message */
+    lr_msg(&m, 10, 2, OC_MSG_KIND_MESSAGE);     /* ...one tombstoned after it */
+    lr_delete(&m, 10, 2);
+    lr_msg(&m, 10, 3, OC_MSG_KIND_CALL);        /* ...and a call event after that */
+    const oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->n_msgs == 3 && c->msgs[1].deleted == 1 && c->msgs[2].kind == OC_MSG_KIND_CALL);
+    const oc_msg *r = oc_model_last_reactable(c);
+    CHECK(r && r->message_id == 1);
+    /* A channel of only those: nothing to react to. */
+    lr_msg(&m, 11, 4, OC_MSG_KIND_MESSAGE);
+    lr_delete(&m, 11, 4);
+    lr_msg(&m, 11, 5, OC_MSG_KIND_CALL);
+    c = oc_model_channel(&m, 11);
+    CHECK(c && c->n_msgs == 2);
+    CHECK(oc_model_last_reactable(c) == NULL);
+    /* An empty channel, and none at all. */
+    oc_channel empty;
+    memset(&empty, 0, sizeof empty);
+    CHECK(oc_model_last_reactable(&empty) == NULL);
+    CHECK(oc_model_last_reactable(NULL) == NULL);
     oc_model_free(&m);
 }
 
@@ -2325,6 +2400,42 @@ static void test_time_preview(void) {
     }
     if (saved) setenv("TZ", keep, 1); else unsetenv("TZ");
     tzset();
+}
+
+/* An edit to the conversation's newest message, by the preview's author, is
+ * what the sidebar's preview then shows (REQ-051): fixing what you just sent
+ * fixes the line under the conversation's name too. An edit to an older
+ * message leaves the preview alone. */
+static void test_edit_preview(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 76; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 76; e.message_id = 8; e.author_id = 2;
+    e.body = strdup("the first line");
+    oc_model_apply(&m, &e); free(e.body);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 76; e.message_id = 9; e.author_id = 2;
+    e.body = strdup("lunch at noon tomorow");
+    oc_model_apply(&m, &e); free(e.body);
+    const oc_channel *c = oc_model_channel(&m, 76);
+    CHECK(c && strcmp(c->preview, "lunch at noon tomorow") == 0);
+
+    /* The older one: its text changes, the preview does not. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 76; e.message_id = 8;
+    e.body = strdup("the first line, fixed");
+    oc_model_apply(&m, &e); free(e.body);
+    c = oc_model_channel(&m, 76);
+    CHECK(c && c->n_msgs == 2 && strcmp(c->msgs[0].body, "the first line, fixed") == 0);
+    CHECK(c && strcmp(c->preview, "lunch at noon tomorow") == 0);
+
+    /* The newest: the preview takes the new text. */
+    memset(&e, 0, sizeof e); e.type = OC_EV_EDIT; e.channel_id = 76; e.message_id = 9;
+    e.body = strdup("lunch at noon tomorrow");
+    oc_model_apply(&m, &e); free(e.body);
+    c = oc_model_channel(&m, 76);
+    CHECK(c && c->msgs[1].edited && strcmp(c->preview, "lunch at noon tomorrow") == 0);
+    oc_model_free(&m);
 }
 
 /* A spoiler never shows in an excerpt (MARKDOWN.md §1d): the sidebar's
@@ -6552,7 +6663,7 @@ static void test_browser_signin(void) {
         CHECK(c != NULL);
         CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
         const oc_model *m = oc_client_model(c);
-        CHECK(strncmp(m->signin_url, "https://central.example/oidc/authorize?workspace=ws_browser_test&", 65) == 0);
+        CHECK(strncmp(m->signin_url, "https://central.example/v1/workspace/oidc/authorize?workspace=ws_browser_test&", 78) == 0);
         CHECK(m->signin_seq == 1 && !m->authed);
         CHECK(browser_complete(m, &is, "https://accounts.google.com|dana", "b1", DANA, NULL) == 0);
         /* The tab was answered after the daemon accepted the token, not before:
@@ -6916,6 +7027,81 @@ static void test_action_pairing(void) {
  * with "-compatible", byte for byte what the daemon stored. With export off it
  * is not offered, a request is refused with the plain sentence, and the
  * download queued behind it still completes. Its own daemon each time. */
+/* A stand-in for central's release notes: one request, answered with notes. */
+static void *rn_central_once(void *arg) {
+    int lfd = *(int *)arg;
+    int c = accept(lfd, NULL, NULL);
+    if (c < 0) return NULL;
+    char buf[2048];
+    ssize_t n = read(c, buf, sizeof buf - 1);
+    (void)n;
+    static const char B[] = "{\"release\":21,\"build_id\":\"abc1234\",\"published_at\":\"2026-11-24T00:00:00Z\","
+                            "\"sections\":[{\"title\":\"New\",\"items\":[{\"title\":\"Webhooks\",\"url\":\"https://x/1\"}]}]}";
+    char resp[1024];
+    int rn = snprintf(resp, sizeof resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                      "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof B - 1, B);
+    ssize_t wr = write(c, resp, (size_t)rn);
+    (void)wr;
+    close(c);
+    return NULL;
+}
+
+/* What's new (PROTOCOL.md §5.16r): a client asks its own daemon, which asks
+ * central, and the notes arrive in the model, read as before. */
+static void test_release_notes_client(void) {
+    char db[sizeof g_dir + 40];
+    snprintf(db, sizeof db, "%s/release_notes.db", g_dir);
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    oc_dbwriter *dbw = oc_dbwriter_start(db);
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    oc_dbwriter_set_pw_mem(dbw, 2048);
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER, 2048) != 0);
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 4) == 0);
+    socklen_t sl = sizeof sa;
+    getsockname(lfd, (struct sockaddr *)&sa, &sl);
+    pthread_t cth;
+    CHECK(pthread_create(&cth, NULL, rn_central_once, &lfd) == 0);
+    char url[64], pk[1024], aud[128];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", ntohs(sa.sin_port));
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    oc_release_notes_worker *rn = oc_release_notes_start(url, aud, pk, NULL, NULL);
+    CHECK(rn != NULL);
+    oc_netloop_set_release_notes(rn);
+
+    struct core_loop_arg arg;
+    memset(&arg, 0, sizeof arg);
+    arg.srv = &srv; arg.dbw = dbw;
+    pthread_t th;
+    CHECK(core_loop_start(&arg, &th) == 0);
+    oc_client *a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+    CHECK(a != NULL);
+    if (a) {
+        CHECK(WAIT_FOR(a, m->authed));
+        oc_client_get_release_notes(a, "abc1234");
+        CHECK(WAIT_FOR(a, m->rn_ready));
+        static oc_releasenotes notes;
+        CHECK(oc_model_take_release_notes((oc_model *)oc_client_model(a), &notes) == OC_RN_OK);
+        CHECK(notes.release == 21 && notes.n_sections == 1 && notes.sections[0].n_items == 1 &&
+              !strcmp(notes.sections[0].items[0].title, "Webhooks"));   /* contract: the notes as central gave them */
+        CHECK(oc_model_take_release_notes((oc_model *)oc_client_model(a), &notes) == -1);   /* taken once */
+        oc_client_stop(a);
+    }
+    pthread_join(cth, NULL);
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_netloop_set_release_notes(NULL);
+    oc_release_notes_stop(rn);
+    close(lfd);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+}
+
 static void test_export_client(int on) {
     char data[sizeof g_dir + 40], db[sizeof g_dir + 40];
     snprintf(data, sizeof data, "%s/export_data_%d", g_dir, on);
@@ -7040,6 +7226,7 @@ int run_client_core_tests(void) {
 
     test_group_dm_title();
     test_missed_calls_model();
+    test_last_reactable();
     test_snippet_offer();
     test_action_pairing();
     test_groups_model();
@@ -7067,6 +7254,7 @@ int run_client_core_tests(void) {
     test_workspace_sender_model();
     test_time_preview();
     test_spoiler_preview();
+    test_edit_preview();
     test_badge_tiers();
     test_osnotify_null();
     test_feedback();
@@ -7075,6 +7263,7 @@ int run_client_core_tests(void) {
     test_unread_counts_what_notifies();
     test_capabilities();
     test_emoji_aliases();
+    test_settings_snapshot_whole();
     test_server_build();
     test_deployment_name();
     test_invitation_text();
@@ -8641,6 +8830,7 @@ int run_client_core_tests(void) {
     test_out_of_office();
     test_local_browser();
     test_device_client();
+    test_release_notes_client();
     test_export_client(1);
     test_export_client(0);
     oc_test_rmtree(g_dir);

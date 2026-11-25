@@ -32,7 +32,6 @@
 #include <string.h>
 
 #include "platform.h"
-#include "releasenotes.h"   /* what's new: fetched on a thread (oc_plat_releasenotes_*) */
 #include "a11y_win32.h"
 #include "openchime_res.h"
 #include "st_dwrite.h"
@@ -266,6 +265,46 @@ static HWND msgwnd(void) {
 }
 
 void oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) { SDL_SetTextInputArea(w, r, 0); }
+
+/* The system caret (REQ-269, ARCH-99): created on SDL's HWND, 1 pixel wide and
+ * as tall as the drawn caret, and moved with it. Never ShowCaret: an
+ * XOR-painted GDI caret over the renderer's surface would flicker, and the
+ * application draws the caret people see. Created again only when its height
+ * changes -- CreateCaret replaces the thread's caret, and each one is an
+ * object-created event to whatever is watching. */
+static HWND g_caret_hwnd;
+static int  g_caret_h;
+
+void oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r) {
+    if (!r) {
+        if (g_caret_hwnd) DestroyCaret();
+        g_caret_hwnd = NULL; g_caret_h = 0;
+        return;
+    }
+    HWND h = hwnd_of(w);
+    if (!h) return;
+    int ch = r->h < 1 ? 1 : r->h;
+    if (h != g_caret_hwnd || ch != g_caret_h) {
+        if (!CreateCaret(h, NULL, 1, ch)) { g_caret_hwnd = NULL; g_caret_h = 0; return; }
+        g_caret_hwnd = h; g_caret_h = ch;
+    }
+    SetCaretPos(r->x, r->y);
+}
+
+/* Windows' own account of the caret, not ours: the thread's caret window and
+ * height from GetGUIThreadInfo, its position from GetCaretPos. */
+int oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out) {
+    HWND h = hwnd_of(w);
+    GUITHREADINFO gi; memset(&gi, 0, sizeof gi); gi.cbSize = sizeof gi;
+    if (!h || !GetGUIThreadInfo(GetCurrentThreadId(), &gi) || gi.hwndCaret != h) return 0;
+    POINT p;
+    if (!GetCaretPos(&p)) return 0;
+    out->x = p.x; out->y = p.y;
+    out->w = gi.rcCaret.right - gi.rcCaret.left;
+    out->h = gi.rcCaret.bottom - gi.rcCaret.top;
+    return 1;
+}
+
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 1920; *max_h = 1080; }
 void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 30; }
 const char *oc_plat_mic_settings_name(void) { return "Windows privacy settings"; }
@@ -622,35 +661,6 @@ int oc_plat_picker_answer(const char *path) {
     return 1;
 }
 
-/* The release notes, on a thread of their own: the fetch blocks for as long as
- * the network takes (releasenotes.h), and the window must not. The thread fills
- * the result and then says so; the tick reads it once. */
-static oc_releasenotes g_rn_result;
-static char            g_rn_build[80];
-static volatile LONG   g_rn_state;       /* 0 idle, 1 running, 2 done */
-static int             g_rn_rc;
-
-static DWORD WINAPI rn_thread(LPVOID arg) {
-    (void)arg;
-    g_rn_rc = oc_releasenotes_fetch(g_rn_build, &g_rn_result);
-    InterlockedExchange(&g_rn_state, 2);
-    return 0;
-}
-
-void oc_plat_releasenotes_start(const char *build_id) {
-    if (InterlockedCompareExchange(&g_rn_state, 1, 0) != 0) return;
-    snprintf(g_rn_build, sizeof g_rn_build, "%s", build_id ? build_id : "");
-    HANDLE h = CreateThread(NULL, 0, rn_thread, NULL, 0, NULL);
-    if (!h) { g_rn_rc = OC_RN_FAILED; InterlockedExchange(&g_rn_state, 2); return; }
-    CloseHandle(h);
-}
-
-int oc_plat_releasenotes_poll(void *out) {
-    if (InterlockedCompareExchange(&g_rn_state, 0, 2) != 2) return -1;
-    memcpy(out, &g_rn_result, sizeof g_rn_result);
-    return g_rn_rc;
-}
-
 int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap) {
     static WCHAR file[32 * MAX_PATH];
     WCHAR flt[400];
@@ -795,6 +805,14 @@ uint32_t oc_plat_idle_ms(void) {
     LASTINPUTINFO li = { sizeof li, 0 };
     if (!GetLastInputInfo(&li)) return 0;
     return (uint32_t)(GetTickCount() - li.dwTime);
+}
+
+/* "Show animations" (Settings > Accessibility > Visual effects) is
+ * SPI_GETCLIENTAREAANIMATION: on means animate, so reducing is its inverse. */
+int oc_plat_reduce_motion(void) {
+    BOOL on = TRUE;
+    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0)) return -1;
+    return on ? 0 : 1;
 }
 
 /* ---- the clipboard --------------------------------------------------------- */

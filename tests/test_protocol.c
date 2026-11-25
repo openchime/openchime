@@ -163,11 +163,11 @@ static void test_auth_frames(void) {
         CHECK(out.challenge.len == 43);
     }
     {
-        oc_auth_redirect in = { oc_slice_str("https://central.example/oidc/authorize?workspace=ws_1") };
+        oc_auth_redirect in = { oc_slice_str("https://central.example/v1/workspace/oidc/authorize?workspace=ws_1") };
         ROUNDTRIP(oc_encode_auth_redirect(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_REDIRECT, h, p);
         oc_auth_redirect out;
         CHECK(oc_decode_auth_redirect(&p, &out) == OC_OK);
-        CHECK(slice_eq_str(out.authorize_url, "https://central.example/oidc/authorize?workspace=ws_1"));
+        CHECK(slice_eq_str(out.authorize_url, "https://central.example/v1/workspace/oidc/authorize?workspace=ws_1"));
     }
     {   /* A device code's four frames (AUTH.md §8.11). */
         oc_auth_device_begin in = { oc_slice_str("local"), oc_slice_str("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU") };
@@ -3173,6 +3173,43 @@ static void test_connection_frames(void) {
 
 /* Outgoing webhooks: every frame through and back; a create naming more
  * channels than a webhook takes is refused. */
+/* A build's release notes, asked of the client's own daemon (CLIENT.md). */
+static void test_release_notes_frames(void) {
+    static uint8_t frame[OC_MAX_FRAME_SIZE];
+    {
+        oc_release_notes_get in = { oc_slice_str("0eb632b") };
+        ROUNDTRIP(oc_encode_release_notes_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RELEASE_NOTES_GET, h, p);
+        oc_release_notes_get out;
+        CHECK(oc_decode_release_notes_get(&p, &out) == OC_OK && slice_eq_str(out.build_id, "0eb632b"));
+    }
+    {
+        oc_release_notes in = { oc_slice_str("0eb632b"), 200, oc_slice_str("{\"release\":21}") };
+        ROUNDTRIP(oc_encode_release_notes(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RELEASE_NOTES, h, p);
+        oc_release_notes out;
+        CHECK(oc_decode_release_notes(&p, &out) == OC_OK && slice_eq_str(out.build_id, "0eb632b") &&
+              out.status == 200 && slice_eq_str(out.body, "{\"release\":21}"));
+    }
+    /* A build id is a plain token: empty, too long, or with a slash or a space,
+     * it is refused. */
+    static const char *const BAD[] = { "", "a/b", "a b", "../x",
+        "0123456789012345678901234567890123456789012345678901234567890123456789" };
+    for (size_t i = 0; i < sizeof BAD / sizeof *BAD; i++) {
+        uint8_t raw[256]; oc_wbuf w2; oc_wbuf_init(&w2, raw, sizeof raw);
+        oc_w_str(&w2, oc_slice_str(BAD[i]));
+        oc_rbuf p2; oc_rbuf_init(&p2, raw, w2.len);
+        oc_release_notes_get out;
+        CHECK(oc_decode_release_notes_get(&p2, &out) == OC_E_MALFORMED);
+    }
+    /* A body larger than a frame can carry is not encoded. */
+    {
+        static char big[OC_RELEASE_NOTES_MAX + 1];
+        memset(big, 'x', sizeof big);
+        oc_release_notes in = { oc_slice_str("b"), 200, { (const uint8_t *)big, sizeof big } };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_release_notes(&w, OC_PROTOCOL_VERSION, &in) != OC_OK);
+    }
+}
+
 static void test_outgoing_webhook_frames(void) {
     static uint8_t frame[4096];
     {
@@ -3788,6 +3825,7 @@ int run_protocol_tests(void) {
     test_agent_frames();
     test_connection_frames();
     test_outgoing_webhook_frames();
+    test_release_notes_frames();
     test_preview_frames();
     test_call_frames();
     test_block_frames();

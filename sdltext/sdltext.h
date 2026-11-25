@@ -75,6 +75,10 @@ typedef struct {
 void st_ctx_destroy(st_ctx *);
 /* Whether the system has a font family of that name. */
 int  st_family_present(st_ctx *, const char *family);
+/* A family's ascent and cap height as fractions of its em, read from the font
+ * (its regular face) — the figures ARCH-108's pinned line box is derived from.
+ * Returns 1, or 0 with both set to 0 when they cannot be read. */
+int  st_family_metrics(st_ctx *, const char *family, float *ascent_em, float *cap_em);
 /* DPI x zoom. Layout geometry stays in DIPs; a raster-path backend renders at
  * this scale so glyphs are sharp at any DPI. */
 void st_ctx_set_scale(st_ctx *, float scale);
