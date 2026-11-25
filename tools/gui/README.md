@@ -47,6 +47,7 @@ pushing a client change, and the feature's own test when a change touches it.
 - [Reading the caret harness](#reading-the-caret-harness)
 - [Reading the announce harness](#reading-the-announce-harness)
 - [Reading the motion harness](#reading-the-motion-harness)
+- [Reading the contrast harness](#reading-the-contrast-harness)
 - [Seeing the whole window](#seeing-the-whole-window)
 - [`clipped=`: text that does not fit its own box](#clipped-text-that-does-not-fit-its-own-box)
 - [Observing the tray balloon](#observing-the-tray-balloon)
@@ -353,6 +354,7 @@ when reading its output.
 | `chords` | web | | 9750 | a shortcut pressed quickly in the browser is still the shortcut | [Driving the web client](#driving-the-web-client) |
 | `collapse` | win32 web | | 9700 | long messages collapsed by the reader | its header |
 | `composer` | win32 | | 9540 | the composer's layout | [Reading the composer harness](#reading-the-composer-harness) |
+| `contrast` | win32 web | | 9685 | High contrast: the preference, the system's setting, the palette's ratios | [Reading the contrast harness](#reading-the-contrast-harness) |
 | `cursor` | win32 web | | 9505 | the mouse cursor's shape, read from the client | [Reading the cursor harness](#reading-the-cursor-harness) |
 | `drafts` | win32 | | 9560 | deleting a draft from Drafts | [Reading the drafts harness](#reading-the-drafts-harness) |
 | `emoji_admin` | win32 web | | 9525 | Admin > Custom emoji | its header |
@@ -1212,6 +1214,37 @@ saved is there after the client starts again. The highlight and the tray are
 asserted in `make test` (`tests/test_motion.c`), where their arithmetic is.
 Not in CI, for the smoke's reason. Run it when a change touches something that
 moves on screen, or the preferences string.
+
+## Reading the contrast harness
+
+Appearance's High contrast (REQ-262) is Off, On or Follow system, the
+default; Follow system takes Windows' high contrast or the browser's
+`prefers-contrast: more`, read at start, whenever the window gains focus and
+when the system's theme changes. On, the palette is one of two fixed
+high-contrast palettes, light or dark as the Theme row says, and the colour
+scheme does not apply. `tools/gui/features/contrast.sh` drives the client
+against its own fixture daemon (port 9685) and reads the dump's `contrast`
+line: `pref=` (0 Off, 1 On, 2 Follow system), `sys=` (the system's answer as
+the client takes it: 1 on, 0 off, -1 unknown) and `on=` (whether the
+high-contrast palette is in force); and the `palette` line, every token by
+name, `on_accent=` (the ink on an accent or danger fill) included. The
+test-only verb `syscontrast 0|1|-1` stands in for the system's answer (-1 goes
+back to the system's own), so both branches of Follow system run on any
+machine; `contrast 0|1|2` sets the preference and saves it. It asserts that
+the default is Follow system; that Follow system is on when the system says 1
+and off when it says 0, On is on with a system that says 0, and Off is off
+with one that says 1; that, on, in Dark and in Light, the dumped palette
+clears 7:1 for every text ink on every surface, the rail's icon on the rail
+and the on-accent ink on accent, accent-dim and danger, and 4.5:1 for every
+control ink on every surface, computed from the `palette` line with the same
+arithmetic as `oc_theme_contrast`; that a colour scheme clicked while it is on
+leaves the palette as it was, and turning it off shows that scheme's rail and
+accent; that Appearance has the row's three choices, one clicked is put back
+by Cancel, and System's Reset returns it to Follow system; and that the
+choice saved is there after the client starts again. The same ratios are
+asserted from the palette itself in `make test` (`tests/test_theme.c`). Not
+in CI, for the smoke's reason. Run it when a change touches the palette, the
+ink on a filled control, or the preferences string.
 
 ## Seeing the whole window
 

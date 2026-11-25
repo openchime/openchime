@@ -513,6 +513,13 @@ int oc_plat_reduce_motion(void) {
         return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : 0;
     });
 }
+/* The page's prefers-contrast: more; -1 where the browser cannot be asked. */
+int oc_plat_high_contrast(void) {
+    return EM_ASM_INT({
+        if (!window.matchMedia) return -1;
+        return window.matchMedia('(prefers-contrast: more)').matches ? 1 : 0;
+    });
+}
 
 /* ---- the clipboard --------------------------------------------------------- */
 

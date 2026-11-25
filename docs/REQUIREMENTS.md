@@ -2639,6 +2639,14 @@ choose — which makes each one a per-frontend *obligation*.*
   grades captured frames can only fail on a pixel something actually painted: a
   marker no scene draws, or a fill derived per scheme whose other values are
   never rendered, is invisible to it.
+
+  **The graphical clients have offered high contrast**, Off, On or Follow
+  system, the default; Follow system is on when the system asks for it
+  (Windows' high contrast, a browser's `prefers-contrast: more`). On, light or
+  dark still follows the theme, and a fixed palette of the client's own
+  replaces the colour scheme, in which every text ink has cleared **7:1** and
+  every control ink **4.5:1** against every surface it is drawn on, asserted
+  from the palette as the 3:1 floor is.
 - **REQ-263.** A failure of the daemon's own that needs a person — a TLS
   certificate it cannot obtain or renew, one close to expiry — has been shown to
   the workspace's owners and admins in every client, with a distinct warning

@@ -815,6 +815,14 @@ int oc_plat_reduce_motion(void) {
     return on ? 0 : 1;
 }
 
+/* Settings > Accessibility > Contrast themes: HCF_HIGHCONTRASTON while one is
+ * in force. */
+int oc_plat_high_contrast(void) {
+    HIGHCONTRASTW hc = { .cbSize = sizeof hc };
+    if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0)) return -1;
+    return (hc.dwFlags & HCF_HIGHCONTRASTON) ? 1 : 0;
+}
+
 /* ---- the clipboard --------------------------------------------------------- */
 
 char *oc_plat_clipboard_files(void) {

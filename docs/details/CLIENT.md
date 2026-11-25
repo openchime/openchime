@@ -1354,6 +1354,28 @@ The arithmetic is `client/gui/app/motion.c`, one function per moving thing, so
 with the other preferences in the account's bucket under `M:` (0 Off, 1 On,
 2 Follow system), reverts on Cancel and returns to Follow system on Reset.
 
+**High contrast is Off, On or Follow system (REQ-262)**, the row after Theme.
+Follow system is the default and asks the platform (`oc_plat_high_contrast`:
+Windows' high contrast, `SPI_GETHIGHCONTRAST`'s `HCF_HIGHCONTRASTON`; a
+browser's `prefers-contrast: more`) at start, whenever the window gains focus
+and on `SDL_EVENT_SYSTEM_THEME_CHANGED`; an unknown answer reads as off, and
+the palette is re-applied (`palette_changed`) only when the answer moves. It is
+a switch beside the mode, not a third mode: light or dark still follows the
+Theme row. On, `client/gui/app/theme.c` copies one of two fixed palettes,
+`HC_DARK` or `HC_LIGHT`, in place of the mode's palette and the colour scheme,
+the derived selection tint included; the scheme row says it does not apply,
+and a scheme picked meanwhile is kept and takes effect when high contrast goes
+off. In both palettes every text ink (TEXT, MUTED, FAINT, ACCENT, DANGER)
+clears 7:1 against every surface it is drawn on and every control ink
+(BORDER, ACCENT_DIM, ONLINE, AWAY, NOTICE) 4.5:1, which `tests/test_theme.c`
+asserts from the tables. A label or icon on an accent, accent-dim or danger
+fill is drawn in its own token, `OC_COL_ON_ACCENT`, never a literal white:
+white in the ordinary palettes, black in the dark high-contrast one, where no
+accent light enough to read on black can carry white at 7:1. The choice is
+kept with the other preferences under `H:` (0 Off, 1 On, 2 Follow system;
+absent reads as Follow system), is in the Preferences snapshot so Cancel
+reverts it, and returns to Follow system on Reset.
+
 ### About OpenChime: both builds on one screen
 
 The workspace menu's **About OpenChime** (and the palette's) is a small dialog

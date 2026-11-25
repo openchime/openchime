@@ -3661,6 +3661,17 @@ static int   g_sys_motion_test = -1;   /* test-only stand-in for it, 0 or 1; -1 
 static void motion_sys_read(void) { g_sys_motion = oc_plat_reduce_motion(); }
 static int  motion_sys(void) { return g_sys_motion_test >= 0 ? g_sys_motion_test : g_sys_motion; }
 static int  motion_reduced(void) { return oc_motion_reduced(g_pref_motion, motion_sys()); }
+/* High contrast (REQ-262, theme.h): Off, On, or Follow system, the default,
+ * the same pattern as Reduce motion. The system's answer is read at start,
+ * whenever the window gains focus and when the system's theme changes; the
+ * harness can stand in for it (`syscontrast`). */
+static int   g_pref_contrast = OC_HC_SYSTEM;
+static int   g_sys_contrast = -1;        /* oc_plat_high_contrast(): 1, 0, -1 unknown */
+static int   g_sys_contrast_test = -1;   /* test-only stand-in for it, 0 or 1; -1 none */
+static int  contrast_sys(void) { return g_sys_contrast_test >= 0 ? g_sys_contrast_test : g_sys_contrast; }
+static int  contrast_on(void) { return oc_high_contrast_on(g_pref_contrast, contrast_sys()); }
+static void contrast_apply(void);       /* fwd: re-applies the palette when the answer changes */
+static void contrast_sys_read(void) { g_sys_contrast = oc_plat_high_contrast(); contrast_apply(); }
 
 
 static float textsize_mult(void) {
@@ -3929,7 +3940,7 @@ static void draw_chip_r(gfx *rt, rectf b, const char *label, int on) {
     fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hover ? OC_COL_HOVER : OC_COL_INPUT);
     if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, label, g_meta, b, on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+    draw_text(rt, label, g_meta, b, on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
 
@@ -4384,7 +4395,7 @@ static void draw_alert_badge(gfx *rt, const oc_model *m, float y) {
     float cx = RAIL_W / 2;
     rectf b = rf(cx + 6, y + 2, cx + 24, y + 20);
     fill_round(rt, b, OC_R_PILL, m->srvalerts_unacked ? OC_COL_DANGER : OC_COL_AWAY);
-    draw_lucide(rt, OC_ICON_ALERT, rf(b.left + 3, b.top + 3, b.right - 3, b.bottom - 3), 0xFFFFFF);
+    draw_lucide(rt, OC_ICON_ALERT, rf(b.left + 3, b.top + 3, b.right - 3, b.bottom - 3), OC_COL_ON_ACCENT);
 }
 
 /* The main nav items (the user's list). "More" is synthesized only on overflow. */
@@ -4454,7 +4465,7 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     if (oc_model_is_workspace_sender(m, uid)) {
         fill_round(rt, box, radius, OC_COL_ACCENT);
         float in = (box.right - box.left) * 0.22f;
-        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), 0xFFFFFF);
+        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), OC_COL_ON_ACCENT);
         return;
     }
     /* Removed from the workspace (REQ-033): shown disabled, a plain grey tile
@@ -4535,7 +4546,7 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     if (g_nav_hover == NAV_SWITCHER) fill_round_a(rt, av, OC_R_AVATAR_LG, 0xFFFFFF, 0.12f);
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
-    draw_text(rt, init, g_avatar, av, 0xFFFFFF);
+    draw_text(rt, init, g_avatar, av, OC_COL_ON_ACCENT);
     /* "N elsewhere": unread sitting in the workspaces you are not
      * looking at. Without it, holding several clients would be invisible. */
     int elsewhere = ws_unread_elsewhere();
@@ -4550,7 +4561,7 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         rectf b = rf(av.right - bw + 6, av.top - 6, av.right + 6, av.top + 12);
         fill_round(rt, b, OC_R_PILL, OC_COL_DANGER);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, badge, g_meta, b, 0xFFFFFF);
+        draw_text(rt, badge, g_meta, b, OC_COL_ON_ACCENT);
         g_meta->align = ST_ALIGN_LEFT;
     }
     rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
@@ -4817,7 +4828,7 @@ static void draw_menu(gfx *rt) {
             }
         }
         char init[2] = { in0, 0 };
-        draw_text(rt, init, g_avatar, av, 0xFFFFFF);
+        draw_text(rt, init, g_avatar, av, OC_COL_ON_ACCENT);
         /* Three rows, 18px apart and non-overlapping (they used to collide). */
         draw_text(rt, nm, g_title, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
         char hostline[288]; oc_hostport(g_host, g_port, hostline, sizeof hostline);
@@ -5445,7 +5456,7 @@ static void draw_call_tile(gfx *rt, const oc_model *m, const oc_call_stats *st, 
     if (me ? st->muted && !st->ptt : ps && ps->muted) {
         rectf mb = rf(t.right - UIS(20), t.top + UIS(4), t.right - UIS(4), t.top + UIS(20));
         fill_round(rt, mb, UIS(8), OC_COL_DANGER);
-        draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
+        draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), OC_COL_ON_ACCENT);
     }
 }
 
@@ -5497,7 +5508,7 @@ static void call_button(gfx *rt, rectf b, int icon, const char *label, int on, i
     fill_round(rt, b, OC_R_CONTROL, bg);
     if (danger == 2) stroke_round(rt, b, OC_R_CONTROL, OC_COL_DANGER, 1.5f);
     else if (!on && !danger) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    uint32_t fg = danger == 2 ? OC_COL_DANGER : (on || danger) ? 0xFFFFFF : OC_COL_TEXT;
+    uint32_t fg = danger == 2 ? OC_COL_DANGER : (on || danger) ? OC_COL_ON_ACCENT : OC_COL_TEXT;
     float ic = UIS(18.0f), x = b.left + UIS(10);
     if (icon >= 0) {
         draw_lucide(rt, icon, rf(x, (b.top + b.bottom - ic) / 2, x + ic, (b.top + b.bottom + ic) / 2), fg);
@@ -5546,7 +5557,7 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         fill_round(rt, pill, UIS(9), invited ? OC_COL_ACCENT : OC_COL_INPUT);
         int oa = g_meta->align;
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, count, g_meta, pill, invited ? 0xFFFFFF : OC_COL_MUTED);
+        draw_text(rt, count, g_meta, pill, invited ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = oa;
     }
     if (in_rect(g_calls_plus, g_mouse_x, g_mouse_y)) fill_round(rt, g_calls_plus, OC_R_CONTROL, OC_COL_HOVER);
@@ -5562,7 +5573,7 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         fill_round(rt, mp, UIS(9), OC_COL_DANGER);
         int oa = g_meta->align;
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, mc, g_meta, mp, 0xFFFFFF);
+        draw_text(rt, mc, g_meta, mp, OC_COL_ON_ACCENT);
         g_meta->align = oa;
         g_calls_missed_mark = mp;
     }
@@ -5834,7 +5845,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 fill_round(rt, pill, ph / 2, OC_COL_ACCENT);
                 { int oa = g_micro->align;
                   g_micro->align = ST_ALIGN_CENTER;
-                  draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
+                  draw_text(rt, badge, g_micro, pill, OC_COL_ON_ACCENT);
                   g_micro->align = oa; }
             } else if (badge[0]) {
                 /* Drafts waiting + anything that FAILED to send — drawn in
@@ -6005,7 +6016,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 rectf br = rf(sx1 - UIS(40), ry + 6, sx1 - UIS(10), ry + ROW_H - 6);
                 fill_round(rt, br, OC_R_PILL, OC_COL_ACCENT);
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, badge, g_meta, br, 0xFFFFFF);
+                draw_text(rt, badge, g_meta, br, OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             } else if (r->channel_id && oc_model_call_from(m, r->channel_id)) {
                 /* A call going on, started here: the phone, as Slack marks a huddle. */
@@ -7633,7 +7644,7 @@ static void mcell_covers(gfx *rt, const oc_msg *msg, const mcell *cl, float ox, 
             }
             if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
             else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
-            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), 0xFFFFFF);
+            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), OC_COL_ON_ACCENT);
             if (!q) hit = c;
             else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
         }
@@ -7928,7 +7939,7 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
         spoiler_caption(msg, body, k, cap, sizeof cap);
         float ry = mtab_down(body, body->spl[k].r[0].y);
         draw_text(rt, cap, g_meta, rf(tx + body->spl[k].r[0].x + 4, by + ry,
-                                      tx + content_w, by + ry + body->spl[k].r[0].h), 0xFFFFFF);
+                                      tx + content_w, by + ry + body->spl[k].r[0].h), OC_COL_ON_ACCENT);
     }
     return body->mh;
 }
@@ -8247,7 +8258,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             rectf box = rf(mx, my, mx + mk, my + mk);
             if (k->done) { fill_round(rt, box, UIS(3.0f), OC_COL_ACCENT); done++; }
             stroke_round(rt, box, UIS(3.0f), k->done ? OC_COL_ACCENT : OC_COL_MUTED, 1.0f);
-            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), 0xFFFFFF);
+            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), OC_COL_ON_ACCENT);
             char who[96] = "";
             if (k->done && k->done_by) {
                 const char *nm = oc_model_user_name((oc_model *)m, k->done_by);
@@ -9268,7 +9279,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
         int on = g_search_sort == (uint8_t)k, hot = in_rect(b, g_mouse_x, g_mouse_y);
         fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hot ? OC_COL_HOVER : OC_COL_INPUT);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, SORTS[k], g_meta, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        draw_text(rt, SORTS[k], g_meta, b, on ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_meta->align = ST_ALIGN_LEFT;
         g_srch_sort_btn[k] = b;
         sx = b.left - 4;
@@ -10258,7 +10269,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
                 if (!days[d].enabled) stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
                 if (days[d].enabled) {
                     g_meta->align = ST_ALIGN_CENTER;
-                    draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+                    draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
                     g_meta->align = ST_ALIGN_LEFT;
                 }
                 g_sched_day_chk[d] = chk;
@@ -11524,7 +11535,7 @@ static rectf chip(gfx *rt, float x, float y, const char *label,
     if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_meta, b,
-              on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+              on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
     return b;
 }
@@ -11866,7 +11877,7 @@ static void draw_files_view(gfx *rt, const oc_model *m, rectf reg) {
     g_file_up_btn = rf(reg.right - 116, reg.top + 14, reg.right - 20, reg.top + 42);
     fill_round(rt, g_file_up_btn, OC_R_CONTROL, OC_COL_ACCENT);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Upload", g_meta, g_file_up_btn, 0xFFFFFF);
+    draw_text(rt, "Upload", g_meta, g_file_up_btn, OC_COL_ON_ACCENT);
     g_meta->align = ST_ALIGN_LEFT;
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     rectf body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
@@ -11953,6 +11964,8 @@ enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
 /* Appearance's Reduce motion (REQ-269): a number of its own, so the rows
  * above keep theirs. */
 enum { PREF_ROW_MOTION = 130 };
+/* ...and High contrast (REQ-262), beside it. */
+enum { PREF_ROW_CONTRAST = 131 };
 
 /* Each row's name in its choices' automation ids, `prefs.<name>.<value>`
  * (REQ-290). Fixed here rather than derived from the label, so rewording a row
@@ -11961,6 +11974,7 @@ static const struct { int row; const char *aid; } PREF_ROW_AIDS[] = {
     { PREF_ROW_THEME, "theme" },         { PREF_ROW_ACCENT, "scheme" },
     { PREF_ROW_FONT, "font" },           { PREF_ROW_TEXTSIZE, "textsize" },
     { PREF_ROW_DENSITY, "density" },     { PREF_ROW_MOTION, "motion" },
+    { PREF_ROW_CONTRAST, "contrast" },
     { PREF_ROW_MEMBERS, "members" },     { PREF_ROW_TOASTPOS, "notices" },
     { PREF_ROW_TIME, "time" },           { PREF_ROW_DAYSEP, "daysep" },
     { PREF_ROW_EDITOR, "editor" },       { PREF_ROW_ENTER, "enter" },
@@ -12063,8 +12077,14 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
               rf(body.left + 24, y, swatch_left - 12, y + 22), OC_COL_TEXT);
     {
         char hint[96];
-        snprintf(hint, sizeof hint, "%s: the sidebar and the accent.",
-                 oc_theme_scheme_name(oc_theme_scheme()));
+        /* High contrast has a fixed palette of its own: the scheme picked is
+         * kept, and applies again when high contrast goes off. */
+        if (oc_theme_high_contrast())
+            snprintf(hint, sizeof hint, "%s: does not apply while high contrast is on.",
+                     oc_theme_scheme_name(oc_theme_scheme()));
+        else
+            snprintf(hint, sizeof hint, "%s: the sidebar and the accent.",
+                     oc_theme_scheme_name(oc_theme_scheme()));
         draw_text(rt, hint, g_meta,
                   rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
     }
@@ -12166,6 +12186,11 @@ static void draw_prefs(gfx *rt, rectf reg) {
     if (g_pref_cat == PC_APPEARANCE) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
                      "System follows the Windows theme.", THEMES, 3, oc_theme_mode());
+        static const char *CONTRASTS[3] = { "Off", "On", "Follow system" };
+        y = pref_row(rt, body, y, PREF_ROW_CONTRAST, "High contrast",
+                     "Stronger colours, in light and dark; the colour scheme does not apply. "
+                     "Follow system uses the system's own setting.",
+                     CONTRASTS, 3, g_pref_contrast);
         y = pref_accent_row(rt, body, y);
         {
             const char *FONTS[OC_TYPEFACE_COUNT];
@@ -12406,7 +12431,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         g_prof_dm_btn = rf(reg.left + 24, y, reg.right - 24, y + 32);
         fill_round(rt, g_prof_dm_btn, OC_R_CONTROL, OC_COL_ACCENT);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
+        draw_text(rt, "Message", g_ui, g_prof_dm_btn, OC_COL_ON_ACCENT);
         g_ui->align = ST_ALIGN_LEFT;
         y += 40;
         /* Mute them, for me alone; the button says which way it goes. */
@@ -13120,7 +13145,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_call_hdr_btn = rf(statr - bw, 13, statr, HEADER_H - 13);
         if (cv) fill_round(rt, g_call_hdr_btn, OC_R_CONTROL, mine ? OC_COL_ONLINE : OC_COL_ACCENT);
         else    stroke_round(rt, g_call_hdr_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        uint32_t ccol = cv ? 0xFFFFFF : OC_COL_MUTED;
+        uint32_t ccol = cv ? OC_COL_ON_ACCENT : OC_COL_MUTED;
         draw_lucide(rt, OC_ICON_PHONE, rf(g_call_hdr_btn.left + 5, g_call_hdr_btn.top + 4,
                                           g_call_hdr_btn.left + 23, g_call_hdr_btn.bottom - 4), ccol);
         if (cn[0])
@@ -13138,7 +13163,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_listen_btn = rf(statr - lw, 13, statr, HEADER_H - 13);
         if (on) fill_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_ACCENT);
         else    stroke_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        uint32_t lcol = on ? 0xFFFFFF : OC_COL_MUTED;
+        uint32_t lcol = on ? OC_COL_ON_ACCENT : OC_COL_MUTED;
         draw_lucide(rt, on ? OC_ICON_VOLUME : OC_ICON_MUTE,
                     rf(g_listen_btn.left + 5, g_listen_btn.top + 4,
                        g_listen_btn.left + 23, g_listen_btn.bottom - 4), lcol);
@@ -13190,7 +13215,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_unread_jump = rf(statr - bw, 14, statr, HEADER_H - 14);
         fill_round(rt, g_unread_jump, OC_R_PILL, OC_COL_DANGER);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, lbl, g_meta, g_unread_jump, 0xFFFFFF);
+        draw_text(rt, lbl, g_meta, g_unread_jump, OC_COL_ON_ACCENT);
         g_meta->align = ST_ALIGN_LEFT;
         statr = g_unread_jump.left - 12;
     } else {
@@ -13504,12 +13529,12 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         rectf r = rf(px + 6, y, px + pw - 6, y + rowh);
         if (i == g_pal_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
-                  i == g_pal_sel ? 0xFFFFFF : OC_COL_TEXT);
+                  i == g_pal_sel ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_meta->align = ST_ALIGN_RIGHT;
         draw_text(rt, hit[i].kind, g_meta,
                   baseline_align(rf(px + 18, y, px + pw - 90, y + rowh),
                                  g_ui, g_meta, px + 18, px + pw - 18),
-                  i == g_pal_sel ? 0xFFFFFF : OC_COL_FAINT);
+                  i == g_pal_sel ? OC_COL_ON_ACCENT : OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
         g_pal_rows[g_n_pal_rows].r = r;
         g_pal_rows[g_n_pal_rows].cmd = hit[i].cmd;
@@ -13853,7 +13878,7 @@ static void nt_paint(void) {
         fill_round(g_nt_win.g, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), OC_R_CONTROL, OC_COL_ACCENT);
         draw_lucide(g_nt_win.g, OC_ICON_DMS,
                     rf(ix + pad, iy + pad, ix + NTOAST_ICON - pad, iy + NTOAST_ICON - pad),
-                    0xFFFFFF);
+                    OC_COL_ON_ACCENT);
         float tx = r.left + g.text_x, tr = r.right - NTOAST_PAD;
         draw_text(g_nt_win.g, g_nt[i].title, g_ui_b,
                   rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
@@ -14988,7 +15013,7 @@ static void draw_signin(gfx *rt, float W, float H) {
     /* Mark: the accent rounded square the rail uses for the workspace avatar. */
     rectf mark = rf(cx - 18, y, cx + 18, y + 36);
     fill_round(rt, mark, OC_R_AVATAR_LG, OC_COL_ACCENT);
-    draw_text(rt, "O", g_avatar, mark, 0xFFFFFF);
+    draw_text(rt, "O", g_avatar, mark, OC_COL_ON_ACCENT);
     y += 52;
 
     g_display->align = ST_ALIGN_CENTER;
@@ -15139,7 +15164,7 @@ static void draw_signin(gfx *rt, float W, float H) {
         stroke_round(rt, g_si_remember_box, OC_R_CONTROL,
                      g_si_remember ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
         if (g_si_remember)
-            draw_text(rt, "\xE2\x9C\x93", g_meta, rf(fx + 2, y, fx + 18, y + 20), 0xFFFFFF);
+            draw_text(rt, "\xE2\x9C\x93", g_meta, rf(fx + 2, y, fx + 18, y + 20), OC_COL_ON_ACCENT);
         draw_text(rt, "Remember me", g_meta, rf(fx + 24, y, fx + fw, y + 20), OC_COL_MUTED);
         y += 30;
     }
@@ -15147,7 +15172,7 @@ static void draw_signin(gfx *rt, float W, float H) {
     g_si_btn = rf(fx, y, fx + fw, y + 40);
     fill_round(rt, g_si_btn, OC_R_CONTROL, OC_COL_ACCENT);
     g_ui->align = ST_ALIGN_CENTER;
-    draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, 0xFFFFFF);
+    draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, OC_COL_ON_ACCENT);
     g_ui->align = ST_ALIGN_LEFT;
     y += 50;
 
@@ -15232,7 +15257,7 @@ static void draw_autocomplete(gfx *rt, float x0, float w, float h) {
         g_ac_rows[i] = r;
         if (i == g_ac_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, g_ac[i].disp, g_ui, rf(px + 12, y + 3, px + pw - 12, y + rowh),
-                  i == g_ac_sel ? 0xFFFFFF : OC_COL_TEXT);
+                  i == g_ac_sel ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         if (g_ac_kind == OC_AC_MENTION && g_ac[i].repl[0] == '@' && model()) {
             uint64_t au = oc_model_user_id(model(), g_ac[i].repl + 1);
             if (au && oc_model_user_is_agent(model(), au))
@@ -16151,7 +16176,7 @@ static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_co
         if (oc_dictate_speaking(g_dict))
             stroke_round(rt, rf(r.left - 2, r.top - 2, r.right + 2, r.bottom + 2), OC_R_CONTROL + 2,
                          live_col, 2.0f);
-        ink = 0xFFFFFF;
+        ink = OC_COL_ON_ACCENT;
     }
     draw_lucide(rt, icon, composer_glyph(r), ink);
 }
@@ -16669,7 +16694,7 @@ static void preview_btn_draw(gfx *rt, const char *label) {
     else if (hot)  fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_HOVER);
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_meta, g_preview_btn,
-              g_preview ? 0xFFFFFF : hot ? OC_COL_TEXT : OC_COL_MUTED);
+              g_preview ? OC_COL_ON_ACCENT : hot ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
 
@@ -16890,12 +16915,12 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
          * be the one bright mark on a grey control. */
         rectf seam = rf(gx0 + sq - 0.5f, cy + 5, gx0 + sq + 0.5f, cy + sq - 5);
         if (no_sched)      g_sched_btn = rf(0, 0, 0, 0);
-        else if (has_text) gfx_fill(rt, gr(seam), 0xFFFFFF, 0.35f);
+        else if (has_text) gfx_fill(rt, gr(seam), OC_COL_ON_ACCENT, 0.35f);
         else               fill(rt, seam, OC_COL_BORDER);
         /* Two strokes, not the "\u25BE" glyph: the glyph is a solid triangle
          * that sits off the optical centre of its em box, and next to a line
          * icon it reads as a different family. */
-        uint32_t cc2 = has_text ? 0xFFFFFF : OC_COL_FAINT;
+        uint32_t cc2 = has_text ? OC_COL_ON_ACCENT : OC_COL_FAINT;
         float ccx = (g_sched_btn.left + g_sched_btn.right) / 2 + 0.5f;
         float ccy = (cy + cy + sq) / 2, d = 3.2f;
         if (!no_sched) {
@@ -16905,7 +16930,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     }
     /* Proportional, not a raw 8: against a shrunken square a fixed inset
      * eventually inverts the icon's own rect. */
-    draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_send_btn), has_text ? 0xFFFFFF : OC_COL_FAINT);
+    draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_send_btn), has_text ? OC_COL_ON_ACCENT : OC_COL_FAINT);
     /* LAST, over everything in the box: the action row's tooltip. */
     draw_act_tip(rt, ACT_ATTACH, ACT_SCHEDULE, bx0, bx1);
 }
@@ -17186,10 +17211,10 @@ static void modal_button(gfx *rt, rectf r, const char *label, int kind) {
     if (kind == MB_DANGER_PRIMARY) {
         fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
         if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
-        tc = 0xFFFFFF;
+        tc = OC_COL_ON_ACCENT;
     } else if (kind == MB_PRIMARY) {
         fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
-        tc = 0xFFFFFF;
+        tc = OC_COL_ON_ACCENT;
     } else if (kind == MB_DANGER) {
         fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
         stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
@@ -17560,7 +17585,7 @@ static void draw_form(gfx *rt, rectf body) {
                              g_form_focus == i ? 1.5f : 1.0f);
             if (on) {
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
+                draw_text(rt, "\u2713", g_meta, box, OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             }
             draw_text(rt, f->label, g_ui, rf(body.left + FORM_CHECK_LBL_X, y, body.right, y + FORM_BOX_H), OC_COL_TEXT);
@@ -17967,6 +17992,7 @@ static struct {
     oc_spoken_opts spoken;
     int  announce_new;
     int  motion;
+    int  contrast;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17987,6 +18013,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.spoken   = g_pref_spoken;
     g_prefs_snap.announce_new = g_pref_announce_new;
     g_prefs_snap.motion   = g_pref_motion;
+    g_prefs_snap.contrast = g_pref_contrast;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -18015,6 +18042,10 @@ static void prefs_restore(void) {
     g_pref_spoken = g_prefs_snap.spoken;
     g_pref_announce_new = g_prefs_snap.announce_new;
     g_pref_motion = g_prefs_snap.motion;
+    if (g_pref_contrast != g_prefs_snap.contrast) {
+        g_pref_contrast = g_prefs_snap.contrast;
+        contrast_apply();
+    }
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -18155,7 +18186,7 @@ static void cal_month_draw(gfx *rt, float cx, float y, int yr, int mon, const ch
         else if (!mark && on && in_rect(c, g_mouse_x, g_mouse_y)) fill_round(rt, c, OC_R_CONTROL, OC_COL_HOVER);
         if (today && !chosen) stroke_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
         char num[4]; snprintf(num, sizeof num, "%d", d);
-        draw_text(rt, num, g_meta, c, chosen ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+        draw_text(rt, num, g_meta, c, chosen ? OC_COL_ON_ACCENT : on ? OC_COL_TEXT : OC_COL_FAINT);
         if (*n_out < 42) {
             out[*n_out].r = c; out[*n_out].y = yr; out[*n_out].m = mon; out[*n_out].d = d; out[*n_out].on = on;
             (*n_out)++;
@@ -18292,7 +18323,7 @@ static void draw_sched_custom(gfx *rt, rectf body) {
         else if (on && in_rect(r, g_mouse_x, g_mouse_y)) fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
         char tl[16]; sched_time_label((uint16_t)(k * 30), tl, sizeof tl);
         draw_text(rt, tl, g_meta, rf(r.left + UIS(10.0f), r.top, r.right, r.bottom),
-                  sel ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+                  sel ? OC_COL_ON_ACCENT : on ? OC_COL_TEXT : OC_COL_FAINT);
         /* Recorded clipped to the box, so a half-visible row cannot be clicked
          * outside it. */
         rectf hit = rf(r.left, r.top > inner.top ? r.top : inner.top,
@@ -19229,7 +19260,7 @@ static void draw_poll_compose(gfx *rt, rectf body) {
         if (on) {
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "✓", g_meta, box, 0xFFFFFF);
+            draw_text(rt, "✓", g_meta, box, OC_COL_ON_ACCENT);
             g_meta->align = oa;
         }
         draw_text(rt, CHK[k], g_ui, rf(lx + UIS(31.0f), y + UIS(3.0f), lr, y + UIS(27.0f)),
@@ -21260,7 +21291,7 @@ static void draw_pfields_admin(gfx *rt, const oc_model *m, rectf body) {
         g_pf_new_btn = rf(body.right - 140, y, body.right - 20, y + 30);
         fill_round(rt, g_pf_new_btn, OC_R_CONTROL, OC_COL_ACCENT);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "New field", g_ui, g_pf_new_btn, 0xFFFFFF);
+        draw_text(rt, "New field", g_ui, g_pf_new_btn, OC_COL_ON_ACCENT);
         g_ui->align = ST_ALIGN_LEFT;
     }
     y += 48;
@@ -21690,7 +21721,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, ready ? "Start group message" : "Pick one more",
                   g_meta, rf(g_pick_go.left, g_pick_go.top + 4, g_pick_go.right, g_pick_go.bottom),
-                  ready ? 0xFFFFFF : OC_COL_MUTED);
+                  ready ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         y += 48;
     }
@@ -21722,7 +21753,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
             if (on) {
                 gfx_ellipse(rt, ccx, ccy, 11, 11, OC_COL_ACCENT, 1.0f);
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, "\u2713", g_meta, rf(chk.left, chk.top + 2, chk.right, chk.bottom), 0xFFFFFF);
+                draw_text(rt, "\u2713", g_meta, rf(chk.left, chk.top + 2, chk.right, chk.bottom), OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             } else {
                 gfx_ellipse_stroke(rt, ccx, ccy, 11, 11, 1.5f, OC_COL_BORDER, 1.0f);
@@ -21822,7 +21853,7 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         else if (hover) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, L[i], g_meta, b,
-                  on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+                  on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         g_act_filters[i] = b;
         fx = b.right + 3;
@@ -22064,7 +22095,7 @@ static void draw_browse(gfx *rt, const oc_model *m, rectf body) {
             }
             g_ui->align = ST_ALIGN_CENTER;
             draw_text(rt, c->joined ? "Open" : "Join", g_ui, rf(b.left, b.top + 1, b.right, b.bottom),
-                      c->joined ? OC_COL_TEXT : 0xFFFFFF);
+                      c->joined ? OC_COL_TEXT : OC_COL_ON_ACCENT);
             g_ui->align = ST_ALIGN_LEFT;
             if (g_n_browse_rows < 64) {
                 g_browse_rows[g_n_browse_rows].r = b;
@@ -23255,7 +23286,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         if (!g_nm_e2e) stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         if (g_nm_e2e) {
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+            draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
             g_meta->align = ST_ALIGN_LEFT;
         }
         const char *lab = "End-to-end encrypted";
@@ -23337,13 +23368,13 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         /* One hairline seam, so the two halves read as two buttons. */
         if (!e2e)
             fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
-                 ready ? 0xFFFFFF : OC_COL_BORDER);
+                 ready ? OC_COL_ON_ACCENT : OC_COL_BORDER);
         draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_nm_send),
-                    ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT));
+                    ready ? OC_COL_ON_ACCENT : OC_INK_ON(TH_FAINT, TH_INPUT));
         if (e2e) g_nm_sched = rf(0, 0, 0, 0);
         else {   /* The same two strokes the conversation's chevron is drawn with, for
              * the reason given there: the glyph reads as a different family. */
-            uint32_t cc = ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT);
+            uint32_t cc = ready ? OC_COL_ON_ACCENT : OC_INK_ON(TH_FAINT, TH_INPUT);
             float ccx = (g_nm_sched.left + g_nm_sched.right) / 2 + 0.5f;
             float ccy = cy + sq / 2, d = 3.2f;
             gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc, 1.0f);
@@ -23639,7 +23670,7 @@ static void draw_empty_state(gfx *rt, rectf body, int icon,
          * fonts_build — a whole-app alignment bug from one button. */
         int opara = g_ui->para;
         g_ui->para = PARA_MID;
-        draw_text(rt, cta, g_ui, b, 0xFFFFFF);
+        draw_text(rt, cta, g_ui, b, OC_COL_ON_ACCENT);
         g_ui->para = opara;
         *out_btn = b;
     }
@@ -24071,7 +24102,7 @@ static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, 
         if (muted) {
             rectf mb = rf(card.right - UIS(28), card.top + UIS(8), card.right - UIS(8), card.top + UIS(28));
             fill_round(rt, mb, UIS(10), OC_COL_DANGER);
-            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), OC_COL_ON_ACCENT);
         }
     } else {
         /* The face grows with the card, keeping room under it for the name and
@@ -24088,7 +24119,7 @@ static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, 
         if (muted) {
             rectf mb = rf(avr.right - UIS(14), avr.bottom - UIS(14), avr.right + UIS(6), avr.bottom + UIS(6));
             fill_round(rt, mb, UIS(10), OC_COL_DANGER);
-            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), OC_COL_ON_ACCENT);
         }
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(rt, name, g_ui, rf(card.left + 8, ay + av + 6, card.right - 8, ay + av + UIS(28)), OC_COL_TEXT);
@@ -24299,7 +24330,7 @@ static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
             fill_round(rt, fb, UIS(13), g_home_filter == i ? OC_COL_ACCENT : OC_COL_INPUT);
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, FL[i], g_meta, fb, g_home_filter == i ? 0xFFFFFF : OC_COL_TEXT);
+            draw_text(rt, FL[i], g_meta, fb, g_home_filter == i ? OC_COL_ON_ACCENT : OC_COL_TEXT);
             g_meta->align = oa;
             char aid[32], an[48];
             snprintf(aid, sizeof aid, "calls.filter.%s", i == 0 ? "all" : i == 1 ? "joined" : "missed");
@@ -24659,7 +24690,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
             fill_round(rt, rf(rb.left + UIS(12), (rb.top + rb.bottom) / 2 - UIS(5), rb.left + UIS(22),
                               (rb.top + rb.bottom) / 2 + UIS(5)), UIS(5), REC_RED);
             draw_text(rt, rl, g_ui, rf(rb.left + UIS(28), rb.top, rb.right - 6, rb.bottom),
-                      m->call.recording ? 0xFFFFFF : OC_COL_TEXT);
+                      m->call.recording ? OC_COL_ON_ACCENT : OC_COL_TEXT);
             call_btn_add(rb, CC_RECORD, "call.record", m->call.recording ? "Recording: on. Stop recording"
                                                                           : "Recording: off. Record the call");
             cb = rb;
@@ -25258,7 +25289,7 @@ static void draw_newcall(gfx *rt, const oc_model *m, rectf body) {
             rectf box = rf(row.left + 6, row.top + 7, row.left + 24, row.top + 25);
             if (g_cpick_on[i]) fill_round(rt, box, 3, OC_COL_ACCENT);
             else stroke_round(rt, box, 3, OC_COL_BORDER, 1.5f);
-            if (g_cpick_on[i]) draw_text(rt, "✓", g_meta, rf(box.left + 3, box.top, box.right, box.bottom), 0xFFFFFF);
+            if (g_cpick_on[i]) draw_text(rt, "✓", g_meta, rf(box.left + 3, box.top, box.right, box.bottom), OC_COL_ON_ACCENT);
             const char *nm = oc_model_user_name(m, g_cpick_uid[i]);
             draw_user_avatar(rt, m, g_cpick_uid[i], nm ? nm : "", rf(row.left + 32, row.top + 4, row.left + 54, row.top + 26), g_meta);
             draw_text(rt, nm && nm[0] ? nm : "someone", g_ui, rf(row.left + 62, row.top, row.right - 8, row.bottom), OC_COL_TEXT);
@@ -25481,7 +25512,7 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
         }
         if (!g_threads_unread) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, lbl, g_meta, b, g_threads_unread ? 0xFFFFFF : OC_COL_MUTED);
+        draw_text(rt, lbl, g_meta, b, g_threads_unread ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         g_threads_unread_btn = b;
     }
@@ -25565,7 +25596,7 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
                 fill_round(rt, pill, OC_R_PILL, OC_COL_ACCENT);
                 { int oa = g_micro->align;
                   g_micro->align = ST_ALIGN_CENTER;
-                  draw_text(rt, up, g_micro, pill, 0xFFFFFF);
+                  draw_text(rt, up, g_micro, pill, OC_COL_ON_ACCENT);
                   g_micro->align = oa; }
             }
         }
@@ -28173,7 +28204,7 @@ static void draw_pastechoice(gfx *rt, float W, float H) {
         if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         int was = g_ui->align;
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, LBL[k], g_ui, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        draw_text(rt, LBL[k], g_ui, b, on ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_ui->align = was;
         g_pch_btn[k] = b;
         x = b.right + gap;
@@ -28603,7 +28634,7 @@ static void draw_table_editor(gfx *rt, rectf body) {
         if (t->header) {
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "\xE2\x9C\x93", g_meta, box, 0xFFFFFF);
+            draw_text(rt, "\xE2\x9C\x93", g_meta, box, OC_COL_ON_ACCENT);
             g_meta->align = oa;
         }
         draw_text(rt, hl, g_ui, rf(x + UIS(31.0f), y, x + UIS(31.0f) + text_width(hl, g_ui) + 4, y + UIS(30.0f)),
@@ -31889,7 +31920,7 @@ static void bar_paint(oc_win *w, const char *line, const bar_btn *btns, int n) {
         fill_round(w->g, r, OC_R_CONTROL, i == 0 ? (hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT) : (hot ? OC_COL_HOVER : OC_COL_INPUT));
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(w->g, btns[i].label, g_ui, rf(r.left, r.top + 5, r.right, r.bottom),
-                  !btns[i].enabled ? OC_COL_FAINT : i == 0 ? 0xFFFFFF : OC_COL_TEXT);
+                  !btns[i].enabled ? OC_COL_FAINT : i == 0 ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_ui->align = ST_ALIGN_LEFT;
         x -= bw + pad;
     }
@@ -32393,7 +32424,7 @@ static void vm_btn(gfx *rt, rectf r, const char *label, int cmd, int primary, in
                        stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f); }
     g_ui->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
-              primary ? 0xFFFFFF : danger ? OC_COL_DANGER : OC_COL_TEXT);
+              primary ? OC_COL_ON_ACCENT : danger ? OC_COL_DANGER : OC_COL_TEXT);
     g_ui->align = ST_ALIGN_LEFT;
     if (g_n_vm_btns < VM_MAX_BTNS) {
         g_vm_btns[g_n_vm_btns].r = r;
@@ -32632,8 +32663,8 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
                         if (o[i].on) fill_round(rt, b, UIS(3), OC_COL_ACCENT);
                         stroke_round(rt, b, UIS(3), o[i].on ? OC_COL_ACCENT : OC_COL_MUTED, 1.2f);
                         if (o[i].on) {
-                            gfx_line(rt, b.left + UIS(3), b.top + UIS(7), b.left + UIS(6), b.top + UIS(10), 1.6f, 0xFFFFFF, 1.0f);
-                            gfx_line(rt, b.left + UIS(6), b.top + UIS(10), b.right - UIS(3), b.top + UIS(4), 1.6f, 0xFFFFFF, 1.0f);
+                            gfx_line(rt, b.left + UIS(3), b.top + UIS(7), b.left + UIS(6), b.top + UIS(10), 1.6f, OC_COL_ON_ACCENT, 1.0f);
+                            gfx_line(rt, b.left + UIS(6), b.top + UIS(10), b.right - UIS(3), b.top + UIS(4), 1.6f, OC_COL_ON_ACCENT, 1.0f);
                         }
                         tx = b.right + UIS(8);
                     }
@@ -33119,6 +33150,16 @@ static void palette_changed(void) {
 /* Every theme switch goes through here so no caller can forget the children. */
 static void theme_set(int mode) {
     oc_theme_apply(mode);
+    palette_changed();
+}
+
+/* High contrast on or off, as the preference and the system now say, through
+ * palette_changed like any other palette change -- and only when the answer
+ * moved, so a focus change that finds the system as it was costs nothing. */
+static void contrast_apply(void) {
+    int on = contrast_on();
+    if (on == oc_theme_high_contrast()) return;
+    oc_theme_set_high_contrast(on);
     palette_changed();
 }
 
@@ -34396,6 +34437,7 @@ static void pref_choose(oc_win *hwnd, int row, int v) {
     case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
     case PREF_ROW_MOTION:   g_pref_motion = v; break;
+    case PREF_ROW_CONTRAST: g_pref_contrast = v; contrast_apply(); break;
     case PREF_ROW_RESET:
         /* Not persisted here: Save commits, like every other control on
          * this card. Cancel puts the old values back from the snapshot. */
@@ -34404,6 +34446,8 @@ static void pref_choose(oc_win *hwnd, int row, int v) {
         g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
         g_pref_notify = NOTIFY_FULL;
         g_pref_motion = OC_MOTION_SYSTEM;
+        g_pref_contrast = OC_HC_SYSTEM;
+        contrast_apply();
         g_pref_flash = FLASH_IDLE;
         g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
         g_pref_font = OC_TYPEFACE_DEFAULT;
@@ -38669,6 +38713,9 @@ static void prefs_save(void) {
         /* ...and Reduce motion: Off, On or Follow system. */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";M:%d", g_pref_motion);
+        /* ...and High contrast: Off, On or Follow system. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";H:%d", g_pref_contrast);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38682,6 +38729,7 @@ static void prefs_load(const oc_model *m) {
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
     int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
     int mo = OC_MOTION_SYSTEM;   /* no `M:`: follow the system */
+    int hc = OC_HC_SYSTEM;       /* no `H:`: follow the system */
     /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
     oc_spoken_opts spk = oc_spoken_defaults();
     int an = 1;
@@ -38727,6 +38775,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
             else if (k == 'N') nl = val ? 1 : 0;
             else if (k == 'M') mo = (val < 0 || val >= OC_MOTION_PREF_COUNT) ? OC_MOTION_SYSTEM : val;
+            else if (k == 'H') hc = (val < 0 || val >= OC_HC_PREF_COUNT) ? OC_HC_SYSTEM : val;
             else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
             else if (k == 'A') an = val ? 1 : 0;
             else if (k == 'F') font = (val < 0 || val >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : val;
@@ -38753,6 +38802,9 @@ static void prefs_load(const oc_model *m) {
     g_pref_daysep  = d ? 1 : 0;
     g_pref_enter_newline = nl;
     g_pref_motion = mo;
+    g_pref_contrast = hc;
+    /* Before theme_set, which applies the palette: high contrast decides which. */
+    oc_theme_set_high_contrast(contrast_on());
     g_pref_spoken = spk;
     g_pref_announce_new = an;
     g_pref_font = font;
@@ -41652,6 +41704,11 @@ static void test_dump(const char *path) {
      * setting in force, and whether the focused field's caret is lit now. */
     fprintf(f, "motion pref=%d sys=%d reduced=%d caretlit=%d\n",
             g_pref_motion, motion_sys(), motion_reduced(), caret_lit_now());
+    /* High contrast (REQ-262): the preference (0 Off, 1 On, 2 Follow system),
+     * the system's answer as the client takes it (`syscontrast` included), and
+     * whether the high-contrast palette is the one in force. */
+    fprintf(f, "contrast pref=%d sys=%d on=%d\n",
+            g_pref_contrast, contrast_sys(), oc_theme_high_contrast());
     /* The system caret (ARCH-99). Reported because it is invisible by design —
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
@@ -42435,7 +42492,8 @@ static void test_dump(const char *path) {
         static const char *const TOK[TH_COUNT] = {
             "accent", "accent_dim", "rail", "sidebar", "base", "header",
             "input", "select", "hover", "border", "rail_icon", "text",
-            "muted", "faint", "danger", "notice", "online", "away"
+            "muted", "faint", "danger", "notice", "online", "away",
+            "on_accent"
         };
         fprintf(f, "palette mode=%d light=%d n=%d", oc_theme_mode(),
                 oc_theme_is_light(), (int)TH_COUNT);
@@ -44256,6 +44314,27 @@ static void test_poll(oc_win *hwnd) {
         if (arg[0] >= '0' && arg[0] <= '2' && !arg[1]) {
             g_pref_motion = arg[0] - '0';
             prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "contrast")) {
+        /* `contrast 0|1|2`: High contrast Off, On or Follow system, saved as
+         * the Appearance row and Save save it. */
+        if (arg[0] >= '0' && arg[0] <= '2' && !arg[1]) {
+            g_pref_contrast = arg[0] - '0';
+            contrast_apply();
+            prefs_save();
+            invalidate();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "syscontrast")) {
+        /* `syscontrast 0|1|-1`, test-only: what the client takes the system's
+         * high-contrast setting to be, so Follow system can be checked both
+         * ways on any machine. -1 goes back to what the system said. Never
+         * saved. */
+        if (!strcmp(arg, "0") || !strcmp(arg, "1") || !strcmp(arg, "-1")) {
+            g_sys_contrast_test = atoi(arg);
+            contrast_apply();
             invalidate();
             test_ack("ok");
         } else test_ack("err");
@@ -46943,6 +47022,8 @@ static int on_focus_gained(oc_win *hwnd) {
         /* The system's reduce-motion setting may have changed while the
          * window was in the background: asked again (REQ-269). */
         motion_sys_read();
+        /* ...and so may its high-contrast setting (REQ-262). */
+        contrast_sys_read();
         /* The window has the keyboard again, so the composer is typeable
          * again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
@@ -47175,6 +47256,8 @@ static void handle_event(const SDL_Event *e) {
             thumbs_drop();
             invalidate();
         }
+        /* Windows raises this when a contrast theme goes on or off too. */
+        contrast_sys_read();
         return;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
         if (win == hwnd) on_focus_gained(hwnd);
@@ -47514,6 +47597,10 @@ int main(int argc, char *argv[]) {
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
     motion_sys_read();   /* Reduce motion's Follow system (REQ-269) */
+    /* High contrast's (REQ-262). Set directly rather than through
+     * contrast_apply: there is no window yet to repaint. */
+    g_sys_contrast = oc_plat_high_contrast();
+    oc_theme_set_high_contrast(contrast_on());
     /* The quick reactions from the start, the default set until preferences
      * say otherwise: an account that has never saved any would otherwise have
      * none, and the hover strip and the menu's emoji row with them. */

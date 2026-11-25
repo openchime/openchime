@@ -197,6 +197,11 @@ uint32_t oc_plat_idle_ms(void);
  * animations", a browser's prefers-reduced-motion. Read at start and whenever
  * the window gains focus, which is when a change made elsewhere can show. */
 int      oc_plat_reduce_motion(void);
+/* Whether the person has asked the system for high contrast (REQ-262): 1 on,
+ * 0 off, -1 when the platform cannot say. Windows' high contrast
+ * (SPI_GETHIGHCONTRAST), a browser's prefers-contrast: more. Read at start,
+ * whenever the window gains focus and when the system's theme changes. */
+int      oc_plat_high_contrast(void);
 
 /* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
 
