@@ -26,15 +26,14 @@ let failures = 0;
 const check = (ok, what) => { if (ok) say('  ok   ' + what); else { say('  FAIL ' + what); failures++; } };
 const tokenOf = () => { try { return new URL(page.url()).searchParams.get('token') || ''; } catch (e) { return ''; } };
 const msg = async () => (await page.locator('p.msg').first().textContent().catch(() => '')) || '';
-// Submit, then wait until the address is the callback's: polled, since the
-// browser may already be there by the time the click resolves.
+// Submit, then wait until the address is the callback's: the browser may
+// already be there by the time the click resolves, which waitForURL allows.
 const submitToCallback = async () => {
   await page.click('button[type="submit"]');
-  const re = new RegExp(cbPath), t0 = Date.now();
-  while (!re.test(page.url())) {
-    if (Date.now() - t0 > 30000) throw new Error('no callback within 30 s; the page is at ' + page.url() + ': ' + (await msg()));
-    await page.waitForTimeout(100);
-  }
+  const re = new RegExp(cbPath);
+  await page.waitForURL(re, { waitUntil: 'commit', timeout: 30000 }).catch(async () => {
+    throw new Error('no callback within 30 s; the page is at ' + page.url() + ': ' + (await msg()));
+  });
 };
 const submitStays = async () => { await page.click('button[type="submit"]'); await page.waitForSelector('p.msg', { timeout: 30000 }); };
 

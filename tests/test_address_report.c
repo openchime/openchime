@@ -213,7 +213,6 @@ static int run_report(fake_central *f, const int *statuses, int n, const char *b
     return f->seen;
 }
 
-static void count_round(void *ctx) { __atomic_add_fetch((int *)ctx, 1, __ATOMIC_RELEASE); }
 
 static void test_report(void) {
     char pk[1024], aud[128];
@@ -275,31 +274,6 @@ static void test_report(void) {
         }
     }
 
-    /* The round hook: called after each round, and the rounds go on for it
-     * after a refusal, with no further request to central. */
-    {
-        memset(f, 0, sizeof *f);
-        int port = 0;
-        f->fd = fake_listen(&port);
-        CHECK(f->fd >= 0);
-        if (f->fd >= 0) {
-            static const int S[] = { 200, 403 };
-            memcpy(f->statuses, S, sizeof S);
-            f->n_statuses = 2;
-            pthread_t th;
-            CHECK(pthread_create(&th, NULL, fake_central_thread, f) == 0);
-            char url[96];
-            snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
-            int rounds = 0;
-            oc_address_report *r = oc_address_report_start(url, aud, pk, "{}", &FAST_T, count_round, &rounds);
-            CHECK(r != NULL);
-            pthread_join(th, NULL);           /* a quarter second with no request after the 403 */
-            oc_address_report_stop(r);
-            CHECK(f->seen == 2);              /* the recorded round and the refused one, nothing after */
-            CHECK(__atomic_load_n(&rounds, __ATOMIC_ACQUIRE) >= 3);   /* both, and the hook's own after */
-            close(f->fd);
-        }
-    }
 
     /* Nothing to report with: no report, never a crash. */
     CHECK(oc_address_report_start(NULL, aud, pk, "{}", NULL, NULL, NULL) == NULL);

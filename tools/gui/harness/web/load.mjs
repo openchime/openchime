@@ -47,33 +47,45 @@ let failures = 0;
 const check = (ok, what) => { console.log((ok ? '  ok   ' : '  FAIL ') + what); if (!ok) failures++; };
 const url = origin + '/app/?host=127.0.0.1&port=1';
 
-// One load: what came over the wire per file, and the load screen's stages.
+// One load: what came over the wire per file, and the load screen's stages. A
+// file's bytes are known at its loadingFinished, which comes after the page
+// has the file, so the count waits until every response seen has finished or
+// failed.
 async function load() {
-  const name = {}, wire = {}, enc = {};
+  const name = {}, wire = {}, enc = {}, pending = new Set();
+  let settled = null;
+  const end = (id) => { pending.delete(id); if (!pending.size && settled) settled(); };
   const onResp = (e) => {
     const f = new URL(e.response.url).pathname.split('/').pop() || 'page';
     name[e.requestId] = f;
     enc[f] = e.response.headers['content-encoding'] || e.response.headers['Content-Encoding'] || '';
+    pending.add(e.requestId);
   };
-  const onDone = (e) => { const f = name[e.requestId]; if (f) wire[f] = (wire[f] || 0) + e.encodedDataLength; };
+  const onDone = (e) => { const f = name[e.requestId]; if (f) wire[f] = (wire[f] || 0) + e.encodedDataLength; end(e.requestId); };
+  const onFail = (e) => end(e.requestId);
   cdp.on('Network.responseReceived', onResp);
   cdp.on('Network.loadingFinished', onDone);
+  cdp.on('Network.loadingFailed', onFail);
   await page.goto(url);
-  let gone = false, failed = '';
-  for (let i = 0; i < 1200 && !gone && !failed; i++) {
-    const s = await page.evaluate(() => {
-      const l = document.getElementById('load');
-      return l ? { failed: l.classList.contains('failed'), text: l.querySelector('.stage').textContent } : { gone: true };
-    }).catch(() => null);
-    if (s && s.gone) gone = true;
-    else if (s && s.failed) failed = s.text;
-    else await page.waitForTimeout(100);
-  }
+  // The load screen comes down when the client has drawn, or says it failed.
+  const s = await page.waitForFunction(() => {
+    const l = document.getElementById('load');
+    if (!l) return { gone: true };
+    return l.classList.contains('failed') ? { failed: l.querySelector('.stage').textContent } : false;
+  }, null, { timeout: 120000 }).then((h) => h.jsonValue()).catch(() => null);
+  const gone = !!(s && s.gone), failed = (s && s.failed) || '';
   const stages = await page.evaluate(() => window.__ocStages || []).catch(() => []);
-  await page.waitForTimeout(300);   // the last files' loadingFinished
+  let unfinished = '';
+  if (pending.size) {
+    await new Promise((resolve) => {
+      const t = setTimeout(() => { unfinished = [...pending].map((id) => name[id]).join(', '); resolve(); }, 30000);
+      settled = () => { clearTimeout(t); resolve(); };
+    });
+  }
   cdp.off('Network.responseReceived', onResp);
   cdp.off('Network.loadingFinished', onDone);
-  return { stages, gone, failed, wire, enc };
+  cdp.off('Network.loadingFailed', onFail);
+  return { stages, gone, failed, wire, enc, unfinished };
 }
 
 const cold = await load();
@@ -85,7 +97,8 @@ const order = ['Downloading', 'Starting', 'Opening'].map((w) => cold.stages.find
 check(order.every((i, k) => i >= 0 && (k === 0 || i > order[k - 1])), 'Downloading, Starting and Opening were shown in that order');
 check(cold.enc['openchime.wasm'] === 'gzip' && cold.enc['openchime.js'] === 'gzip', 'the wasm and the loader arrived gzipped');
 const wasmKB = (cold.wire['openchime.wasm'] || 0) / 1024;
-check(wasmKB > 100 && wasmKB < 4096, `the wasm came over the wire once, ${wasmKB.toFixed(0)} KB`);
+check(wasmKB > 100 && wasmKB < 4096, `the wasm came over the wire once, ${wasmKB.toFixed(0)} KB` +
+      (cold.unfinished ? ` (not finished within 30 s: ${cold.unfinished})` : ''));
 
 // The context menu is the client's own: a right-click on the canvas, or the
 // menu key on the input that holds the keyboard, opens no browser menu over it.
@@ -105,7 +118,8 @@ const warm = await load();
 check(warm.gone && !warm.failed, 'a second load came up too');
 const again = ['page', 'openchime.js', 'openchime.wasm'].map((f) => [f, warm.wire[f] || 0]);
 check(again.every(([, b]) => b < 2048), 'a second load downloaded nothing again: ' +
-      again.map(([f, b]) => `${f} ${(b / 1024).toFixed(1)} KB`).join(', '));
+      again.map(([f, b]) => `${f} ${(b / 1024).toFixed(1)} KB`).join(', ') +
+      (warm.unfinished ? ` (not finished within 30 s: ${warm.unfinished})` : ''));
 
 await browser.close();
 process.exit(failures ? 1 : 0);

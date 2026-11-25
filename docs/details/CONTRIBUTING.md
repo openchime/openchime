@@ -271,6 +271,12 @@ behind upstream.
 on a branch like any other change, and dispatch the release-candidate again on
 the new tip.
 
+**A flaky test is a bug** (TESTING.md §2.3a). A test that gives a different
+result on the same code gets an issue when it is first seen, and is fixed or
+removed before the next merge to `staging`. A failed run, local or in CI, is
+never re-run to get a pass, and a pass on a re-run counts for nothing. The GUI
+and browser tests are held to the same rule.
+
 See [TESTING.md](./TESTING.md) for the two suites.
 
 **A library the daemon links needs its licence notice.** A component added to

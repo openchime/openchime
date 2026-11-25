@@ -782,6 +782,13 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 
 ### 2.3a Brittle tests
 
+**A flaky test is a bug.** A test that gives a different result on the same
+code -- fails once and passes the next time, with nothing changed -- gets an
+issue when it is first seen, and is fixed or removed before the next merge to
+`staging`. A failed run, local or in CI, is never re-run to get a pass: a pass
+on a re-run counts for nothing, and the failure is the one to explain. The GUI
+and browser tests (`tools/gui/`) are held to the same rule.
+
 **A test is brittle if its result can change without a change in behaviour a
 person, an operator or an integrator could see — or if it can stay green while
 that behaviour regresses.** Both are defects in the test: the first fails a

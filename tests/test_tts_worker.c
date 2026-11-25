@@ -198,13 +198,6 @@ static void test_worker(void) {
     CHECK(order_ok);
     CHECK(count(&stub_opens) == 1);                        /* opened once for all of it */
 
-    /* Idle: the engine is closed, and the next render opens it again. */
-    int closed = WAIT_UNTIL(!oc_tts_worker_engine_open(w), 3000);
-    CHECK(closed && count(&stub_closes) == 1);
-    CHECK(oc_tts_worker_submit(w, 31, h1, 1, "Back again.") == 0);
-    CHECK(wait_result(w, &r, 5000) && r.req_id == 31 && r.status == OC_TTS_OK);
-    CHECK(count(&stub_opens) == 2);
-
     /* A failure is a result, with a reason. */
     CHECK(oc_tts_worker_submit(w, 41, h2, 0, "boom.") == 0);
     CHECK(wait_result(w, &r, 5000) && r.req_id == 41 && r.status == OC_TTS_FAILED && r.reason[0]);

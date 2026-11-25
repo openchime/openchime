@@ -21,6 +21,9 @@
 #
 # And across tools/gui:
 #
+#   wait       no web driver (tools/gui/harness/web/*.mjs) calls
+#              waitForTimeout: it waits on the condition itself (waitForURL,
+#              waitForSelector, waitForFunction), never a fixed time;
 #   names      every OC_TEST_* name set or used is read somewhere in the
 #              harness or the scripts (${NAME:-...}, ${NAME}, process.env.NAME):
 #              a name nothing reads is a setting that does nothing.
@@ -67,6 +70,11 @@ lint() {   # lint <root>: the findings, one per line
         if (!plat) printf "%s:1: platforms: no # platforms: line (win32, web or both)\n", F
       }' "$f"
   done
+  # The web drivers wait on what they look for, never a fixed time.
+  for f in "$root"/tools/gui/harness/web/*.mjs; do
+    [ -e "$f" ] || continue
+    grep -n 'waitForTimeout' "$f" | sed "s#^\([0-9]*\):#tools/gui/harness/web/$(basename "$f"):\1: wait: wait on the condition (waitForURL, waitForSelector, waitForFunction), not a fixed time: #"
+  done
   # Every OC_TEST_* name in tools/gui, read by something there: the harness, a
   # driver, run.sh or a script that takes it. Not this file's: its stand-ins.
   local files=() fl
@@ -81,7 +89,7 @@ lint() {   # lint <root>: the findings, one per line
 
 # --- the stand-in: a script breaking each rule, which must each be found -------
 scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT
-mkdir -p "$scratch/tools/gui/features" "$scratch/tools/gui/harness"
+mkdir -p "$scratch/tools/gui/features" "$scratch/tools/gui/harness/web"
 cat > "$scratch/tools/gui/harness/lib.sh" <<'SH'
 gui_begin() { :; }
 port="${OC_TEST_READ:-1}"
@@ -115,6 +123,14 @@ cat > "$scratch/tools/gui/features/noplat.sh" <<'SH'
 gui_begin noplat 9997 /z
 gui_end
 SH
+cat > "$scratch/tools/gui/harness/web/good.mjs" <<'JS'
+await page.waitForURL((u) => u.pathname === '/app/', { timeout: 30000 });
+await new Promise((r) => setTimeout(r, 20));
+JS
+cat > "$scratch/tools/gui/harness/web/bad.mjs" <<'JS'
+await page.goto(url);
+await page.waitForTimeout(300);
+JS
 got="$(lint "$scratch")"
 want=(
   'bad.sh:1: own:'
@@ -128,9 +144,11 @@ want=(
   'badplat.sh:1: platforms: names only win32 and web, not "mac"'
   'noplat.sh:1: platforms: names no platform'
   'bad.sh:5: names: OC_TEST_UNREAD'
+  'web/bad.mjs:2: wait:'
 )
 selfbad=0
 grep -F 'good.sh:' <<<"$got" >/dev/null && { echo "lint: the stand-in that keeps every rule was reported: $(grep -F good.sh: <<<"$got")" >&2; selfbad=1; }
+grep -F 'good.mjs:' <<<"$got" >/dev/null && { echo "lint: the stand-in that keeps every rule was reported: $(grep -F good.mjs: <<<"$got")" >&2; selfbad=1; }
 grep -F 'OC_TEST_READ' <<<"$got" >/dev/null && { echo "lint: a name the harness reads was reported: $(grep -F OC_TEST_READ <<<"$got")" >&2; selfbad=1; }
 grep -F 'harness/lib.sh:' <<<"$got" >/dev/null && { echo "lint: the harness was held to the feature shape" >&2; selfbad=1; }
 for w in "${want[@]}"; do

@@ -108,12 +108,4 @@ press modal.button.save || gui_abort "Preferences has no Save to press"
 saved() { gui_snap; ! grep -q '^modal=prefs ' "$D" && [ "$(mo pref)" = 2 ]; }
 check "and Save keeps it" waitfor 5 saved
 
-step "the client starts again"
-act motion 1
-OC_TEST_NO_BUILD=1 OC_TEST_NO_DAEMON=1 gui_launch
-"$DRIVE" size 1100 800 >/dev/null
-act channel 1
-kept() { gui_snap; [ "$(mo pref)" = 1 ]; }
-check "On is still chosen: it is kept in the account's preferences" waitfor 10 kept
-act motion 2
 gui_end

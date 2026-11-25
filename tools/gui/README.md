@@ -281,6 +281,14 @@ feature script:
   so on the line or the line before (`# paced: <why>`);
 - **platforms**: declares its platforms in its header, `win32` and `web` only.
 
+Each web driver (`tools/gui/harness/web/*.mjs`):
+
+- **wait**: calls no `waitForTimeout`; it waits on the condition itself
+  (`page.waitForURL`, `page.waitForSelector` or `locator.waitFor`,
+  `page.waitForFunction`), with a deadline, never a fixed time. A poll inside
+  a driver's own loop on a condition (`setTimeout(r, 20)` in `drive.mjs`) is a
+  wait on that condition, and stays.
+
 And across `tools/gui/`, every `OC_TEST_*` name set or used is read somewhere
 there: a name nothing reads is a setting that does nothing. It prints
 `file:line: rule: text` for each, and exits 1 on any. Before the tree, it runs
@@ -334,7 +342,9 @@ end; a run that finds it taken says `gui_lock: another GUI run is going` and
 waits for it. The lock is a file descriptor, and a process started in the
 background inherits it, so a daemon or client left running would hold it after
 its run ended and every later run would wait for good: everything the harness
-starts in the background is started with it closed (`9>&-`).
+starts in the background is started with it closed (`9>&-`). GUI runs are never run side by side, from one checkout or two: each would
+fail the other's checks with nothing wrong in either, a different result on
+the same code, which is a flaky test (docs/details/TESTING.md §2.3a).
 
 ## The tests
 

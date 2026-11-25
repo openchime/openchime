@@ -19,13 +19,27 @@ let page = await ctx.newPage();
 const say = (s) => console.log(s);
 let failures = 0;
 const check = (ok, what) => { if (ok) say('  ok   ' + what); else { say('  FAIL ' + what); failures++; } };
-const until = async (what, pred, ms) => {
-  const t0 = Date.now();
-  while (!(await pred())) {
-    if (Date.now() - t0 > ms) throw new Error('timed out waiting for ' + what + '; the page is at ' + page.url());
-    await page.waitForTimeout(100);
-  }
+// Playwright waits on each condition itself; a wait that runs out says what it
+// was waiting for and where the page is.
+const within = async (what, wait) => {
+  try { return await wait; }
+  catch (e) { throw new Error('timed out waiting for ' + what + '; the page is at ' + page.url()); }
 };
+// The client's own dump, once it says the client is signed in. The hook answers
+// once the wasm is up and takes its time, so the page asks it one dump at a
+// time and keeps the newest; the wait looks at that until it says so.
+const signedIn = (what) => within(what, page.waitForFunction(() => {
+  const s = window.__ocSignIn || (window.__ocSignIn = { busy: false, dump: '' });
+  if (/authed=1 connected=1/.test(s.dump)) return s.dump;
+  if (!s.busy && typeof ocHook === 'function' && typeof FS !== 'undefined') {
+    s.busy = true;
+    Promise.resolve().then(() => ocHook('dump /t/d.txt', 5000))
+      .then(() => { s.dump = FS.readFile('/t/d.txt', { encoding: 'utf8' }); })
+      .catch(() => {})
+      .finally(() => { s.busy = false; });
+  }
+  return false;
+}, null, { timeout: 60000, polling: 100 }).then((h) => h.jsonValue()));
 
 // 1. The link: the page sends the browser to the sign-up form before the web
 // client loads -- the client is needed only once the account exists. ?hook=1
@@ -34,7 +48,7 @@ const until = async (what, pred, ms) => {
 let wasmAt = 0;
 page.on('request', (req) => { if (!wasmAt && req.url().endsWith('/openchime.wasm')) wasmAt = Date.now(); });
 await page.goto(`${origin}/app/?invite=${invite}&hook=1`);
-await until('the sign-up form', async () => (await page.locator('form[action="signup"]').count()) === 1, 60000);
+await within('the sign-up form', page.waitForSelector('form[action="signup"]', { state: 'attached', timeout: 60000 }));
 const formAt = Date.now();
 check(page.url().startsWith(origin + '/signin?'), 'the link opens the daemon\'s sign-up form');
 check(!wasmAt || wasmAt >= formAt - 1000, 'without loading the web client first');
@@ -45,22 +59,12 @@ await page.fill('input[name="username"]', 'linked');
 await page.fill('input[name="password"]', 'pebble-canyon-orbit');
 await page.fill('input[name="confirm"]', 'pebble-canyon-orbit');
 await page.click('button[type="submit"]');
-await until('the web client', async () => new URL(page.url()).pathname === '/app/', 30000);
+await within('the web client', page.waitForURL((u) => u.pathname === '/app/', { waitUntil: 'commit', timeout: 30000 }));
 check(!page.url().includes('invite='), 'the browser comes back to the web client');
 
 // 3. The client takes the token off the address and signs in: its own dump
-// says so. The hook answers once the wasm is up, so it is asked until it does.
-let dump = '';
-await until('the client to sign in', async () => {
-  dump = await page.evaluate(async () => {
-    try {
-      if (typeof ocHook !== 'function' || typeof FS === 'undefined') return '';
-      await ocHook('dump /t/d.txt', 5000);
-      return FS.readFile('/t/d.txt', { encoding: 'utf8' });
-    } catch (e) { return ''; }
-  });
-  return /authed=1 connected=1/.test(dump);
-}, 60000).catch((e) => { say('  FAIL ' + e.message); failures++; });
+// says so.
+const dump = await signedIn('the client to sign in').catch((e) => { say('  FAIL ' + e.message); failures++; return ''; });
 check(/authed=1 connected=1/.test(dump), 'the new member is signed in to the web client');
 check(!page.url().includes('token='), 'the token is taken off the address');
 
@@ -69,17 +73,7 @@ check(!page.url().includes('token='), 'the token is taken off the address');
 await page.close();
 page = await ctx.newPage();
 await page.goto(`${origin}/app/?hook=1`);
-let dump2 = '';
-await until('the client to sign in again', async () => {
-  dump2 = await page.evaluate(async () => {
-    try {
-      if (typeof ocHook !== 'function' || typeof FS === 'undefined') return '';
-      await ocHook('dump /t/d.txt', 5000);
-      return FS.readFile('/t/d.txt', { encoding: 'utf8' });
-    } catch (e) { return ''; }
-  });
-  return /authed=1 connected=1/.test(dump2);
-}, 60000).catch((e) => { say('  FAIL ' + e.message); failures++; });
+const dump2 = await signedIn('the client to sign in again').catch((e) => { say('  FAIL ' + e.message); failures++; return ''; });
 check(/authed=1 connected=1/.test(dump2), 'a closed tab keeps the session');
 await browser.close();
 process.exit(failures ? 1 : 0);

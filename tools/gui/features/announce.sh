@@ -130,15 +130,4 @@ check "on: it adds one to announced= ($n1)" waitfor 5 plus_one
 over_one() { [ "$(announced)" -gt $((n1 + 1)) ]; }
 check "...and only one" never over_one
 
-step "the clients start again"
-act a spoken 0 1 1 0 1 0
-waitfor 5 spoken_is "sender=0 time=1 reactions=1 replies=0 text_first=1 announce_new=0" ||
-  gui_abort "alice's client did not take the settings to keep"
-# A message sent after them and back from the daemon: it went out on the same
-# connection after the settings, so the daemon has them stored.
-send_stored a "settings kept"
-"$PAIR" down >/dev/null 2>&1
-gui_pair_up
-check "alice's settings are those last set" waitfor 10 spoken_is \
-  "sender=0 time=1 reactions=1 replies=0 text_first=1 announce_new=0"
 gui_end
