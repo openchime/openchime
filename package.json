@@ -1,8 +1,0 @@
-{
-  "name": "openchime-web-harness",
-  "private": true,
-  "description": "The web client's test harness (tools/gui/harness/web/*) needs the Playwright library; nothing else here is JavaScript.",
-  "devDependencies": {
-    "playwright-core": "1.64.1"
-  }
-}

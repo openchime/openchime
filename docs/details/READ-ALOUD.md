@@ -242,4 +242,3 @@ Full layouts in PROTOCOL.md §5.14b.
 | Full suite — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
 | Full suite — `voice_parity` | the voice model against its reference renderings (`tests/data/voice/`, made once and frozen): with the noise off, every fixture's sample count and at least 40 dB SNR; with it on, the noise's variance within 10% (TTSKIT.md §9) |
 | Full suite (`make test-all`, in the release-candidate) | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
-| Win32 harness | no scripted Listen run. The harness's `voicepreview` verb asks for a voice's audition and reports how long it took (`preview wait_ms=`), and `tools/gui/features/voice.sh` has the real daemon render a sentence (`--tts-say`) that the client's synthetic microphone then speaks |

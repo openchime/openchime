@@ -27,7 +27,7 @@ extern const size_t        oc_webapp_js_gz_len;
 #define NO_CACHE  "Cache-Control: no-cache\r\n"
 
 /* The page's mode (openchime.html): `normal` as compiled in, rewritten to
- * `development` when the daemon is, so the harness's inputs work on a page
+ * `development` when the daemon is, so the development inputs work on a page
  * from a development daemon and on no other. The page never takes its mode
  * from its own address. */
 #define MODE_MARK     "/*OC_MODE*/'normal'"

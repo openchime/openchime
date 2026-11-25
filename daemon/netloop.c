@@ -6085,7 +6085,7 @@ void oc_netloop_set_adopted_address(const char *name) {
 /* The sites as served: the fixed routes above, then the web client's when its
  * wasm is beside the binary (webapp.h) -- on the TLS port only, where the
  * sign-in pages it chains to live; the health port stays health and the
- * harness's WebSocket, nothing a person signs in through in the clear. */
+ * development page's WebSocket, nothing a person signs in through in the clear. */
 static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 18];
 static void sites_init(void) {
     size_t na = 0;

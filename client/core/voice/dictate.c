@@ -31,9 +31,7 @@ struct oc_dictate {
     oc_thread_t         thread;
     atomic_int          stop;
     atomic_int          send_rest;
-    atomic_int          level;
     atomic_int          speaking;
-    atomic_uint         sent;
 };
 
 static void nap(int ms) {
@@ -45,18 +43,11 @@ static void nap(int ms) {
 #endif
 }
 
-static int peak(const int16_t *s, size_t n) {
-    int p = 0;
-    for (size_t i = 0; i < n; i++) { int v = s[i] < 0 ? -s[i] : s[i]; if (v > p) p = v; }
-    return p > 32767 ? 32767 : p;
-}
-
 static void send_ready(oc_dictate *d) {
     size_t n = 0;
     int16_t *pcm = oc_seg_take(d->seg, &n);
     if (pcm && n) {
-        if (oc_client_stt_send(d->client, d->mode, d->channel_id, d->thread_root, pcm, n))
-            atomic_fetch_add(&d->sent, 1);
+        oc_client_stt_send(d->client, d->mode, d->channel_id, d->thread_root, pcm, n);
     }
     free(pcm);                    /* the client copied it; nothing keeps it now */
 }
@@ -78,7 +69,6 @@ static void *capture_main(void *arg) {
          * moment is subtracted from what the microphone heard. */
         oc_audio_reference(frame_pts, ref, OC_SEG_FRAME);
         d->proc->process(d->proc_state, frame, ref, OC_SEG_FRAME);
-        atomic_store(&d->level, peak(frame, OC_SEG_FRAME));
         if (oc_seg_push(d->seg, frame)) send_ready(d);
         atomic_store(&d->speaking, oc_seg_speaking(d->seg));
     }
@@ -139,6 +129,4 @@ void oc_dictate_stop(oc_dictate *d, int send_rest) {
 uint8_t  oc_dictate_mode(const oc_dictate *d)        { return d->mode; }
 uint64_t oc_dictate_channel(const oc_dictate *d)     { return d->channel_id; }
 uint64_t oc_dictate_thread_root(const oc_dictate *d) { return d->thread_root; }
-int      oc_dictate_level(const oc_dictate *d)       { return atomic_load(&((oc_dictate *)d)->level); }
 int      oc_dictate_speaking(const oc_dictate *d)    { return atomic_load(&((oc_dictate *)d)->speaking); }
-uint32_t oc_dictate_sent(const oc_dictate *d)        { return atomic_load(&((oc_dictate *)d)->sent); }

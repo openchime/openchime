@@ -34,7 +34,7 @@
 #
 # Tool binaries are built by their path (make build/demo_client,
 # build/bench_load, build/tts_pack, build/s3_smoke, build/e2e_client,
-# build/signin, build/fuzz/<harness>, build/fuzz/seeds). The rules live in
+# build/fuzz/<harness>, build/fuzz/seeds). The rules live in
 # mk/, one file per concern; scripts/test/fast/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := build test build-all test-all run clean distclean

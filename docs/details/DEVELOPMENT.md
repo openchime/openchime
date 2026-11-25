@@ -36,7 +36,7 @@ build/aarch64/openchimed` cross-builds the daemon for arm64 (build only), and
 compiler (`gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu`,
 `libc6-dev-arm64-cross`). `make openchimed OC_BUILD_ID=<commit>` stamps the build
 id into `openchimed --version`; an unstamped build reports `dev`. There is one
-build: the tests, the GUI and web harness and the demo scripts run it with
+build: the tests and the demo scripts run it with
 `OPENCHIME_MODE=development`, which a deployment never sets (CONFIG.md,
 "Mode"). `make build-all` and `make test-all`, the full build and suite, run
 in CI only.
@@ -104,16 +104,11 @@ rasterizer on this platform — it is not the client's presentation layer.
 It is the reference client: every engine feature is reachable from it.
 Accessibility is first-class (REQ-269/ARCH-99: a UI Automation
 provider over the self-drawn UI, a system caret and spoken notifications), with
-an automation id and an invoke pattern on every actionable element (REQ-290),
-both verified by a real UIA client from outside the process. Rich text and its
+an automation id and an invoke pattern on every actionable element (REQ-290).
+Rich text and its
 toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
-
-**The GUI smoke.** `tools/gui/run.sh smoke` asks whether the client boots and
-runs, on Windows and in the browser, by hand before pushing a client change;
-it is one of the GUI and browser tests, which no suite runs. See
-[tools/gui/README.md](../../tools/gui/README.md), "Reading the GUI smoke".
 
 Every desktop shares one portable self-rendered application layer over SDL3 and
 sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are

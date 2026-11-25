@@ -103,13 +103,6 @@ build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildca
 build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
 	$(CC) $(CFLAGS) -O2 -Ishared -Itests -I$(MBEDTLS_INC) \
 	    tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
-# The sign-in helper as a command, for the shell scripts: prints the token and
-# the verifier a client presents on AUTH, and presents one (`present`) for a
-# script that played the browser itself (the browser checks of the daemon's
-# pages, run by hand, outside both suites).
-build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build-dir
-	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
-	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # Manual S3 smoke test (tests/manual/s3_smoke.c) -- in neither suite.
 # Needs live S3 credentials in the environment; see the header of that file.
 build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_cache.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build-dir

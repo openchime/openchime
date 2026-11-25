@@ -132,16 +132,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   **Copy sign-in link** (Ctrl+C) beside Cancel (Esc): the link the browser was
   given, for one of the person's own choosing, and the way in where no browser
   opened at all (none installed, a locked-down or remote desktop), which the
-  card says plainly when the platform's opener fails. Under the automation hook
-  the URL is written to `signin_url.txt` in the test directory instead of
-  being opened, so a harness can play the browser; its `sicopy` verb is the
-  link's button.
+  card says plainly when the platform's opener fails.
 - **`net.c` — the network thread.** A blocking-socket TLS connection (the client
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
   that interleaves sending queued intents with reading + dispatching server
   frames. Lifted from `tests/e2e_client.c`. A process normally has one oc_client
-  (one net thread), but a multi-client harness (the headless test) spins several
+  (one net thread), but a multi-client test spins several
   concurrently; that is safe because the vendored mbedTLS is built with
   **`MBEDTLS_THREADING`** (`scripts/build/mbedtls.sh`), so its internal shared
   state is mutex-protected.
@@ -682,11 +679,7 @@ model; translate input to intents }, stop.
   Summarize (`header.summarize`), each topic's chevron (`summary.topic.<t>`),
   each citation (`summary.cite.<n>`) and each pickable day of the range card
   (`sumrange.day.<yyyymmdd>`, with `sumrange.prev`/`.next`) are buttons in the
-  accessibility tree, invoked as a click. Harness verbs: `summenu` opens the
-  menu, `summary <scope>` asks without it and `summary close` closes it,
-  `sumrange [<first> <last>]` opens the range card (and picks those days),
-  `sumtoggle <t>` shows or hides a topic's details, and `sumcite <n>` goes to a
-  citation's message (`sumcite <n> hover` shows its card).
+  accessibility tree, invoked as a click.
 - **Linux GUI (planned):** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
   native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
@@ -709,8 +702,7 @@ model; translate input to intents }, stop.
 surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
-`InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/harness/win32/uia_probe.ps1`. Preferences' choices are
+`InvokePattern` on every actionable element (**REQ-290**). Preferences' choices are
 published as tabs named for their row and choice ("Reduce motion: On"), with
 the current one marked ", selected", under ids `prefs.<row>.<value>`, the value
 being what the choice stores. What a message says to a screen reader
@@ -722,8 +714,7 @@ as it arrives. One function builds every message's name from those settings
 <when>: <text>", with arrivals announced. The settings are synced with the other
 preferences. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
-`sharebar`: the line as Text, the buttons invokable), read and pressed by
-`tools/gui/harness/win32/uia_recbar.ps1`. Rich text and its toolbar
+`sharebar`: the line as Text, the buttons invokable). Rich text and its toolbar
 (**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
 byte ranges. Each platform has its own screen capture for sharing in calls; the
 codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
@@ -971,9 +962,7 @@ native trees.
 ## 8. The graphical client
 
 The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
-change to it has to keep. How it is driven and checked is
-[tools/gui/README.md](../../tools/gui/README.md) ("Driving the Win32 GUI", "Seeing the whole window",
-"Reading the GUI smoke").
+change to it has to keep.
 
 ### The text fields are drawn (every platform)
 
@@ -995,7 +984,7 @@ the rendered scene, so a control left visible while its surface was not drawn
 floated over whatever was -- the recurring failure class the rule below was
 written for -- and a native control is the one thing a second platform
 cannot reuse. Drawn, a field is part of the scene: z-order is paint order,
-the harness's screenshot sees it, and the web client draws it the same way.
+and the web client draws it the same way.
 
 **Every field's visibility is still decided in one place, `layout_natives()`**
 (the name kept so the rule's history reads), from three shared predicates --
@@ -1031,16 +1020,6 @@ variable. A press outside every field returns the keyboard to the window, as
 clicking a native window did; the shortcuts (`accel_dispatch`) run before any
 field sees a key, as they always have.
 
-The dump reports each field's visibility beside the three predicates, because
-a boolean is a better assertion than an image when what you want to know is
-*whether* a control is shown. Read `re=` with the composer in mind: it reports
-whether the composer's **rect is non-empty**; every other flag is a field's
-`visible`:
-
-```
-natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
-```
-
 **The six search boxes are one control.** Find a conversation, search messages,
 search files, search people, Jump to (Ctrl+K) and search emoji are each a
 field over chrome the client draws, and all six are built the same way:
@@ -1048,17 +1027,11 @@ field over chrome the client draws, and all six are built the same way:
 scale, with the glyph centred -- and `search_text_box()` is where the field's
 text goes, after the glyph, up to the right inset. The field wears the UI
 token (`g_ui`), so it follows the text size and the DPI as everything else
-does. The dump reports each box so this is checked rather than looked at, in
-device pixels:
-
-```
-searchbox find made=1 vis=1 ... edit=112,67,224,86 box=80,62,234,92 text=""
-```
+does.
 
 A new gated field (the Files view's "Search files" box, `g_ffind`, is the
 model) is gated on the view it belongs to -- never on a predicate that merely
-happens to be true there -- and checked across all views from the dump before it
-is shown to anybody.
+happens to be true there.
 
 ### Shortcuts belong in the message loop, not a window proc
 
@@ -1092,12 +1065,7 @@ focus.
   is not offered does nothing, and is not typed. Upper case is the same key;
   with Ctrl or Alt held, or while a menu, a modal, a drawn field or an edit has
   the keyboard, letters are what they were. Edit and the thread take the
-  keyboard off the message, to the typing. The sheet lists them; the dump's
-  `kbfocus ran=` is the command the last key press ran as one (0 for none).
-- Test with `tools/gui/harness/win32/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
-  The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
-  in place of the keyboard's state), because the shortcuts read the modifiers;
-  posting a bare key proves nothing.
+  keyboard off the message, to the typing. The sheet lists them.
 
 ### Modals: one frame, explicit commit
 
@@ -1163,12 +1131,11 @@ deliberately:
   like every other text field in the client;
 - the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
   themed app were never worth it — and none of them was dismissible the way every
-  other sheet is, screenshot-comparable, or reachable by the harness.
+  other sheet is.
 
 **The tree publishes what is REACHABLE, not what was laid out.** Two rules, both
 about rects that describe space an element is clipped away from — which reads as
-a collision to `chromefit` and as bounds to a screen reader, and is wrong in the
-same way for both:
+bounds to a screen reader, and is wrong:
 
 - **A scrolling surface's rows are clipped to it.** A row's rect is in the list's
   own coordinates, so the topmost one routinely starts above the list and the
@@ -1211,8 +1178,7 @@ screen, since nothing about the field says that it scrolls. A channel's descript
 **Text gets the height its glyphs need, not a round number.** A rect written as
 `y + 80` is three lines at 100% and not two at the largest text size on a scaled
 display, and the difference is a sentence losing its last word inside a box every
-rect-based check calls correct — which is what `clipped=` (tools/gui/README.md) exists to
-catch. `text_rect()` measures instead. A field that must stay ONE line, like the
+rect-based check calls correct. `text_rect()` measures instead. A field that must stay ONE line, like the
 composer's cue, takes a non-wrapping format so it ends in an ellipsis rather than
 wrapping into a second line there is no room for, and its rect is the format's
 pinned line box.
@@ -1300,9 +1266,7 @@ field offers suggested statuses (five defaults plus recent ones, kept under the
 clear time in one click. The "Clear after" chips are prefilled by bucketing the
 member's live `status_expires`, so the dialog reopens showing what is actually
 set. The card publishes its buttons, suggestion rows and chips to the a11y
-tree, which is what lets `chromefit` prove the card holds its own content — the
-defect that motivated the rebuild was a chip row clipped at the card's edge,
-invisible to any check that never saw its rects.
+tree.
 
 ### Preferences is two-paned, and appearance applies live
 
@@ -1310,8 +1274,8 @@ Categories left (**Appearance / Messages / Notifications / System**), one pane's
 rows right. **System** is where the app behaves as an application rather than as a
 chat surface — what the close button does, whether it starts with Windows — and it
 ends with Reset. There is no *Advanced*: it held Reset and a DPI override, the
-override was a harness affordance rather than a setting (the app takes its scale
-from what Windows reports, ARCH-97), and one button is not a category.
+override was not a setting a person needs (the app takes its scale from what
+Windows reports, ARCH-97), and one button is not a category.
 
 A row's hit-boxes exist only while its category is showing — the click
 router and the painter share `g_pref_cat` so they cannot disagree — and the sheet
@@ -1388,9 +1352,7 @@ the short commit it was compiled from (`shared/build_id.h`, UPGRADING.md); a
 release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
 `OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
-into a report; the harness's `about` verb opens the dialog and answers that
-line, which the web client's GUI test checks in the browser (tools/gui/README.md,
-"Reading the web client harness").
+into a report.
 
 ### What's new: this build's release notes
 
@@ -1410,11 +1372,7 @@ date and each section's items; an item with a link opens it in the browser.
 `https://openchime.io/releases/build/<build id>`. A build that is not a release
 says "This build is not a release." with a link to every release -- a source
 build ("dev") is never asked about -- and a fetch that fails or times out says
-"Could not load the release notes." with the page's link. Under the hook, a URL
-to open is written where every URL the hook opens is (`signin_url.txt`), and the
-dump's `whatsnew=` line gives the card's state (`loading`, `shown`,
-`notrelease`, `failed`), the release and how many items it lists
-(`tools/gui/features/whatsnew.sh`).
+"Could not load the release notes." with the page's link.
 
 ### What the window says, and where (REQ-263)
 
@@ -1819,6 +1777,4 @@ baseline are derived from the family's own ascent and cap height, read with
 `st_family_metrics` (ARCH-108), Segoe UI's when they can't be read, so the
 table's pairs are Segoe UI's and another family has its own. The font follows
 the account (`F:` in the preferences value), previews at once and reverts on
-Cancel like text size, and Reset returns it to Default. The test dump's
-text-size line reports the family asked for and the one used (`fontpick=`,
-`fontfam=`, `fontmissing=`) and the figures (`fontasc=`, `fontcap=`).
+Cancel like text size, and Reset returns it to Default.

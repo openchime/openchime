@@ -62,9 +62,7 @@ text fields are drawn by the application on every platform (CLIENT.md, "The
 text fields are drawn"), so the sign-in field, the search boxes and a form's
 fields are the same code here. Signed in with a password, it
 shows the workspace: the sidebar, a channel's transcript with mentions, the
-member pane, the composer; the GUI smoke (`tools/gui/run.sh --web smoke`) checks that
-through the client's own test hook (the model dumped, a screenshot taken) in a
-headless Chromium.
+member pane, the composer.
 
 **The browser platform** (`client/gui/platform/web/`), what a page can do of
 the contract: images decode through `createImageBitmap` and a 2D canvas, read
@@ -160,10 +158,6 @@ way out (`client/core/signin_web.c`, the browser's `signin.c`), and starts the
 core with the result (`oc_client_start_signin_result`), whose first connection
 presents `AUTH{oidc}` as a desktop's does after its listener hears the
 redirect. A stored session reconnects on a reload without visiting the page.
-Under the test harness, on a page from a development daemon, the client types
-for the person:
-`?env=OPENCHIME_DEV_SIGNIN=user:password` has the page post the daemon's
-sign-in form itself and follow the redirect back (`plat_web.c`).
 
 **A link to open.** `/app/?open=<openchime:// link>` (CLIENT.md, "Links") is
 followed once the client has signed in, as a link given on the command line is.
@@ -184,8 +178,7 @@ installed. Outside a secure context, or if Web Crypto fails, the page starts
 the client as `openchime --signin <host:port> --invite <hex>` and the sign-in
 begins as any other. The clients offer the link in the
 invitation text where the daemon's pages open directly
-(`oc_client_pages_direct`); `tools/gui/harness/web/invite.mjs` proves it from a cold
-browser (`tools/gui/run.sh web_pages`).
+(`oc_client_pages_direct`).
 
 **Media in the browser.** The same media, voice and call code the desktop
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,
@@ -201,9 +194,7 @@ input segments speech and the daemon's recogniser answers; a call joins the
 others' through the daemon's relay over the connection (`calls-tcp`, CALLS.md:
 a page has no UDP, so the engine starts on the connection and never probes),
 encrypted end to end as on a desktop; a screen is shared and a shared one
-viewed. Verified in a headless Chromium with its fake camera and microphone,
-two tabs in one call, the recogniser answering a spoken clip through the
-synthetic microphone. The computer's own sound in a screen recording is the
+viewed. The computer's own sound in a screen recording is the
 audio the browser gives with the screen (`getDisplayMedia` with audio): a
 tab's sound anywhere, the system's on Chromium for Windows and ChromeOS, and
 none on Firefox or Safari, where the recording goes on without it as it does
@@ -219,8 +210,7 @@ the media clock. One context per device rate; where the browser gave a
 context another rate (Safari for a microphone), a speexdsp resampler runs in
 the callback. A browser that cannot start the worklet falls back to a
 `ScriptProcessorNode` on the page's thread (1024 frames of latency), and the
-console says which ran (`oc-web: audio worklet`); `tools/gui/features/web_client.sh`
-requires the worklet (tools/gui/README.md, "Reading the web client harness"). The device lists come from a cache the page keeps
+console says which ran (`oc-web: audio worklet`). The device lists come from a cache the page keeps
 (`devices_web.c`), so any thread can ask; the labels appear once a device
 has been allowed, as the browser decides.
 
@@ -235,8 +225,7 @@ cluster); and bidirectional levels (UAX #9 without the bracket-pair rule),
 with each right-to-left run measured and drawn with the canvas's direction
 set and a line's runs placed in visual order, and alignment following the
 paragraph's reading direction as DirectWrite's does. Tested on the host
-(`tests/test_sdltext_unicode.c`) and in the browser through the client's
-`sttest` verb, which `tools/gui/features/web_client.sh` runs.
+(`tests/test_sdltext_unicode.c`).
 
 **The input method.** A browser's IME composes into an element, so the
 platform keeps a hidden `<input>` at the caret (`oc_plat_text_input_area`,
@@ -244,14 +233,11 @@ the contract's one line for it; Win32 answers with SDL's text input area)
 and hands its composition to SDL's own events -- `SDL_EVENT_TEXT_EDITING`
 while composing, `SDL_EVENT_TEXT_INPUT` at the commit -- so the composer
 shows the composition underlined and takes the result as it does from a
-desktop IME. `tools/gui/features/web_client.sh` plays a Japanese composition into
-it, through the web driver's `ime` verb.
+desktop IME.
 
 Rough edges: fonts are the browser's, so layouts are near-identical to
-Windows, not pixel-identical, and the harness compares state, not pixels. The picker and the clipboard need a
-user gesture, as the browser requires, so the harness drives uploads through
-the composer's file tray and the test hook instead, and sets and reads the
-browser's clipboard from the driver (`sysclip`, `syspaste`, `sysclipread`, TESTING.md); a crash leaves nothing but the console.
+Windows, not pixel-identical. The picker and the clipboard need a user
+gesture, as the browser requires; a crash leaves nothing but the console.
 
 What a page cannot have, and the application lives without: a tray, the
 taskbar's flash and progress, the platform's certificate viewer, autostart,
@@ -291,10 +277,4 @@ address>:<TLS port>/` (self-signed in development, so the browser asks once).
 The wasm libraries are built once into `build/wasm/` and never touch the
 native trees in `third_party/`. The page takes the workspace in its query
 (`host` and `port`, or `ws`, for a page served from elsewhere than the
-daemon; they become the application's `--signin`) and, on a page in
-development mode, with `hook=1`, the client's test hook on the page's
-filesystem (`ocHook('verb')`, `ocShot()`), which is what the tests drive. The
-client's checks in a browser are the GUI and browser tests (`tools/gui/run.sh
---web`, tools/gui/README.md), run by hand and in neither suite (TESTING.md
-§3.4); they need Chrome: the one `CHROME` names, else the installed
-`google-chrome` on `PATH`.
+daemon; they become the application's `--signin`).

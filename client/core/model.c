@@ -2277,7 +2277,6 @@ static void call_history_apply(oc_model *m, const oc_call_history_view *v) {
     }
     m->call_hist_more = v->more;
     m->call_hist_loaded = 1;
-    m->call_hist_seq++;
 }
 
 /* A call's page. The same call's transcript continued (its lines from where
@@ -2320,7 +2319,6 @@ static void call_deleted_apply(oc_model *m, uint64_t call_id, uint8_t what, uint
         if (m->call_hist[i].call_id != call_id) continue;
         if (what == OC_CALL_DEL_TRANSCRIPT) m->call_hist[i].flags &= (uint8_t)~OC_CALL_HIST_TRANSCRIPT;
         else if (!p || p->call_id != call_id || !p->n_recordings) m->call_hist[i].flags &= (uint8_t)~OC_CALL_HIST_RECORDING;
-        m->call_hist_seq++;
     }
 }
 

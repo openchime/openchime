@@ -90,8 +90,7 @@ image pulls and runs). That is release verification, not a suite: it checks a
 publication, not a change.
 
 **Manual harnesses** live in `tools/` and are run by hand, never by either
-suite: the GUI and browser tests (`tools/gui/`, [tools/gui/README.md](../../tools/gui/README.md);
-"The GUI and browser tests", below), the TUI demo (`tools/demo/`), the
+suite: the TUI demo (`tools/demo/`), the
 capacity benchmark (`tools/bench.sh`) and the toolchain check
 (`tools/toolchains.sh`).
 
@@ -156,9 +155,6 @@ ThreadSanitizer part, a clang with libFuzzer for the fuzzing harnesses,
 `ffmpeg`, and for the release's artifacts
 `podman`, `buildah`, `rpm`, `cpio`, `nsis`, `python3-pefile`, and clang and
 the pinned CMake `scripts/build/makemsix.sh` fetches.
-
-**The GUI and browser tests** (`tools/gui/run.sh`): tools/gui/README.md,
-"Prerequisites"; the runner checks them and names what is missing.
 
 **TUI script** (`tools/demo/tui.sh`): `tmux` and `curl`.
 
@@ -246,7 +242,7 @@ compiler's, a linker's); and what the manual harnesses under
 
 - Compiled `-O0 -g` (debuggable). A non-zero exit fails the suite. One rule
   builds the single binary from every `tests/*.c` except the tool programs
-  (`e2e_client`, `demo_client`, `bench_load`, `testsignin_main`), plus the
+  (`e2e_client`, `demo_client`, `bench_load`), plus the
   daemon and app-core objects it links (`mk/tests.mk`), each source compiled
   to its own object under the object tree.
 
@@ -445,12 +441,7 @@ framework.
   `e2e` on both; text both ways, the sender reading its own; an edit, a reaction and
   a delete as in any DM; closed, nothing sent after it, and forgotten with its text;
   and a declined invitation. It also checks the credential store's remembered peer
-  keys. `tools/gui/features/pdm.sh` (on Win32, and in the browser with
-  `tools/gui/run.sh --web pdm`) drives two GUI clients: New message with
-  "End-to-end encrypted" ticked, bob accepting on his device, the same safety number
-  and no file, Send later or Files tab in the conversation, what alice wrote in New
-  message arriving once it is open and bob's answer from the normal composer reaching
-  her, ended and put away, and a second one declined.
+  keys.
 - **Tables** (REQ-220, ARCH-100, MARKDOWN.md §1a) — `tests/test_richtext.c`'s
   `test_tables` covers what is a table and what is not: the ordinary case with
   every alignment, no outer pipes, no header, short and long rows, `\|`, the
@@ -493,46 +484,15 @@ framework.
   frames into the model -- the selection kept when a tally arrives without it, the
   poll gone with a tombstone and not brought back by a late tally, the who-voted
   rows for the poll asked about only -- and the live run posts, votes and asks who
-  voted between two clients through the real daemon. `tools/gui/features/polls.sh`
-  drives the card in both GUI clients (tools/gui/README.md).
-- **The system caret** (REQ-269, ARCH-99) — `tools/gui/features/caret.sh`, on
-  Win32: the caret Windows reports for the client's thread, read back into the
-  dump's `caret` line, sits at the drawn caret while the message box has focus,
-  follows typing and the arrow keys, moves to the search box when that takes
-  focus and back when Escape leaves it, and is gone when no field has focus (tools/gui/README.md, "Reading the
-  caret harness").
+  voted between two clients through the real daemon.
 - **What a message says to a screen reader** (REQ-269, ARCH-99) —
   `tests/test_spoken.c` (fast) builds a message's spoken name from its parts:
   the defaults reproduce the transcript's two forms exactly, present and
   deleted; each switch on its own adds or removes only its part; reactions in
   the message's order, replies at none, one and many, the text first, nobody
   named read as "someone", and the cut at a small buffer on a whole UTF-8
-  character. `tools/gui/features/announce.sh`, on Win32, drives two clients:
-  Preferences > Accessibility and its Cancel, the defaults, everything on with a
-  reaction and a reply, the text alone, arrivals announced or not, and the
-  settings kept across a restart (tools/gui/README.md, "Reading the announce
-  harness").
-- **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tools/gui/features/calls.sh`
-  and `callhome.sh` (`# needs: callrec`), `newcall.sh`, `prejoin.sh` and
-  `camera.sh`, on Win32 and in the browser. `calls.sh`: New Call opened from a
-  conversation with its subject and people asked, the summary card while the
-  call runs and after (who took part, Play), the sidebar's mark of a call going
-  on, the Calls panel's Join and Decline, the call view's subject and chat, Record
-  and the recording mark naming who records with its Stop, the screen-reader
-  announcements of the recording and of joins and leaves, and the pre-join
-  screen's notice of a recorded call. `callhome.sh`: the Calls panel's one list —
-  Active pinned, Past under date headings, older calls loading as it scrolls, the
-  filters, faces, the page beside the list or in place of it with Back, the
-  sidebar's missed mark and its clearing, Call back — and the call's page in
-  order, with the timeline strip's bars and the recording's span
-  (`OPENCHIME_DEV_CALL_HISTORY_PAGE` makes the history's pages small).
-  `newcall.sh`: every way into New Call, its preview, search by person, group and
-  channel, the cap refused, chips, a blank subject filled in, Enter from a
-  conversation, and Invite. `prejoin.sh`: the pre-join screen before every join,
-  Cancel, joining muted, joining with the camera on, and audio only when the
-  camera cannot start. `camera.sh`: self-view shrunk, hidden and shown, kept in
-  the preferences. Run them against `make openchimed WEB=1 CALLREC=1` (`run.sh`
-  passes the remembered `CALLREC` through). `tests/test_e2e.c`: SFrame
+  character.
+- **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113/136) — `tests/test_e2e.c`: SFrame
   against RFC 9605's vectors (every header encoding, suite 0x0004's key, salt and
   ciphertext), HPKE Auth mode against RFC 9180 A.1.3 (the ephemeral, receiver and
   sender keys, the sealed message), then what vectors do not cover — altered
@@ -589,8 +549,7 @@ framework.
   spellings, and `oc_hostport`, `oc_addr_is_loopback` and
   `oc_workspace_takes_suffix` — the managed suffix beside a bare name or nothing
   typed, never beside an address, a port, a dotted name or `localhost` — hold to
-  their tables (`tools/gui/features/web_signin.sh` checks the Win32 field shows it for
-  `acme` and not for the daemon's address); a
+  their tables; a
   client resolves `[::1]:<port>`, signs in and sends over IPv6 with nothing else
   looked up; the call engine picks the relay's family IPv4 first and IPv6 when
   that is all there is, starts on the connection when it has no UDP, and dana, on
@@ -786,8 +745,7 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 code -- fails once and passes the next time, with nothing changed -- gets an
 issue when it is first seen, and is fixed or removed before the next merge to
 `staging`. A failed run, local or in CI, is never re-run to get a pass: a pass
-on a re-run counts for nothing, and the failure is the one to explain. The GUI
-and browser tests (`tools/gui/`) are held to the same rule.
+on a re-run counts for nothing, and the failure is the one to explain.
 
 **A test is brittle if its result can change without a change in behaviour a
 person, an operator or an integrator could see — or if it can stay green while
@@ -799,8 +757,7 @@ one in which something did. Every rule below follows from that one.
 machine contracts only: wire and protocol bytes and opcodes, error codes and
 HTTP statuses, configuration names (`OPENCHIME_*`), the version line, JSON
 field names, and the hashes of committed data. **No C test matches a person's
-words** (the GUI harnesses still read a few `si_err` texts; a marker would
-replace them) — a page's sentence, an error's text, an e-mail's or an invitation's
+words** — a page's sentence, an error's text, an e-mail's or an invitation's
 wording, a prompt — not even where the words are part of a contract: text that
 is registered or legal is checked through the constant that holds it, or its
 hash, in one place. Everything else is asserted as an outcome (the account
@@ -861,8 +818,7 @@ A limit on speed is asserted as the mechanism behind it (the work was
 batched, the cache was hit, no blob operation ran on the loop's thread, a
 message was delivered while a backend read was held); a window, a moment or a
 rate is asserted on a clock the test injects and moves (§2.3), or by an
-explicit sweep through it, a step at a time, each waited on. (The web client's
-checks wait on the client's state, §3.4.)
+explicit sweep through it, a step at a time, each waited on.
 
 **Isolation.** Each test has its own data, paths and ports (§2.3, §2.4):
 `tests/testenv.h`'s `oc_test_mkdtemp` and `oc_test_rmtree` for files,
@@ -999,15 +955,10 @@ under the same name, on a box restarted with it: a full handshake, no session
 resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, and
-it is also how every suite signs in, and a real browser is held to it too
-(`web_pages`, §3.4): `tests/testsignin.h` plays the browser --
+it is also how every suite signs in: `tests/testsignin.h` plays the browser --
 the form POSTed to the daemon's page over TLS, the token read off the 303 --
 and the client presents that token, so a suite's sign-in is a person's. The
-same helper is the `signin` command (`build/signin`) and links into the e2e,
-demo and bench clients; the GUI harness presses the card's Sign in and plays
-the browser from the URL the client publishes under its hook (`sign_in_card`
-and `play_browser`, `tools/gui/harness/lib.sh`), and the web client, its own browser,
-types for the harness with `OPENCHIME_DEV_SIGNIN=user:password` (development mode).
+same helper links into the e2e, demo and bench clients.
 `test_jwt`: a token the daemon's issuer mints verifies against its key, name and
 audience, and not with a byte changed, for another audience, from another key or
 past its time; a `sub` names a user only as `local|<id>`. `itest_netloop`
@@ -1026,20 +977,6 @@ self-signed daemon on loopback — sign-up with the setup token, the password
 page, a wrong password leaving it waiting, cancel, and a session kept by
 Remember me. Mutation proofs cover the verifier, `Origin`, direct-versus-tunnel both ways,
 the tunnel's certificate and `Host` checks, the page's limiter and the subject.
-`tools/gui/features/web_signin.sh` drives it on Windows: the Win32 client, with no
-credentials, against a self-signed daemon at the WSL address —
-certificate trusted, the sign-in link offered to copy while the browser is
-awaited and copied by the card's button, sign-up through the tunnel with the setup token, password
-changed on its page, and, the workspace forgotten, the old password refused and
-the new one signing in; then, forgotten again, the card checked to say nothing
-under a heading that already names the workspace, a reset's code entered on the
-card, the reset page opened through the client's own tunnel, the password set
-and the sign-in it goes on to signing in; PowerShell plays the browser from
-`signin_url.txt`. The invitation and the reset code go through the card's real
-dialogs — opened by a click on the link (`clickform`, acked before the dialog's
-nested loop starts), typed into (`formtype`) and answered with Enter or Esc —
-and the card is checked to stay the view under each and after it, since the
-attempt a dialog starts is watched only while the card is on screen.
 
 **A device code** (AUTH.md §8.11): `test_protocol`
 round-trips its four frames. `test_devicecodes` drives the table alone — pending,
@@ -1297,19 +1234,6 @@ dependency file names it, and no other), since a struct that grows would
 otherwise leave the client mixing two layouts, which shows only as random traps
 at run time.
 
-How it behaves in a browser is checked by hand, in neither suite: the GUI and
-browser tests ("The GUI and browser tests", below) run the feature scripts
-against the web client in a headless Chromium (`tools/gui/run.sh --web`), and
-two of them are the browser's alone. `web_client` records a video message in
-wasm from the synthetic camera, with the audio on the Web Audio worklet, runs
-the text layer's `sttest`, plays a composition from the input method and reads
-About; `web_pages` drives the daemon's own pages -- the first owner signed up
-with the setup token, a wrong password refused, the password changed, the
-browser's token presented on `AUTH`, an invitation link opened cold in a second
-browser, and the client's cold and warm load. What each asserts is
-tools/gui/README.md, "Reading the web client harness" and "Reading the web
-pages harness".
-
 The WebSocket transport itself is covered natively, in `itest_netloop`'s HTTP
 stack scenario: the upgrade's accept value and echoed subprotocol, HELLO's
 answer in frames, a ping's pong, and an unmasked frame ending the connection.
@@ -1333,8 +1257,7 @@ the release compiles with the same gcc as the fast build, so there is no
 second release-compiler pass, and the daemon's release compile is `stage`'s
 alone; and the end-to-end run (§3.2) is the one thing the in-process suites cannot
 show, since they link the daemon's code without its `main()`. No GUI or
-browser test runs in either suite or in CI: they are run by hand ("The GUI and
-browser tests", below).
+browser test runs in either suite or in CI.
 
 The tests run on `ubuntu-24.04`; the release builds on `ubuntu-22.04`
 (`stage`), whose glibc 2.35 is the release binary's floor. The native build,
@@ -1650,7 +1573,7 @@ build/openchime-tui 127.0.0.1 8443             # <host> <port>: a device-code si
   default `/data` is neither, and the daemon exits before `netloop: listening`.
   `tools/demo/tui.sh` sets it to a temp dir.
 - `demo_client` (`make build/demo_client`) is the flexible black-box tool:
-  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | reply <channel> <parent> <text> | invite [uses]`
+  `demo_client <host> <port> <user> <pass> token <apns|fcm> <tok> | send <channel> <text> | reply <channel> <parent> <text>`
   against a running daemon (its usage lists the rest).
 
 ## A death always leaves evidence
@@ -1675,16 +1598,6 @@ The CRT's two exits are routed in as well: `abort()` and an invalid-parameter
 call both raise a real exception, so they produce the ordinary report
 instead of vanishing.
 
-**Prove it rather than wait for it.** `tools/gui/harness/win32/drive.sh die <av|abort|badparam|fastfail|kill>`
-forces one class each. `av`, `abort` and `badparam` produce a crash report;
-`fastfail` and `kill` produce none, by construction, and are caught by the ring.
-
-**The harness closes the client gracefully** (`CloseMainWindow`, falling back to
-force after three seconds) for a reason that matters here: `Stop-Process -Force`
-is a `TerminateProcess`, which is correctly reported as a death that ran no
-handler. Force-killing on every launch would fill the test directory with
-post-mortems the harness caused on purpose and bury the one that matters.
-
 ## Symbolicating a Win32 crash
 
 `make build` ships a **stripped** `build/openchime.exe` and keeps the
@@ -1703,14 +1616,3 @@ address with its `addr2line` (llvm-symbolizer, which reads PE + DWARF; both in
 
 Keep the `.debug` file for any binary handed to somebody else; without it a
 minidump from that build resolves to nothing.
-
-## The GUI and browser tests
-
-The real clients -- the Win32 client on a Windows desktop and the web client in
-a headless Chromium -- are driven against a real daemon by the feature scripts
-under `tools/gui/`, and the daemon's own pages from a real browser by the same
-runner (`tools/gui/run.sh`). Those checks are run by hand, and in neither suite
-nor CI: a client change is checked with them before it is pushed (the GUI smoke
-first). How to run them, their prerequisites, the harness, the shape every
-feature script keeps, the variables and each test's notes are
-[tools/gui/README.md](../../tools/gui/README.md).

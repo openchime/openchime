@@ -121,7 +121,7 @@ FUZZ_RUNS_jwt      := 50000
 FUZZ_RUNS_webauthn := 33000
 FUZZ_RUNS_idtoken  := 20000
 FUZZ_RUNS_image    := 6000
-TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
+TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests
 

@@ -14,8 +14,8 @@ name: test-all
 # cached by that script's hash, one cache per library. One runner image
 # everywhere, ubuntu-24.04, the same one the release builds on.
 #
-# The end-to-end test (scripts/test/full/e2e.sh) and the web client's checks
-# run the daemon in development mode, so this job lives here and not in a
+# The end-to-end test (scripts/test/full/e2e.sh) runs the daemon in
+# development mode, so this job lives here and not in a
 # release-path workflow, which scripts/test/fast/release_lint.sh keeps free of
 # it. The rest of the full suite -- the checks on the packages, the images and
 # the Windows installers -- runs in release-candidate.yml on the artifacts it

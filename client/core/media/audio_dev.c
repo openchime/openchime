@@ -161,10 +161,6 @@ struct oc_audio_dev {
     /* Synthetic: when the tone source / real-time sink last caught up. */
     int64_t       syn_start_us;
     uint64_t      syn_frames;
-    /* Synthetic capture: what the microphone "hears" instead of the tone, when
-     * OPENCHIME_DEV_MIC names a WAV (played once, then silence). */
-    int16_t      *syn_clip;
-    size_t        syn_clip_n;
     /* Synthetic capture: the tone is silent for this many frames from open
      * (OPENCHIME_DEV_MIC_LEAD_MS), while an echo is still heard. */
     uint64_t      syn_lead;
@@ -198,44 +194,6 @@ static int use_synthetic(void) {
 static int mic_denied(void) {
     const char *t = oc_env_dev("OPENCHIME_DEV_AUDIO");
     return t && strcmp(t, "mic-denied") == 0;
-}
-
-/* OPENCHIME_DEV_MIC: a 16-bit PCM WAV at `rate` with `channels`, for the
- * synthetic microphone to speak -- so voice input is testable end to end on a
- * machine with no microphone. NULL (and the tone) when unset or unusable. */
-static int16_t *load_test_clip(int rate, int channels, size_t *n_out) {
-    const char *path = oc_env_dev("OPENCHIME_DEV_MIC");
-    if (!path) return NULL;
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    unsigned char h[12];
-    int16_t *pcm = NULL;
-    int ok_fmt = 0;
-    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) goto done;
-    for (;;) {
-        unsigned char c[8];
-        if (fread(c, 1, 8, f) != 8) break;
-        uint32_t len = (uint32_t)c[4] | (uint32_t)c[5] << 8 | (uint32_t)c[6] << 16 | (uint32_t)c[7] << 24;
-        if (!memcmp(c, "fmt ", 4) && len >= 16) {
-            unsigned char fm[16];
-            if (fread(fm, 1, 16, f) != 16) break;
-            unsigned tag = fm[0] | fm[1] << 8, ch = fm[2] | fm[3] << 8, bits = fm[14] | fm[15] << 8;
-            uint32_t sr = (uint32_t)fm[4] | (uint32_t)fm[5] << 8 | (uint32_t)fm[6] << 16 | (uint32_t)fm[7] << 24;
-            ok_fmt = tag == 1 && (int)ch == channels && bits == 16 && (int)sr == rate;
-            if (fseek(f, (long)(len - 16 + (len & 1)), SEEK_CUR) != 0) break;
-        } else if (!memcmp(c, "data", 4)) {
-            if (!ok_fmt || len < 2) break;
-            pcm = malloc(len);
-            if (pcm && fread(pcm, 1, len, f) == len) *n_out = len / 2 / (size_t)channels;
-            else { free(pcm); pcm = NULL; }
-            break;
-        } else if (fseek(f, (long)(len + (len & 1)), SEEK_CUR) != 0) {
-            break;
-        }
-    }
-done:
-    fclose(f);
-    return pcm;
 }
 
 static int peak(const int16_t *s, size_t n) {
@@ -331,7 +289,6 @@ static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rat
 
     if (use_synthetic()) {
         d->synthetic = 1;
-        if (capture && !loopback) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
         if (capture && !loopback) {
             const char *lead = oc_env_dev("OPENCHIME_DEV_MIC_LEAD_MS");
             int ms = lead ? atoi(lead) : 0;
@@ -373,15 +330,6 @@ static double syn_loop_value(double t_s) {
     return v;
 }
 
-/* The synthetic microphone's tone: 440 Hz, or OPENCHIME_DEV_TONE's. Two clients
- * on one machine in a call each speak their own, so either can tell which of
- * them it is hearing. */
-static double mic_tone_hz(void) {
-    const char *t = oc_env_dev("OPENCHIME_DEV_TONE");
-    double hz = t ? atof(t) : 0.0;
-    return hz > 20.0 && hz < 7000.0 ? hz : 440.0;
-}
-
 /* 0 none; 1 the echo over the microphone's own tone; 2 the echo alone. */
 static int mic_echo(void) {
     const char *t = oc_env_dev("OPENCHIME_DEV_MIC_ECHO");
@@ -401,12 +349,7 @@ static void synthetic_catch_up(oc_audio_dev *d) {
     while (frames > 0) {
         size_t n = frames > 960 ? 960 : frames;
         if (d->capture) {
-            if (d->syn_clip) {
-                for (size_t i = 0; i < n * (size_t)d->channels; i++) {
-                    size_t k = (size_t)d->syn_frames * (size_t)d->channels + i;
-                    chunk[i] = k < d->syn_clip_n * (size_t)d->channels ? d->syn_clip[k] : 0;
-                }
-            } else if (d->loopback) {
+            if (d->loopback) {
                 for (size_t i = 0; i < n; i++) {
                     double t = ((double)d->syn_start_us + (double)(d->syn_frames + i) * 1e6 / d->rate) / 1e6;
                     int16_t v = (int16_t)syn_loop_value(t);
@@ -414,7 +357,7 @@ static void synthetic_catch_up(oc_audio_dev *d) {
                 }
             } else {
                 int echo = mic_echo();
-                double hz = mic_tone_hz();
+                const double hz = 440.0;   /* the synthetic microphone's tone */
                 for (size_t i = 0; i < n; i++) {
                     double t = (double)(d->syn_frames + i) / d->rate;
                     int talking = echo != 2 && d->syn_frames + i >= d->syn_lead;
@@ -430,7 +373,7 @@ static void synthetic_catch_up(oc_audio_dev *d) {
             if (put < n * (size_t)d->channels)
                 atomic_fetch_add(&d->overruns, (n * (size_t)d->channels - put) / (size_t)d->channels);
             atomic_fetch_add(&d->pushed, n);
-            atomic_store(&d->level, d->syn_clip ? peak(chunk, n * (size_t)d->channels) : 8000);
+            atomic_store(&d->level, 8000);
         } else {
             size_t got = ring_pop(&d->ring, chunk, n * (size_t)d->channels);
             if (got < n * (size_t)d->channels) memset(chunk + got, 0, (n * (size_t)d->channels - got) * sizeof *chunk);
@@ -492,7 +435,6 @@ void oc_audio_close(oc_audio_dev *d) {
     if (d->impl) { const oc_audio_backend *b = oc_audio_platform_backend(); if (b) b->close(d); }
     if (d->ref_slot >= 0) atomic_store(&g_ref[d->ref_slot].used, 0);
     if (d->owns_mic) atomic_store(&g_capture_open, 0);
-    free(d->syn_clip);
     free(d->ring.buf);
     free(d);
 }

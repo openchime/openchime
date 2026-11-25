@@ -418,7 +418,6 @@ static void test_mode(void) {
     CHECK(!strcmp(oc_config_get()->dev.users, "alice:pw:owner"));
     /* The clients' inputs are known names, not stored. */
     accepts("OPENCHIME_DEV_AUDIO", "synthetic");
-    accepts("OPENCHIME_DEV_DIR", "/srv/oc-x");
     accepts("OPENCHIME_DEV_SUFFIX", "chat.example");
     /* Development enrols with a loopback test service only. */
     refuses("OPENCHIME_ENROLL_URL", "https://openchime.io");
@@ -471,7 +470,7 @@ static void test_mode(void) {
     static const char *const devs[][2] = {
         { "OPENCHIME_DEV_USERS", "alice:pw:owner" }, { "OPENCHIME_DEV_FILE_PAGE", "2" },
         { "OPENCHIME_DEV_CALL_MAX", "3" }, { "OPENCHIME_DEV_CONNS_PER_IP", "0" }, { "OPENCHIME_DEV_SEND_RATE", "0" },
-        { "OPENCHIME_DEV_AUDIO", "synthetic" }, { "OPENCHIME_DEV_SIGNIN", "alice:pw" },
+        { "OPENCHIME_DEV_AUDIO", "synthetic" },
     };
     /* A demo admits visitors with central's invite to local accounts:
      * it needs both sources, and is refused without. */
@@ -540,7 +539,7 @@ static void test_reload_and_registry(void) {
     }
     CHECK(operator_rows == 52);     /* OPENCHIME_MODE, OPENCHIME_DEMO_TERMS_URL, the four OPENCHIME_MCP settings, OPENCHIME_H264_EXPORT, the three OPENCHIME_CALL_RECORDING, the six image-preview settings and OPENCHIME_RETENTION_DAYS among them */
     CHECK(managed_rows == 7);
-    CHECK(dev_rows == 6 + 13);      /* the daemon's six, and the clients' */
+    CHECK(dev_rows == 6 + 8);       /* the daemon's six, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
     /* No row is also a removed name. */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++)

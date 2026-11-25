@@ -42,8 +42,8 @@ canvas{display:block;outline:none}
   // The mode (CONFIG.md "Mode"): `normal` as built, rewritten by the daemon
   // that serves this page when it runs in development mode (daemon/webapp.c),
   // and by tools/web/serve.py. Never read from the address: only on a page
-  // from a development daemon do the harness's inputs below (?hook=, ?shot=,
-  // ?cmd=, ?env=, ?mic=) do anything, so a link cannot turn them on.
+  // from a development daemon does the development input below (?env=)
+  // do anything, so a link cannot turn it on.
   const mode = /*OC_MODE*/'normal';
   const dev = mode === 'development';
   const host = q.get('host') || location.hostname;
@@ -80,75 +80,14 @@ canvas{display:block;outline:none}
   // A script error before the first frame is a start that failed (fail() does
   // nothing once the screen is down).
   window.addEventListener('error', (ev) => fail('OpenChime could not start: ' + (ev.message || 'a script failed')));
-  // The test hook (OPENCHIME_DEV_DIR, TESTING.md), on the page's filesystem,
-  // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
-  // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
-  // that many milliseconds, for a harness to read off the console.
-  // ?hook=1 is kept for the tab: the sign-in leaves the page and comes back
-  // to /app/ without the query, and the harness still wants the hook there.
-  if (dev && q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
-  let hookKept = false; try { hookKept = dev && sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
-  // The development inputs (?env=, ?mic=) are kept for the tab the same way: the
-  // sign-in leaves for the daemon's page and comes back without the query.
+  // The development input (?env=) is kept for the tab: the sign-in leaves for
+  // the daemon's page and comes back without the query.
   // OPENCHIME_MODE itself is the page's, never an ?env=.
-  let envs = dev ? q.getAll('env').filter((kv) => !kv.startsWith('OPENCHIME_MODE=')) : [], micUrl = dev ? q.get('mic') : '';
+  let envs = dev ? q.getAll('env').filter((kv) => !kv.startsWith('OPENCHIME_MODE=')) : [];
   if (dev) try {
     if (envs.length) sessionStorage.setItem('oc.env', JSON.stringify(envs));
     else envs = JSON.parse(sessionStorage.getItem('oc.env') || '[]');
-    if (micUrl) sessionStorage.setItem('oc.mic', micUrl);
-    else micUrl = sessionStorage.getItem('oc.mic') || '';
   } catch (e) {}
-  // The harness's instructions (?cmd=, ?at=, ?ime=, ?script=, ?dumpat=, ?wait=,
-  // ?shot=) are kept for the tab too, as one set, so the page that comes back
-  // from signing in carries out what the first one was asked to.
-  const testKeys = ['cmd', 'at', 'ime', 'script', 'dumpat', 'wait', 'shot'];
-  let tq = new URLSearchParams();
-  if (dev) try {
-    if (testKeys.some((k) => q.has(k))) {
-      for (const k of testKeys) for (const v of q.getAll(k)) tq.append(k, v);
-      sessionStorage.setItem('oc.test', tq.toString());
-    } else tq = new URLSearchParams(sessionStorage.getItem('oc.test') || '');
-  } catch (e) {}
-  // The model dump's line that says whether the client is signed in (the
-  // first line when it is not: the sign-in card's state).
-  const authLine = (t) => { const ls = t.split('\n'); return ls.find((l) => l.startsWith('authed=')) || ls[0]; };
-  const hookOn = dev && (q.get('hook') === '1' || hookKept || tq.has('shot') || tq.has('cmd'));
-  // The verb goes in, and the FRESH ack comes back: the old one is removed
-  // first and the answer polled for, up to `wait` ms (a slow verb answers
-  // late; a stale ack would be the previous verb's).
-  window.ocHook = (cmd, wait) => new Promise((res) => {
-    try { FS.unlink('/t\\ack'); } catch (e) {}
-    FS.writeFile('/t\\cmd', cmd);
-    const t0 = Date.now(), limit = wait || 10000;
-    const poll = () => { let a = null; try { a = FS.readFile('/t\\ack', { encoding: 'utf8' }); } catch (e) {}
-      if (a !== null) res(a); else if (Date.now() - t0 > limit) res('(no ack)'); else setTimeout(poll, 20); };
-    setTimeout(poll, 20);
-  });
-  // The model dump, fresh, or null when the hook did not answer (or the
-  // runtime is not up yet).
-  const dumpNow = async () => {
-    try { if ((await ocHook('dump /dump.txt', 10000)) === '(no ack)') return null; return FS.readFile('/dump.txt', { encoding: 'utf8' }); } catch (e) { return null; }
-  };
-  // Poll the dump until ok(text) holds: that text, or null once `limit` ms
-  // pass. What the harness waits on is the client's state, never a schedule.
-  const untilDump = async (ok, limit) => {
-    const t0 = Date.now();
-    for (;;) {
-      const t = await dumpNow();
-      if (t !== null && ok(t)) return t;
-      if (Date.now() - t0 > limit) return null;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-  };
-  // Signed in, or SIGNIN-FAIL: logged with the dump's line, so the harness
-  // fails at once rather than waiting out a clock of its own.
-  const signedIn = async () => {
-    if (await untilDump((t) => authLine(t).includes('authed=1'), 60000)) return true;
-    const t = await dumpNow();
-    console.log('SIGNIN-FAIL:' + (t === null ? '(no dump)' : authLine(t)));
-    return false;
-  };
-  window.ocShot = async () => { await ocHook('shot /shot.bmp', 1500); const b = FS.readFile('/shot.bmp'); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
   // The command line. Served by the daemon (WEB.md) the page is
   // `openchime --signin <host:port>`: the workspace is the page's own origin
   // (or ?ws=, or ?host=&port=, for a page served from elsewhere), and the
@@ -197,19 +136,12 @@ canvas{display:block;outline:none}
   }
   var Module = {
     arguments: args,
-    // The test knobs the native harness sets in the environment (TESTING.md)
-    // are the page's ?env=NAME=value (repeatable); ?mic=<url> puts a WAV on the
-    // page's filesystem at /mic.wav for OPENCHIME_DEV_MIC.
+    // The development settings (CONFIG.md "Development mode only") are the
+    // page's ?env=NAME=value (repeatable).
     preRun: [() => {
       ENV.OPENCHIME_MODE = mode;
       if (q.has('stats')) ENV.OC_WEB_STATS = '1';
-      if (hookOn) { ENV.OPENCHIME_DEV_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
       for (const kv of envs) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
-      if (micUrl) {
-        addRunDependency('mic');
-        fetch(micUrl).then((r) => r.arrayBuffer()).then((b) => { FS.writeFile('/mic.wav', new Uint8Array(b)); removeRunDependency('mic'); })
-          .catch((e) => { console.error('mic: ' + e); removeRunDependency('mic'); });
-      }
     }],
     canvas: document.getElementById('canvas'),
     // The wasm is fetched here rather than by the loader, so its bytes can be
@@ -252,66 +184,6 @@ canvas{display:block;outline:none}
       if (q.get('open')) setTimeout(() => Module.ccall('oc_web_handoff', null, ['string', 'string'], ['url', q.get('open')]), 4000);
     },
   };
-  if (hookOn && tq.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(tq.get('cmd')))), parseInt(tq.get('at') || '6000', 10));
-  // ?ime=1: once signed in, a composition is played into the hidden input the
-  // platform keeps for the input method (plat_web.c) -- what a Japanese IME
-  // sends -- and the composer's line is logged as IME-COMPOSING: once it shows
-  // two units composing (comp=2), and as IME: once it holds two committed
-  // characters (len=2), for the web test; each is polled for, and logged as it
-  // stands if it never comes.
-  if (hookOn && tq.get('ime') === '1') (async () => {
-    if (!(await signedIn())) return;
-    await ocHook('channel general', 10000);
-    const edLine = (t) => (t || '').split('\n').find((l) => l.startsWith('ed ')) || '';
-    if (!(await untilDump((t) => edLine(t) !== '', 30000))) { console.log('IME-ERR: no composer'); return; }
-    const ime = document.getElementById('oc-ime');
-    ime.focus();
-    ime.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
-    ime.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'にほ' }));
-    const mid = edLine((await untilDump((t) => / comp=2 /.test(edLine(t)), 10000)) || (await dumpNow()));
-    console.log('IME-COMPOSING:' + mid);
-    ime.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }));
-    const after = edLine((await untilDump((t) => /^ed len=2 /.test(edLine(t)), 10000)) || (await dumpNow()));
-    console.log('IME:' + after);
-  })();
-  // ?script=step|step…: once the client is signed in, each step in turn. A
-  // step is a verb, sent and its ACK awaited and logged; or `verb~pattern …`,
-  // after whose ACK the dump is polled until every pattern (regular
-  // expressions, space-separated) matches one line of it, logged as UNTIL. A
-  // step that is not answered, or whose state never comes, ends the script.
-  // Then DUMPALL: of the model -- the web test's way of recording a video
-  // message end to end, paced by the client's state and not by a clock.
-  if (hookOn && tq.has('script')) (async () => {
-    if (!(await signedIn())) return;
-    for (const step of tq.get('script').split('|')) {
-      const [verb, cond] = step.split('~');
-      const ack = await ocHook(verb, 30000);
-      console.log('ACK ' + verb + ': ' + ack);
-      if (ack === '(no ack)') break;
-      if (cond) {
-        const pats = cond.split(' ').filter((x) => x).map((x) => new RegExp(x));
-        const held = await untilDump((t) => t.split('\n').some((l) => pats.every((re) => re.test(l))), 60000);
-        console.log('UNTIL ' + verb + ': ' + (held ? 'ok' : 'never: ' + cond));
-        if (!held) break;
-      }
-    }
-    await ocHook('dump /dump.txt', 10000);
-    try { console.log('DUMPALL:' + btoa(unescape(encodeURIComponent(FS.readFile('/dump.txt', { encoding: 'utf8' }))))); } catch (e) { console.log('DUMP-ERR:' + e); }
-  })();
-  if (hookOn && tq.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + authLine(FS.readFile('/dump.txt', { encoding: 'utf8' }))); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(tq.get('dumpat'), 10));
-  // ?wait=authed&shot=1: poll the model until it is signed in (or 60 s pass),
-  // log that line as DUMP:, then the screenshot -- the test's whole exchange.
-  if (hookOn && tq.get('wait') === 'authed') (async () => {
-    const t0 = Date.now(); let line = '';
-    while (Date.now() - t0 < 60000) {
-      await new Promise((r) => setTimeout(r, 1500));
-      try { await ocHook('dump /dump.txt', 1200); line = authLine(FS.readFile('/dump.txt', { encoding: 'utf8' })); } catch (e) { line = ''; }
-      if (line.includes('authed=1')) break;
-    }
-    console.log('DUMP:' + line);
-    if (tq.has('shot')) { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }
-  })();
-  else if (hookOn && tq.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(tq.get('shot'), 10));
 }
 </script>
 <script>

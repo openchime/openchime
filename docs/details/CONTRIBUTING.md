@@ -116,10 +116,6 @@ test** (TESTING.md): the fast one, `make build` and `make test`, here, before
 every push; and the full one, `make build-all` and `make test-all`, in CI,
 once per release-candidate. Each refuses to run on the other side.
 
-**Before pushing a GUI change, run `tools/gui/run.sh smoke`**, and the
-feature's own test where the change touches one (tools/gui/README.md). No
-suite runs them.
-
 ## Commits
 
 - `OC-<issue>: Capitalised imperative summary` — **no trailing punctuation**, at

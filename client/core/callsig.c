@@ -7,7 +7,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "env.h"           /* oc_env_dev */
 #include <string.h>
 
 void oc_callsig_init(oc_callsig *cs) {
@@ -328,11 +327,8 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
         break;
     }
     case OC_CMD_CALL_HISTORY: {
-        /* A page at a time; development mode may make it smaller, so a test
-         * reaches the next page with a handful of calls. */
-        const char *dev = oc_env_dev("OPENCHIME_DEV_CALL_HISTORY_PAGE");
-        int lim = dev ? atoi(dev) : 0;
-        oc_call_history h = { c->start_ms, (uint16_t)(lim > 0 && lim <= (int)OC_CALL_HISTORY_PAGE ? (unsigned)lim : OC_CALL_HISTORY_PAGE) };
+        /* A page at a time. */
+        oc_call_history h = { c->start_ms, (uint16_t)OC_CALL_HISTORY_PAGE };
         rc = oc_encode_call_history(&w, OC_PROTOCOL_VERSION, &h);
         break;
     }

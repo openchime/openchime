@@ -116,5 +116,4 @@ the map behind it.
 | [MODERATION.md](./plans/MODERATION.md) | The moderator role, reports, and the three permissions. | ARCH-128; REQ-371–374 |
 
 Outside `docs/`: [LICENSING.md](../LICENSING.md) holds the project's licence
-terms, and [tools/gui/README.md](../tools/gui/README.md) how the graphical
-client is driven and checked by hand.
+terms.

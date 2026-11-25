@@ -34,7 +34,7 @@ list_files() {
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git ls-files -z --cached --others --exclude-standard -- "${scan[@]}"
     else
-        find "${scan[@]}" \( -name node_modules -o -name __pycache__ \) -prune -o -type f -print0 2>/dev/null
+        find "${scan[@]}" -name __pycache__ -prune -o -type f -print0 2>/dev/null
     fi
 }
 used=$(list_files | grep -zvE '\.(png|ico|bin|ort|npz|wav|bmp)$|^tests/test_config\.c$' \

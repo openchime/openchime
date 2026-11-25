@@ -225,12 +225,8 @@ clock video frames use; playback reports the samples the device has consumed,
 which is the clock a player — or a call's jitter buffer — runs on. Video messages
 record at 48 kHz mono; calls open it at 16 kHz. `OPENCHIME_DEV_AUDIO=synthetic`
 swaps the devices for a tone source and a real-time sink, so both run in
-`make test` on a machine with no sound hardware; with it, `OPENCHIME_DEV_MIC=<wav>`
-makes the synthetic microphone speak a recording, and `OPENCHIME_DEV_AUDIO=mic-denied`
-refuses the microphone as the operating system refuses a blocked one — which is how
-`tools/gui/features/voice.sh` drives voice input — and `OPENCHIME_DEV_TONE` changes the
-synthetic microphone's tone, which is how `tools/gui/features/calls.sh` tells two clients
-apart.
+`make test` on a machine with no sound hardware, and `OPENCHIME_DEV_AUDIO=mic-denied`
+refuses the microphone as the operating system refuses a blocked one.
 
 **Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
 16 kHz mono. The microphone has one owner: a second capture is refused
@@ -497,8 +493,7 @@ speech, which is the failure the harness exists to catch.
 
 **After the canceller, the preprocessor.** A call runs speexdsp's preprocessor on
 the cancelled frame: noise suppression and automatic gain, after cancellation so
-the far end's echo is gone before the gain can lift it. It is what makes a steady hum disappear — `tools/gui/features/calls.sh` checks that
-with a test tone, which to it is a hum — and why the call view offers it as a
+the far end's echo is gone before the gain can lift it. It is what makes a steady hum disappear, and why the call view offers it as a
 switch.
 
 ---

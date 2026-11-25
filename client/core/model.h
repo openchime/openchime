@@ -983,12 +983,10 @@ typedef struct {
     uint32_t     call_back_seq, call_lost_seq;
     /* The call history (CALLS.md §1): the pages fetched so far, newest first
      * (heap, `n_call_hist` of them); `call_hist_more` while older ones are
-     * there to ask for (oc_client_call_history with the oldest's start).
-     * `call_hist_seq` bumps per page. */
+     * there to ask for (oc_client_call_history with the oldest's start). */
     oc_call_hist_view *call_hist;
     size_t             n_call_hist;
     uint8_t            call_hist_more, call_hist_loaded;
-    uint32_t           call_hist_seq;
     /* The call page last fetched (heap, NULL none): its transcript's lines
      * gathered page by page as oc_client_call_detail asks from the next.
      * `call_page_seq` bumps per page and per delete. */
