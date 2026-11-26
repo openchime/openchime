@@ -171,4 +171,4 @@ net loop.
 | The delivery worker and the check | `daemon/webhooks_out.c` |
 | Glue | `daemon/netloop.c` (`owh_tick`), `daemon/main.c` |
 | Admin > Webhooks | `client/gui/app/app.c`; the client core's `oc_client_*_outgoing_webhook*` |
-| Tests | `tests/test_dbwriter.c` (`test_outgoing_webhooks`), `tests/test_webhooks_out.c`, `tests/test_protocol.c`, `tests/test_migrate.c`, `tools/gui/features/webhooks_out.sh` |
+| Tests | `tests/test_dbwriter.c` (`test_outgoing_webhooks`), `tests/test_webhooks_out.c`, `tests/test_protocol.c`, `tests/test_migrate.c` |

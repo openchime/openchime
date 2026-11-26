@@ -33,9 +33,9 @@ void st__map_free(st_map *map);
 int st__b2w(const st_map *, size_t byte_off);
 int st__w2b(const st_map *, int u16_off);
 
-/* ---- Unicode, for a backend that lays text out itself (st_canvas.c; a
- * FreeType backend later). DirectWrite does all three inside its layout; here
- * they come from utf8proc's tables, on the UTF-16 units the map speaks. ---- */
+/* ---- Unicode, for a backend that lays text out itself (st_canvas.c,
+ * st_ft.c). DirectWrite does all three inside its layout; here they come
+ * from utf8proc's tables, on the UTF-16 units the map speaks. ---- */
 
 /* Grapheme clusters (UAX #29): cb[u] is 1 where a cluster starts, for every
  * unit, and cb[n] is 1. The second unit of a surrogate pair, a combining

@@ -101,7 +101,7 @@ void  oc_call_engine_camera_subscribe(oc_call_engine *e, int all, const uint64_t
  * voice reaches it (lip sync). */
 int   oc_call_engine_camera_frame(oc_call_engine *e, uint64_t user, oc_frame *dst, uint32_t *seq);
 
-/* What is happening, for the call view and the test harness. */
+/* What is happening, for the call view and the tests. */
 typedef struct {
     uint64_t user_id;
     uint8_t  slot;

@@ -33,12 +33,13 @@ client/gui/app/       the graphical application, portable: SDL3 for the window a
                       input, oc_gfx for drawing, sdltext for text (ARCH-80)
 client/gui/gfx/       oc_gfx, the primitives over the SDL renderer (ARCH-107)
 client/gui/platform/  platform.h -- what a platform supplies -- and one directory
-                      implementing it per platform: win32/ (the reference), web/;
-                      linux/ and mac/ are the next two
+                      implementing it per platform: win32/ (the reference), web/,
+                      linux/; mac/ is next
 client/shared/ assets and services shared by the TUI and the GUI: icons, the
                OS notification backends, the credential store backends
 sdltext/       portable text layout and hit-testing, one backend per platform
-               (DirectWrite, the browser's canvas; FreeType and Core Text next)
+               (DirectWrite, the browser's canvas, FreeType with HarfBuzz and
+               fontconfig; Core Text next)
 ```
 
 **The platform contract** (`client/gui/platform/platform.h`) is the whole of
@@ -57,7 +58,7 @@ platform has to say asynchronously (a URL handed over by a second launch, a
 tray click, an accessibility invoke) arrives as one SDL user event, so the
 application has one inbox. The accessibility tree is published through
 `client/gui/platform/a11y.h` the same way: UIA on Windows, an ARIA mirror on
-the web (`a11y_web.c`).
+the web (`a11y_web.c`), AT-SPI on Linux (`a11y_atspi.c`).
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
 frontend is pure view + input — it renders the view-model and emits intents. Get
@@ -132,16 +133,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   **Copy sign-in link** (Ctrl+C) beside Cancel (Esc): the link the browser was
   given, for one of the person's own choosing, and the way in where no browser
   opened at all (none installed, a locked-down or remote desktop), which the
-  card says plainly when the platform's opener fails. Under the automation hook
-  the URL is written to `signin_url.txt` in the test directory instead of
-  being opened, so a harness can play the browser; its `sicopy` verb is the
-  link's button.
+  card says plainly when the platform's opener fails.
 - **`net.c` — the network thread.** A blocking-socket TLS connection (the client
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
   that interleaves sending queued intents with reading + dispatching server
   frames. Lifted from `tests/e2e_client.c`. A process normally has one oc_client
-  (one net thread), but a multi-client harness (the headless test) spins several
+  (one net thread), but a multi-client test spins several
   concurrently; that is safe because the vendored mbedTLS is built with
   **`MBEDTLS_THREADING`** (`scripts/build/mbedtls.sh`), so its internal shared
   state is mutex-protected.
@@ -682,15 +680,76 @@ model; translate input to intents }, stop.
   Summarize (`header.summarize`), each topic's chevron (`summary.topic.<t>`),
   each citation (`summary.cite.<n>`) and each pickable day of the range card
   (`sumrange.day.<yyyymmdd>`, with `sumrange.prev`/`.next`) are buttons in the
-  accessibility tree, invoked as a click. Harness verbs: `summenu` opens the
-  menu, `summary <scope>` asks without it and `summary close` closes it,
-  `sumrange [<first> <last>]` opens the range card (and picks those days),
-  `sumtoggle <t>` shows or hides a topic's details, and `sumcite <n>` goes to a
-  citation's message (`sumcite <n> hover` shows its card).
-- **Linux GUI (planned):** the **same portable client** (ARCH-80) — the shared
-  app layer over SDL3, with a FreeType/fontconfig text backend and a small
-  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
-  would supply. Today the Linux build is the TUI only.
+  accessibility tree, invoked as a click.
+- **Linux GUI (`client/gui/app/` over `client/gui/platform/linux/`,
+  `make linux-gui`):** the **same portable client** (ARCH-80), the same
+  sources as Windows and the web, over SDL3 built for Linux with both its
+  video backends: Wayland first, and X11 through the same code, SDL choosing
+  whichever the session offers. Not a GTK app: the client self-draws
+  everything a toolkit would supply, and asks the desktop for the rest through
+  the freedesktop conventions -- D-Bus, the desktop portals, XDG directories
+  and `.desktop` files -- rather than any one desktop's API, so it holds under
+  GNOME, KDE and the others. D-Bus is GLib's GIO, spoken directly; no
+  libdbus, libnotify, ATK or libatspi. What each part of the platform contract
+  is here (`plat_linux.c`):
+  - **Text:** sdltext's FreeType backend (`sdltext/st_ft.c`, ARCH-106):
+    families resolved by fontconfig (`system-ui` is the desktop's own UI
+    font, ARCH-97), each run shaped by HarfBuzz, a code point the face lacks
+    drawn from fontconfig's fallback.
+  - **Files and state:** the data directory is `$XDG_DATA_HOME/openchime`;
+    the crash rings are files there, `mmap`'d; a crash report is written by a
+    signal handler on its own stack. A second launch hands its URL to the
+    running instance over a Unix socket in `$XDG_RUNTIME_DIR`. Autostart is a
+    `.desktop` file in `$XDG_CONFIG_HOME/autostart`; `openchime://` links are
+    a `.desktop` file in `$XDG_DATA_HOME/applications`, made the
+    `x-scheme-handler` default in `mimeapps.list`. The session token is in the
+    keyring through libsecret (`client/shared/secret_libsecret.c`).
+  - **The desktop:** the clipboard's files (`text/uri-list`), images and HTML
+    are SDL's clipboard data; the file pickers are SDL3's dialogs, the
+    portal's FileChooser; sign-in opens the default browser (`SDL_OpenURL`).
+    Dark or light, high contrast and reduced motion come from the Settings
+    portal (`org.freedesktop.appearance`'s `color-scheme` and `contrast`,
+    `org.gnome.desktop.interface`'s `enable-animations`), each "cannot say"
+    where the setting is absent. Idle time is GNOME's idle monitor, and 0,
+    unknown, on a compositor that offers none.
+  - **Images:** JPEG, PNG and WebP decode through the daemon's hardened
+    decoders (libjpeg-turbo, libspng, libwebp), GIF and BMP through
+    `stb_image`, all behind ARCH-137's byte and pixel caps.
+  - **Notifications** (`client/shared/osnotify_linux.c`): the desktop's
+    notification server, `org.freedesktop.Notifications`. A second for the
+    same conversation replaces the first, a read conversation's is withdrawn
+    (`CloseNotification`), the sound is the freedesktop sound theme's name,
+    and a click or a button comes back as `ActionInvoked`, the click carrying
+    the conversation's `openchime://` link. The reply box is offered only
+    where the server lists `inline-reply`. With no server, the client's own
+    notification window carries on, as when Windows' chain runs out.
+  - **Accessibility** (`a11y_atspi.c`, ARCH-99): the published snapshot as
+    AT-SPI objects on the accessibility bus -- each item's name, role,
+    extents and states (focused, selected), its automation id as the
+    accessible id (REQ-290), the composer's text and caret through the Text
+    interface, `DoAction` raising the same invoke event a UIA invoke does, and
+    announcements spoken through an announcement event. There is no system
+    caret to place: assistive technology reads the caret from the Text
+    interface.
+  - **Capture** (`client/core/media/cap_portal.c`): the camera and the screen
+    through the Camera and ScreenCast portals, the frames read from the
+    PipeWire stream the portal opens. The portal's own dialog picks the
+    screen or window; a refused or dismissed request is the same "denied" as
+    Windows' privacy block. No V4L2 device is opened and no X11 screen grabbed.
+  - **The tray:** `SDL_CreateTray`, a StatusNotifierItem where the desktop
+    shows one, and nothing where it cannot be made (the client carries on
+    without it). It is an icon with a menu, **Open OpenChime** and
+    **More…**, standing for the click and the right-click the Windows tray
+    takes, because SDL 3.4's Linux tray reports no clicks on the icon itself.
+  - **What Wayland forbids** answers "not available", as the contract allows:
+    a window cannot be kept out of another application's capture, a shared
+    window or screen cannot be found on the desktop (so no border is drawn
+    round it), and a window asked to sit at a screen corner (the client's own
+    notification window) stays where the compositor places it. The caption's colour and the window's corners are
+    the compositor's. Bringing the window to the front asks with an
+    xdg-activation token where the compositor offers one, and a compositor
+    may still decline. There is no taskbar badge or progress common to the
+    desktops, no certificate viewer, and no privacy settings page to open.
 - **macOS/iOS:** the portable client over SDL3 on macOS, with a
   CoreText backend and an Obj-C native shim where Apple leaves no C surface;
   UIKit on iOS is its own effort over the core.
@@ -709,8 +768,10 @@ model; translate input to intents }, stop.
 surfaces every engine feature, and a feature is surfaced there first.
 Accessibility (REQ-269) is a UIA provider over the self-drawn UI, a real system
 caret and UIA events (**ARCH-99**), with an `AutomationId` and an
-`InvokePattern` on every actionable element (**REQ-290**), verified from outside
-the process by `tools/gui/harness/win32/uia_probe.ps1`. What a message says to a screen reader
+`InvokePattern` on every actionable element (**REQ-290**). Preferences' choices are
+published as tabs named for their row and choice ("Reduce motion: On"), with
+the current one marked ", selected", under ids `prefs.<row>.<value>`, the value
+being what the choice stores. What a message says to a screen reader
 is the person's to choose, in Preferences > Accessibility: the sender, the time,
 the reactions and the replies, each on or off, the text before or after the
 sender and the time, and whether a new message from someone else is read out
@@ -719,8 +780,7 @@ as it arrives. One function builds every message's name from those settings
 <when>: <text>", with arrivals announced. The settings are synced with the other
 preferences. The recording and sharing bars are
 windows of their own, so each is served as its own small tree (`recbar`,
-`sharebar`: the line as Text, the buttons invokable), read and pressed by
-`tools/gui/harness/win32/uia_recbar.ps1`. Rich text and its toolbar
+`sharebar`: the line as Text, the buttons invokable). Rich text and its toolbar
 (**REQ-220**, ARCH-100) are a shared parser in `shared/richtext.c` plus sdltext
 byte ranges. Each platform has its own screen capture for sharing in calls; the
 codec and the transport are in the core (REQ-161, [CALLS.md](./CALLS.md) §6).
@@ -958,8 +1018,11 @@ no transitive dependencies of their own (ARCH-75); the TUI's one optional
 system link is libsecret-1, for the keyring, where `pkg-config` finds it. The GUI is one application
 (`client/gui/app/`) compiled over a platform directory: `make build`
 cross-compiles it with the pinned llvm-mingw over `client/gui/platform/win32/`
-and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same
-sources over their own platform directory once it exists. Release artifacts
+and the SDL3 and mbedTLS built for Windows; `make linux-gui` builds the same
+sources natively over `client/gui/platform/linux/`, with SDL3 built for Linux
+(`scripts/build/sdl3_linux.sh`) and the system packages it needs
+(DEVELOPMENT.md, "The Linux GUI"), and a macOS build will be the same sources
+over its own platform directory. Release artifacts
 come from CI/CD, never a dev machine.
 The web build (`make build/web/openchime.js`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
 builds mbedTLS, SDL3 and the codecs for wasm once into `build/wasm/`, beside the
@@ -967,10 +1030,8 @@ native trees.
 
 ## 8. The graphical client
 
-The rules and the surfaces of the portable GUI (§3, Windows and the web) that a
-change to it has to keep. How it is driven and checked is
-[tools/gui/README.md](../../tools/gui/README.md) ("Driving the Win32 GUI", "Seeing the whole window",
-"Reading the GUI smoke").
+The rules and the surfaces of the portable GUI (§3, Windows, Linux and the web) that a
+change to it has to keep.
 
 ### The text fields are drawn (every platform)
 
@@ -992,7 +1053,7 @@ the rendered scene, so a control left visible while its surface was not drawn
 floated over whatever was -- the recurring failure class the rule below was
 written for -- and a native control is the one thing a second platform
 cannot reuse. Drawn, a field is part of the scene: z-order is paint order,
-the harness's screenshot sees it, and the web client draws it the same way.
+and the web client draws it the same way.
 
 **Every field's visibility is still decided in one place, `layout_natives()`**
 (the name kept so the rule's history reads), from three shared predicates --
@@ -1028,16 +1089,6 @@ variable. A press outside every field returns the keyboard to the window, as
 clicking a native window did; the shortcuts (`accel_dispatch`) run before any
 field sees a key, as they always have.
 
-The dump reports each field's visibility beside the three predicates, because
-a boolean is a better assertion than an image when what you want to know is
-*whether* a control is shown. Read `re=` with the composer in mind: it reports
-whether the composer's **rect is non-empty**; every other flag is a field's
-`visible`:
-
-```
-natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
-```
-
 **The six search boxes are one control.** Find a conversation, search messages,
 search files, search people, Jump to (Ctrl+K) and search emoji are each a
 field over chrome the client draws, and all six are built the same way:
@@ -1045,17 +1096,11 @@ field over chrome the client draws, and all six are built the same way:
 scale, with the glyph centred -- and `search_text_box()` is where the field's
 text goes, after the glyph, up to the right inset. The field wears the UI
 token (`g_ui`), so it follows the text size and the DPI as everything else
-does. The dump reports each box so this is checked rather than looked at, in
-device pixels:
-
-```
-searchbox find made=1 vis=1 ... edit=112,67,224,86 box=80,62,234,92 text=""
-```
+does.
 
 A new gated field (the Files view's "Search files" box, `g_ffind`, is the
 model) is gated on the view it belongs to -- never on a predicate that merely
-happens to be true there -- and checked across all views from the dump before it
-is shown to anybody.
+happens to be true there.
 
 ### Shortcuts belong in the message loop, not a window proc
 
@@ -1089,12 +1134,7 @@ focus.
   is not offered does nothing, and is not typed. Upper case is the same key;
   with Ctrl or Alt held, or while a menu, a modal, a drawn field or an edit has
   the keyboard, letters are what they were. Edit and the thread take the
-  keyboard off the message, to the typing. The sheet lists them; the dump's
-  `kbfocus ran=` is the command the last key press ran as one (0 for none).
-- Test with `tools/gui/harness/win32/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
-  The verb says which modifiers it holds (`g_synth_mods`, which `mod_down` reads
-  in place of the keyboard's state), because the shortcuts read the modifiers;
-  posting a bare key proves nothing.
+  keyboard off the message, to the typing. The sheet lists them.
 
 ### Modals: one frame, explicit commit
 
@@ -1160,12 +1200,11 @@ deliberately:
   like every other text field in the client;
 - the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
   themed app were never worth it — and none of them was dismissible the way every
-  other sheet is, screenshot-comparable, or reachable by the harness.
+  other sheet is.
 
 **The tree publishes what is REACHABLE, not what was laid out.** Two rules, both
 about rects that describe space an element is clipped away from — which reads as
-a collision to `chromefit` and as bounds to a screen reader, and is wrong in the
-same way for both:
+bounds to a screen reader, and is wrong:
 
 - **A scrolling surface's rows are clipped to it.** A row's rect is in the list's
   own coordinates, so the topmost one routinely starts above the list and the
@@ -1208,8 +1247,7 @@ screen, since nothing about the field says that it scrolls. A channel's descript
 **Text gets the height its glyphs need, not a round number.** A rect written as
 `y + 80` is three lines at 100% and not two at the largest text size on a scaled
 display, and the difference is a sentence losing its last word inside a box every
-rect-based check calls correct — which is what `clipped=` (tools/gui/README.md) exists to
-catch. `text_rect()` measures instead. A field that must stay ONE line, like the
+rect-based check calls correct. `text_rect()` measures instead. A field that must stay ONE line, like the
 composer's cue, takes a non-wrapping format so it ends in an ellipsis rather than
 wrapping into a second line there is no room for, and its rect is the format's
 pinned line box.
@@ -1297,9 +1335,7 @@ field offers suggested statuses (five defaults plus recent ones, kept under the
 clear time in one click. The "Clear after" chips are prefilled by bucketing the
 member's live `status_expires`, so the dialog reopens showing what is actually
 set. The card publishes its buttons, suggestion rows and chips to the a11y
-tree, which is what lets `chromefit` prove the card holds its own content — the
-defect that motivated the rebuild was a chip row clipped at the card's edge,
-invisible to any check that never saw its rects.
+tree.
 
 ### Preferences is two-paned, and appearance applies live
 
@@ -1307,8 +1343,8 @@ Categories left (**Appearance / Messages / Notifications / System**), one pane's
 rows right. **System** is where the app behaves as an application rather than as a
 chat surface — what the close button does, whether it starts with Windows — and it
 ends with Reset. There is no *Advanced*: it held Reset and a DPI override, the
-override was a harness affordance rather than a setting (the app takes its scale
-from what Windows reports, ARCH-97), and one button is not a category.
+override was not a setting a person needs (the app takes its scale from what
+Windows reports, ARCH-97), and one button is not a category.
 
 A row's hit-boxes exist only while its category is showing — the click
 router and the painter share `g_pref_cat` so they cannot disagree — and the sheet
@@ -1351,6 +1387,28 @@ The arithmetic is `client/gui/app/motion.c`, one function per moving thing, so
 with the other preferences in the account's bucket under `M:` (0 Off, 1 On,
 2 Follow system), reverts on Cancel and returns to Follow system on Reset.
 
+**High contrast is Off, On or Follow system (REQ-262)**, the row after Theme.
+Follow system is the default and asks the platform (`oc_plat_high_contrast`:
+Windows' high contrast, `SPI_GETHIGHCONTRAST`'s `HCF_HIGHCONTRASTON`; a
+browser's `prefers-contrast: more`) at start, whenever the window gains focus
+and on `SDL_EVENT_SYSTEM_THEME_CHANGED`; an unknown answer reads as off, and
+the palette is re-applied (`palette_changed`) only when the answer moves. It is
+a switch beside the mode, not a third mode: light or dark still follows the
+Theme row. On, `client/gui/app/theme.c` copies one of two fixed palettes,
+`HC_DARK` or `HC_LIGHT`, in place of the mode's palette and the colour scheme,
+the derived selection tint included; the scheme row says it does not apply,
+and a scheme picked meanwhile is kept and takes effect when high contrast goes
+off. In both palettes every text ink (TEXT, MUTED, FAINT, ACCENT, DANGER)
+clears 7:1 against every surface it is drawn on and every control ink
+(BORDER, ACCENT_DIM, ONLINE, AWAY, NOTICE) 4.5:1, which `tests/test_theme.c`
+asserts from the tables. A label or icon on an accent, accent-dim or danger
+fill is drawn in its own token, `OC_COL_ON_ACCENT`, never a literal white:
+white in the ordinary palettes, black in the dark high-contrast one, where no
+accent light enough to read on black can carry white at 7:1. The choice is
+kept with the other preferences under `H:` (0 Off, 1 On, 2 Follow system;
+absent reads as Follow system), is in the Preferences snapshot so Cancel
+reverts it, and returns to Follow system on Reset.
+
 ### About OpenChime: both builds on one screen
 
 The workspace menu's **About OpenChime** (and the palette's) is a small dialog
@@ -1363,9 +1421,7 @@ the short commit it was compiled from (`shared/build_id.h`, UPGRADING.md); a
 release number is a label on a build and is not in either binary, so the build
 is what is shown. **Copy** puts the whole as one line on the clipboard --
 `OpenChime client <build> (win32), server <build>, protocol <n>` -- for pasting
-into a report; the harness's `about` verb opens the dialog and answers that
-line, which the web client's GUI test checks in the browser (tools/gui/README.md,
-"Reading the web client harness").
+into a report.
 
 ### What's new: this build's release notes
 
@@ -1385,11 +1441,7 @@ date and each section's items; an item with a link opens it in the browser.
 `https://openchime.io/releases/build/<build id>`. A build that is not a release
 says "This build is not a release." with a link to every release -- a source
 build ("dev") is never asked about -- and a fetch that fails or times out says
-"Could not load the release notes." with the page's link. Under the hook, a URL
-to open is written where every URL the hook opens is (`signin_url.txt`), and the
-dump's `whatsnew=` line gives the card's state (`loading`, `shown`,
-`notrelease`, `failed`), the release and how many items it lists
-(`tools/gui/features/whatsnew.sh`).
+"Could not load the release notes." with the page's link.
 
 ### What the window says, and where (REQ-263)
 
@@ -1794,6 +1846,4 @@ baseline are derived from the family's own ascent and cap height, read with
 `st_family_metrics` (ARCH-108), Segoe UI's when they can't be read, so the
 table's pairs are Segoe UI's and another family has its own. The font follows
 the account (`F:` in the preferences value), previews at once and reverts on
-Cancel like text size, and Reset returns it to Default. The test dump's
-text-size line reports the family asked for and the one used (`fontpick=`,
-`fontfam=`, `fontmissing=`) and the figures (`fontasc=`, `fontcap=`).
+Cancel like text size, and Reset returns it to Default.

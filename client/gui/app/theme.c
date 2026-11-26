@@ -1,22 +1,11 @@
 /*
- * OpenChime Win32 GUI — the two palettes and the switch between them (REQ-262). See theme.h.
+ * OpenChime GUI — the two palettes and the switch between them (REQ-262). See theme.h.
  */
 
 #include "theme.h"
 #include "protocol.h"   /* OC_PRESENCE_* */
 
 #include <math.h>
-
-/* Windows only for the one registry read below. Everything else here is colour
- * arithmetic, and it is compiled into the test binary on Linux so the contrast
- * guarantee can be asserted by `make test` rather than only by an audit somebody
- * remembers to run on a Windows box. */
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#endif
 
 /* Dark: a deep-blue accent on a dark neutral shell, with real elevation steps
  * (darkest rail -> lightest canvas) so the panes read as distinct layers. */
@@ -39,6 +28,7 @@ static const uint32_t DARK[TH_COUNT] = {
     [TH_NOTICE]     = 0x14B8A6,
     [TH_ONLINE]     = 0x3BA55D,
     [TH_AWAY]       = 0xD9A441,
+    [TH_ON_ACCENT]  = 0xFFFFFF,
 };
 
 /* Light: the same *structure* inverted, not merely brighter colours — the rail
@@ -64,11 +54,69 @@ static const uint32_t LIGHT[TH_COUNT] = {
     [TH_NOTICE]     = 0x0F766E,
     [TH_ONLINE]     = 0x2A8544,
     [TH_AWAY]       = 0x9A6A00,
+    [TH_ON_ACCENT]  = 0xFFFFFF,
+};
+
+/* HIGH CONTRAST (REQ-262): one fixed palette per mode, used in place of the two
+ * above and of every colour scheme while it is on. The structure is the same --
+ * the rail darkest, the canvas lightest in light, the panes as distinct layers --
+ * but every text ink (TEXT, MUTED, FAINT, ACCENT, DANGER) clears 7:1 on every
+ * surface it is painted on, and every control ink (BORDER, ACCENT_DIM, ONLINE,
+ * AWAY, NOTICE) 4.5:1. tests/test_theme.c asserts both from these tables.
+ *
+ * Dark: a black canvas and near-black panes, near-white inks, and accents light
+ * enough to read on black -- which is why the ink ON an accent fill is black
+ * here: no accent can clear 7:1 against black and carry white text at 7:1 too. */
+static const uint32_t HC_DARK[TH_COUNT] = {
+    [TH_ACCENT]     = 0x80C4FF,
+    [TH_ACCENT_DIM] = 0x4FA3F7,
+    [TH_RAIL]       = 0x000000,
+    [TH_SIDEBAR]    = 0x0A0A0A,
+    [TH_BASE]       = 0x000000,
+    [TH_HEADER]     = 0x0A0A0A,
+    [TH_INPUT]      = 0x141414,
+    [TH_SELECT]     = 0x142640,
+    [TH_HOVER]      = 0x1E1E1E,
+    [TH_BORDER]     = 0x9E9E9E,
+    [TH_RAIL_ICON]  = 0xFFFFFF,
+    [TH_TEXT]       = 0xFFFFFF,
+    [TH_MUTED]      = 0xDCDCDC,
+    [TH_FAINT]      = 0xC8C8C8,
+    [TH_DANGER]     = 0xFFA098,
+    [TH_NOTICE]     = 0x3EE0CB,
+    [TH_ONLINE]     = 0x4ADE80,
+    [TH_AWAY]       = 0xFFC94D,
+    [TH_ON_ACCENT]  = 0x000000,
+};
+
+/* Light: a white canvas, black inks, and accents dark enough for white on
+ * them; the rail is black, so its icons stay white. */
+static const uint32_t HC_LIGHT[TH_COUNT] = {
+    [TH_ACCENT]     = 0x0040A0,
+    [TH_ACCENT_DIM] = 0x00307A,
+    [TH_RAIL]       = 0x000000,
+    [TH_SIDEBAR]    = 0xF5F5F5,
+    [TH_BASE]       = 0xFFFFFF,
+    [TH_HEADER]     = 0xF5F5F5,
+    [TH_INPUT]      = 0xFFFFFF,
+    [TH_SELECT]     = 0xD6E6FA,
+    [TH_HOVER]      = 0xEBEBEB,
+    [TH_BORDER]     = 0x5E5E5E,
+    [TH_RAIL_ICON]  = 0xFFFFFF,
+    [TH_TEXT]       = 0x000000,
+    [TH_MUTED]      = 0x262626,
+    [TH_FAINT]      = 0x383838,
+    [TH_DANGER]     = 0x8B0000,
+    [TH_NOTICE]     = 0x005C55,
+    [TH_ONLINE]     = 0x0A6630,
+    [TH_AWAY]       = 0x6B4500,
+    [TH_ON_ACCENT]  = 0xFFFFFF,
 };
 
 uint32_t oc_theme[TH_COUNT];
 static int g_mode = -1;
 static int g_scheme = OC_SCHEME_MIDNIGHT;
+static int g_high_contrast = 0;
 
 /* A scheme is the RAIL and the ACCENT together, per mode:
  *   name, dark rail, light rail, dark accent, dark dim, light accent, light dim.
@@ -103,26 +151,18 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
     return (r << 16) | (g << 8) | bl;
 }
 
-/* The user's app theme, from the same registry value the shell reads. Anything
- * unreadable means dark: this app was designed dark, so that is the safe miss. */
-#ifndef _WIN32
-/* Off Windows there is no shell preference to read. Dark is the documented safe
- * miss, and the tests drive LIGHT and DARK explicitly rather than through
- * SYSTEM, so this never decides anything they assert. */
-static int system_prefers_light(void) { return 0; }
-#else
-static int system_prefers_light(void) {
-    HKEY k;
-    DWORD v = 0, sz = sizeof v, type = 0;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return 0;
-    LONG rc = RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&v, &sz);
-    RegCloseKey(k);
-    return (rc == ERROR_SUCCESS && type == REG_DWORD && v == 1);
-}
-#endif  /* _WIN32 */
+/* The desktop's light-or-dark preference, asked through the function the
+ * application hands in (oc_plat_prefers_light) rather than called by name:
+ * this file is compiled into the test binary, which has no platform layer, and
+ * the tests drive LIGHT and DARK explicitly rather than through SYSTEM. Asked
+ * on every resolution, so a change made in the desktop's settings shows the
+ * next time the theme is resolved. Anything but 1 means dark: this app was
+ * designed dark, so that is the safe miss. */
+static int (*g_prefers_light)(void);
+
+void oc_theme_set_system_query(int (*prefers_light)(void)) { g_prefers_light = prefers_light; }
+
+static int system_prefers_light(void) { return g_prefers_light && g_prefers_light() == 1; }
 
 /* --- the contrast guarantee (REQ-262) --------------------------------------
  *
@@ -200,6 +240,15 @@ void oc_theme_apply(int mode) {
     g_mode = mode;
     int light = (mode == OC_THEME_LIGHT) ||
                 (mode == OC_THEME_SYSTEM && system_prefers_light());
+    if (g_high_contrast) {
+        /* A fixed palette: no scheme and no derived selection, so nothing a
+         * scheme picks can pull a pair under its ratio. The ink table is still
+         * resolved, so OC_INK_ON answers as it always does. */
+        const uint32_t *hc = light ? HC_LIGHT : HC_DARK;
+        for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = hc[i];
+        resolve_ink_table();
+        return;
+    }
     const uint32_t *src = light ? LIGHT : DARK;
     for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = src[i];
     /* The scheme is applied AFTER the palette copy, not folded into the tables:
@@ -249,6 +298,19 @@ uint32_t oc_theme_scheme_rail(int scheme) {
 }
 
 int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_SYSTEM : g_mode; }
+
+int oc_high_contrast_on(int pref, int sys) {
+    if (pref == OC_HC_ON)  return 1;
+    if (pref == OC_HC_OFF) return 0;
+    return sys == 1;      /* Follow system, and anything outside the three */
+}
+
+void oc_theme_set_high_contrast(int on) {
+    g_high_contrast = on ? 1 : 0;
+    oc_theme_apply(oc_theme_mode());      /* re-resolve; the mode decides which palette */
+}
+
+int oc_theme_high_contrast(void) { return g_high_contrast; }
 
 const char *oc_theme_mode_name(int mode) {
     return mode == OC_THEME_LIGHT ? "Light"

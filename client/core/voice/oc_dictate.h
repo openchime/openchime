@@ -37,11 +37,7 @@ void oc_dictate_stop(oc_dictate *d, int send_rest);
 uint8_t  oc_dictate_mode(const oc_dictate *d);
 uint64_t oc_dictate_channel(const oc_dictate *d);
 uint64_t oc_dictate_thread_root(const oc_dictate *d);
-/* The microphone's peak level, 0..32767, after echo cancellation. */
-int      oc_dictate_level(const oc_dictate *d);
 /* Whether the detector hears speech right now. */
 int      oc_dictate_speaking(const oc_dictate *d);
-/* Segments sent so far. */
-uint32_t oc_dictate_sent(const oc_dictate *d);
 
 #endif

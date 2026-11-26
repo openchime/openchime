@@ -11,9 +11,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 # The full suite's checks on the release's artifacts (make test-all
-# PART=packages, image and windows), one name each: the rest of
+# PART=packages, image, windows and linux-client), one name each: the rest of
 # scripts/test/full/ is code tests.
-artifacts=(glibc_floor same_binary speech package unit_file image db_restore windows)
+artifacts=(glibc_floor same_binary speech package unit_file image db_restore windows linux_client)
 paths=(.github/workflows/release-candidate.yml .github/workflows/release.yml Dockerfile entrypoint.sh
        packaging/*.sh packaging/*.env packaging/*/* scripts/release/smoke/*.sh)
 for a in "${artifacts[@]}"; do paths+=("scripts/test/full/$a.sh"); done

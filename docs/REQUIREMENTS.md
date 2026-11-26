@@ -1273,7 +1273,7 @@ where one exists.
 
 - **REQ-150.** A user has been able to start a server-relayed audio call, from
   Calls home or from a channel, a direct message or a group DM, and to join one
-  they were asked to (REQ-301/302), from the Win32 and web clients. No
+  they were asked to (REQ-301/302), from the graphical clients: Win32, Linux and web. No
   peer-to-peer or ICE negotiation path has existed (ARCH-18).
 - **REQ-151.** Audio has been encoded with Opus by the client — 16 kHz, in-band
   FEC and DTX, through the echo canceller and noise suppression — and relayed
@@ -2639,6 +2639,14 @@ choose — which makes each one a per-frontend *obligation*.*
   grades captured frames can only fail on a pixel something actually painted: a
   marker no scene draws, or a fill derived per scheme whose other values are
   never rendered, is invisible to it.
+
+  **The graphical clients have offered high contrast**, Off, On or Follow
+  system, the default; Follow system is on when the system asks for it
+  (Windows' high contrast, a browser's `prefers-contrast: more`, the Linux desktop's `contrast` appearance setting). On, light or
+  dark still follows the theme, and a fixed palette of the client's own
+  replaces the colour scheme, in which every text ink has cleared **7:1** and
+  every control ink **4.5:1** against every surface it is drawn on, asserted
+  from the palette as the 3:1 floor is.
 - **REQ-263.** A failure of the daemon's own that needs a person — a TLS
   certificate it cannot obtain or renew, one close to expiry — has been shown to
   the workspace's owners and admins in every client, with a distinct warning
@@ -2709,25 +2717,18 @@ choose — which makes each one a per-frontend *obligation*.*
   equivalent on each other platform — that does not change with layout, wording,
   window size, theme, language or the element's position in a list.
 
-  **This is a testability requirement, not a second accessibility one.** REQ-269
-  is about what assistive technology can *convey*; this is about what an automated
-  test can *address*. The two share the UIA provider (ARCH-99) and are otherwise
-  different obligations: a control can be perfectly legible to a screen reader and
-  still be impossible to locate reliably from a test.
+  **Why it is a requirement of its own.** REQ-269 is about what assistive
+  technology can *convey*; this is about what it can *address and press*.
+  Screen readers, voice control and switch access locate a control by its id
+  and act on it through UI Automation, and they cannot do that reliably by
+  coordinates, visible text or tree position: coordinates move whenever a pane
+  is re-laid out, visible text moves when wording or locale changes, and tree
+  position moves when a list gains a row.
 
-  **Why it is a requirement at all.** The supported way to drive a Windows
-  application is UI Automation, and the discipline that makes it reliable is
-  locating elements by id rather than by coordinates, visible text or tree
-  position. Coordinates move whenever a pane is re-laid out; visible text moves
-  when wording or locale changes; tree position moves when a list gains a row.
-  A harness that drives by coordinates produces failures that need
-  interpretation — a click that lands two pixels outside a
-  chip is indistinguishable from a feature that does not work.
-
-  **The identifier is part of the control, not of the test.** It is assigned where
-  the control is defined, is reviewed like any other name, and does not change to
-  suit a test that has broken — a renamed id is a breaking change to the automation
-  surface in the same way a renamed wire field is to the protocol.
+  **The identifier is part of the control.** It is assigned where the control
+  is defined, is reviewed like any other name, and does not change casually — a
+  renamed id is a breaking change to the accessibility tree in the same way a
+  renamed wire field is to the protocol.
 
   **Dynamic elements get composed ids**: a per-conversation row is
   `conv.<channel_id>`, not `conv.3`, because the third row is a different
@@ -2738,16 +2739,13 @@ choose — which makes each one a per-frontend *obligation*.*
   conversation, message, composer control, formatting button, filter chip, tab,
   pane row and modal button carries an id and — where it is a control rather than
   content — an `InvokePattern`, so a client can press it rather than click at a
-  measured point. Verified from OUTSIDE the process: `tools/gui/harness/win32/uia_probe.ps1`
-  asserts that no actionable element lacks an id, that no id is claimed twice and
-  that each is invokable, and `tools/gui/harness/win32/uia_invoke.ps1` presses one by id in the
-  GUI tests (tools/gui/README.md), which are run by hand.
+  measured point.
 
   **Invokes are marshalled, not executed where they arrive.** UIA calls come in on
   an RPC thread; the app posts the element's token to its own window and runs it
   there, because every rect, menu and model pointer it touches belongs to the UI
-  thread. Each token ends in the same call the mouse path makes — an automation
-  route that reimplemented the action would be testing a second implementation.
+  thread. Each token ends in the same call the mouse path makes, so an invoke and
+  a click cannot do different things.
 
 ---
 

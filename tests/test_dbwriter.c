@@ -73,9 +73,16 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
  * excerpt helpers its queries use, and what the search index's triggers call
  * whenever `messages` is written). Every connection the test binary opens has
  * them already (tests/main.c); registered here too, as this helper says. */
+/* A connection of the test's own, beside a running writer. The writer writes
+ * when it chooses -- after a job's result is out, it may still be pruning --
+ * so this one waits for the lock as the daemon's own connections do, rather
+ * than failing on the first SQLITE_BUSY. */
 static int raw_open(const char *path, sqlite3 **db) {
     int rc = sqlite3_open(path, db);
-    if (rc == SQLITE_OK) oc_migrate_functions(*db);
+    if (rc == SQLITE_OK) {
+        sqlite3_busy_timeout(*db, 5000);
+        oc_migrate_functions(*db);
+    }
     return rc;
 }
 

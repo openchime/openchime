@@ -118,6 +118,63 @@ old for the packages; RHEL 9 runs the container image (Podman or Docker).
   graphical client and the terminal client (`openchime-tui`), optionally on
   `PATH`. A release whose installer is not code-signed says so in its notes,
   and SmartScreen warns before running it.
+- **Linux:** the graphical client, `openchime`, from the same apt and dnf
+  repositories as the daemon, or from its Flatpak repository (below).
 - **Terminal client on Linux:** not in the packages; build it from source
   (`make build/openchime-tui`) and run `build/openchime-tui <workspace>`, or
   `build/openchime-tui <host> <port>` to connect to an address directly.
+
+### The Linux client
+
+The graphical client is its own package, `openchime`, beside the daemon's
+`openchimed` in the same signed repositories and the same release, for amd64
+and arm64; installing one does not install the other. Each channel adds the
+desktop entry, which also opens `openchime://` links, and the icons, and
+`openchime --version` names the build, as the daemon's does.
+
+**Debian / Ubuntu** — Ubuntu 24.04 or Debian 13 (trixie) and newer, with the
+repository added as for the daemon (above):
+
+```sh
+sudo apt update && sudo apt install openchime
+```
+
+**Fedora / RHEL / Rocky / Alma** — Fedora 40 or RHEL 10 and newer, with the
+repository added as for the daemon (above):
+
+```sh
+sudo dnf install openchime
+```
+
+The packages need glibc 2.39 and the distribution's own FreeType, HarfBuzz,
+fontconfig, PipeWire, GLib and libsecret, which every desktop has. That is
+the floor (ARCH-20): Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL 10+.
+**Older systems** (Ubuntu 22.04, Debian 12, RHEL 9 and the like) **use the
+Flatpak**, which brings its own runtime.
+
+**Flatpak** — any Linux desktop with Flatpak:
+
+```sh
+flatpak install https://api.openchime.io/v1/public/releases/dist/flatpak/io.openchime.OpenChime.flatpakref
+```
+
+That adds the repository as the remote `openchime`, installs the client,
+`io.openchime.OpenChime`, and the runtime it runs on,
+`org.freedesktop.Platform` 26.08, from Flathub, and `flatpak update` takes
+each later release. To add only the repository:
+
+```sh
+flatpak remote-add --if-not-exists openchime https://api.openchime.io/v1/public/releases/dist/flatpak/io.openchime.OpenChime.flatpakrepo
+flatpak install openchime io.openchime.OpenChime
+```
+
+The second command needs Flathub as a remote too, for the runtime. The
+repository is the project's own, not Flathub, and its summary is signed with
+the same archive signing key as the apt and dnf repositories; the files that
+add it carry the key. Each release also attaches the client as single-file
+bundles, `io.openchime.OpenChime-<N>-x86_64.flatpak` and `-aarch64.flatpak`
+(`flatpak install <file>`), which take their runtime from Flathub; a client
+installed from one is not updated by `flatpak update`. In the sandbox the client reaches the network, the display
+(Wayland, else X11), the GPU, PipeWire for calls, and on the session bus the
+desktop portals, notifications, the tray and the Secret Service, where its
+session is kept as the packages keep it.

@@ -212,9 +212,9 @@ static HRESULT STDMETHODCALLTYPE s_GetPatternProvider(IRawElementProviderSimple 
     if (pid == UIA_ValuePatternId && is_composer) {
         *out = (IUnknown *)&e->v; s_AddRef(&e->s); return S_OK;
     }
-    /* InvokePattern is what makes the tree DRIVABLE rather than merely readable:
-     * without it a test can find a control and then has no way to press it but
-     * to click at a measured point, which is the thing REQ-290 exists to end. */
+    /* InvokePattern is what makes the tree ACTIONABLE rather than merely readable:
+     * without it a screen reader or voice control can find a control and then has
+     * no way to press it but to click at a measured point (REQ-290). */
     if (pid == UIA_InvokePatternId) {
         EnterCriticalSection(&g_lock);
         int inv = item_invokable(e->idx);
@@ -243,7 +243,7 @@ static HRESULT STDMETHODCALLTYPE s_GetPropertyValue(IRawElementProviderSimple *t
                 : item_kind(e->idx, OC_ACC_TAB)             ? UIA_TabItemControlTypeId
                                                             : UIA_ListItemControlTypeId;
         break;
-    /* The identifier a test locates by (REQ-290). Stable across layout, wording,
+    /* The identifier assistive technology locates by (REQ-290). Stable across layout, wording,
      * size, theme, language and position — which is exactly what Name is not. */
     case UIA_AutomationIdPropertyId:
         if (e->idx >= 0 && e->idx < g_n_items && g_items[e->idx].aid[0]) {

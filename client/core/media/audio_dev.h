@@ -8,13 +8,9 @@
  *
  * `OPENCHIME_DEV_AUDIO=synthetic` replaces the devices with a 440 Hz tone
  * source and a sink that consumes at real-time pace, so recording and playback
- * run in tests on a machine with no sound hardware. With it,
- * `OPENCHIME_DEV_MIC=<file.wav>` (16-bit PCM at the capture rate and channel
- * count) is what the synthetic microphone hears instead of the tone: the file
- * once, then silence, so voice input can be driven with real speech.
+ * run in tests on a machine with no sound hardware.
  * `OPENCHIME_DEV_AUDIO=mic-denied` is the synthetic devices with every capture
- * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is.
- * `OPENCHIME_DEV_TONE=<hz>` changes the synthetic microphone's tone. */
+ * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is. */
 #ifndef OC_AUDIO_DEV_H
 #define OC_AUDIO_DEV_H
 

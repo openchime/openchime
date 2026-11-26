@@ -1,0 +1,28 @@
+# The sandbox the Flatpak runs in: what `flatpak build-finish` writes into the
+# application's metadata (packaging/build-client-flatpak.sh), one argument a
+# line. Each is a thing the client does; nothing here is for convenience.
+#
+# A window: Wayland, and X11 where the session has no Wayland, with the shared
+# memory X11 uses, and the GPU SDL renders on.
+--socket=wayland
+--socket=fallback-x11
+--share=ipc
+--device=dri
+# The workspace's server, and the calls' relay.
+--share=network
+# The microphone, the speakers, and the camera and screen streams the portals
+# hand over (client/core/media/cap_portal.c), all on PipeWire.
+--filesystem=xdg-run/pipewire-0
+# On the session bus: the portals (screen and camera capture, the desktop's
+# settings, file pickers), which every Flatpak reaches; desktop notifications
+# (client/shared/osnotify_linux.c); the tray's StatusNotifierItem host; the
+# accessibility bus (client/gui/platform/linux/a11y_atspi.c); and the desktop's
+# Secret Service, where libsecret keeps the session (client/shared/
+# secret_libsecret.c), which the client asks directly as the .deb's does, so
+# libsecret is told to use it rather than its file in the sandbox.
+--talk-name=org.freedesktop.portal.Desktop
+--talk-name=org.freedesktop.Notifications
+--talk-name=org.kde.StatusNotifierWatcher
+--talk-name=org.a11y.Bus
+--talk-name=org.freedesktop.secrets
+--env=SECRET_BACKEND=service

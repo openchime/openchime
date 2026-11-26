@@ -32,6 +32,7 @@ enum {
     TH_NOTICE,       /* transient notices — see the note below */
     TH_ONLINE,
     TH_AWAY,
+    TH_ON_ACCENT,    /* a label or icon drawn ON an accent, accent-dim or danger fill */
     TH_COUNT
 };
 
@@ -69,15 +70,43 @@ const char *oc_theme_scheme_name(int scheme);
 uint32_t oc_theme_scheme_accent(int scheme);
 uint32_t oc_theme_scheme_rail(int scheme);
 
-/* Apply a mode. OC_THEME_SYSTEM follows the Windows apps-use-light-theme
- * setting, resolving to dark when it cannot be read. */
+/* Where OC_THEME_SYSTEM asks the desktop: the platform's oc_plat_prefers_light,
+ * handed in by the application at start (1 light, 0 dark, -1 cannot say). Until
+ * then, and whenever it answers anything but 1, SYSTEM resolves to dark. */
+void oc_theme_set_system_query(int (*prefers_light)(void));
+/* Apply a mode. OC_THEME_SYSTEM follows the desktop's light-or-dark preference,
+ * resolving to dark when it cannot be read. */
 void oc_theme_apply(int mode);
 /* Is the palette in force the LIGHT one? Not the same question as the mode: SYSTEM
  * resolves to either. Anything outside theme.c that has to match the shell — the
- * window caption, for one — asks this rather than re-reading the registry. */
+ * window caption, for one — asks this rather than asking the desktop again. */
 int  oc_theme_is_light(void);
 int  oc_theme_mode(void);            /* the mode last applied (not the resolved one) */
 const char *oc_theme_mode_name(int mode);
+
+/* --- high contrast (REQ-262) -----------------------------------------------
+ *
+ * A switch beside the mode, not a third mode: light or dark still follows the
+ * Theme row. While it is on, the palette is one of two fixed high-contrast
+ * palettes, one per mode, and the colour scheme does not apply -- not the rail,
+ * not the accent, not the selection tint derived from it. The scheme chosen is
+ * kept and comes back when it goes off. In both palettes every text ink clears
+ * 7:1 and every control ink 4.5:1 against every surface it is drawn on, which
+ * tests/test_theme.c asserts from the palette.
+ *
+ * The preference's values, in the order its row shows them. Follow system is
+ * the default and is on when the system says so: Windows high contrast, a
+ * browser's prefers-contrast: more. */
+enum { OC_HC_OFF = 0, OC_HC_ON = 1, OC_HC_SYSTEM = 2, OC_HC_PREF_COUNT };
+
+/* Whether high contrast is on: On is on, Off is off, and Follow system is on
+ * only when the system says so (`sys` 1); 0 and -1 (unknown) are off. A value
+ * outside the three reads as Follow system. */
+int  oc_high_contrast_on(int pref, int sys);
+
+/* Turn the high-contrast palette on or off and re-apply the mode in force. */
+void oc_theme_set_high_contrast(int on);
+int  oc_theme_high_contrast(void);
 
 /* CORNER RADII, in DIPs.
  *
@@ -134,6 +163,12 @@ const char *oc_theme_mode_name(int mode);
 #define OC_COL_NOTICE      oc_theme[TH_NOTICE]
 #define OC_COL_ONLINE      oc_theme[TH_ONLINE]
 #define OC_COL_AWAY        oc_theme[TH_AWAY]
+/* The ink of a label or icon drawn on an ACCENT, ACCENT_DIM or DANGER fill:
+ * primary and selected buttons and chips, unread badges, the palette's
+ * selected row. White in the dark and light palettes; part of the palette
+ * rather than a literal because a high-contrast palette cannot carry white on
+ * an accent that also reads on a near-black surface (REQ-262). */
+#define OC_COL_ON_ACCENT   oc_theme[TH_ON_ACCENT]
 
 /* --- the presence marker's shape (REQ-122) ---------------------------------
  *

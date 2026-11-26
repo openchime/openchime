@@ -75,7 +75,6 @@ $(WIN_TUI_BIN): $(WIN_TUI_OBJS) $(WIN_TUI_RES) $(WIN_MBEDLIBS) | build-dir
 # SDL supplies the entry point (SDL_main.h); -mwindows selects the GUI subsystem
 # (no console). SDL3 is committed in third_party/SDL3 (docs/details/VENDORS.md §1) and
 # cross-built from it by scripts/build/sdl3_windows.sh, statically linked.
-SDL3_VERSION := 3.4.14
 SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
 SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a
 # The OS libraries a static SDL3 needs beyond what the GUI already links.
@@ -134,6 +133,12 @@ $(WIN_GUI_BIN): $(WIN_GUI_OBJS) $(WIN_GUI_RES) $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $
 	$(WINOBJCOPY) --only-keep-debug $@ $(WIN_GUI_SYMS)
 	$(WINOBJCOPY) --strip-debug --strip-unneeded $@
 	$(WINOBJCOPY) --add-gnu-debuglink=$(WIN_GUI_SYMS) $@
+
+# sdltext's test program (sdltext/st_test.c) against DirectWrite: the same
+# program as build/sdltext_test (mk/tests.mk), a console .exe run on Windows.
+build/sdltext_test.exe: sdltext/st_test.c $(SDLTEXT_WIN) $(wildcard sdltext/*.h) $(MINGW_CC) | build-dir
+	$(WINCC) $(WIN_CFLAGS) -std=c11 $(SDLTEXT_INC) sdltext/st_test.c $(SDLTEXT_WIN) \
+	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static $(WIN_REPRO_LDFLAGS) -o $@
 
 # Both clients, once their binaries are named above.
 windows: $(WIN_GUI_BIN) $(WIN_TUI_BIN)

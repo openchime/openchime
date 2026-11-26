@@ -11,6 +11,7 @@ every push — is [CONTRIBUTING.md](./CONTRIBUTING.md); the suites are
 make build      # the fast build (a bare `make`): the daemon alone, and the Windows clients
 make test       # the fast suite, before every push (TESTING.md)
 make run TTS=1 STT=1 SUM=1 WEB=1   # every feature: read-aloud, voice input, summaries, the web client
+make linux-gui  # the Linux GUI, build/openchime-gui (its packages: "The Linux GUI", below)
 ```
 
 Requires a C toolchain, Python 3, and curl with network access on the first
@@ -36,7 +37,7 @@ build/aarch64/openchimed` cross-builds the daemon for arm64 (build only), and
 compiler (`gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu`,
 `libc6-dev-arm64-cross`). `make openchimed OC_BUILD_ID=<commit>` stamps the build
 id into `openchimed --version`; an unstamped build reports `dev`. There is one
-build: the tests, the GUI and web harness and the demo scripts run it with
+build: the tests and the demo scripts run it with
 `OPENCHIME_MODE=development`, which a deployment never sets (CONFIG.md,
 "Mode"). `make build-all` and `make test-all`, the full build and suite, run
 in CI only.
@@ -104,21 +105,93 @@ rasterizer on this platform — it is not the client's presentation layer.
 It is the reference client: every engine feature is reachable from it.
 Accessibility is first-class (REQ-269/ARCH-99: a UI Automation
 provider over the self-drawn UI, a system caret and spoken notifications), with
-an automation id and an invoke pattern on every actionable element (REQ-290),
-both verified by a real UIA client from outside the process. Rich text and its
+an automation id and an invoke pattern on every actionable element (REQ-290).
+Rich text and its
 toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
-**The GUI smoke.** `tools/gui/run.sh smoke` asks whether the client boots and
-runs, on Windows and in the browser, by hand before pushing a client change;
-it is one of the GUI and browser tests, which no suite runs. See
-[tools/gui/README.md](../../tools/gui/README.md), "Reading the GUI smoke".
-
 Every desktop shares one portable self-rendered application layer over SDL3 and
 sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are
 ports of that layer rather than GTK and AppKit rewrites, as the web client
-already is. Mobile has frontends of its own over the same core.
+already is. Linux is (below); macOS is next. Mobile has frontends of its own
+over the same core.
+
+### The Linux GUI
+
+The **Linux GUI** is that application over `client/gui/platform/linux/`
+(CLIENT.md §3): text through sdltext's FreeType, HarfBuzz and fontconfig
+backend, D-Bus through GLib's GIO for notifications, accessibility (AT-SPI)
+and the desktop portals, the session token in the keyring through libsecret,
+and the camera and the screen through the portals and PipeWire. `make
+linux-gui` builds it as `build/openchime-gui`; `make build` does not, because
+it needs system development packages a machine that only builds the daemon
+need not have. Run it from a desktop session, Wayland or X11.
+
+On Ubuntu or Debian it needs:
+
+```sh
+sudo apt install cmake pkg-config \
+  libfreetype-dev libharfbuzz-dev libfontconfig-dev libglib2.0-dev libsecret-1-dev libpipewire-0.3-dev \
+  libx11-dev libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxrandr-dev libxss-dev \
+  libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libdecor-0-dev \
+  fonts-dejavu-core dbus pipewire wireplumber
+```
+
+The first line of packages is what the GUI compiles and links against, each
+found through `pkg-config` and only by the targets that need it; one missing
+stops the build before anything compiles, naming the `pkg-config` names it
+could not find. The next two are the headers of SDL3's two video backends: the
+first `make linux-gui` builds SDL3 for Linux once from the committed tree
+(`scripts/build/sdl3_linux.sh`, a few minutes, into
+`third_party/sdl3-3.4.14/`), with both X11 and Wayland, and stops, naming the
+backend, if SDL could not find the headers for either. Neither library of a
+backend is linked: SDL opens the one the session offers when it starts. The
+DejaVu fonts, `dbus`, `pipewire` and `wireplumber` are for the two test
+programs (TESTING.md §2.2c); the GUI's test starts a PipeWire and a
+WirePlumber of its own for its stream group, under its own temporary
+directory, and stops them, so one already running for the desktop is neither
+used nor disturbed:
+
+```sh
+make build/sdltext_test && build/sdltext_test
+make build/linux_gui_test && dbus-run-session build/linux_gui_test
+```
+
+Each exits with its failure count. Neither `make test` nor `make build` builds
+them; the full suite runs both.
+
+`build/openchime-gui --version` prints the build it is (`openchime <build id>
+(protocol <n>)`) and exits, opening no window, as the TUI and the daemon do.
+The desktop knows the client by its application ID, `io.openchime.OpenChime`,
+which also names its desktop entry, its icons and its AppStream metainfo
+(`packaging/linux-client/`), the Flatpak and the window's class; a package
+installs the binary as `openchime`.
+
+**Against a sysroot.** `make linux-gui LINUX_SYSROOT=<dir>` builds the GUI
+against the libraries in `<dir>` instead of the machine's: the compiler, the
+linker and `pkg-config` read the sysroot alone, and SDL3, the objects and the
+binary go into directories named for it (`build/<sysroot>/openchime-gui`).
+Two sysroots are fetched pinned into `third_party/`, each by its script, and
+neither installs anything on the machine (VENDORS.md §2):
+
+- `scripts/build/sysroot_ubuntu_arm64.sh` lays out Ubuntu 24.04's arm64
+  packages, pinned in `scripts/build/sysroot_ubuntu_arm64.list`, in
+  `third_party/sysroot-ubuntu-24.04-arm64/`. `make ARCH=aarch64 linux-gui`
+  on an x86 machine uses it by default, with Ubuntu's gcc 12 cross compiler
+  (`gcc-12-aarch64-linux-gnu`): the arm64 `.deb`'s and `.rpm`'s client.
+- `scripts/build/freedesktop_sdk.sh <x86_64|aarch64>` fetches the
+  Freedesktop SDK and runtime pinned in
+  `packaging/linux-client/freedesktop-runtime.conf` into a Flatpak
+  installation of the tree's own and lays the SDK out as
+  `third_party/freedesktop-sdk-<branch>-<arch>/`: the Flatpak's client
+  (`make linux-gui LINUX_SYSROOT=third_party/freedesktop-sdk-26.08-x86_64`).
+  It needs `flatpak` and `ostree`, and about 950 MB per architecture.
+
+make runs each script when the GUI is asked for against its sysroot and the
+sysroot is missing or its pin has moved. The client's packages themselves
+are the full build's (`make build-all PART=linux-client`, TESTING.md), made
+in CI only.
 
 ## Local development environment
 

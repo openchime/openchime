@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The client's AppStream metadata: what a software centre shows for the
+     package and the Flatpak. Its id is the Flatpak's application ID, which
+     also names the .desktop file it launches. -->
+<component type="desktop-application">
+  <id>io.openchime.OpenChime</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>OpenChime</name>
+  <summary>Chat client for an OpenChime server</summary>
+  <description>
+    <p>
+      OpenChime is a business chat system you can run yourself. This is its
+      desktop client: messaging, channels, threads and search; calls with
+      screen sharing and cameras, encrypted end to end; recorded video
+      messages; and read-aloud, voice input and conversation summaries, all
+      computed on the workspace's own server.
+    </p>
+    <p>
+      It signs in to a workspace on an OpenChime server and keeps its session
+      in the desktop's keyring. A link to a workspace opens in it.
+    </p>
+  </description>
+  <developer id="io.openchime">
+    <name>OpenChime</name>
+  </developer>
+  <launchable type="desktop-id">io.openchime.OpenChime.desktop</launchable>
+  <url type="homepage">https://openchime.io</url>
+  <categories>
+    <category>Network</category>
+    <category>Chat</category>
+  </categories>
+  <provides>
+    <binary>openchime</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+</component>

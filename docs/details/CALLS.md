@@ -183,7 +183,7 @@ remembered with the preferences. Under a shared screen the strip is tiles too, e
 or a face. The view takes only the cameras it draws — every card in the grid, the large one
 and the strip's tiles otherwise, none while another view is on screen — and tells the relay
 when that changes (`CALL_VIDEO_SUB`, §7.4). The controls are `call.camera`,
-`call.camera.picker`, `call.layout` and `call.selfview` to a screen reader and the harness,
+`call.camera.picker`, `call.layout` and `call.selfview` to a screen reader,
 as every call control is. Above the bar is the push-to-talk hint, whatever route the audio
 takes. Before joining the view shows who is in the call and **Join** (and **Decline** for an
 invitation), which opens the pre-join screen.
@@ -209,7 +209,7 @@ which has other ids, uses its own defaults.
 
 **Invitation toasts** carry **Join** and **Decline**, and the call sound.
 
-**Every control has a name** for a screen reader and the harness: `sidebar.calls`,
+**Every control has a name** for a screen reader: `sidebar.calls`,
 `sidebar.calls.new`, `calls.new`, `calls.filter.all`, `calls.filter.joined`,
 `calls.filter.missed`, `calls.row.<id>`, `calls.join.<id>`, `calls.decline.<id>`,
 `calls.callback.<id>`, `callpage.back`, `call.msg.<id>`, `call.msg.<id>.play`,
@@ -440,8 +440,6 @@ cover: tampering, a wrong key or another sender, another info or aad, low-order 
 replay window. The client end-to-end test, which runs the switches between epochs, (`test_client_core.c`) taps the relay and checks it sees only
 ciphertext, and that after a participant leaves every packet is under an epoch it was
 never given a key for; and a shared screen crosses it as SFrame too (§6.9).
-`tools/gui/features/calls.sh` runs two Win32 clients (two web clients with `OC_TEST_PLATFORM=web`) in a call and checks each receives the other's
-packets, every one decrypting once the keys are in.
 
 ## 6. Screen sharing
 
@@ -706,9 +704,6 @@ cross into `client/core` and are encoded there, so the wire is the same everywhe
   costs NACKs and resends, not the picture; faye joins late and has a picture
   within seconds; erik takes over, which stops dana's; erik stops and the picture
   goes.
-- `tools/gui/features/calls.sh`: two Win32 clients, or two web clients — alice shares, bob's view shows her
-  screen with readable, rising frame numbers; full screen, Esc, actual size; the
-  accessibility names; bob takes over; bob stops.
 
 ## 7. Camera video
 
@@ -833,10 +828,6 @@ less as views take fewer: a speaker layout of the speaker and a strip of four ta
 - `tests/itest_netloop.c`: `CALL_CAMERA` marking the roster in the same epoch, and a
   leave, a disconnect and a rejoin clearing it; someone outside the call refused;
   `CALL_VIDEO_SUB` only from a participant, and the relay honouring it.
-- `tools/gui/features/camera.sh`: two clients, Win32 or web — the camera button and picker,
-  each card showing the other's camera with rising frame numbers and your own mirrored,
-  the grid and the speaker layout, the subscription following the cards drawn, a camera
-  turned off back to a face, and a camera the system refuses said as such (TESTING.md).
 - `tests/test_client_core.c`: through the real daemon and relay with a tap — two people
   turn their synthetic cameras on and each decodes the other's rising frame numbers; the
   tap sees only SFrame behind the camera's stream tag; one shares a screen with the
@@ -954,6 +945,3 @@ recording past `OPENCHIME_CALL_RECORDING_DAYS` is deleted by the storage pass.
   not counted toward the cap, the recording's row and spool, and an empty one failed.
 - `tests/test_dbwriter.c`: a recording made and failed in the database, the list a start
   resumes, and the retention.
-- `tools/gui/features/calls.sh`, `callhome.sh` and `prejoin.sh`: Record, the mark naming
-  who records and its Stop, the announcements, the pre-join screen's notice, the summary
-  card's Play, and the recording played on the call's page (TESTING.md).

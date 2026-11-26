@@ -201,10 +201,170 @@ static void test_away_ring_clears_the_floor(void) {
     CHECK(checked == N_SURFACES * OC_SCHEME_COUNT * 2);
 }
 
+/* --- high contrast (REQ-262) ------------------------------------------------
+ *
+ * The high-contrast palettes promise more than the floor: 7:1 for every ink
+ * text is written in, 4.5:1 for every ink a control is drawn in, each against
+ * every surface it lands on. Asserted over both palettes under every scheme,
+ * so a scheme that leaked into the high-contrast palette would fail here too. */
+
+#define HC_TEXT     7.0f
+#define HC_CONTROLS 4.5f
+
+static const struct { int tok; const char *name; } HC_TEXT_INKS[] = {
+    { TH_TEXT, "TEXT" }, { TH_MUTED, "MUTED" }, { TH_FAINT, "FAINT" },
+    { TH_ACCENT, "ACCENT" }, { TH_DANGER, "DANGER" },
+};
+static const struct { int tok; const char *name; } HC_CONTROL_INKS[] = {
+    { TH_BORDER, "BORDER" }, { TH_ACCENT_DIM, "ACCENT_DIM" },
+    { TH_ONLINE, "ONLINE" }, { TH_AWAY, "AWAY" }, { TH_NOTICE, "NOTICE" },
+};
+/* The fills a label is drawn ON in TH_ON_ACCENT. */
+static const struct { int tok; const char *name; } ACCENT_FILLS[] = {
+    { TH_ACCENT, "ACCENT" }, { TH_ACCENT_DIM, "ACCENT_DIM" }, { TH_DANGER, "DANGER" },
+};
+#define NELEM(a) ((int)(sizeof (a) / sizeof (a)[0]))
+
+/* One pair against a ratio: counted, and printed by name when it falls short. */
+static int hc_pair(const char *ink, int ink_tok, const char *surf, int surf_tok,
+                   int scheme, int light, float want) {
+    float c = oc_theme_contrast(oc_theme[ink_tok], oc_theme[surf_tok]);
+    if (c >= want) return 0;
+    printf("  high contrast: %s on %s, %s %s: %06X on %06X is %.2f:1, under %.1f:1\n",
+           ink, surf, oc_theme_scheme_name(scheme), light ? "light" : "dark",
+           oc_theme[ink_tok], oc_theme[surf_tok], (double)c, (double)want);
+    return 1;
+}
+
+static void test_high_contrast_text_clears_7(void) {
+    int checked = 0, failures_here = 0;
+    for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++) {
+        for (int light = 0; light < 2; light++) {
+            oc_theme_set_scheme(scheme);
+            oc_theme_set_high_contrast(1);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            for (int i = 0; i < NELEM(HC_TEXT_INKS); i++)
+                for (int s = 0; s < N_SURFACES; s++, checked++)
+                    failures_here += hc_pair(HC_TEXT_INKS[i].name, HC_TEXT_INKS[i].tok,
+                                             SURFACES[s].name, SURFACES[s].tok,
+                                             scheme, light, HC_TEXT);
+            failures_here += hc_pair("RAIL_ICON", TH_RAIL_ICON, "RAIL", TH_RAIL,
+                                     scheme, light, HC_TEXT);
+            checked++;
+            for (int f = 0; f < NELEM(ACCENT_FILLS); f++, checked++)
+                failures_here += hc_pair("ON_ACCENT", TH_ON_ACCENT,
+                                         ACCENT_FILLS[f].name, ACCENT_FILLS[f].tok,
+                                         scheme, light, HC_TEXT);
+            oc_theme_set_high_contrast(0);
+        }
+    }
+    /* (5 inks x 6 surfaces + the rail + 3 fills) x 4 schemes x 2 modes. */
+    CHECK(checked == (NELEM(HC_TEXT_INKS) * N_SURFACES + 1 + NELEM(ACCENT_FILLS)) *
+                     OC_SCHEME_COUNT * 2);
+    CHECK(checked == 272);
+    CHECK(failures_here == 0);
+}
+
+static void test_high_contrast_controls_clear_4_5(void) {
+    int checked = 0, failures_here = 0;
+    for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++) {
+        for (int light = 0; light < 2; light++) {
+            oc_theme_set_scheme(scheme);
+            oc_theme_set_high_contrast(1);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            for (int i = 0; i < NELEM(HC_CONTROL_INKS); i++)
+                for (int s = 0; s < N_SURFACES; s++, checked++)
+                    failures_here += hc_pair(HC_CONTROL_INKS[i].name, HC_CONTROL_INKS[i].tok,
+                                             SURFACES[s].name, SURFACES[s].tok,
+                                             scheme, light, HC_CONTROLS);
+            oc_theme_set_high_contrast(0);
+        }
+    }
+    /* 5 inks x 6 surfaces x 4 schemes x 2 modes. */
+    CHECK(checked == NELEM(HC_CONTROL_INKS) * N_SURFACES * OC_SCHEME_COUNT * 2);
+    CHECK(checked == 240);
+    CHECK(failures_here == 0);
+}
+
+/* With high contrast on, the scheme changes nothing: not the rail, not the
+ * accent, not the selection derived from it -- not one token. */
+static void test_high_contrast_ignores_the_scheme(void) {
+    for (int light = 0; light < 2; light++) {
+        uint32_t first[TH_COUNT];
+        oc_theme_set_high_contrast(1);
+        for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++) {
+            oc_theme_set_scheme(scheme);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            CHECK(oc_theme_high_contrast() == 1);
+            for (int t = 0; t < TH_COUNT; t++) {
+                if (scheme == 0) first[t] = oc_theme[t];
+                else if (oc_theme[t] != first[t]) {
+                    printf("  high contrast: token %d moved under %s %s: %06X, not %06X\n",
+                           t, oc_theme_scheme_name(scheme), light ? "light" : "dark",
+                           oc_theme[t], first[t]);
+                    CHECK(oc_theme[t] == first[t]);
+                }
+            }
+        }
+        /* ...and it is not simply the ordinary palette: dark and light differ
+         * from what they are without it. */
+        oc_theme_set_high_contrast(0);
+        int differ = 0;
+        for (int t = 0; t < TH_COUNT; t++) differ += oc_theme[t] != first[t];
+        CHECK(differ > 0);
+    }
+}
+
+/* Off again gives back exactly what the mode and the scheme give without it. */
+static void test_high_contrast_off_is_unchanged(void) {
+    for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++) {
+        for (int light = 0; light < 2; light++) {
+            uint32_t before[TH_COUNT];
+            oc_theme_set_high_contrast(0);
+            oc_theme_set_scheme(scheme);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            for (int t = 0; t < TH_COUNT; t++) before[t] = oc_theme[t];
+            oc_theme_set_high_contrast(1);
+            CHECK(oc_theme_high_contrast() == 1);
+            oc_theme_set_high_contrast(0);
+            CHECK(oc_theme_high_contrast() == 0);
+            for (int t = 0; t < TH_COUNT; t++) CHECK(oc_theme[t] == before[t]);
+            /* The resolved inks come back too. */
+            CHECK(oc_ink_on(TH_FAINT, TH_SELECT) != oc_theme[TH_FAINT]);
+        }
+    }
+}
+
+/* Without high contrast the ink on an accent is white, as it was a literal. */
+static void test_on_accent_is_white_without_high_contrast(void) {
+    oc_theme_set_high_contrast(0);
+    for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++)
+        for (int light = 0; light < 2; light++) {
+            oc_theme_set_scheme(scheme);
+            oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+            CHECK(oc_theme[TH_ON_ACCENT] == 0xFFFFFF);
+            CHECK(OC_COL_ON_ACCENT == 0xFFFFFFu);
+        }
+}
+
+/* Off, On and Follow system, against a system that says on, off and nothing. */
+static void test_high_contrast_follows_the_preference(void) {
+    for (int sys = -1; sys <= 1; sys++) {
+        CHECK(oc_high_contrast_on(OC_HC_ON, sys) == 1);
+        CHECK(oc_high_contrast_on(OC_HC_OFF, sys) == 0);
+        CHECK(oc_high_contrast_on(OC_HC_SYSTEM, sys) == (sys == 1));
+        /* Outside the three reads as Follow system. */
+        CHECK(oc_high_contrast_on(7, sys) == (sys == 1));
+        CHECK(oc_high_contrast_on(-1, sys) == (sys == 1));
+    }
+}
+
 int run_theme_tests(void) {
     printf("test_theme: the contrast floor over every ink x surface x scheme x mode, "
            "one-way escalation, the faint tier survives, the reported pairs, "
-           "the ratio arithmetic, distinct presence marks, the away ring\n");
+           "the ratio arithmetic, distinct presence marks, the away ring, "
+           "high contrast at 7:1 and 4.5:1, blind to the scheme, off unchanged, "
+           "white on the accent without it, and its preference\n");
     test_contrast_arithmetic();
     test_every_pair_clears_the_floor();
     test_escalation_is_one_way();
@@ -212,7 +372,14 @@ int run_theme_tests(void) {
     test_the_reported_pairs();
     test_presence_marks_are_distinct();
     test_away_ring_clears_the_floor();
+    test_high_contrast_text_clears_7();
+    test_high_contrast_controls_clear_4_5();
+    test_high_contrast_ignores_the_scheme();
+    test_high_contrast_off_is_unchanged();
+    test_on_accent_is_white_without_high_contrast();
+    test_high_contrast_follows_the_preference();
     /* Leave the palette as the rest of the suite expects to find it. */
+    oc_theme_set_high_contrast(0);
     oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
     oc_theme_apply(OC_THEME_DARK);
     return failures;

@@ -28,7 +28,6 @@
 #include <string.h>
 
 #include "platform.h"
-#include "env.h"        /* oc_env_dev: the harness's inputs, development mode only */
 #include "st_canvas.h"
 
 static uint32_t g_evtype;
@@ -99,33 +98,8 @@ int   oc_plat_nav_go(int delta) {
     return 1;
 }
 /* The page goes to the daemon's sign-in page itself; it comes back to /app/
- * with the token (oc_plat_signin_result). In development mode, with
- * OPENCHIME_DEV_SIGNIN=user:password set (tools/gui/README.md) is its own harness: it
- * posts the page's form as the person would type it -- same origin, so the
- * browser sends the Origin the page requires -- and follows the page's 303
- * back here with the token. The product path, with the typing done. */
+ * with the token (oc_plat_signin_result). */
 int   oc_plat_open_signin(const char *url) {
-    const char *typed = oc_env_dev("OPENCHIME_DEV_SIGNIN");
-    if (typed && strchr(typed, ':')) {
-        EM_ASM({
-            var url = UTF8ToString($0);
-            var cred = UTF8ToString($1);
-            var i = cred.indexOf(":");
-            (async function () {
-                try {
-                    var u = new URL(url, location.href);
-                    var body = new URLSearchParams();
-                    body.set("redirect_uri", u.searchParams.get("redirect_uri") || "");
-                    body.set("nonce", u.searchParams.get("nonce") || "");
-                    body.set("username", cred.slice(0, i));
-                    body.set("password", cred.slice(i + 1));
-                    var r = await fetch(u.pathname, { method: "POST", body: body, redirect: "follow", credentials: "same-origin" });
-                    location.assign(r.url);
-                } catch (e) { console.error("test sign-in: " + e); location.assign(url); }
-            })();
-        }, url, typed);
-        return 1;
-    }
     EM_ASM({ location.assign(UTF8ToString($0)); }, url);
     return 1;
 }
@@ -348,17 +322,14 @@ void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r) {
 }
 /* The browser's caret is the hidden input element's, which
  * oc_plat_text_input_area already keeps at the drawn caret: nothing more to
- * place, and no platform caret of its own to read back. */
+ * place. */
 void  oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r) { (void)w; (void)r; }
-int   oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out) { (void)w; (void)out; return 0; }
 void  oc_plat_window_front(SDL_Window *w) { (void)w; EM_ASM({ window.focus(); }); }
-int   oc_plat_window_is_front(SDL_Window *w) { (void)w; return EM_ASM_INT({ return document.hasFocus() ? 1 : 0; }); }
-int   oc_plat_window_has_keyboard(SDL_Window *w) { (void)w; return 1; }
 void  oc_plat_window_caption_dark(SDL_Window *w, int dark) {
     (void)w;
     EM_ASM({ document.documentElement.style.colorScheme = $0 ? "dark" : "light"; }, dark);
 }
-int   oc_plat_window_round(SDL_Window *w) { (void)w; return -1; }
+void  oc_plat_window_round(SDL_Window *w) { (void)w; }
 int   oc_plat_window_capture_exclude(SDL_Window *w, int on) { (void)w; (void)on; return 0; }
 void  oc_plat_window_click_through(SDL_Window *w, int on) { (void)w; (void)on; }
 
@@ -372,7 +343,6 @@ int oc_plat_badge(SDL_Window *w, int count, uint32_t rgb) {
     EM_ASM({ document.title = UTF8ToString($0); }, title);
     return 1;
 }
-int   oc_plat_badge_status(void) { return 0; }
 void  oc_plat_progress(SDL_Window *w, uint64_t done, uint64_t total) { (void)w; (void)done; (void)total; }
 int   oc_plat_share_rect(const char *id, int *x, int *y, int *w, int *h) {
     (void)id; (void)x; (void)y; (void)w; (void)h; return 0;
@@ -460,12 +430,6 @@ int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *o
     return n;
 }
 
-/* The browser's picker is the page's, not a modal loop on this thread: nothing
- * to tick through, and nothing the hook answers. */
-void oc_plat_set_modal_tick(void (*fn)(void)) { (void)fn; }
-int  oc_plat_picker_open(void) { return 0; }
-int  oc_plat_picker_answer(const char *path) { (void)path; return 0; }
-
 /* Saving: the application writes to a path on the page's filesystem, and
  * tells the platform when it has (oc_plat_file_saved); the browser then
  * downloads it, which is the only "save as" a page has. A download and the
@@ -513,6 +477,16 @@ int oc_plat_reduce_motion(void) {
         return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : 0;
     });
 }
+/* The page's prefers-contrast: more; -1 where the browser cannot be asked. */
+int oc_plat_high_contrast(void) {
+    return EM_ASM_INT({
+        if (!window.matchMedia) return -1;
+        return window.matchMedia('(prefers-contrast: more)').matches ? 1 : 0;
+    });
+}
+/* The page follows its own palette, not the browser's prefers-color-scheme:
+ * -1, and the SYSTEM theme resolves to dark, the safe miss. */
+int oc_plat_prefers_light(void) { return -1; }
 
 /* ---- the clipboard --------------------------------------------------------- */
 

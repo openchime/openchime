@@ -129,7 +129,7 @@ duplication `E_ACCESSDENIED`, GDI black). A window is captured either way.
 **The synthetic sources** are selected with `OPENCHIME_DEV_CAPTURE=synthetic` (or
 `denied`, which fails with `OC_CAP_DENIED`); `synthetic-camera` makes only the
 camera synthetic, so a real screen can be recorded with a known picture in its box.
-They are how every automated test and the GUI harness record without a camera.
+They are how every automated test records without a camera.
 `OPENCHIME_DEV_SCREEN_GONE_MS` makes the synthetic screen go away after that long.
 
 ### 3.3 Microphone and speaker
@@ -376,11 +376,6 @@ any saved file, and then lets the page's copy go.
   Keys: Space, ← and → by 5 s, ↑ and ↓ for volume, M, Esc.
 - **Elsewhere:** a VID badge and a Video filter in the Files view; "🎥 Video
   message (m:ss)" in the sidebar and the notification when there is no caption.
-- **Harness:** `tools/gui/harness/win32/drive.sh vm open|record|stop|discard|retake|send|play|mute|close|seek <ms>`,
-  `vm source camera|<id>`, `vm corner br|bl|tr|tl`, `vm sound on|off`, `vm nocam on|off`;
-  a `vm=` line with the phase, the take, the player and the buttons in `dump`, a
-  `vmsrc` line with the choices, whether the card is aside, the bar and its
-  exclusion, and the video area, and a `vmscreen[n]` line per screen or window.
 
 ## 10. Consent and privacy
 
@@ -432,6 +427,4 @@ frame rate, MP3 at 48 kHz mono and 96 kbit/s, in an MP4.
 | `make test` — export | the H.264 + MP3 writer; the render and worker with stub codecs; the cache; a daemon with export off, on without codecs, and on (§10a) |
 | Full suite — `export_media` | a 1080p recording exported with the real codecs: H.264 Constrained Baseline and MP3 at its size and duration, picture and sound within a frame, peak memory under 96 MB |
 | `make test` — canceller | the ERLE harness at 48 kHz on the 16 kHz band, on the same rooms as voice input's (§4.2) |
-| Win32 harness (synthetic camera) | record, review, send; a second client shows the card and plays it; the Files view and previews; the denied path; the cap |
-| Win32 harness, `tools/gui/features/screenrec.sh` | real Windows.Graphics.Capture with a synthetic camera and sound: screens and windows listed; the box in the chosen corner of the preview; the card stepping aside for the recording bar, which is kept out of the capture and read and pressed through UI Automation; Stop ending the take at the fitted size; the file the daemon stores being VP9 and Opus at that size, with the microphone and the computer's sound in it; a window closed mid-take keeping what came before |
 | By hand, once | a real camera and microphone: permission prompts, switching devices, a full five-minute recording, CPU use; a narrated screen recording with the camera in each corner, watched back |

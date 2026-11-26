@@ -256,7 +256,6 @@ int oc_wintoast_init(const char *aumid) {
     return 1;
 }
 
-int oc_wintoast_available(void) { return g_ready; }
 
 /* XML-escape into `out`. The body is a chat message: it will contain & and <
  * eventually, and an unescaped one makes LoadXml fail, which would read as

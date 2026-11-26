@@ -291,20 +291,6 @@ void oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r) {
     SetCaretPos(r->x, r->y);
 }
 
-/* Windows' own account of the caret, not ours: the thread's caret window and
- * height from GetGUIThreadInfo, its position from GetCaretPos. */
-int oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out) {
-    HWND h = hwnd_of(w);
-    GUITHREADINFO gi; memset(&gi, 0, sizeof gi); gi.cbSize = sizeof gi;
-    if (!h || !GetGUIThreadInfo(GetCurrentThreadId(), &gi) || gi.hwndCaret != h) return 0;
-    POINT p;
-    if (!GetCaretPos(&p)) return 0;
-    out->x = p.x; out->y = p.y;
-    out->w = gi.rcCaret.right - gi.rcCaret.left;
-    out->h = gi.rcCaret.bottom - gi.rcCaret.top;
-    return 1;
-}
-
 void oc_plat_share_limits(int *max_w, int *max_h) { *max_w = 1920; *max_h = 1080; }
 void oc_plat_camera_limits(int *max_w, int *max_h, int *max_fps) { *max_w = 640; *max_h = 480; *max_fps = 30; }
 const char *oc_plat_mic_settings_name(void) { return "Windows privacy settings"; }
@@ -421,9 +407,6 @@ void oc_plat_window_front(SDL_Window *w) {
     SetFocus(h);
 }
 
-int oc_plat_window_is_front(SDL_Window *w) { HWND h = hwnd_of(w); return h && GetForegroundWindow() == h; }
-int oc_plat_window_has_keyboard(SDL_Window *w) { HWND h = hwnd_of(w); return h && GetFocus() == h; }
-
 void oc_plat_window_caption_dark(SDL_Window *w, int dark) {
     HWND h = hwnd_of(w);
     if (!h) return;
@@ -432,13 +415,13 @@ void oc_plat_window_caption_dark(SDL_Window *w, int dark) {
         DwmSetWindowAttribute(h, 19, &d, sizeof d);
 }
 
-int oc_plat_window_round(SDL_Window *w) {
+void oc_plat_window_round(SDL_Window *w) {
     HWND h = hwnd_of(w);
-    if (!h) return -1;
+    if (!h) return;
     /* 33 = DWMWA_WINDOW_CORNER_PREFERENCE, 2 = DWMWCP_ROUND; written out
      * because the mingw headers predate them. Ignored on Windows 10. */
     DWORD round = 2;
-    return (int)DwmSetWindowAttribute(h, 33, &round, sizeof round);
+    DwmSetWindowAttribute(h, 33, &round, sizeof round);
 }
 
 int oc_plat_window_capture_exclude(SDL_Window *w, int on) {
@@ -556,8 +539,6 @@ int oc_plat_badge(SDL_Window *w, int count, uint32_t rgb) {
     return ok;
 }
 
-int oc_plat_badge_status(void) { return (int)g_taskbar_hr; }
-
 void oc_plat_progress(SDL_Window *w, uint64_t done, uint64_t total) {
     static uint64_t shown_done = UINT64_MAX, shown_total = UINT64_MAX;
     HWND h = hwnd_of(w);
@@ -615,57 +596,9 @@ static void filter_w(const char *filter, WCHAR *out, int cap) {
     out[n + 1] = 0;
 }
 
-/* The file dialog's modal loop is the system's, not the client's pump, so the
- * test hook (polled from the client's tick) would go unanswered while it is
- * open. A thread timer is dispatched by any modal loop on this thread, the
- * dialog's included, and runs the tick the application set. No hook procedure
- * on the dialog: OFN_ENABLEHOOK brings back the pre-Vista dialog. */
-static void (*g_modal_tick)(void);
-static int  g_picker_up;
-static HWND g_picker_owner;
-
-void oc_plat_set_modal_tick(void (*fn)(void)) { g_modal_tick = fn; }
-int  oc_plat_picker_open(void) { return g_picker_up; }
-
-static void CALLBACK modal_tick_proc(HWND h, UINT msg, UINT_PTR id, DWORD t) {
-    (void)h; (void)msg; (void)id; (void)t;
-    if (g_modal_tick) g_modal_tick();
-}
-
-/* The open file dialog: the dialog-class window on this thread its owner owns. */
-typedef struct { HWND owner, found; } picker_find;
-static BOOL CALLBACK picker_enum(HWND h, LPARAM lp) {
-    picker_find *pf = (picker_find *)lp;
-    WCHAR cls[16];
-    if (!IsWindowVisible(h) || !GetClassNameW(h, cls, 16) || wcscmp(cls, L"#32770") != 0) return TRUE;
-    if (GetWindow(h, GW_OWNER) != pf->owner) return TRUE;
-    pf->found = h;
-    return FALSE;
-}
-
-int oc_plat_picker_answer(const char *path) {
-    if (!g_picker_up) return 0;
-    picker_find pf = { g_picker_owner, NULL };
-    EnumThreadWindows(GetCurrentThreadId(), picker_enum, (LPARAM)&pf);
-    if (!pf.found) return 0;
-    if (!path) {
-        PostMessageW(pf.found, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
-        return 1;
-    }
-    /* The file name box (cmb13, 0x47C, the combo box's edit), as typed, then OK:
-     * the path comes back through GetOpenFileNameW as a person's pick does. */
-    WCHAR w[MAX_PATH];
-    to_w(path, w, MAX_PATH);
-    SetDlgItemTextW(pf.found, 0x47C, w);
-    PostMessageW(pf.found, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
-    return 1;
-}
-
 int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap) {
     static WCHAR file[32 * MAX_PATH];
     WCHAR flt[400];
-    /* One at a time: a tick inside the dialog must not open a second. */
-    if (g_picker_up) return 0;
     file[0] = 0;
     filter_w(filter, flt, 400);
     OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
@@ -675,13 +608,7 @@ int oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *o
     ofn.nMaxFile = sizeof file / sizeof file[0];
     ofn.lpstrFilter = flt[0] ? flt : NULL;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | (multi ? OFN_ALLOWMULTISELECT : 0);
-    UINT_PTR tick = g_modal_tick ? SetTimer(NULL, 0, 50, modal_tick_proc) : 0;
-    g_picker_owner = ofn.hwndOwner;
-    g_picker_up = 1;
-    BOOL picked = GetOpenFileNameW(&ofn);
-    g_picker_up = 0;
-    if (tick) KillTimer(NULL, tick);
-    if (!picked) return 0;
+    if (!GetOpenFileNameW(&ofn)) return 0;
     size_t o = 0; int n = 0;
     const WCHAR *first = file, *next = file + wcslen(file) + 1;
     char path[1024];
@@ -813,6 +740,29 @@ int oc_plat_reduce_motion(void) {
     BOOL on = TRUE;
     if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0)) return -1;
     return on ? 0 : 1;
+}
+
+/* Settings > Accessibility > Contrast themes: HCF_HIGHCONTRASTON while one is
+ * in force. */
+int oc_plat_high_contrast(void) {
+    HIGHCONTRASTW hc = { .cbSize = sizeof hc };
+    if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0)) return -1;
+    return (hc.dwFlags & HCF_HIGHCONTRASTON) ? 1 : 0;
+}
+
+/* Settings > Personalization > Colors, "Choose your app mode": the same
+ * registry value the shell reads, AppsUseLightTheme, 1 for light. */
+int oc_plat_prefers_light(void) {
+    HKEY k;
+    DWORD v = 0, sz = sizeof v, type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return -1;
+    LONG rc = RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&v, &sz);
+    RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return -1;
+    return v == 1 ? 1 : 0;
 }
 
 /* ---- the clipboard --------------------------------------------------------- */

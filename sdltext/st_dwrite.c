@@ -627,6 +627,10 @@ int st_hit_range(const st_layout *l, size_t off, size_t len, st_rect *out,
                  int cap)
 {
     DWRITE_TEXT_RANGE r = st__range(l, off, len);
+    /* An empty range covers nothing, as on the other backends: DirectWrite
+     * would answer it with the caret's zero-width box. */
+    if (r.length == 0)
+        return 0;
     UINT32 n = 0;
     IDWriteTextLayout_HitTestTextRange(l->lay, r.startPosition, r.length,
                                        0.0f, 0.0f, NULL, 0, &n);

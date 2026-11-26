@@ -46,7 +46,7 @@
 
 #include "client.h"
 #include "net.h"          /* oc_net_probe: how a workspace signs people in */
-#include "oc_thread.h"    /* a harness verb asks the device lists from another thread */
+#include "oc_thread.h"
 #include "signin.h"       /* a browser sign-in resumed from its result (the web client) */
 #include "secret_os.h"
 #include "model.h"
@@ -254,8 +254,7 @@ static void   focus_set(field *f);
 /* The main window and the keyboard's view of it. */
 static int g_quit;               /* the loop ends */
 
-/* Modifier state, as the handlers read it. The harness may hold a synthetic
- * chord (g_synth_mods), see mod_down. */
+/* Modifier state, as the handlers read it; see mod_down. */
 static int mod_down(int key);
 
 /* The window's client area in device pixels (what the scene is laid out in,
@@ -286,13 +285,9 @@ static int to_w_count(const char *s, int bytes) {
 #  define oc_getpid getpid
 #endif
 
-/* The loop and the harness's synthetic input, defined with the loop at the end. */
+/* The loop, defined at the end. */
 static void pump(void);
 static void paint_now(void);
-static void synth_mouse(oc_win *hwnd, int kind, int x_dip, int y_dip);
-static void synth_key(oc_win *hwnd, int key, int up, int alt);
-static void synth_char(oc_win *hwnd, oc_wch ch);
-static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta);
 static void fields_create(void);
 static uint32_t g_app_evtype;      /* the app's own posts to itself: the trust question's resume */
 enum { APP_EV_TRUST_RESUME = 1 };
@@ -720,10 +715,6 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n);
 static int        g_form_open;                       /* a form is on the frame */
 static float      g_form_scroll, g_form_scroll_max;  /* rows scrolled past, and how far they can be */
 static int        g_form_scroll_focus = -1;          /* the row last brought into view */
-/* What the last form returned, for the harness: a form's answer is consumed by its
- * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
- * unassertable. Diagnosis only. */
-static char       g_form_last[320];
 /* The form fields' font: the UI token at the UI family, so a field on our card
  * is not the one control in the app wearing the stock shell font (ARCH-97
  * — the platform owns the family, we own the scale). Rebuilt whenever the scale
@@ -734,12 +725,8 @@ static oc_field  *g_form_f;                           /* the CALLER's array */
 static int        g_form_n;
 static field     *g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD / FF_MULTILINE only */
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
-/* The body the rows were last drawn in (Tab scrolls to a row in it), and, for
- * the harness, each row's drawn extent (its label's top to its hint's or its
- * box's bottom; 0,0 for a row not drawn), so "drawn within the height measured
- * for it" is checkable. */
+/* The body the rows were last drawn in (Tab scrolls to a row in it). */
 static rectf g_form_body;
-static float g_form_row_top[FORM_MAX_FIELDS], g_form_row_bot[FORM_MAX_FIELDS];
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
 /* An optional photo column beside the fields (REQ-240: identity includes the
@@ -791,7 +778,6 @@ static void      (*g_form_on_action)(int field);
 static rectf g_form_sel_box[FORM_MAX_FIELDS];
 static int   g_form_sel_field = -1;      /* which field's list is open, -1 none */
 static int   g_form_sel_scroll;          /* first visible row */
-static rectf g_form_sel_panel;
 #define FORM_SEL_VISIBLE 8               /* rows on screen; the rest scroll */
 static struct { rectf r; int val; } g_form_sel_rows[FORM_SEL_VISIBLE];
 static int   g_n_form_sel_rows;
@@ -1043,15 +1029,10 @@ static st_ctx       *g_st;
 /* The sdltext sink, in capture mode: st_draw hands premultiplied-BGRA pixels
  * here, we make a texture and either draw it now or hand it to the text cache.
  * One slot — the UI thread draws one layout at a time. */
-/* Declared here rather than beside the test hook: the notification window
+/* Declared here: the notification window
  * (below) needs the shell's oc_win *to restore it, and is defined earlier. */
 static oc_win  g_main_win;
 static oc_win *g_main = &g_main_win;
-
-/* sdltext rasterizes into a bitmap two DIPs wider and taller than the ink, so
- * antialiasing at the edges has somewhere to go (st_draw). Anything measuring a
- * text raster has to subtract it or it is measuring the margin. */
-#define ST_RASTER_PAD 2.0f
 
 static gfx_tex *g_cap_tex;
 static int      g_cap_w, g_cap_h;
@@ -1117,10 +1098,6 @@ static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = 
  * link, edit, delete, mark unread and react had no route but a right-click
  * (REQ-264). Drawn lit like a hovered row, so where the keyboard is is visible. */
 static uint64_t g_kb_mid;
-/* The message-menu command the last key press ran as a single key on that
- * message (0 for none: any other key resets it), for the dump: what a key did
- * is read back, not inferred. */
-static int g_kb_ran;
 /* The URL under the cursor, and the one the press landed on. Two,
  * not one, because a link opens on RELEASE over the same address it was pressed
  * on: opening on press would make dragging a selection that starts inside a URL
@@ -1216,18 +1193,12 @@ static int g_n_selfcard_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
+/* The pointer's shape last set (cursor_want), so it is set only on change.
+ * -1 before any. */
+static int g_cursor_kind = -1;
 /* 1 = the rich editor (formatting shown, markup hidden),
  * 0 = plain text, where the markup is what you see and the field never restyles
  * what you typed. Rich by default: it is the mode that needs no explaining. */
-/* The shape last set, for the test dump's `cursor kind=`: a harness reads the
- * client's own state, since a detached session's pointer and a synthetic hover
- * report nothing it could check. -1 before any. */
-static int g_cursor_kind = -1;
-static const char *cursor_kind_name(void) {
-    static const char *const N[3] = { "arrow", "ibeam", "hand" };
-    return g_cursor_kind >= 0 && g_cursor_kind <= 2 ? N[g_cursor_kind] : "none";
-}
-
 static int g_pref_richtext  = 1;
 /* What plain Enter does in the composer: 0 sends (the default), 1 starts a new
  * line. Ctrl+Enter sends and Shift+Enter starts a new line in both, so neither
@@ -1286,8 +1257,8 @@ static int geom_capture(oc_win *hwnd) {
     int x, y, w, h;
     SDL_GetWindowPosition(hwnd->sdl, &x, &y);
     SDL_GetWindowSize(hwnd->sdl, &w, &h);
-    /* Nor a place no monitor shows: a window parked off-screen (by a test harness,
-     * or on a display since unplugged) saved there comes back invisible. */
+    /* Nor a place no monitor shows: a window parked off-screen (on a display
+     * since unplugged) saved there comes back invisible. */
     { SDL_Rect r = { x, y, w, h }; if (!SDL_GetDisplayForRect(&r)) return 0; }
     int mx = (fl & SDL_WINDOW_MAXIMIZED) != 0;
     if (mx) {
@@ -1303,7 +1274,9 @@ static int geom_capture(oc_win *hwnd) {
 }
 /* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
  * silently stops recording makes the last control on a pane simply not respond. */
-static struct { rectf r; int row, val; } g_pref_hits[32];
+/* Each also carries what assistive technology is told about it (REQ-269): its
+ * row's label, the choice's own text, and whether it is the current choice. */
+static struct { rectf r; int row, val; const char *label, *text; int on; } g_pref_hits[32];
 static int g_n_pref_hits;
 /* The quick-reaction slots in Preferences: the tile that opens the picker for a
  * slot, and the small clear badge on it (empty when it is not offered). */
@@ -1386,7 +1359,6 @@ static int  g_pref_deliver = DELIVER_OS;
  * asked for. The chain below falls back, so these differ on a machine without
  * identity, and a test that cannot tell them apart is not testing the chain. */
 enum { DELIVERED_NONE = 0, DELIVERED_WINRT, DELIVERED_BALLOON, DELIVERED_OWN };
-static int  g_delivered_by;
 /* What the last notification was ABOUT. The balloon cannot carry a launch
  * argument the way a toast can, so the only way its click can open the right
  * conversation is to remember. */
@@ -1398,7 +1370,6 @@ static char g_pending_url[512];
 /* What a second process, or the toast activator, hands to the running client. */
 #define OC_COPYDATA_URL    0x4F43  /* a UTF-8 openchime:// URL */
 #define OC_COPYDATA_ACTION 0x4F44  /* a toast button: "arg\nreply" */
-static int  g_wintoast_ok;         /* oc_osn_init's answer, once: the OS raises notifications */
 static char g_aumid[128];
 /* The AppUserModelID. A constant, not a setting: it identifies the application
  * to Windows and must match the installer's shortcut exactly. Changing it
@@ -1431,7 +1402,6 @@ enum { CLOSE_QUITS = 0, CLOSE_HIDES = 1 };
 static int  g_pref_close = CLOSE_QUITS;
 static int  g_pref_min_tray;        /* minimise hides too, off by default */
 static int  g_close_to_tray_told;
-static int  g_hidden_to_tray;      /* observable by the harness; see test_dump */
 /* Set only by app_quit. A close request hides unless this says the close was ASKED
  * for -- one message, two meanings, and the flag is which. */
 static int  g_quitting;
@@ -1465,8 +1435,6 @@ static int dnd_active(const oc_model *m) {
 }
 
 
-static int g_toasts_raised;      /* observable by the harness; see test_dump */
-static int g_osn_withdrawn;      /* notifications taken back on read; likewise */
 
 /* ---- notification sounds (REQ-138) ---------------------------------------
  * The client was silent. A notification you have to be looking at the screen to
@@ -1554,8 +1522,16 @@ static void toast_action_perform(char *payload);   /* fwd — defined with the
  *
  * `reply` is what the user typed into the toast, and this is the only route by
  * which it can arrive: an <input>'s text reaches a COM activator and nothing
- * else. Protocol activation, which carries the toast body's own click, cannot. */
+ * else. Protocol activation, which carries the toast body's own click, cannot.
+ *
+ * Where the platform hands back the click itself (the freedesktop server's
+ * "default" action), its argument is the notification's openchime:// link,
+ * and it is followed as the same click arriving by protocol would be. */
 static void toast_action_cb(const char *arg, const char *reply) {
+    if (arg && !strncmp(arg, "openchime://", 12)) {
+        oc_plat_handoff("url", arg);
+        return;
+    }
     char payload[1200];
     snprintf(payload, sizeof payload, "%s\n%s", arg ? arg : "", reply ? reply : "");
     oc_plat_handoff("action", payload);
@@ -1601,7 +1577,6 @@ static void notify_deliver(const char *title, const char *body, const char *sour
      * plays it depends on the backend and is decided below -- Windows for the
      * toast, us for our own window -- so exactly one of them ever does, and the
      * two cannot disagree about which sound it was. */
-    g_delivered_by = DELIVERED_NONE;
     if (snd < 0 || snd >= SNDV_COUNT) snd = SNDV_DEFAULT;
     g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
     if (g_pref_deliver == DELIVER_NONE) return;
@@ -1611,7 +1586,6 @@ static void notify_deliver(const char *title, const char *body, const char *sour
         if (g_osn_track[tk].sound_at && now - g_osn_track[tk].sound_at < OSN_SOUND_GAP_MS) snd = SNDV_SILENT;
         else g_osn_track[tk].sound_at = now;
     }
-    g_toasts_raised++;
 
 
     if (g_pref_deliver == DELIVER_OS) {
@@ -1629,8 +1603,7 @@ static void notify_deliver(const char *title, const char *body, const char *sour
                  g_host[0] ? g_host : "workspace", (unsigned long long)channel_id);
         /* Actionable when it names a real conversation: a reply box and the
          * quick reactions, so the two things you most often want to do about a
-         * message can be done without opening the app at all. The test verb's
-         * notification names no channel and gets the plain shape.
+         * message can be done without opening the app at all.
          *
          * SEND, THEN THE QUICK REACTIONS -- the same ones the message menu
          * offers, so the notification and the app cannot disagree about what
@@ -1672,15 +1645,13 @@ static void notify_deliver(const char *title, const char *body, const char *sour
         oc_osn n = { title, body, source, tag, grp, arg, snd, nb ? "Reply" : NULL, labels, args, nb };
         int r = oc_osn_show(&n);
         if (r == OC_OSN_SHOWN) {
-            g_delivered_by = DELIVERED_WINRT;
             if (tk >= 0) g_osn_track[tk].raised = 1;   /* to withdraw once it is read */
             return;
         }
-        if (r == OC_OSN_SHOWN_SILENT) { sound_play(snd); g_delivered_by = DELIVERED_BALLOON; return; }
+        if (r == OC_OSN_SHOWN_SILENT) { sound_play(snd); return; }
     }
     own_toast_show(title, body, ws_slot, channel_id);
     sound_play(snd);                       /* our window, our sound */
-    g_delivered_by = DELIVERED_OWN;
 }
 
 /* ---- taskbar badge + flash (REQ-138, REQ-286) -----------------------------
@@ -1694,7 +1665,6 @@ static void notify_deliver(const char *title, const char *body, const char *sour
  * finer rule (count only what would have notified) is still an open call. */
 enum { FLASH_NEVER = 0, FLASH_IDLE = 1, FLASH_ALWAYS = 2 };
 static int  g_pref_flash = FLASH_IDLE;
-static int  g_flashes_raised;       /* observable by the harness; see test_dump */
 static int  g_badge_shown = -1;     /* overlay count last applied; -1 = never */
 
 /* Uploads on their way fill the taskbar button, so a long one can be watched
@@ -1721,7 +1691,6 @@ static void taskbar_flash(oc_win *hwnd) {
     if (g_pref_flash == FLASH_NEVER) return;
     if (g_pref_flash == FLASH_IDLE && oc_plat_idle_ms() < 30000) return;
     SDL_FlashWindow(hwnd->sdl, SDL_FLASH_UNTIL_FOCUSED);
-    g_flashes_raised++;
 }
 
 /* ---- inline image thumbnails -------------------------------------
@@ -1744,7 +1713,6 @@ enum { THUMB_CACHE = 32 };
  * included, so the per-shot bitmap machinery is gone. */
 static struct { uint64_t id; gfx_tex *tex; unsigned w, h; uint8_t *px; unsigned stride; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
-static int g_thumbs_off;                        /* a capture suppresses FETCHES only */
 static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
 static int      g_n_thumb_missing;
 static uint64_t g_thumb_pending;                /* one fetch in flight */
@@ -1763,7 +1731,7 @@ static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
 /* The expanded view pages through the open conversation's media: its place in
  * that sequence as last drawn (0-based, of g_lb_n), and the arrows' rects. */
-static int      g_lb_i = -1, g_lb_n;
+static int      g_lb_i = -1;
 static rectf    g_lb_prev, g_lb_next, g_lb_img;
 /* The video message overlay (recording card or player) is up; see draw_video_overlay. */
 static int g_vm;
@@ -1786,7 +1754,7 @@ static oc_client  *g_dict_client;         /* the client the session sends throug
 static void dict_forget(oc_client *c);    /* fwd: before a client is stopped */
 static void ftray_forget(oc_client *cl);   /* fwd: ...and its upload tray */
 #define VM_MAX_BTNS    12
-static rectf        g_vm_seek, g_vm_close, g_vm_vbox;
+static rectf        g_vm_seek, g_vm_close;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
 static int          g_n_vm_btns;
 static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H);   /* fwd */
@@ -1807,14 +1775,8 @@ static int have_camera(void) {
 }
 /* ---- agents (docs/details/MCP.md §7) ------------------------------------------
  * An agent is not a person: wherever its name is drawn, an "Agent" tag goes
- * beside it, and no presence, status or local time is shown for it. Each
- * surface that draws one counts it for the frame, so the harness can read
- * where tags were drawn (the dump's `agenttags` line). */
-enum { ATAG_TRANSCRIPT = 0, ATAG_MEMBERS, ATAG_MENTION, ATAG_PROFILE, ATAG_SEARCH, ATAG_SUMMARY, ATAG_N };
-static int      g_atag_n[ATAG_N];
-static int      g_via_n;   /* "via <client>" labels drawn in the last frame (AUTH.md §8.13) */
-static uint64_t g_atag_uid[ATAG_N];
-static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line);   /* fwd */
+ * beside it, and no presence, status or local time is shown for it. */
+static float agent_tag(gfx *rt, float x, rectf line);   /* fwd */
 
 static int is_video_msg(const oc_attachment *a) {
     return a && !a->reclaimed && a->media_kind == OC_MEDIA_VIDEO_MESSAGE;
@@ -2100,8 +2062,6 @@ enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVO
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
        CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST,
        CONF_PDM_TRUST, CONF_PDM_SAFETY,
-       /* New ones go last: the dump's `confirm act=` is this number, and the
-        * GUI harness reads it (CONF_CERT_TRUST is act=13 to tools/gui). */
        CONF_WS_FORGET_ALL, CONF_BROADCAST, CONF_DEACTIVATE_SELF, CONF_EMOJI_DELETE,
        /* A call started in a channel asks first, saying how many it will ring;
         * End for everyone asks before it ends the call (CALLS.md §2). */
@@ -2293,7 +2253,7 @@ static int g_notify_open, g_keys_open;
 static int g_about_open;
 /* What's new (CLIENT.md): the About card showing this build's release notes
  * instead of its rows, asked of the workspace's daemon without holding the
- * window (oc_client_get_release_notes). The state is the card's, and the dump's. */
+ * window (oc_client_get_release_notes). The state is the card's. */
 enum { WN_NONE = 0, WN_LOADING, WN_SHOWN, WN_NOTRELEASE, WN_FAILED };
 static int g_whatsnew;                 /* the About card shows What's new */
 static int g_wn_state;
@@ -2411,10 +2371,8 @@ static oc_player *g_listen_player;
  * listen player: hearing a sample must not disturb a channel being read aloud. */
 static oc_player *g_preview_player;
 static uint64_t  g_preview_asked_ms;   /* when the sample was asked for */
-static uint32_t   g_preview_wait_ms;    /* how long the last one took, for the dump */
 static uint8_t   *g_preview_bytes;
 static uint8_t   *g_listen_bytes;
-static size_t     g_listen_len;
 static uint64_t   g_listen_msg;
 static rectf g_ws_dot;            /* workspace connection dot */
 static int g_tab_hover = -1;
@@ -2536,9 +2494,8 @@ static int g_n_moreflyrows;
  * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
 /* MENU_MSG..MENU_THUMB are the CONTEXT menus (ARCH-98). They were native
  * TrackPopupMenu popups, which meant: OS-themed rather than ours, a modal message
- * loop that froze our tick and blocked the message-loop shortcuts, and — the part
- * that mattered most — completely undrivable and unscreenshottable by the harness,
- * so every context action was unverifiable except by hand.
+ * loop that froze our tick and blocked the message-loop shortcuts, and our own
+ * accessibility tree could not publish their items.
  *
  * They keep their OWN command numbers, dispatched per kind, because the dropdown
  * menus' `menu_dispatch` space is already crowded (1-8, 20-22, 40s, 70s, 100+,
@@ -2597,8 +2554,7 @@ static int menu_about(int kind, uint64_t target) {
 }
 static rectf g_menu_emoji[8];         /* per-glyph hit-boxes in MK_EMOJIROW */
 static int   g_n_menu_emoji;
-/* `cut`: the row's label did not fit the row, as last drawn -- for the dump. */
-static struct { float top, bot; int cmd, kind, cut; const char *label; } g_mirows[28];
+static struct { float top, bot; int cmd, kind; const char *label; } g_mirows[28];
 static int   g_n_mirows;
 /* The pause-notifications flyout (the app's one submenu): its own state, on
  * the More-flyout pattern — g_menu stays a single panel. */
@@ -2682,9 +2638,6 @@ static uint64_t g_edit_msg;             /* non-zero => composer is editing this 
 static int      g_preview;
 static uint64_t g_preview_ch;
 static rectf    g_preview_btn;
-static float    g_preview_h;            /* the rendered draft's height, lines and */
-static int      g_preview_lines, g_preview_tabs;   /* tables, for the dump */
-static int      g_preview_held;         /* images it did not ask for, for the dump */
 static void preview_set(oc_win *hwnd, int on);   /* fwd */
 static void preview_draw(gfx *rt, rectf box);     /* fwd */
 
@@ -2750,7 +2703,7 @@ static char  g_si_invite[128];
 static char  g_remember_ws[256];
 static rectf g_si_invite_link;
 static rectf g_si_reset_link;  /* "Have a reset code?" */
-static char  g_si_sub[300];    /* step 2's subtitle as last drawn, for the dump */
+static char  g_si_sub[300];    /* step 2's subtitle as drawn */
 static rectf g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
@@ -2769,7 +2722,6 @@ static rectf g_si_adv_link;
 static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
 static uint64_t g_si_started;    /* GetTickCount64 when the attempt began */
 static field *g_si_e_ws, *g_si_e_user, *g_si_e_pass;   /* the card's fields */
-static int   g_si_suffix_shown; /* the managed suffix, drawn beside the field last frame */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
  * password form, a browser button, or both. */
@@ -2848,8 +2800,6 @@ static uint32_t g_err_seq;
 static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
 static rectf g_retry_btn;              /* banner action hit-box */
 static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
-static rectf g_banner_r;                     /* where it was drawn, for the test dump */
-static int  g_test_demo_banner;              /* test hook: the demo notice, without a demo daemon */
 static int  g_banner_action;           /* what the banner's button does (FBA_*) */
 /* The draft a Delete took away, so its toast's Undo can put it back. */
 static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3]; int valid; } g_undo_draft;
@@ -2961,18 +2911,13 @@ static void toast_tick(const oc_model *m) {
         oc_fb_banner_clear(&g_fb, FBB_CONNECTION);
     }
     /* A public demo says so, all the time it is open (AUTH.md §8.12). */
-    if (m && m->authed && (m->workspace_mode == OC_WS_MODE_DEMO || g_test_demo_banner))
+    if (m && m->authed && m->workspace_mode == OC_WS_MODE_DEMO)
         oc_fb_banner_set(&g_fb, FBB_DEMO, OC_FB_INFO,
                          "This is a public demo: everyone here can read what you post, and it is all erased every night.",
                          NULL, 0);
     else
         oc_fb_banner_clear(&g_fb, FBB_DEMO);
 }
-
-/* Test/automation hook: when OPENCHIME_DEV_DIR is set, the app polls <dir>/cmd
- * each tick and can render itself to a file — a display-independent way to drive
- * and screenshot the client from WSL/CI without screen-scraping. */
-static char g_test_dir[512];
 
 /* ---- crash diagnosis --------------------------------------------- */
 
@@ -3031,16 +2976,6 @@ static oc_crumb_ring  g_crumbs_local;
 static oc_crumb_ring *g_ring = &g_crumbs_local;
 static char   g_ring_path[700];
 
-/* A death that runs no handler, for the harness: the CRT's fast-fail where the
- * platform has one, an immediate exit elsewhere. */
-static void crash_fastfail(void) {
-#if defined(_WIN32)
-    __fastfail(1);
-#else
-    _Exit(7);
-#endif
-}
-
 static void crumb(const char *fmt, ...) {
     oc_crumb_ring *r = g_ring;
     int32_t slot = __atomic_add_fetch(&r->n, 1, __ATOMIC_SEQ_CST) - 1;
@@ -3064,11 +2999,8 @@ static void crumbs_dump(FILE *f, const oc_crumb_ring *r, uint32_t now) {
     }
 }
 
-/* Where a crash report goes. The test dir when the harness is driving, because
- * then I can read it without going near the file system by hand; the
- * platform's per-user data directory for a real user. */
+/* Where a crash report goes: the platform's per-user data directory. */
 static void crash_dir(char *out, size_t cap) {
-    if (g_test_dir[0]) { snprintf(out, cap, "%s", g_test_dir); return; }
     oc_plat_data_dir(out, cap);
 }
 
@@ -3219,7 +3151,6 @@ typedef struct {
     int       pw, ph;         /* texture pixels */
     float     mw, mh;         /* layout metrics, DIPs */
     float     ox, oy;         /* ink offset inside the layout box, DIPs */
-    uint32_t  rgb;            /* the ink, kept for the paint ledger to report */
     unsigned  gen, stamp;
 } txt_ent;
 /* One cache per render target, for the reason cap_blit gives: a texture cannot
@@ -3281,7 +3212,6 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
     best->pw = g_cap_w; best->ph = g_cap_h;
     best->ox = g_cap_dx; best->oy = g_cap_dy;
     best->mw = m.w; best->mh = m.h;
-    best->rgb = rgb;
     best->gen = g_txt_gen;
     best->stamp = ++g_txt_stamp;
     return best;
@@ -3312,34 +3242,7 @@ static rectf baseline_align(rectf anchor, const fmtw *af, const fmtw *of,
     return rf(l, anchor.top + dy, r, anchor.bottom + dy);
 }
 
-/* CLIPPED TEXT, counted as it happens (chromefit's `clipped=`).
- *
- * The fit check compares published RECTANGLES, so a label whose box is the right
- * size and in the right place but whose glyphs do not fit inside it reads as
- * clean -- the Notifications card at 240 DPI had its section titles cut through
- * the middle and reported `overlaps=0 outside=0`. Nothing in a tree of rects can
- * see that; the only place it is knowable is here, where the ink and the rect it
- * is being drawn into are both in hand.
- *
- * INK, not the line box. A line box is ascent + descent + leading, pinned per
- * size token (ARCH-108), and legitimately overhangs a tight rect with nothing
- * cut off -- measuring that would report every second label. The raster is the
- * glyphs themselves.
- *
- * Against the text's OWN rect, not the clip in force. A row scrolled under the
- * fold of a list is cut by the list's clip and is ordinary; the same comparison
- * from the paint ledger cannot tell it from a defect, which is why that check
- * reports horizontal cuts only (TESTING.md). A string measured against the box
- * it was given has no such ambiguity in either axis: the box moving off screen
- * changes nothing about whether the words fit inside it.
- *
- * A DIP of slack, because a raster edge and a rect edge that agree in DIPs can
- * still land a fraction apart once scaled to device pixels. */
-static int   g_clip_n;            /* strings cut by their own rect, this frame */
-static char  g_clip_first[96];    /* ... and the first of them */
-static float g_clip_worst;        /* the deepest cut, DIPs */
-
-static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm, const char *s) {
+static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
     if (!e) return;
     float scale = gfx_scale(rt);
     float dw = e->pw / scale, dh = e->ph / scale;
@@ -3373,50 +3276,8 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm, const char *s
     }
     gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
-    /* The ledger cannot read a colour out of a raster, and must not mistake
-     * sdltext's padding for ink — both are told to it here (see st_draw, which
-     * rasterizes at width+2 x height+2). */
-    gfx_ink(rt, e->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
     gfx_clip_pop(rt);
-    /* `s` NULL exempts the string: a colour emoji's raster is not the ink it was
-     * asked for and its advance is not its ink -- a cell clips a few pixels of
-     * trailing advance and looks perfectly right doing it, forty times a picker
-     * (the same exemption the ledger's `content:emoji` tag makes). */
-    /* `s` NULL exempts the string: a colour emoji's raster is not the ink it was
-     * asked for and its advance is not its ink -- a cell clips a few pixels of
-     * trailing advance and looks perfectly right doing it, forty times a picker
-     * (the same exemption the ledger's `content:emoji` tag makes). */
-    if (s && s[0] && g_test_dir[0]) {
-        /* WHOLE LINES, from the layout metrics -- not the raster against the
-         * rect. The raster is the line box, ascent + descent + leading pinned per
-         * size token (ARCH-108), and it overhangs a tight row by a DIP or two
-         * with nothing cut off: measuring that reports every second label in the
-         * client. A line that does not fit is not a rounding question.
-         *
-         * `line_h` is that pinned box, so `mh` divides by it exactly; a third of
-         * a line of slack absorbs the last line's overhang and nothing wider. */
-        float rh = r.bottom - r.top, lh = fm->line_h;
-        int cut = 0;
-        if (lh > 0.5f) {
-            int have = (int)((rh + lh / 3.0f) / lh);
-            int want = (int)((e->mh + lh / 3.0f) / lh);
-            if (have < 1) have = 1;
-            if (want > have) cut = want - have;
-        }
-        /* HORIZONTALLY only where nothing trims. A format that does not wrap is
-         * given sdltext's ellipsis (mk_fmt_s), so running out of room ends in
-         * a "…" -- legible, deliberate, and a question of layout style rather
-         * than a defect. A WRAPPING format has no trimming to fall back on, so a
-         * word longer than its column is cut mid-glyph and nothing says so. */
-        float over_w = fm->wrap ? e->mw - (r.right - r.left) : 0;
-        if (cut || over_w > 1.0f) {
-            g_clip_n++;
-            float deep = cut ? cut * lh : over_w;
-            if (deep > g_clip_worst) g_clip_worst = deep;
-            if (!g_clip_first[0]) snprintf(g_clip_first, sizeof g_clip_first, "%s", s);
-        }
-    }
 }
 
 /* Width of `s` in `fmt`, for placing something immediately after it. */
@@ -3491,16 +3352,7 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
         }
     }
     if (!fmt) return;
-    /* Declared as content for the audit, and it is the honest label: a COLOUR
-     * glyph's raster is not tinted ink, so the colour handed to txt_get is not
-     * the colour on screen and asking what contrast it has against the surface
-     * behind it produces a number about nothing. Its advance is not its ink
-     * either -- an emoji cell clips a few pixels of trailing advance and looks
-     * perfectly correct doing it, which the truncation check would otherwise
-     * report once per cell, forty times a picker. */
-    gfx_tag(rt, "content:emoji");
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt, NULL);
-    gfx_tag(rt, NULL);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
     draw_emoji_fmt(rt, s, r, g_emoji);
@@ -3509,7 +3361,7 @@ static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
 static void draw_text(gfx *rt, const char *s, fmtw *fmt,
                       rectf r, uint32_t rgb) {
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt, s);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt);
 }
 
 /* Like draw_text, but tints every occurrence of a whitespace-separated term from
@@ -3650,15 +3502,21 @@ static fmtw *mk_fmt(const char *family, float size, int wt,
 static int   g_pref_textsize = 1;      /* 0 Small … 3 Largest */
 static int   g_pref_density = 1;       /* 0 compact, 1 cozy */
 /* Reduce motion (REQ-269, motion.h): Off, On, or Follow system, the default.
- * The system's answer is read at start and whenever the window gains focus;
- * the harness can stand in for it (`sysmotion`), so the Follow-system branch
- * is reachable without changing the machine. */
+ * The system's answer is read at start and whenever the window gains focus. */
 static int   g_pref_motion = OC_MOTION_SYSTEM;
 static int   g_sys_motion = -1;        /* oc_plat_reduce_motion(): 1, 0, -1 unknown */
-static int   g_sys_motion_test = -1;   /* test-only stand-in for it, 0 or 1; -1 none */
 static void motion_sys_read(void) { g_sys_motion = oc_plat_reduce_motion(); }
-static int  motion_sys(void) { return g_sys_motion_test >= 0 ? g_sys_motion_test : g_sys_motion; }
+static int  motion_sys(void) { return g_sys_motion; }
 static int  motion_reduced(void) { return oc_motion_reduced(g_pref_motion, motion_sys()); }
+/* High contrast (REQ-262, theme.h): Off, On, or Follow system, the default,
+ * the same pattern as Reduce motion. The system's answer is read at start,
+ * whenever the window gains focus and when the system's theme changes. */
+static int   g_pref_contrast = OC_HC_SYSTEM;
+static int   g_sys_contrast = -1;        /* oc_plat_high_contrast(): 1, 0, -1 unknown */
+static int  contrast_sys(void) { return g_sys_contrast; }
+static int  contrast_on(void) { return oc_high_contrast_on(g_pref_contrast, contrast_sys()); }
+static void contrast_apply(void);       /* fwd: re-applies the palette when the answer changes */
+static void contrast_sys_read(void) { g_sys_contrast = oc_plat_high_contrast(); contrast_apply(); }
 
 
 static float textsize_mult(void) {
@@ -3671,9 +3529,6 @@ static float textsize_mult(void) {
  * the system ships, Default being the platform's own. Follows the account like
  * text size, and is its own preview like text size. */
 static int   g_pref_font = OC_TYPEFACE_DEFAULT;
-/* Test-only (`fontfam <name>`): a family asked for by name, outside the list,
- * so the harness can ask for one no system has. Empty in a shipped client. */
-static char  g_font_test_family[64];
 static const char *g_font_used;        /* the family the formats are built with */
 static int   g_font_missing;           /* the family asked for is not installed */
 
@@ -3685,19 +3540,9 @@ static int ui_family_present(void *user, const char *family) {
     return g_st ? st_family_present(g_st, family) : 0;
 }
 
-/* The family asked for: the test override, else the choice from the list. */
-static const char *ui_family_asked(void) {
-    if (g_font_test_family[0]) return g_font_test_family;
-    int i = (g_pref_font < 0 || g_pref_font >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : g_pref_font;
-    return i == OC_TYPEFACE_DEFAULT ? oc_typeface_default(ui_family_present, NULL) : OC_TYPEFACES[i].family;
-}
-
 /* Resolve the family and read its figures: once per fonts_build. */
 static void ui_family_resolve(void) {
-    if (g_font_test_family[0])
-        g_font_used = oc_typeface_resolve_family(g_font_test_family, ui_family_present, NULL, &g_font_missing);
-    else
-        g_font_used = oc_typeface_resolve(g_pref_font, ui_family_present, NULL, &g_font_missing);
+    g_font_used = oc_typeface_resolve(g_pref_font, ui_family_present, NULL, &g_font_missing);
     if (!g_st || !st_family_metrics(g_st, g_font_used, &g_font_asc, &g_font_cap))
         g_font_asc = g_font_cap = 0.0f;   /* Segoe UI's figures (oc_typeface_pin) */
 }
@@ -3798,10 +3643,6 @@ static int gfx_stack_init(void) {
     if (!g_ren) return 0;
     g_gfx = gfx_create(g_ren);
     if (!g_gfx) return 0;
-    /* The paint ledger costs an allocation and a row per primitive, so it is on
-     * only while the harness is driving — the same gate every other test hook
-     * uses. A shipped client never allocates it. */
-    if (g_test_dir[0]) gfx_ledger_enable(g_gfx, 1);
     st_sink sink = { NULL, cap_blit };
     g_st = oc_plat_text_create(&sink);
     if (!g_st) return 0;
@@ -3927,7 +3768,7 @@ static void draw_chip_r(gfx *rt, rectf b, const char *label, int on) {
     fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hover ? OC_COL_HOVER : OC_COL_INPUT);
     if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, label, g_meta, b, on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+    draw_text(rt, label, g_meta, b, on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
 
@@ -4382,7 +4223,7 @@ static void draw_alert_badge(gfx *rt, const oc_model *m, float y) {
     float cx = RAIL_W / 2;
     rectf b = rf(cx + 6, y + 2, cx + 24, y + 20);
     fill_round(rt, b, OC_R_PILL, m->srvalerts_unacked ? OC_COL_DANGER : OC_COL_AWAY);
-    draw_lucide(rt, OC_ICON_ALERT, rf(b.left + 3, b.top + 3, b.right - 3, b.bottom - 3), 0xFFFFFF);
+    draw_lucide(rt, OC_ICON_ALERT, rf(b.left + 3, b.top + 3, b.right - 3, b.bottom - 3), OC_COL_ON_ACCENT);
 }
 
 /* The main nav items (the user's list). "More" is synthesized only on overflow. */
@@ -4407,7 +4248,6 @@ static int g_n_shelf;
 static int g_shelf_hover = -1;
 /* How many sidebar rows painted themselves SELECTED this frame. Two at once is a
  * defect the shot showed and no assertion could. */
-static int g_n_sbsel;
 static int ws_unread_elsewhere(void);   /* fwd */
 static int main_is_conversation(void); /* fwd — the sidebar's selection asks it too */
 static void ed_caret_kill(void);       /* fwd — the paint pass owns the caret's life */
@@ -4415,11 +4255,11 @@ static void caret_place(SDL_Rect area); /* fwd — the system caret, for every d
 static int  g_caret_placed;            /* set by caret_place, cleared each paint */
 
 static void avatar_want(uint64_t aid) {
-    if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
+    if (!aid || g_thumb_pending || !g_client) return;
     if (thumb_get(NULL, aid, NULL, NULL) || thumb_failed(aid)) return;
     /* Previewing sends nothing (CLIENT.md): it stays a placeholder, and the draw
      * after the preview closes asks. */
-    if (g_preview) { g_preview_held++; return; }
+    if (g_preview) return;
     g_thumb_pending = aid;
     g_thumb_deadline = now_ms() + 8000;
     oc_client_fetch_attachment(g_client, aid);
@@ -4452,7 +4292,7 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     if (oc_model_is_workspace_sender(m, uid)) {
         fill_round(rt, box, radius, OC_COL_ACCENT);
         float in = (box.right - box.left) * 0.22f;
-        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), 0xFFFFFF);
+        draw_lucide(rt, OC_ICON_HOME, rf(box.left + in, box.top + in, box.right - in, box.bottom - in), OC_COL_ON_ACCENT);
         return;
     }
     /* Removed from the workspace (REQ-033): shown disabled, a plain grey tile
@@ -4471,12 +4311,6 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
         if (draw_avatar_image(rt, aid, box, radius, 1)) return;
         avatar_want(aid);        /* not here yet: fall through to the initial */
     }
-    /* Tagged for the audit: an avatar's colour is derived from the user id, so
-     * it is CONTENT and deliberately outside the theme palette. Without the
-     * tag the palette check reports every person in the workspace as an
-     * unthemed colour, and a check that fires on correct code is one people
-     * learn to skip. */
-    gfx_tag(rt, "content:avatar");
     fill_round(rt, box, radius, tint);
     const char *nm = (name && name[0]) ? name : "user";
     char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
@@ -4484,7 +4318,6 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     fmt->align = ST_ALIGN_CENTER;
     draw_text(rt, ini, fmt, box, 0xFFFFFF);
     fmt->align = prev;
-    gfx_tag(rt, NULL);
 }
 
 /* A group conversation's marker: how many people are in it, not one of their
@@ -4533,7 +4366,7 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     if (g_nav_hover == NAV_SWITCHER) fill_round_a(rt, av, OC_R_AVATAR_LG, 0xFFFFFF, 0.12f);
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
-    draw_text(rt, init, g_avatar, av, 0xFFFFFF);
+    draw_text(rt, init, g_avatar, av, OC_COL_ON_ACCENT);
     /* "N elsewhere": unread sitting in the workspaces you are not
      * looking at. Without it, holding several clients would be invisible. */
     int elsewhere = ws_unread_elsewhere();
@@ -4548,7 +4381,7 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         rectf b = rf(av.right - bw + 6, av.top - 6, av.right + 6, av.top + 12);
         fill_round(rt, b, OC_R_PILL, OC_COL_DANGER);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, badge, g_meta, b, 0xFFFFFF);
+        draw_text(rt, badge, g_meta, b, OC_COL_ON_ACCENT);
         g_meta->align = ST_ALIGN_LEFT;
     }
     rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
@@ -4815,7 +4648,7 @@ static void draw_menu(gfx *rt) {
             }
         }
         char init[2] = { in0, 0 };
-        draw_text(rt, init, g_avatar, av, 0xFFFFFF);
+        draw_text(rt, init, g_avatar, av, OC_COL_ON_ACCENT);
         /* Three rows, 18px apart and non-overlapping (they used to collide). */
         draw_text(rt, nm, g_title, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
         char hostline[288]; oc_hostport(g_host, g_port, hostline, sizeof hostline);
@@ -4894,7 +4727,6 @@ static void draw_menu(gfx *rt) {
                 g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
                 g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
                 g_mirows[g_n_mirows].kind = MK_STATUSROW;
-                g_mirows[g_n_mirows].cut = 0;
                 g_mirows[g_n_mirows].label = g_mi[i].label;
                 g_n_mirows++;
             }
@@ -4906,8 +4738,6 @@ static void draw_menu(gfx *rt) {
             if (lit)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), OC_R_CONTROL, OC_COL_HOVER);
             uint32_t col = g_mi[i].danger ? OC_COL_DANGER : OC_COL_TEXT;
-            rectf lr = rf(x + MI_TEXT_L, cy, panel.right - MI_TEXT_R -
-                          (g_mi[i].kind == MK_SUB ? MI_CHEVRON : 0.0f), cy + ih);
             draw_text(rt, g_mi[i].label, g_ui, rf(x + MI_TEXT_L, cy, panel.right - MI_TEXT_R, cy + ih), col);
             if (g_mi[i].kind == MK_SUB) {
                 g_meta->align = ST_ALIGN_RIGHT;
@@ -4919,7 +4749,6 @@ static void draw_menu(gfx *rt) {
                 g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
                 g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
                 g_mirows[g_n_mirows].kind = g_mi[i].kind;
-                g_mirows[g_n_mirows].cut = text_width(g_mi[i].label, g_ui) > lr.right - lr.left;
                 g_mirows[g_n_mirows].label = g_mi[i].label;
                 g_n_mirows++;
             }
@@ -5024,7 +4853,7 @@ static void sidebar_surface(gfx *rt, float h) {
  * foot of the sidebar, the header's call button and the member picker. The core
  * does the signaling and the keys; the engine (client/core/call) the audio; this
  * is the view and the controls. Every control is a menu_dispatch command in the
- * CC_* range, so a click, a screen reader's invoke and the harness take one path. */
+ * CC_* range, so a click and a screen reader's invoke take one path. */
 
 enum { CC_MUTE = 2100, CC_LEAVE, CC_END, CC_JOIN, CC_DECLINE, CC_INVITE, CC_NS,
        CC_MICMENU, CC_SPKMENU, CC_HDR, CC_PLUS, CC_OPEN, CC_PICK_GO, CC_PICK_CANCEL,
@@ -5068,7 +4897,6 @@ static oc_client      *g_call_client;       /* the client whose call the engine 
 static uint64_t        g_call_view_id;      /* VIEW_CALL shows this call; 0 while one starts */
 static uint64_t        g_call_view_ch;      /* ...and beside it its chat (CALLS.md §1) */
 static uint64_t        g_cpage_id;          /* VIEW_CALLPAGE shows this call's page */
-static uint64_t        g_rec_notice_id;     /* the recorded call whose notice is up before joining */
 static uint64_t        g_rec_ack_id;        /* joined after the notice: acknowledged once gated */
 static uint64_t        g_home_ids[CH_ROWS_MAX];   /* Calls home's rows, by call */
 static int             g_n_home;
@@ -5093,27 +4921,15 @@ static int      g_pj_apply_mute, g_pj_apply_cam;
 static void newcall_closed(void);
 static int  newcall_room(const oc_model *m);
 static int  newcall_ticked(void);
-static rectf           g_rec_mark;          /* the Recording mark, as drawn */
-static rectf           g_calls_missed_mark; /* the sidebar's missed-calls mark, as drawn */
-/* The summary cards drawn this frame, for the dump. */
-static struct { uint64_t id; int live, faces, rec; } g_card_drawn[16];
-static int g_n_card_drawn;
 static float call_faces(gfx *rt, const oc_model *m, const uint64_t *faces, int n, float x, float cy);   /* fwd */
 static uint64_t        g_sb_live[16];       /* conversations the sidebar marked with a call going on */
 static int             g_n_sb_live;
 static float           g_call_chat_px;      /* where the call's chat column began, 0 none */
-static int             g_rec_notice_on;     /* the recorded call's notice is up */
 #define REC_RED 0xE5484D
 /* Self-view (CALLS.md §2): 0 your card among the others, 1 small in a corner,
  * 2 hidden; kept with the preferences (S:). */
 static int g_selfview;
 static rectf g_self_tile;                  /* the small self-view, as drawn */
-/* The recording marks drawn this frame, for the dump. */
-static struct { char where[8]; char label[80]; int stop; } g_rec_drawn[12];
-static int g_n_rec_drawn;
-/* What the call has said to a screen reader (CALLS.md §8): the latest few. */
-static char g_call_said[8][112];
-static unsigned g_n_call_said;
 static int             g_call_ns = 1;       /* noise suppression and gain (prefs z:) */
 static uint32_t        g_call_mic_h, g_call_spk_h;   /* the chosen devices, by id hash (prefs o:/p:) */
 static oc_audio_device g_call_mics[CC_MAX_DEV], g_call_spks[CC_MAX_DEV];
@@ -5132,7 +4948,6 @@ static struct { rectf r; uint64_t ch; } g_call_rows[8];
 static int             g_n_call_rows;
 static int             g_call_settings;     /* the call's settings panel is open */
 static int             g_call_start_ok;     /* a start's confirmation said yes (call_start_confirmed) */
-static int             g_call_banner_on;    /* the conversation shown has its call's banner */
 static int             g_call_chat_hidden;  /* the call view's conversation panel is folded away */
 static rectf           g_call_mute_btn;     /* the call view's Mute, for its tip */
 static uint32_t        g_call_err_seq;      /* the refusal last seen arrive, and when */
@@ -5187,7 +5002,7 @@ static int      g_cam_on;                /* this device's camera: turned on and 
 static uint32_t g_cam_h;                 /* the chosen camera, by a hash of its id (prefs j:) */
 static int      g_call_layout;           /* 0 the grid, 1 the speaker large (prefs l:) */
 static uint64_t g_call_speaker;          /* who the speaker layout shows large */
-/* What this frame drew, for the subscription and the test dump: each person's
+/* What this frame drew, for the subscription: each person's
  * card or tile, whether it showed their camera, and whether it was the large one. */
 static struct { uint64_t uid; rectf r; int cam, big, fno; } g_cam_drawn[OC_MAX_CALL_PARTICIPANTS];
 static int      g_n_cam_drawn;
@@ -5222,16 +5037,10 @@ static void call_rects_reset(void) {
     g_n_call_rows = 0;
     g_call_hdr_btn = g_calls_plus = g_cstrip = g_cstrip_mute = g_cstrip_leave = rf(0, 0, 0, 0);
     g_call_mute_btn = rf(0, 0, 0, 0);
-    g_call_banner_on = 0;
     g_share_stage = rf(0, 0, 0, 0);
     g_n_cam_drawn = 0;
-    g_rec_mark = rf(0, 0, 0, 0);
-    g_calls_missed_mark = rf(0, 0, 0, 0);
-    g_rec_notice_on = 0;
     g_n_home = 0;
-    g_n_card_drawn = 0;
     g_n_sb_live = 0;
-    g_n_rec_drawn = 0;
     g_self_tile = rf(0, 0, 0, 0);
     if (g_cpick_subject && !g_cpick_open) field_show(g_cpick_subject, 0);
     if (g_cpick_q && !g_cpick_open) field_show(g_cpick_q, 0);
@@ -5443,7 +5252,7 @@ static void draw_call_tile(gfx *rt, const oc_model *m, const oc_call_stats *st, 
     if (me ? st->muted && !st->ptt : ps && ps->muted) {
         rectf mb = rf(t.right - UIS(20), t.top + UIS(4), t.right - UIS(4), t.top + UIS(20));
         fill_round(rt, mb, UIS(8), OC_COL_DANGER);
-        draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
+        draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), OC_COL_ON_ACCENT);
     }
 }
 
@@ -5495,7 +5304,7 @@ static void call_button(gfx *rt, rectf b, int icon, const char *label, int on, i
     fill_round(rt, b, OC_R_CONTROL, bg);
     if (danger == 2) stroke_round(rt, b, OC_R_CONTROL, OC_COL_DANGER, 1.5f);
     else if (!on && !danger) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    uint32_t fg = danger == 2 ? OC_COL_DANGER : (on || danger) ? 0xFFFFFF : OC_COL_TEXT;
+    uint32_t fg = danger == 2 ? OC_COL_DANGER : (on || danger) ? OC_COL_ON_ACCENT : OC_COL_TEXT;
     float ic = UIS(18.0f), x = b.left + UIS(10);
     if (icon >= 0) {
         draw_lucide(rt, icon, rf(x, (b.top + b.bottom - ic) / 2, x + ic, (b.top + b.bottom + ic) / 2), fg);
@@ -5544,7 +5353,7 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         fill_round(rt, pill, UIS(9), invited ? OC_COL_ACCENT : OC_COL_INPUT);
         int oa = g_meta->align;
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, count, g_meta, pill, invited ? 0xFFFFFF : OC_COL_MUTED);
+        draw_text(rt, count, g_meta, pill, invited ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = oa;
     }
     if (in_rect(g_calls_plus, g_mouse_x, g_mouse_y)) fill_round(rt, g_calls_plus, OC_R_CONTROL, OC_COL_HOVER);
@@ -5560,9 +5369,8 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         fill_round(rt, mp, UIS(9), OC_COL_DANGER);
         int oa = g_meta->align;
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, mc, g_meta, mp, 0xFFFFFF);
+        draw_text(rt, mc, g_meta, mp, OC_COL_ON_ACCENT);
         g_meta->align = oa;
-        g_calls_missed_mark = mp;
     }
     char an[120];
     snprintf(an, sizeof an, "Calls: %zu going on%s%s", m->n_calls, invited ? ", you are asked to join" : "",
@@ -5615,20 +5423,12 @@ static rectf draw_rec_mark(gfx *rt, const oc_model *m, float left, float cy, uin
         snprintf(aid, sizeof aid, "%s.recmark.stop", where);
         call_btn_add(sb, CC_REC_STOP, aid, "Stop recording");
     }
-    if (g_n_rec_drawn < (int)(sizeof g_rec_drawn / sizeof g_rec_drawn[0])) {
-        snprintf(g_rec_drawn[g_n_rec_drawn].where, sizeof g_rec_drawn[0].where, "%s", where);
-        snprintf(g_rec_drawn[g_n_rec_drawn].label, sizeof g_rec_drawn[0].label, "%s", lbl);
-        g_rec_drawn[g_n_rec_drawn].stop = stop;
-        g_n_rec_drawn++;
-    }
     return mk;
 }
 
-/* Said to a screen reader once, and kept for the dump. */
+/* Said to a screen reader once. */
 static void call_say(const char *text) {
     oc_a11y_announce(text);
-    snprintf(g_call_said[g_n_call_said % 8], sizeof g_call_said[0], "%s", text);
-    g_n_call_said++;
 }
 
 static float call_strip_h(const oc_model *m) {
@@ -5789,10 +5589,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
             { VIEW_DIRECTORY, "People", OC_ICON_USER },
         };
         float sy = top;
-        g_n_sbsel = 0;
         for (size_t si = 0; si < sizeof SHELF / sizeof SHELF[0]; si++) {
             int on = (g_view == SHELF[si].view);
-            if (on) g_n_sbsel++;
             /* Inset 2px exactly as a conversation row's selection is: two
              * highlight shapes in one column read as a defect, not a style. */
             rectf row = rf(sx0, sy + 2, sx1, sy + ROW_H - 2);
@@ -5832,7 +5630,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 fill_round(rt, pill, ph / 2, OC_COL_ACCENT);
                 { int oa = g_micro->align;
                   g_micro->align = ST_ALIGN_CENTER;
-                  draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
+                  draw_text(rt, badge, g_micro, pill, OC_COL_ON_ACCENT);
                   g_micro->align = oa; }
             } else if (badge[0]) {
                 /* Drafts waiting + anything that FAILED to send — drawn in
@@ -5910,7 +5708,6 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
              * has the main area, but painting it selected then lit two rows at
              * once. */
             int selected = (r->channel_id == g_sel) && main_is_conversation();
-            if (selected) g_n_sbsel++;
             /* MUTED (REQ-137): the row de-emphasises and its badge goes.
              * This is what makes mute different from notification level "none" —
              * level silences the notification, mute also stops the conversation
@@ -6003,7 +5800,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 rectf br = rf(sx1 - UIS(40), ry + 6, sx1 - UIS(10), ry + ROW_H - 6);
                 fill_round(rt, br, OC_R_PILL, OC_COL_ACCENT);
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, badge, g_meta, br, 0xFFFFFF);
+                draw_text(rt, badge, g_meta, br, OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             } else if (r->channel_id && oc_model_call_from(m, r->channel_id)) {
                 /* A call going on, started here: the phone, as Slack marks a huddle. */
@@ -6385,7 +6182,7 @@ static int tables_uncovered(uint64_t mid, const oc_rt_spoiler *sv, size_t nsv, o
     }
     return kept;
 }
-/* The spoilers drawn this frame, for a click, assistive technology and the dump.
+/* The spoilers drawn this frame, for a click and assistive technology.
  * Every spoiler is covered whether or not it finds room here: past the bound one
  * is revealed by the message's "Show spoilers". */
 enum { SPL_HITS = 256 };
@@ -6559,7 +6356,6 @@ typedef struct {
     int        pw, ph;
     float      mh;        /* height as drawn, DIPs: the layout's, each table's band
                            * swapped for its grid */
-    uint32_t   rgb;       /* the ink, kept for the paint ledger to report */
     size_t     blen;      /* body byte length (selection clamps to it) */
     /* the inline boxes (custom emoji, time tokens): where they landed, and
      * what each draws; the entry's own, freed with it */
@@ -7397,8 +7193,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     }
 
     /* Raster now, once; the texture is what frames blit. */
-    best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
-    st_draw(g_st, lay, 0, 0, best->rgb, 1.0f);
+    st_draw(g_st, lay, 0, 0, msg->deleted ? OC_COL_FAINT : OC_COL_TEXT, 1.0f);
     best->mid = msg->message_id;
     best->sig = sig;
     best->cw = cw;
@@ -7584,32 +7379,20 @@ static float tscroll_get(uint64_t mid, int idx) {
 
 /* Every grid drawn this frame: its frame (grid coordinates are frame.left -
  * scroll, frame.top), the part of it on screen, and how far it scrolls -- what
- * the wheel, the context menu, assistive technology and the dump ask about. */
+ * the wheel, the context menu and assistive technology ask about. */
 typedef struct {
     uint64_t mid;
     int      idx, thr;        /* the table's index in the body; drawn in the thread pane */
     float    cw;              /* the width its message was laid out at */
     rectf    frame, vis;
     float    scroll, max;
-    float    btop, bbot;      /* the whole body as drawn, for the dump */
 } tabhit;
 static tabhit g_tabhits[TABHITS];
 static int    g_n_tabhits;
 static rectf  g_tab_clip;     /* what the list drawing a message shows of it */
 static int    g_tab_thr;      /* ... and whether that list is the thread pane */
 
-static const tabhit *tabhit_find(uint64_t mid, int idx, int thr) {
-    for (int i = 0; i < g_n_tabhits; i++)
-        if (g_tabhits[i].mid == mid && g_tabhits[i].idx == idx && g_tabhits[i].thr == thr)
-            return &g_tabhits[i];
-    return NULL;
-}
-
 static void time_box_draw(gfx *rt, const oc_msg *msg, int64_t ms, rectf box);   /* fwd */
-/* The custom emoji drawn in message bodies and their tables this frame, for
- * the dump. */
-static int g_n_emojiboxes;
-
 /* A cell's spoilers that are shown, or that are not, its text at ox,oy in the
  * column [cx0, cx1): as the body's covers (spoiler_covers), kept to the column,
  * and a click's only where the grid's frame and the list show them. */
@@ -7631,7 +7414,7 @@ static void mcell_covers(gfx *rt, const oc_msg *msg, const mcell *cl, float ox, 
             }
             if (shown) fill_round_a(rt, c, OC_R_CONTROL, OC_COL_MUTED, 0.16f);
             else       fill_round(rt, c, OC_R_CONTROL, OC_COL_MUTED);
-            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), 0xFFFFFF);
+            if (!q && !shown) draw_text(rt, "Spoiler", g_meta, rf(c.left + 4, c.top, c.right, c.bottom), OC_COL_ON_ACCENT);
             if (!q) hit = c;
             else { if (c.left < hit.left) hit.left = c.left; if (c.right > hit.right) hit.right = c.right; hit.bottom = c.bottom; }
         }
@@ -7692,14 +7475,12 @@ static void mtab_draw(gfx *rt, const oc_msg *msg, mlay_ent *e, int k, float x, f
             mcell_covers(rt, msg, cl, ox, oy, cx0, cx1, frame, clip, 1);
             if (cl->tex) {
                 gfx_rect dst = { ox + cl->dx, oy + cl->dy, cl->pw / sc, cl->ph / sc };
-                gfx_ink(rt, OC_COL_TEXT, ST_RASTER_PAD, ST_RASTER_PAD);
                 gfx_tex_draw(rt, cl->tex, dst, 0.0f, 1.0f);
             }
             for (int i = 0; i < cl->nbox; i++) {
                 const st_rect *br = &cl->box[i].r;
                 rectf box = rf(ox + br->x, oy + br->y, ox + br->x + br->w, oy + br->y + br->h);
                 if (!cl->box[i].aid) { time_box_draw(rt, msg, cl->box[i].ms, box); continue; }
-                g_n_emojiboxes++;
                 if (!draw_avatar_image(rt, cl->box[i].aid, box, 3.0f, 1)) {
                     avatar_want(cl->box[i].aid);
                     draw_text(rt, ":…:", g_meta, box, OC_COL_FAINT);
@@ -7762,21 +7543,18 @@ static void body_draw_split(gfx *rt, const oc_msg *msg, mlay_ent *e, float tx, f
         if (hi > lo && e->tex) {
             gfx_clip_push(rt, gr(rf(tx - UIS(20.0f), by + lo + d, right + UIS(20.0f), by + hi + d)));
             gfx_rect dst = { tx, by + d, e->pw / sc, e->ph / sc };
-            gfx_ink(rt, e->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
             gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
             gfx_clip_pop(rt);
         }
         if (k < e->ntab) {
-            int h = g_n_tabhits;
             mtab_draw(rt, msg, e, k, tx, by + e->tab[k].top, cw);
-            if (h < g_n_tabhits) { g_tabhits[h].btop = by; g_tabhits[h].bbot = by + e->mh; }
             d += e->tab[k].seg_h - (e->tab[k].band1 - e->tab[k].band0);
         }
     }
 }
 
 /* The time tokens drawn this frame, every one, where and which moment: for the
- * hover's full date and zone (time_tip_draw), keyboard focus's, and the dump.
+ * hover's full date and zone (time_tip_draw) and keyboard focus's.
  * Grown as a frame needs; short of memory, a token is drawn without its tip. */
 static struct timehit { rectf r; uint64_t mid; int64_t ms; } *g_timehits;
 static int g_n_timehits, g_timehits_cap;
@@ -7881,7 +7659,6 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
     } else if (body->tex) {
         float sc = gfx_scale(rt);
         gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
-        gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
         gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
     }
     /* A covered spoiler's cover, solid and over its text, so nothing in the
@@ -7911,7 +7688,6 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
             time_box_draw(rt, msg, body->box[i].ms, box);
             continue;
         }
-        g_n_emojiboxes++;
         if (!draw_avatar_image(rt, body->box[i].aid, box, 3.0f, 1)) {
             avatar_want(body->box[i].aid);
             /* Until the bytes arrive the shortcode is the honest
@@ -7926,7 +7702,7 @@ static float body_draw(gfx *rt, const oc_msg *msg, mlay_ent *body, float tx, flo
         spoiler_caption(msg, body, k, cap, sizeof cap);
         float ry = mtab_down(body, body->spl[k].r[0].y);
         draw_text(rt, cap, g_meta, rf(tx + body->spl[k].r[0].x + 4, by + ry,
-                                      tx + content_w, by + ry + body->spl[k].r[0].h), 0xFFFFFF);
+                                      tx + content_w, by + ry + body->spl[k].r[0].h), OC_COL_ON_ACCENT);
     }
     return body->mh;
 }
@@ -8013,7 +7789,7 @@ static void draw_snippet_card(gfx *rt, const oc_msg *msg, const oc_attachment *a
     } else {
         draw_text(rt, snip_failed(at->id) ? "preview unavailable" : "loading\xE2\x80\xA6", g_meta,
                   rf(x, y, card.right, y + LINE_H), OC_COL_FAINT);
-        if (!g_preview && !g_thumbs_off) snip_want(at->id);
+        if (!g_preview) snip_want(at->id);
     }
     if (g_n_snip_hits < (int)(sizeof g_snip_hits / sizeof g_snip_hits[0])) {
         g_snip_hits[g_n_snip_hits].r = card;
@@ -8058,7 +7834,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         rectf hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
         draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
         float tagw = oc_model_user_is_agent(m, msg->author_id)
-                   ? agent_tag(rt, ATAG_TRANSCRIPT, msg->author_id, tx + text_width(nm, g_title) + 8, hl) : 0;
+                   ? agent_tag(rt, tx + text_width(nm, g_title) + 8, hl) : 0;
         if (msg->via[0]) {
             /* Posted through an AI client (AUTH.md §8.13): said beside the author. */
             char via[128];
@@ -8066,7 +7842,6 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             float vx = tx + text_width(nm, g_title) + 8 + tagw;
             draw_text(rt, via, g_meta, baseline_align(hl, g_title, g_meta, vx, hl.right), OC_COL_MUTED);
             tagw += text_width(via, g_meta) + 8;
-            g_via_n++;
         }
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
@@ -8245,7 +8020,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             rectf box = rf(mx, my, mx + mk, my + mk);
             if (k->done) { fill_round(rt, box, UIS(3.0f), OC_COL_ACCENT); done++; }
             stroke_round(rt, box, UIS(3.0f), k->done ? OC_COL_ACCENT : OC_COL_MUTED, 1.0f);
-            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), 0xFFFFFF);
+            if (k->done) draw_lucide(rt, OC_ICON_CHECK, rf(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), OC_COL_ON_ACCENT);
             char who[96] = "";
             if (k->done && k->done_by) {
                 const char *nm = oc_model_user_name((oc_model *)m, k->done_by);
@@ -8307,7 +8082,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             gfx_tex *pbmp = at->poster_id ? thumb_get(rt, at->poster_id, &iw, &ih) : NULL;
             fill_round(rt, area, OC_R_CONTROL, 0x101010);
             if (pbmp) gfx_tex_draw(rt, pbmp, gr(area), OC_R_CONTROL, 1.0f);
-            else if (at->poster_id && !g_preview && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
+            else if (at->poster_id && !g_preview && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
                 g_thumb_pending = at->poster_id;
                 g_thumb_deadline = now_ms() + 8000;
                 oc_client_fetch_attachment(g_client, at->poster_id);
@@ -8375,12 +8150,8 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                 draw_text(rt, thumb_failed(key) ? "preview unavailable" : "loading\u2026",
                           g_meta, ph, OC_COL_FAINT);
                 g_meta->align = ST_ALIGN_LEFT;
-                /* Ask for it — one at a time, and only for what is on screen.
-                 * Never while thumbnails are suppressed for the screenshot
-                 * harness: that render is not the user's screen, and treating
-                 * its forced miss as "not fetched yet" re-requested every image
-                 * on every shot. */
-                if (!g_preview && !g_thumbs_off && !thumb_failed(key) && !g_thumb_pending && g_client) {
+                /* Ask for it — one at a time, and only for what is on screen. */
+                if (!g_preview && !thumb_failed(key) && !g_thumb_pending && g_client) {
                     g_thumb_pending = key;
                     g_thumb_deadline = now_ms() + 8000;
                     img_fetch(at->id, at->mime, OC_PREVIEW_RUNG_INLINE_WIRE);
@@ -8689,13 +8460,6 @@ static void draw_call_event(gfx *rt, const oc_model *m, const oc_msg *msg, rectf
             }
         }
         draw_text(rt, line, g_meta, rf(lx, ly - UIS(10), bx, ly + UIS(10)), OC_COL_MUTED);
-        if (g_n_card_drawn < 16) {
-            g_card_drawn[g_n_card_drawn].id = msg->call_id;
-            g_card_drawn[g_n_card_drawn].live = live;
-            g_card_drawn[g_n_card_drawn].faces = nf;
-            g_card_drawn[g_n_card_drawn].rec = h && (h->flags & OC_CALL_HIST_RECORDING);
-            g_n_card_drawn++;
-        }
         return;
     }
     /* A missed call stored before calls had their own records: said from the
@@ -9266,7 +9030,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
         int on = g_search_sort == (uint8_t)k, hot = in_rect(b, g_mouse_x, g_mouse_y);
         fill_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : hot ? OC_COL_HOVER : OC_COL_INPUT);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, SORTS[k], g_meta, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        draw_text(rt, SORTS[k], g_meta, b, on ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_meta->align = ST_ALIGN_LEFT;
         g_srch_sort_btn[k] = b;
         sx = b.left - 4;
@@ -9328,7 +9092,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
             /* The name, its Agent tag, then the rest of the line after it. */
             draw_text(rt, aun, g_meta, hrow, OC_COL_MUTED);
             hx += text_width(aun, g_meta) + 6;
-            hx += agent_tag(rt, ATAG_SEARCH, r->author_id, hx, hrow);
+            hx += agent_tag(rt, hx, hrow);
             snprintf(head, sizeof head, "·  %s  ·  %s", (ch && ch->name) ? ch->name : "channel", when);
         } else {
             snprintf(head, sizeof head, "%s  ·  %s  ·  %s", aun, (ch && ch->name) ? ch->name : "channel", when);
@@ -10256,7 +10020,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
                 if (!days[d].enabled) stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
                 if (days[d].enabled) {
                     g_meta->align = ST_ALIGN_CENTER;
-                    draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+                    draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
                     g_meta->align = ST_ALIGN_LEFT;
                 }
                 g_sched_day_chk[d] = chk;
@@ -10350,7 +10114,6 @@ static void scale_apply(oc_win *hwnd);        /* fwd — text size / zoom (ARCH-
 static void dpi_set(oc_win *hwnd, unsigned dpi);  /* fwd */
 static void layout_search(oc_win *hwnd);     /* fwd */
 static int  window_is_covered(void);      /* fwd */
-static int  g_a11y_n;    /* items published last frame — reported, so the tree is assertable */
 static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined beside the composer state it reads */
 
 /* Move `delta` conversations through the sidebar as it is currently shown, so
@@ -10370,20 +10133,12 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
  * `GetFocus()` returns NULL for our thread, and the composer's auto-focus — which
  * is gated on exactly that — never fires. Every keystroke is dropped until the
  * user clicks, which is what the idle-focus comment further down describes and
- * what this closes properly.
- *
- * It also fixed the thing that had been reported as a flaky smoke failure three
- * times: the suite launches a client while it is still killing the previous one
- * through a PowerShell interop process, and that contention is precisely the case
- * where the show does not activate. A clean launch with nothing competing
- * activated every time, which is why the A/B against an older build looked like a
- * regression and then refused to reproduce. */
+ * what this closes properly. */
 static void show_and_focus(oc_win *hwnd) {
     if (!hwnd || !hwnd->sdl) return;
-    /* Whatever brought the window back -- the tray icon, a permalink, the test
-     * harness -- it is no longer hidden. Cleared HERE because this is the one
+    /* Whatever brought the window back -- the tray icon, a permalink -- it is no
+     * longer hidden. Cleared HERE because this is the one
      * function that shows it. */
-    g_hidden_to_tray = 0;
     SDL_ShowWindow(hwnd->sdl);
     /* A minimised window is "shown" too, so without this "show and focus"
      * left an iconic window iconic: focused, painting nothing. */
@@ -10719,20 +10474,7 @@ static void accel_run(oc_win *hwnd, int action) {
 /* Called from on_event for every key press and release. Returns 1 when it
  * claimed the key, so no field or handler sees it and the text SDL sends for
  * the same press is dropped (g_claimed_text). */
-/* ---- who is holding a modifier ---------------------------------------------
- * Normally the real keyboard. While the harness is delivering a SYNTHETIC chord
- * this holds the modifier set it means, and the handlers read that instead.
- *
- * The harness used to fake the chord by writing the thread's key state with
- * SetKeyboardState and letting the handlers read it back with GetKeyState. That
- * round trip through the OS is racy: Windows resyncs a thread's input state from
- * the real keyboard around focus and foreground changes, so a synthetic Ctrl
- * could be gone by the time it was read — intermittently, and only on the runs
- * where the window was not foreground. It produced years-of-your-life failures
- * that moved between runs and never reproduced by hand. The
- * state does not need to travel through the OS at all: the hook knows which
- * modifiers it means, so it says so. */
-static int g_synth_mods = -1;
+/* ---- who is holding a modifier --------------------------------------------- */
 
 /* While a key event is handled, the modifiers held when that key was pressed
  * (its own e->key.mod), not the keyboard's state now. The browser hands SDL its
@@ -10743,10 +10485,6 @@ static int g_synth_mods = -1;
 static int g_event_mods = -1;
 
 static int mod_down(int vk) {
-    if (g_synth_mods >= 0)
-        return vk == OCK_CONTROL ? !!(g_synth_mods & AM_CTRL)
-             : vk == OCK_ALT     ? !!(g_synth_mods & AM_ALT)
-             : vk == OCK_SHIFT   ? !!(g_synth_mods & AM_SHIFT) : 0;
     SDL_Keymod m = g_event_mods >= 0 ? (SDL_Keymod)g_event_mods : SDL_GetModState();
     return vk == OCK_CONTROL ? (m & SDL_KMOD_CTRL) != 0
          : vk == OCK_ALT     ? (m & SDL_KMOD_ALT) != 0
@@ -10774,7 +10512,6 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
         return 1;
     }
     if (up) return 0;
-    g_kb_ran = 0;                        /* the dump's ran= is this press's, or 0 */
     if (VM_UP() && !alt && vm_key(hwnd, key)) { invalidate(); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
@@ -10977,7 +10714,7 @@ static const char *about_server(const oc_model *m) {
 
 enum { ABOUT_ROWS = 3 };   /* client, server, protocol: the card is sized to them */
 
-/* The one line Copy puts on the clipboard, and the test hook's ack. */
+/* The one line Copy puts on the clipboard. */
 static void about_text(const oc_model *m, char *out, size_t cap) {
     snprintf(out, cap, "OpenChime client %s (%s), server %s, protocol %u",
              OC_BUILD_ID, oc_plat_name(), about_server(m), (unsigned)OC_PROTOCOL_VERSION);
@@ -11522,7 +11259,7 @@ static rectf chip(gfx *rt, float x, float y, const char *label,
     if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_meta, b,
-              on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+              on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
     return b;
 }
@@ -11864,7 +11601,7 @@ static void draw_files_view(gfx *rt, const oc_model *m, rectf reg) {
     g_file_up_btn = rf(reg.right - 116, reg.top + 14, reg.right - 20, reg.top + 42);
     fill_round(rt, g_file_up_btn, OC_R_CONTROL, OC_COL_ACCENT);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Upload", g_meta, g_file_up_btn, 0xFFFFFF);
+    draw_text(rt, "Upload", g_meta, g_file_up_btn, OC_COL_ON_ACCENT);
     g_meta->align = ST_ALIGN_LEFT;
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     rectf body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
@@ -11904,6 +11641,9 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
             g_pref_hits[g_n_pref_hits].val = i;
+            g_pref_hits[g_n_pref_hits].label = label;
+            g_pref_hits[g_n_pref_hits].text = opts[i];
+            g_pref_hits[g_n_pref_hits].on = on;
             g_n_pref_hits++;
         }
         bx = b.left - 6;
@@ -11948,10 +11688,38 @@ enum { PREF_ROW_SAY_SENDER = 120, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
 /* Appearance's Reduce motion (REQ-269): a number of its own, so the rows
  * above keep theirs. */
 enum { PREF_ROW_MOTION = 130 };
+/* ...and High contrast (REQ-262), beside it. */
+enum { PREF_ROW_CONTRAST = 131 };
+
+/* Each row's name in its choices' automation ids, `prefs.<name>.<value>`
+ * (REQ-290). Fixed here rather than derived from the label, so rewording a row
+ * or re-laying its chips out cannot move an id. */
+static const struct { int row; const char *aid; } PREF_ROW_AIDS[] = {
+    { PREF_ROW_THEME, "theme" },         { PREF_ROW_ACCENT, "scheme" },
+    { PREF_ROW_FONT, "font" },           { PREF_ROW_TEXTSIZE, "textsize" },
+    { PREF_ROW_DENSITY, "density" },     { PREF_ROW_MOTION, "motion" },
+    { PREF_ROW_CONTRAST, "contrast" },
+    { PREF_ROW_MEMBERS, "members" },     { PREF_ROW_TOASTPOS, "notices" },
+    { PREF_ROW_TIME, "time" },           { PREF_ROW_DAYSEP, "daysep" },
+    { PREF_ROW_EDITOR, "editor" },       { PREF_ROW_ENTER, "enter" },
+    { PREF_ROW_EMOTICONS, "emoticons" }, { PREF_ROW_DELIVER, "deliver" },
+    { PREF_ROW_NOTIFY, "notify" },       { PREF_ROW_SNDMUTE, "sound" },
+    { PREF_ROW_FLASH, "flash" },         { PREF_ROW_NOTIFY + 100, "levels" },
+    { PREF_ROW_CLOSE, "close" },         { PREF_ROW_MINTRAY, "mintray" },
+    { PREF_ROW_STARTUP, "startup" },     { PREF_ROW_RESET, "reset" },
+    { PREF_ROW_SAY_SENDER, "say.sender" },       { PREF_ROW_SAY_TIME, "say.time" },
+    { PREF_ROW_SAY_REACTIONS, "say.reactions" }, { PREF_ROW_SAY_REPLIES, "say.replies" },
+    { PREF_ROW_SAY_ORDER, "say.order" },         { PREF_ROW_ANNOUNCE_NEW, "announcenew" },
+};
+static const char *pref_row_aid(int row) {
+    for (size_t i = 0; i < sizeof PREF_ROW_AIDS / sizeof PREF_ROW_AIDS[0]; i++)
+        if (PREF_ROW_AIDS[i].row == row) return PREF_ROW_AIDS[i].aid;
+    return NULL;
+}
 
 /* One of Accessibility's rows set to choice `v`: the one path the rows' clicks
- * and the harness's `spoken` verb both take. 0 when `row` is not one of them.
- * Saved by the caller (Save, or the verb), as every other row is. */
+ * take. 0 when `row` is not one of them. Saved by the caller (Save), as every
+ * other row is. */
 static int spoken_pref_set(int row, int v) {
     v = v ? 1 : 0;
     switch (row) {
@@ -11974,8 +11742,7 @@ static int spoken_pref_set(int row, int v) {
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-/* ACCESSIBILITY comes last, after the categories that were here before it, so
- * each of theirs keeps its index (`prefs <index>` in the harness). */
+/* ACCESSIBILITY comes last, after the categories that were here before it. */
 enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_AICLIENTS,
        PC_ACCESSIBILITY, PC_COUNT };
 /* SYSTEM is where the application behaves as an application rather than as a
@@ -12002,14 +11769,8 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
          * they have on screen, where the accent appears ON the rail. Two half-discs
          * were the alternative and read as a single two-tone colour rather than as
          * a surface and a highlight. */
-        /* Tagged as content for the audit: a swatch shows a scheme you have
-         * NOT picked, so three of the four are deliberately colours the theme
-         * in force does not name. Untagged, the palette check reports the
-         * chooser as four unthemed surfaces every time it is opened. */
-                gfx_tag(rt, "content:swatch");
                 gfx_ellipse(rt, cx, cy, 11, 11, oc_theme_scheme_rail(i), 1.0f);
                 gfx_ellipse(rt, cx, cy, 5.5f, 5.5f, oc_theme_scheme_accent(i), 1.0f);
-                gfx_tag(rt, NULL);
         if (i == oc_theme_scheme()) {
             /* A ring, not a tick: a tick in the accent colour on the accent colour is
              * invisible, and one in white is invisible on the light swatches. */
@@ -12019,6 +11780,9 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = PREF_ROW_ACCENT;
             g_pref_hits[g_n_pref_hits].val = i;
+            g_pref_hits[g_n_pref_hits].label = "Colour scheme";
+            g_pref_hits[g_n_pref_hits].text = oc_theme_scheme_name(i);
+            g_pref_hits[g_n_pref_hits].on = (i == oc_theme_scheme());
             g_n_pref_hits++;
         }
         bx = b.left - 6;
@@ -12030,8 +11794,14 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
               rf(body.left + 24, y, swatch_left - 12, y + 22), OC_COL_TEXT);
     {
         char hint[96];
-        snprintf(hint, sizeof hint, "%s: the sidebar and the accent.",
-                 oc_theme_scheme_name(oc_theme_scheme()));
+        /* High contrast has a fixed palette of its own: the scheme picked is
+         * kept, and applies again when high contrast goes off. */
+        if (oc_theme_high_contrast())
+            snprintf(hint, sizeof hint, "%s: does not apply while high contrast is on.",
+                     oc_theme_scheme_name(oc_theme_scheme()));
+        else
+            snprintf(hint, sizeof hint, "%s: the sidebar and the accent.",
+                     oc_theme_scheme_name(oc_theme_scheme()));
         draw_text(rt, hint, g_meta,
                   rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
     }
@@ -12133,6 +11903,11 @@ static void draw_prefs(gfx *rt, rectf reg) {
     if (g_pref_cat == PC_APPEARANCE) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
                      "System follows the Windows theme.", THEMES, 3, oc_theme_mode());
+        static const char *CONTRASTS[3] = { "Off", "On", "Follow system" };
+        y = pref_row(rt, body, y, PREF_ROW_CONTRAST, "High contrast",
+                     "Stronger colours, in light and dark; the colour scheme does not apply. "
+                     "Follow system uses the system's own setting.",
+                     CONTRASTS, 3, g_pref_contrast);
         y = pref_accent_row(rt, body, y);
         {
             const char *FONTS[OC_TYPEFACE_COUNT];
@@ -12271,11 +12046,8 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Sign in and start receiving messages when you sign in.",
                      ONOFF2, 2, startup_enabled() ? 1 : 0);
         /* Reset ends the category it belongs to. "Advanced" held this and a DPI
-         * override and nothing else; the override was a harness affordance that
-         * had no business being a user-facing setting, and one button is not a
-         * category. The app manages DPI from what Windows reports (ARCH-97) and
-         * the harness drives it through the `dpi` verb, which never went through
-         * here. */
+         * override and nothing else; the override had no business being a
+         * user-facing setting, and one button is not a category. The app manages DPI from what Windows reports (ARCH-97). */
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
@@ -12345,7 +12117,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
          * nothing it does not have -- no presence, no status, no local time, no
          * conversation of its own (docs/details/MCP.md §7). */
         float tw = text_width("Agent", g_meta) + UIS(16);
-        agent_tag(rt, ATAG_PROFILE, g_profile_uid, cx - tw / 2, rf(reg.left + 12, y, reg.right - 12, y + 20));
+        agent_tag(rt, cx - tw / 2, rf(reg.left + 12, y, reg.right - 12, y + 20));
         y += 34;
     } else {
     uint8_t pres = oc_model_presence_of(m, g_profile_uid);
@@ -12373,7 +12145,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         g_prof_dm_btn = rf(reg.left + 24, y, reg.right - 24, y + 32);
         fill_round(rt, g_prof_dm_btn, OC_R_CONTROL, OC_COL_ACCENT);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
+        draw_text(rt, "Message", g_ui, g_prof_dm_btn, OC_COL_ON_ACCENT);
         g_ui->align = ST_ALIGN_LEFT;
         y += 40;
         /* Mute them, for me alone; the button says which way it goes. */
@@ -12910,8 +12682,6 @@ static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
 
 static int dm_index_view(void);   /* fwd */
 static rectf g_dms_new_btn;       /* the DMs list's header: New message */
-static char  g_hdr_title[160];    /* the header as last drawn, for the test dump */
-static rectf g_hdr_r;
 
 /* Back and forward, ahead of a header's title, as a browser's: dimmed while
  * there is nowhere to go. Returns where the title starts. */
@@ -12940,14 +12710,12 @@ static void draw_dms_header(gfx *rt, float x0, float w) {
     g_dms_new_btn = rf(right - call_button_w("New message", OC_ICON_SQUARE_PEN), by, right, by + bh);
     call_button(rt, g_dms_new_btn, OC_ICON_SQUARE_PEN, "New message", 0, 0);
     draw_text(rt, "Direct messages", g_title, rf(tx, 0, g_dms_new_btn.left - UIS(12), HEADER_H), OC_COL_TEXT);
-    snprintf(g_hdr_title, sizeof g_hdr_title, "Direct messages");
 }
 
 static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     fill(rt, rf(x0, 0, x0 + w, HEADER_H), OC_COL_HEADER);
     fill(rt, rf(x0, HEADER_H - 1, x0 + w, HEADER_H), OC_COL_BORDER);
     g_dms_new_btn = rf(0, 0, 0, 0);
-    g_hdr_r = rf(x0, 0, x0 + w, HEADER_H);
     if (dm_index_view()) { draw_dms_header(rt, x0, w); return; }
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
@@ -12999,7 +12767,6 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
         snprintf(title, sizeof title, "%s", t2);
     }
-    snprintf(g_hdr_title, sizeof g_hdr_title, "%s", title);
     /* MEASURE the right-hand cluster before drawing the title, and reserve what it
      * actually needs. A flat 240 was fine at 100% and at Largest text left the
      * title a rect narrower than one word — the header rendered as a bare "#",
@@ -13087,7 +12854,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_call_hdr_btn = rf(statr - bw, 13, statr, HEADER_H - 13);
         if (cv) fill_round(rt, g_call_hdr_btn, OC_R_CONTROL, mine ? OC_COL_ONLINE : OC_COL_ACCENT);
         else    stroke_round(rt, g_call_hdr_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        uint32_t ccol = cv ? 0xFFFFFF : OC_COL_MUTED;
+        uint32_t ccol = cv ? OC_COL_ON_ACCENT : OC_COL_MUTED;
         draw_lucide(rt, OC_ICON_PHONE, rf(g_call_hdr_btn.left + 5, g_call_hdr_btn.top + 4,
                                           g_call_hdr_btn.left + 23, g_call_hdr_btn.bottom - 4), ccol);
         if (cn[0])
@@ -13105,7 +12872,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_listen_btn = rf(statr - lw, 13, statr, HEADER_H - 13);
         if (on) fill_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_ACCENT);
         else    stroke_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        uint32_t lcol = on ? 0xFFFFFF : OC_COL_MUTED;
+        uint32_t lcol = on ? OC_COL_ON_ACCENT : OC_COL_MUTED;
         draw_lucide(rt, on ? OC_ICON_VOLUME : OC_ICON_MUTE,
                     rf(g_listen_btn.left + 5, g_listen_btn.top + 4,
                        g_listen_btn.left + 23, g_listen_btn.bottom - 4), lcol);
@@ -13157,7 +12924,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         g_unread_jump = rf(statr - bw, 14, statr, HEADER_H - 14);
         fill_round(rt, g_unread_jump, OC_R_PILL, OC_COL_DANGER);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, lbl, g_meta, g_unread_jump, 0xFFFFFF);
+        draw_text(rt, lbl, g_meta, g_unread_jump, OC_COL_ON_ACCENT);
         g_meta->align = ST_ALIGN_LEFT;
         statr = g_unread_jump.left - 12;
     } else {
@@ -13176,8 +12943,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
 static void select_tab(int t) {
     if (t < 0 || t >= TAB_COUNT) return;
     const oc_model *mm = model();
-    /* A tab that does not exist here cannot be selected — by click, by the palette,
-     * or by the test hook. Switching from a channel to a DM while About was open
+    /* A tab that does not exist here cannot be selected — by click or by the palette. Switching from a channel to a DM while About was open
      * would otherwise leave the pane showing a surface with no tab. */
     if (mm && g_sel && !tab_applies(oc_model_channel((oc_model *)mm, g_sel), t)) t = TAB_MESSAGES;
     if (mm && mm->pinlist_open)  oc_client_close_pins(g_client);
@@ -13276,13 +13042,11 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
 static float draw_banner(gfx *rt, const oc_model *m, float x0, float w, float top_off) {
     (void)m;
     g_banner_on = 0;
-    g_banner_r = rf(0, 0, 0, 0);
     const oc_fb_banner *b = oc_fb_banner_top(&g_fb);
     if (!b) return 0;
     uint32_t accent = b->severity == OC_FB_ERROR ? OC_COL_DANGER
                     : b->severity == OC_FB_WARN  ? OC_COL_AWAY : OC_COL_NOTICE;
     rectf r = rf(x0, HEADER_H + top_off, x0 + w, HEADER_H + top_off + BANNER_H);
-    g_banner_r = r;
     fill(rt, r, OC_COL_SIDEBAR);
     fill(rt, rf(x0, r.top, x0 + 3, r.bottom), accent);          /* status edge */
     fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
@@ -13471,12 +13235,12 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         rectf r = rf(px + 6, y, px + pw - 6, y + rowh);
         if (i == g_pal_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
-                  i == g_pal_sel ? 0xFFFFFF : OC_COL_TEXT);
+                  i == g_pal_sel ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_meta->align = ST_ALIGN_RIGHT;
         draw_text(rt, hit[i].kind, g_meta,
                   baseline_align(rf(px + 18, y, px + pw - 90, y + rowh),
                                  g_ui, g_meta, px + 18, px + pw - 18),
-                  i == g_pal_sel ? 0xFFFFFF : OC_COL_FAINT);
+                  i == g_pal_sel ? OC_COL_ON_ACCENT : OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
         g_pal_rows[g_n_pal_rows].r = r;
         g_pal_rows[g_n_pal_rows].cmd = hit[i].cmd;
@@ -13540,7 +13304,6 @@ static struct {
 static int  g_n_nt;
 static int  g_nt_hover = -1;         /* hovering holds it open */
 static int  g_nt_close_hover = -1;   /* the close box under the pointer, -1 none */
-static int  g_nt_shown;              /* observable by the harness; see test_dump */
 
 static void nt_layout(void);
 static void nt_paint(void);
@@ -13599,7 +13362,6 @@ static void nt_activate(int i) {
     uint64_t ws = g_nt[i].ws_slot, cid = g_nt[i].channel_id;
     g_n_nt = 0;
     if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl);
-    g_nt_shown = 0;
     if (g_main) {
         show_and_focus(g_main);
         if ((int)ws != g_ws_active && (int)ws < g_n_wss) { ws_save_active(); ws_load((int)ws); }
@@ -13610,10 +13372,7 @@ static void nt_activate(int i) {
 
 /* Do what a toast's button asked for, on the UI THREAD.
  *
- * Separate from the message handler because the activator is COM-driven and
- * therefore undrivable by the harness: a verb feeds this the same string
- * Windows would, so the reply and the reaction are testable without a real
- * click on a real toast.
+ * Separate from the message handler because the activator is COM-driven.
  *
  * "verb|workspace|channel|extra\nreply" -- one line for what was pressed, one
  * for what was typed, because a reply may contain anything including the
@@ -13699,7 +13458,7 @@ static void nt_drop(int i) {
     for (int k = i; k < g_n_nt - 1; k++) g_nt[k] = g_nt[k + 1];
     g_n_nt--;
     g_nt_hover = g_nt_close_hover = -1;
-    if (!g_n_nt) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); g_nt_shown = 0; }
+    if (!g_n_nt) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); }
     else { nt_layout(); nt_paint(); }
 }
 
@@ -13720,7 +13479,6 @@ static void nt_hover(int mx, int my) {
  * assumed: the attribute is silently ignored on Windows 10, and the toast
  * cannot be photographed from outside -- a desktop capture over RDP comes back
  * black, for the same reason the rect above is reported from in here. */
-static int g_nt_round_hr = -1;
 
 static int nt_create(void) {
     if (g_nt_win.sdl) return 1;
@@ -13743,7 +13501,7 @@ static int nt_create(void) {
     if (!g_nt_win.sdl) return 0;
     /* Let the platform round it: the card cannot round its own fill, since
      * there is no colour that is right against an arbitrary desktop. */
-    g_nt_round_hr = oc_plat_window_round(g_nt_win.sdl);
+    oc_plat_window_round(g_nt_win.sdl);
     g_nt_win.ren = SDL_CreateRenderer(g_nt_win.sdl, NULL);
     if (!g_nt_win.ren) return 0;
     g_nt_win.g = gfx_create(g_nt_win.ren);
@@ -13820,7 +13578,7 @@ static void nt_paint(void) {
         fill_round(g_nt_win.g, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), OC_R_CONTROL, OC_COL_ACCENT);
         draw_lucide(g_nt_win.g, OC_ICON_DMS,
                     rf(ix + pad, iy + pad, ix + NTOAST_ICON - pad, iy + NTOAST_ICON - pad),
-                    0xFFFFFF);
+                    OC_COL_ON_ACCENT);
         float tx = r.left + g.text_x, tr = r.right - NTOAST_PAD;
         draw_text(g_nt_win.g, g_nt[i].title, g_ui_b,
                   rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
@@ -13868,7 +13626,6 @@ static void own_toast_show(const char *title, const char *body,
     g_n_nt++;
     nt_layout();
     SDL_ShowWindow(g_nt_win.sdl);
-    g_nt_shown = 1;
     nt_paint();
 }
 
@@ -13886,7 +13643,7 @@ static void nt_tick(void) {
         g_n_nt--; changed = 1;
     }
     if (!changed) return;
-    if (g_n_nt == 0) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); g_nt_shown = 0; }
+    if (g_n_nt == 0) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); }
     else { nt_layout(); nt_paint(); }
 }
 
@@ -14084,7 +13841,6 @@ static struct { rectf r; int kind, topic, num; uint64_t mid; } g_sumhits[256];
 static int   g_n_sumhits;
 static float g_sum_scroll, g_sum_max;
 static rectf g_sum_count_r, g_sum_people_r;
-static int   g_sum_force_cite;              /* the harness's "hover" over [n] */
 /* Which topics have their details hidden, for the summary they were hidden in. */
 static unsigned char *g_sum_closed;
 static size_t   g_sum_closed_n;
@@ -14148,7 +13904,6 @@ static float sum_rich(gfx *rt, const char *s, fmtw *fmt, float x, float y, float
     if (g_cap_tex) {
         float sc = gfx_scale(rt);
         gfx_rect dst = { x + g_cap_dx, y + g_cap_dy, (float)g_cap_w / sc, (float)g_cap_h / sc };
-        gfx_ink(rt, rgb, ST_RASTER_PAD, ST_RASTER_PAD);
         gfx_tex_draw(rt, g_cap_tex, dst, 0.0f, 1.0f);
         gfx_tex_destroy(g_cap_tex);
         g_cap_tex = NULL;
@@ -14436,7 +14191,6 @@ static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
         for (size_t i = 0; i < np && tw < sizeof tip; i++) {
             const char *sep = i == 0 ? "" : np == 2 ? " and " : i + 1 == np ? ", and " : ", ";
             int ag = oc_model_user_is_agent(m, v->posters[i].id);
-            if (ag) { g_atag_n[ATAG_SUMMARY]++; g_atag_uid[ATAG_SUMMARY] = v->posters[i].id; }
             int k = snprintf(tip + tw, sizeof tip - tw, "%s%s%s", sep, v->posters[i].name, ag ? " (Agent)" : "");
             if (k < 0) break;
             tw += (size_t)k;
@@ -14446,9 +14200,7 @@ static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
     }
     int hit = -1;
     for (int i = 0; i < g_n_sumhits; i++) {
-        int on = g_sum_force_cite ? (g_sumhits[i].kind == SH_CITE && g_sumhits[i].num == g_sum_force_cite)
-                                  : in_rect(g_sumhits[i].r, g_mouse_x, g_mouse_y);
-        if (on) { hit = i; break; }
+        if (in_rect(g_sumhits[i].r, g_mouse_x, g_mouse_y)) { hit = i; break; }
     }
     if (hit < 0) return;
     if (g_sumhits[hit].kind == SH_TOGGLE) {
@@ -14534,7 +14286,6 @@ static void summarize_start(oc_win *hwnd, uint64_t cid, uint8_t scope, uint64_t 
     if (cid != g_sel) select_channel(cid);
     if (oc_client_summarize(g_client, cid, scope, rs, re)) {
         g_sum_scroll = 0;
-        g_sum_force_cite = 0;
         rp_push(RP_SUMMARY);
         layout_composer(hwnd);
     }
@@ -14548,7 +14299,6 @@ static void summary_open_notice(oc_win *hwnd, uint64_t id, uint64_t cid, uint8_t
     if (cid != g_sel) select_channel(cid);
     if (oc_client_summary_open_notice(g_client, id, cid, scope)) {
         g_sum_scroll = 0;
-        g_sum_force_cite = 0;
         rp_push(RP_SUMMARY);
         layout_composer(hwnd);
     }
@@ -14621,7 +14371,7 @@ static void mem_head_button(gfx *rt, rectf b, int icon) {
 
 /* The tag, at `x` on `line`, vertically centred: its width and the gap after
  * it, or 0 when it would not fit before line's right edge. */
-static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line) {
+static float agent_tag(gfx *rt, float x, rectf line) {
     static const char T[] = "Agent";
     float tw = text_width(T, g_meta) + UIS(10), h = UIS(16), cy = (line.top + line.bottom) / 2;
     if (x + tw > line.right) return 0;
@@ -14631,7 +14381,6 @@ static float agent_tag(gfx *rt, int surface, uint64_t uid, float x, rectf line) 
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, T, g_meta, r, OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
-    if (surface >= 0 && surface < ATAG_N) { g_atag_n[surface]++; g_atag_uid[surface] = uid; }
     return tw + UIS(6);
 }
 
@@ -14821,7 +14570,7 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                                   oc_model_dnd_of(m, cm->user_id), 2.0f);
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
-        if (cm_agent) agent_tag(rt, ATAG_MEMBERS, cm->user_id, x0 + 34 + text_width(disp, g_ui) + 6, rf(x0 + 34, y, W - 76, y + ROW_H));
+        if (cm_agent) agent_tag(rt, x0 + 34 + text_width(disp, g_ui) + 6, rf(x0 + 34, y, W - 76, y + ROW_H));
         /* Role glyph INLINE, immediately after the name — not in a column of its
          * own. Almost nobody is an owner or an admin, so a reserved column spends
          * horizontal space on every row to serve the rare one, in a pane only
@@ -14955,7 +14704,7 @@ static void draw_signin(gfx *rt, float W, float H) {
     /* Mark: the accent rounded square the rail uses for the workspace avatar. */
     rectf mark = rf(cx - 18, y, cx + 18, y + 36);
     fill_round(rt, mark, OC_R_AVATAR_LG, OC_COL_ACCENT);
-    draw_text(rt, "O", g_avatar, mark, 0xFFFFFF);
+    draw_text(rt, "O", g_avatar, mark, OC_COL_ON_ACCENT);
     y += 52;
 
     g_display->align = ST_ALIGN_CENTER;
@@ -15050,7 +14799,6 @@ static void draw_signin(gfx *rt, float W, float H) {
 
     /* Field chrome. The fields are drawn on these same rects. */
     const char *labels[1] = { "Workspace" }; int nfields = g_si_step == 1 ? 1 : 0;
-    g_si_suffix_shown = 0;
     if (g_si_step == 2) {
         draw_text(rt, "Your username and password go into the workspace's own sign-in page, "
                       "which opens in your browser.", g_meta_w, rf(fx, y, fx + fw, y + SI_NOTE_H - 6),
@@ -15073,7 +14821,6 @@ static void draw_signin(gfx *rt, float W, float H) {
          * dotted name is reached as typed, and the suffix after it read as part
          * of the name. */
         if (g_si_step == 1 && si_suffix_applies()) {
-            g_si_suffix_shown = 1;
             char suf[80]; snprintf(suf, sizeof suf, ".%s", oc_default_suffix());
             g_meta->align = ST_ALIGN_RIGHT;
             draw_text(rt, suf, g_meta, rf(fx, y + 20, fx + fw - 12, y + 52), OC_COL_MUTED);
@@ -15106,7 +14853,7 @@ static void draw_signin(gfx *rt, float W, float H) {
         stroke_round(rt, g_si_remember_box, OC_R_CONTROL,
                      g_si_remember ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
         if (g_si_remember)
-            draw_text(rt, "\xE2\x9C\x93", g_meta, rf(fx + 2, y, fx + 18, y + 20), 0xFFFFFF);
+            draw_text(rt, "\xE2\x9C\x93", g_meta, rf(fx + 2, y, fx + 18, y + 20), OC_COL_ON_ACCENT);
         draw_text(rt, "Remember me", g_meta, rf(fx + 24, y, fx + fw, y + 20), OC_COL_MUTED);
         y += 30;
     }
@@ -15114,7 +14861,7 @@ static void draw_signin(gfx *rt, float W, float H) {
     g_si_btn = rf(fx, y, fx + fw, y + 40);
     fill_round(rt, g_si_btn, OC_R_CONTROL, OC_COL_ACCENT);
     g_ui->align = ST_ALIGN_CENTER;
-    draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, 0xFFFFFF);
+    draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, OC_COL_ON_ACCENT);
     g_ui->align = ST_ALIGN_LEFT;
     y += 50;
 
@@ -15199,11 +14946,11 @@ static void draw_autocomplete(gfx *rt, float x0, float w, float h) {
         g_ac_rows[i] = r;
         if (i == g_ac_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, g_ac[i].disp, g_ui, rf(px + 12, y + 3, px + pw - 12, y + rowh),
-                  i == g_ac_sel ? 0xFFFFFF : OC_COL_TEXT);
+                  i == g_ac_sel ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         if (g_ac_kind == OC_AC_MENTION && g_ac[i].repl[0] == '@' && model()) {
             uint64_t au = oc_model_user_id(model(), g_ac[i].repl + 1);
             if (au && oc_model_user_is_agent(model(), au))
-                agent_tag(rt, ATAG_MENTION, au, px + 12 + text_width(g_ac[i].disp, g_ui) + 8, rf(px, y, px + pw - 12, y + rowh));
+                agent_tag(rt, px + 12 + text_width(g_ac[i].disp, g_ui) + 8, rf(px, y, px + pw - 12, y + rowh));
         }
         y += rowh;
     }
@@ -16118,7 +15865,7 @@ static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_co
         if (oc_dictate_speaking(g_dict))
             stroke_round(rt, rf(r.left - 2, r.top - 2, r.right + 2, r.bottom + 2), OC_R_CONTROL + 2,
                          live_col, 2.0f);
-        ink = 0xFFFFFF;
+        ink = OC_COL_ON_ACCENT;
     }
     draw_lucide(rt, icon, composer_glyph(r), ink);
 }
@@ -16636,7 +16383,7 @@ static void preview_btn_draw(gfx *rt, const char *label) {
     else if (hot)  fill_round(rt, g_preview_btn, OC_R_CONTROL, OC_COL_HOVER);
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_meta, g_preview_btn,
-              g_preview ? 0xFFFFFF : hot ? OC_COL_TEXT : OC_COL_MUTED);
+              g_preview ? OC_COL_ON_ACCENT : hot ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 }
 
@@ -16857,12 +16604,12 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
          * be the one bright mark on a grey control. */
         rectf seam = rf(gx0 + sq - 0.5f, cy + 5, gx0 + sq + 0.5f, cy + sq - 5);
         if (no_sched)      g_sched_btn = rf(0, 0, 0, 0);
-        else if (has_text) gfx_fill(rt, gr(seam), 0xFFFFFF, 0.35f);
+        else if (has_text) gfx_fill(rt, gr(seam), OC_COL_ON_ACCENT, 0.35f);
         else               fill(rt, seam, OC_COL_BORDER);
         /* Two strokes, not the "\u25BE" glyph: the glyph is a solid triangle
          * that sits off the optical centre of its em box, and next to a line
          * icon it reads as a different family. */
-        uint32_t cc2 = has_text ? 0xFFFFFF : OC_COL_FAINT;
+        uint32_t cc2 = has_text ? OC_COL_ON_ACCENT : OC_COL_FAINT;
         float ccx = (g_sched_btn.left + g_sched_btn.right) / 2 + 0.5f;
         float ccy = (cy + cy + sq) / 2, d = 3.2f;
         if (!no_sched) {
@@ -16872,7 +16619,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     }
     /* Proportional, not a raw 8: against a shrunken square a fixed inset
      * eventually inverts the icon's own rect. */
-    draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_send_btn), has_text ? 0xFFFFFF : OC_COL_FAINT);
+    draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_send_btn), has_text ? OC_COL_ON_ACCENT : OC_COL_FAINT);
     /* LAST, over everything in the box: the action row's tooltip. */
     draw_act_tip(rt, ACT_ATTACH, ACT_SCHEDULE, bx0, bx1);
 }
@@ -16897,9 +16644,7 @@ static rectf g_modal_card;
 /* ---- confirm() : a themed confirmation on the modal frame ----------
  *
  * Replaces MessageBoxW. Native message boxes cannot be themed, look foreign beside
- * the rest of the app, and — the reason this moved up the list — **cannot be driven
- * by the harness**, so every destructive action was unverifiable. Rotating a webhook
- * and revoking an invite both landed unverified for exactly that reason.
+ * the rest of the app, and sit outside our own accessibility tree.
  *
  * The pending action is an id plus a target rather than a function pointer, so the
  * modal frame's generic dispatch can run it without a per-confirmation callback.
@@ -17153,10 +16898,10 @@ static void modal_button(gfx *rt, rectf r, const char *label, int kind) {
     if (kind == MB_DANGER_PRIMARY) {
         fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
         if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
-        tc = 0xFFFFFF;
+        tc = OC_COL_ON_ACCENT;
     } else if (kind == MB_PRIMARY) {
         fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
-        tc = 0xFFFFFF;
+        tc = OC_COL_ON_ACCENT;
     } else if (kind == MB_DANGER) {
         fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
         stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f);
@@ -17478,17 +17223,13 @@ static float form_row_tops(float w, float *tops) {
 static void draw_form(gfx *rt, rectf body) {
     g_n_form_hits = 0;
     g_n_form_sel_rows = 0;
-    g_form_sel_panel = rf(0, 0, 0, 0);
     for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_sel_box[i] = rf(0, 0, 0, 0);
     if (!g_form_f) return;
     /* Rows that do not fit the card scroll (the wheel moves g_form_scroll).
      * A row is drawn whole or not at all, so a text field is never half
      * under the edge with its keyboard still in it; and when the keyboard
      * moves to a row out of sight, the rows move to show it. */
-    for (int i = 0; i < FORM_MAX_FIELDS; i++) {
-        g_form_erect[i] = rf(0, 0, 0, 0);
-        g_form_row_top[i] = g_form_row_bot[i] = 0;
-    }
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
     g_form_body = body;
     float tops[FORM_MAX_FIELDS], view = body.bottom - body.top;
     float total = form_row_tops(body.right - body.left, tops);
@@ -17513,7 +17254,6 @@ static void draw_form(gfx *rt, rectf body) {
         /* Whole or not at all: a row whose measured bottom crosses the body's is
          * skipped (half a pixel for rounding), and the measure is the drawn row. */
         if (g_form_scroll_max > 0 && (y < body.top - 0.5f || y + rh > body.bottom + 0.5f)) { y += rh; continue; }
-        float drawn_bot = y;
         if (f->kind == FF_CHECK) {
             float cy0 = y + (FORM_BOX_H - FORM_CHECK_BOX) / 2;
             rectf box = rf(body.left, cy0, body.left + FORM_CHECK_BOX, cy0 + FORM_CHECK_BOX);
@@ -17527,7 +17267,7 @@ static void draw_form(gfx *rt, rectf body) {
                              g_form_focus == i ? 1.5f : 1.0f);
             if (on) {
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
+                draw_text(rt, "\u2713", g_meta, box, OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             }
             draw_text(rt, f->label, g_ui, rf(body.left + FORM_CHECK_LBL_X, y, body.right, y + FORM_BOX_H), OC_COL_TEXT);
@@ -17538,7 +17278,6 @@ static void draw_form(gfx *rt, rectf body) {
                 g_form_hits[g_n_form_hits].val = !on;
                 g_n_form_hits++;
             }
-            drawn_bot = y + FORM_BOX_H;
         } else if (f->kind == FF_CHOICE) {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             int cur = atoi(f->value), k = 0;
@@ -17569,7 +17308,6 @@ static void draw_form(gfx *rt, rectf body) {
                 bx = b.right + FORM_CHIP_GAP_X;
                 k++;
             }
-            drawn_bot = cy + FORM_BOX_H;
         } else if (f->kind == FF_SELECT) {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             float action_w = 0;
@@ -17610,7 +17348,6 @@ static void draw_form(gfx *rt, rectf body) {
             draw_text(rt, open ? "▴" : "▾", g_meta,
                       rf(box.right - FORM_SEL_CHEV_L, box.top + FORM_SEL_CHEV_Y,
                          box.right - FORM_SEL_CHEV_R, box.bottom), OC_COL_FAINT);
-            drawn_bot = box.bottom;
         } else {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + FORM_LABEL_H), OC_COL_TEXT);
             float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : FORM_BOX_H;
@@ -17633,16 +17370,13 @@ static void draw_form(gfx *rt, rectf body) {
             if (g_form_edit[i])
                 field_draw(rt, g_form_edit[i], rf(box.left + FORM_TEXT_X, box.top + FORM_BOX_PAD_Y,
                                                   box.right - FORM_TEXT_X, box.bottom - FORM_BOX_PAD_Y), OC_COL_TEXT);
-            drawn_bot = box.bottom;
             if (f->hint && f->hint[0]) {
-                drawn_bot = box.bottom + FORM_HINT_GAP + form_hint_h(f->hint, body.right - body.left);
+                float hint_bot = box.bottom + FORM_HINT_GAP + form_hint_h(f->hint, body.right - body.left);
                 draw_text(rt, f->hint, g_meta_w,
-                          rf(body.left, box.bottom + FORM_HINT_GAP, body.right, drawn_bot),
+                          rf(body.left, box.bottom + FORM_HINT_GAP, body.right, hint_bot),
                           i == g_form_err_field ? OC_COL_DANGER : OC_COL_FAINT);
             }
         }
-        g_form_row_top[i] = y;
-        g_form_row_bot[i] = drawn_bot;
         y += rh;
     }
     /* Where the rows are, when there are more than fit: a thin bar on the
@@ -17703,7 +17437,6 @@ static void draw_form(gfx *rt, rectf body) {
                 break;              /* one adjustment; the rows are far enough apart */
             }
             rectf panel = rf(box.left, top, box.right, top + ph);
-            g_form_sel_panel = panel;
             /* NO drop shadow. The time dropdown (draw_tp) casts one in
              * OC_COL_RAIL, which is invisible against the dark sidebar it opens
              * over and a hard navy band against a white modal card — copying it
@@ -17934,6 +17667,7 @@ static struct {
     oc_spoken_opts spoken;
     int  announce_new;
     int  motion;
+    int  contrast;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17954,6 +17688,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.spoken   = g_pref_spoken;
     g_prefs_snap.announce_new = g_pref_announce_new;
     g_prefs_snap.motion   = g_pref_motion;
+    g_prefs_snap.contrast = g_pref_contrast;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -17982,6 +17717,10 @@ static void prefs_restore(void) {
     g_pref_spoken = g_prefs_snap.spoken;
     g_pref_announce_new = g_prefs_snap.announce_new;
     g_pref_motion = g_prefs_snap.motion;
+    if (g_pref_contrast != g_prefs_snap.contrast) {
+        g_pref_contrast = g_prefs_snap.contrast;
+        contrast_apply();
+    }
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
@@ -18122,7 +17861,7 @@ static void cal_month_draw(gfx *rt, float cx, float y, int yr, int mon, const ch
         else if (!mark && on && in_rect(c, g_mouse_x, g_mouse_y)) fill_round(rt, c, OC_R_CONTROL, OC_COL_HOVER);
         if (today && !chosen) stroke_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
         char num[4]; snprintf(num, sizeof num, "%d", d);
-        draw_text(rt, num, g_meta, c, chosen ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+        draw_text(rt, num, g_meta, c, chosen ? OC_COL_ON_ACCENT : on ? OC_COL_TEXT : OC_COL_FAINT);
         if (*n_out < 42) {
             out[*n_out].r = c; out[*n_out].y = yr; out[*n_out].m = mon; out[*n_out].d = d; out[*n_out].on = on;
             (*n_out)++;
@@ -18259,7 +17998,7 @@ static void draw_sched_custom(gfx *rt, rectf body) {
         else if (on && in_rect(r, g_mouse_x, g_mouse_y)) fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
         char tl[16]; sched_time_label((uint16_t)(k * 30), tl, sizeof tl);
         draw_text(rt, tl, g_meta, rf(r.left + UIS(10.0f), r.top, r.right, r.bottom),
-                  sel ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+                  sel ? OC_COL_ON_ACCENT : on ? OC_COL_TEXT : OC_COL_FAINT);
         /* Recorded clipped to the box, so a half-visible row cannot be clicked
          * outside it. */
         rectf hit = rf(r.left, r.top > inner.top ? r.top : inner.top,
@@ -19196,7 +18935,7 @@ static void draw_poll_compose(gfx *rt, rectf body) {
         if (on) {
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "✓", g_meta, box, 0xFFFFFF);
+            draw_text(rt, "✓", g_meta, box, OC_COL_ON_ACCENT);
             g_meta->align = oa;
         }
         draw_text(rt, CHK[k], g_ui, rf(lx + UIS(31.0f), y + UIS(3.0f), lr, y + UIS(27.0f)),
@@ -19308,7 +19047,7 @@ static int poll_compose_click(oc_win *hwnd, int x, int y) {
     return in_rect(g_modal_card, x, y);
 }
 
-/* The card's controls by number, for assistive technology and the dump: the
+/* The card's controls by number, for assistive technology: the
  * option rows, their removes, then the rest. A deadline day is its date. */
 enum { PCA_OPT = 0, PCA_RM = OC_POLL_MAX_OPTIONS, PCA_ADD = 2 * OC_POLL_MAX_OPTIONS, PCA_MULTI, PCA_ANON,
        PCA_NODL, PCA_CLOSES, PCA_PREV, PCA_NEXT, PCA_Q, PCA_TIME, PCA_N };
@@ -19770,8 +19509,7 @@ static void modal_enter(oc_win *hwnd, int *flag) {
      * the command palette and the emoji picker each claim EVERY click while open
      * (on_click returns early for them), and layout_natives hides their boxes
      * whenever something covers the window — so a palette left open behind a modal
-     * was INVISIBLE and ate every click meant for the card. Found by the smoke,
-     * whose preamble happened to leave the palette open; a user reaches it by
+     * was INVISIBLE and ate every click meant for the card. A user reaches it by
      * opening Preferences with the palette up. close_overlays() cannot do this
      * itself: it has no window handle, and these three need one to restore focus
      * and repaint. */
@@ -19798,7 +19536,6 @@ static void modal_enter(oc_win *hwnd, int *flag) {
 }
 
 /* Close it. `commit` decides which way: Save runs commit, Cancel runs restore. */
-static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
 static void bc_unconfirmed(void);   /* fwd */
 static void modal_finish(int save) {
@@ -19836,7 +19573,6 @@ static void modal_finish(int save) {
     g_te_open = 0;
     g_sv_open = 0;
     if (te_was) te_closed();
-    g_modal_closed_by = save ? "save" : "cancel";
     if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
     /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
      * is the one taken when IT opened and is left alone: the dialog on top was a
@@ -19856,39 +19592,28 @@ static void modal_finish(int save) {
 
 /* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
  * consumed the click. */
-/* The last click the frame saw, and what became of it. Kept because two of this
- * work's three bugs were "the click went somewhere else" and no screenshot can
- * show that. */
-static char g_modal_lastclick[128] = "";
 
 static int modal_frame_click(oc_win *hwnd, int x, int y) {
     (void)hwnd;
     if (!modal_open()) return 0;
-    snprintf(g_modal_lastclick, sizeof g_modal_lastclick,
-             "pt=%d,%d card=%.0f,%.0f,%.0f,%.0f", x, y,
-             g_modal_card.left, g_modal_card.top, g_modal_card.right, g_modal_card.bottom);
     /* Nothing is dismissible until the frame has been PAINTED once: the card rect
      * is measured during paint, and an unset one made every click "outside", so a
      * modal opened from a menu or a keystroke and clicked before the next repaint
-     * dismissed itself. Found by driving it, not by reading it. */
-    if (g_modal_card.right <= g_modal_card.left) {
-        strncat(g_modal_lastclick, " SWALLOWED-unpainted",
-                sizeof g_modal_lastclick - strlen(g_modal_lastclick) - 1);
-        return 1;
-    }
-    if (in_rect(g_modal_close_btn, x, y)) { modal_finish(0); g_modal_closed_by = "x-button"; return 1; }
+     * dismissed itself. */
+    if (g_modal_card.right <= g_modal_card.left) return 1;
+    if (in_rect(g_modal_close_btn, x, y)) { modal_finish(0); return 1; }
     for (int i = 0; i < g_n_modal_btns; i++)
         if (in_rect(g_modal_btns[i].r, x, y)) {
             int cmd = g_modal_btns[i].cmd;
-            if (cmd == MODAL_OK)          { modal_finish(1); g_modal_closed_by = "footer-ok"; }
-            else if (cmd == MODAL_CANCEL) { modal_finish(0); g_modal_closed_by = "footer-cancel"; }
+            if (cmd == MODAL_OK)          { modal_finish(1); }
+            else if (cmd == MODAL_CANCEL) { modal_finish(0); }
             else                          menu_dispatch(hwnd, cmd);
             return 1;
         }
     /* Outside the card dismisses, and dismiss means CANCEL — the same as ✕ and
      * Esc. A click in the dark that silently saved would be the worst of the
      * three. */
-    if (!in_rect(g_modal_card, x, y)) { modal_finish(0); g_modal_closed_by = "scrim"; return 1; }
+    if (!in_rect(g_modal_card, x, y)) { modal_finish(0); return 1; }
     return 0;
 }
 
@@ -20020,10 +19745,10 @@ static int modal_key(oc_win *hwnd, int vk) {
         picker_close(hwnd);
         return 1;
     }
-    if (vk == OCK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
+    if (vk == OCK_ESCAPE) { modal_finish(0); return 1; }
     if (vk == OCK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
-        else if (g_modal_primary_cmd == MODAL_CANCEL) { modal_finish(0); g_modal_closed_by = "enter"; }
+        else if (g_modal_primary_cmd == MODAL_CANCEL) { modal_finish(0); }
         else if (g_modal_primary_cmd != -1)  menu_dispatch(hwnd, g_modal_primary_cmd);
         return 1;
     }
@@ -20215,8 +19940,7 @@ static rectf g_adm_tabs[ADM_COUNT];
  * The workspace's agents, each with its tokens; New agent and New token ask for
  * a name and the scopes, each scope shown with what it allows; a token minted
  * is shown here once, with Copy, until Done. Every button is one entry in
- * g_agtbtns, so a click, the keyboard's invoke and the harness press the same
- * thing. */
+ * g_agtbtns, so a click and the keyboard's invoke press the same thing. */
 enum { AGB_NEW = 1, AGB_TOKENS, AGB_REMOVE, AGB_BACK, AGB_MINT, AGB_REVOKE, AGB_COPY, AGB_DONE,
        /* AI clients (AUTH.md §8.13), in Preferences and on Admin's tab: the same buttons. */
        AGB_CN_APPROVE, AGB_CN_LIFE, AGB_CN_ALLOW, AGB_CN_DECLINE, AGB_CN_REVOKE, AGB_CN_REVOKE_ALL };
@@ -20548,7 +20272,7 @@ static void draw_agents_admin(gfx *rt, const oc_model *m, rectf body) {
         if (!u->agent || u->disabled) continue;
         any = 1;
         draw_text(rt, u->name, g_ui, rf(x, y, right - 200, y + 30), OC_COL_TEXT);
-        agent_tag(rt, -1, u->user_id, x + text_width(u->name, g_ui) + 8, rf(x, y, right - 200, y + 30));
+        agent_tag(rt, x + text_width(u->name, g_ui) + 8, rf(x, y, right - 200, y + 30));
         snprintf(aid, sizeof aid, "admin.agent.%llu.tokens", (unsigned long long)u->user_id);
         snprintf(nm, sizeof nm, "%s's tokens", u->name);
         agtbtn(rt, rf(right - 190, y + 2, right - 100, y + 28), "Tokens", 0, AGB_TOKENS, u->user_id, aid, nm);
@@ -20568,8 +20292,8 @@ static void draw_agents_admin(gfx *rt, const oc_model *m, rectf body) {
  * and whether it is on; New webhook asks for the address, the channels and the
  * events, each event with what it carries. The daemon checks the address
  * answers before saving it, and the signing secret is shown here once, with
- * Copy, until Done. Every button is one entry in g_whbtns, so a click, the
- * keyboard's invoke and the harness press the same thing. */
+ * Copy, until Done. Every button is one entry in g_whbtns, so a click and the
+ * keyboard's invoke press the same thing. */
 enum { WHB_NEW = 1, WHB_ON, WHB_OFF, WHB_DELETE, WHB_COPY, WHB_DONE };
 static struct { rectf r; int kind; uint64_t id; char aid[OC_ACC_AID_MAX]; char name[96]; } g_whbtns[96];
 static int      g_n_whbtns;
@@ -21227,7 +20951,7 @@ static void draw_pfields_admin(gfx *rt, const oc_model *m, rectf body) {
         g_pf_new_btn = rf(body.right - 140, y, body.right - 20, y + 30);
         fill_round(rt, g_pf_new_btn, OC_R_CONTROL, OC_COL_ACCENT);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "New field", g_ui, g_pf_new_btn, 0xFFFFFF);
+        draw_text(rt, "New field", g_ui, g_pf_new_btn, OC_COL_ON_ACCENT);
         g_ui->align = ST_ALIGN_LEFT;
     }
     y += 48;
@@ -21657,7 +21381,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, ready ? "Start group message" : "Pick one more",
                   g_meta, rf(g_pick_go.left, g_pick_go.top + 4, g_pick_go.right, g_pick_go.bottom),
-                  ready ? 0xFFFFFF : OC_COL_MUTED);
+                  ready ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         y += 48;
     }
@@ -21689,7 +21413,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
             if (on) {
                 gfx_ellipse(rt, ccx, ccy, 11, 11, OC_COL_ACCENT, 1.0f);
                 g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, "\u2713", g_meta, rf(chk.left, chk.top + 2, chk.right, chk.bottom), 0xFFFFFF);
+                draw_text(rt, "\u2713", g_meta, rf(chk.left, chk.top + 2, chk.right, chk.bottom), OC_COL_ON_ACCENT);
                 g_meta->align = ST_ALIGN_LEFT;
             } else {
                 gfx_ellipse_stroke(rt, ccx, ccy, 11, 11, 1.5f, OC_COL_BORDER, 1.0f);
@@ -21789,7 +21513,7 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         else if (hover) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, L[i], g_meta, b,
-                  on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+                  on ? OC_COL_ON_ACCENT : hover ? OC_COL_TEXT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         g_act_filters[i] = b;
         fx = b.right + 3;
@@ -22031,7 +21755,7 @@ static void draw_browse(gfx *rt, const oc_model *m, rectf body) {
             }
             g_ui->align = ST_ALIGN_CENTER;
             draw_text(rt, c->joined ? "Open" : "Join", g_ui, rf(b.left, b.top + 1, b.right, b.bottom),
-                      c->joined ? OC_COL_TEXT : 0xFFFFFF);
+                      c->joined ? OC_COL_TEXT : OC_COL_ON_ACCENT);
             g_ui->align = ST_ALIGN_LEFT;
             if (g_n_browse_rows < 64) {
                 g_browse_rows[g_n_browse_rows].r = b;
@@ -22216,9 +21940,7 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
     if (focused && oc_motion_caret_lit(now_ms(), g_tgt_blink, motion_reduced())) {   /* steady when reduced */
         memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
         float wc = text_width(tmp, fmt);
-        gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(x0 + wc, box.top + UIS(7), x0 + wc + 1.0f, box.bottom - UIS(7)), OC_COL_TEXT);
-        gfx_tag(rt, NULL);
     }
 }
 
@@ -22598,9 +22320,7 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
     if (focused && l && oc_motion_caret_lit(now_ms(), f->blink, motion_reduced())) {   /* steady when reduced */
         st_rect cr = fld_caret_rect(f, l, f->caret);
         float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
-        gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(cx, oy + cr.y + 1, cx + 1.0f, oy + cr.y + cr.h - 1), OC_COL_TEXT);
-        gfx_tag(rt, NULL);
     }
     /* Where an IME should put its candidates, and the system caret screen
      * readers and magnifiers follow (REQ-269, ARCH-99): every frame the field
@@ -23222,7 +22942,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         if (!g_nm_e2e) stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         if (g_nm_e2e) {
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+            draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
             g_meta->align = ST_ALIGN_LEFT;
         }
         const char *lab = "End-to-end encrypted";
@@ -23304,13 +23024,13 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         /* One hairline seam, so the two halves read as two buttons. */
         if (!e2e)
             fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
-                 ready ? 0xFFFFFF : OC_COL_BORDER);
+                 ready ? OC_COL_ON_ACCENT : OC_COL_BORDER);
         draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_nm_send),
-                    ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT));
+                    ready ? OC_COL_ON_ACCENT : OC_INK_ON(TH_FAINT, TH_INPUT));
         if (e2e) g_nm_sched = rf(0, 0, 0, 0);
         else {   /* The same two strokes the conversation's chevron is drawn with, for
              * the reason given there: the glyph reads as a different family. */
-            uint32_t cc = ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT);
+            uint32_t cc = ready ? OC_COL_ON_ACCENT : OC_INK_ON(TH_FAINT, TH_INPUT);
             float ccx = (g_nm_sched.left + g_nm_sched.right) / 2 + 0.5f;
             float ccy = cy + sq / 2, d = 3.2f;
             gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc, 1.0f);
@@ -23606,7 +23326,7 @@ static void draw_empty_state(gfx *rt, rectf body, int icon,
          * fonts_build — a whole-app alignment bug from one button. */
         int opara = g_ui->para;
         g_ui->para = PARA_MID;
-        draw_text(rt, cta, g_ui, b, 0xFFFFFF);
+        draw_text(rt, cta, g_ui, b, OC_COL_ON_ACCENT);
         g_ui->para = opara;
         *out_btn = b;
     }
@@ -23709,8 +23429,7 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
     /* The search field's CHROME — the rounded container and the glyph — with the
      * field drawn inside it, exactly as the Files search is built. Reserving the
      * space without painting the box once left an unframed field on a white
-     * pane: reported visible by the harness and invisible to a person, which is
-     * the worst of both. */
+     * pane, invisible to a person. */
     g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
     search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
     if (g_dir_edit) field_draw(rt, g_dir_edit, search_text_box(g_dir_search_box), OC_COL_TEXT);
@@ -23979,12 +23698,10 @@ static float call_chat_left(float W) {
  * The way into a call is where the conversation is, not only a numbered phone in
  * the header. Returns its height. */
 static float draw_call_banner(gfx *rt, const oc_model *m, float x0, float w, float top) {
-    g_call_banner_on = 0;
     if (!m || !g_sel || dm_index_view()) return 0;
     const oc_call_view *v = oc_model_call_from(m, g_sel);
     int in = call_here(m) && m->call.from_channel == g_sel;
     if (!v && !in) return 0;
-    g_call_banner_on = 1;
     if (in) v = &m->call;
     char names[200] = "", head[260], sub[120], dur[16];
     for (int i = 0; i < v->n_parts && i < 4; i++) {
@@ -24038,7 +23755,7 @@ static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, 
         if (muted) {
             rectf mb = rf(card.right - UIS(28), card.top + UIS(8), card.right - UIS(8), card.top + UIS(28));
             fill_round(rt, mb, UIS(10), OC_COL_DANGER);
-            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), OC_COL_ON_ACCENT);
         }
     } else {
         /* The face grows with the card, keeping room under it for the name and
@@ -24055,7 +23772,7 @@ static void draw_call_card(gfx *rt, const oc_model *m, const oc_call_stats *st, 
         if (muted) {
             rectf mb = rf(avr.right - UIS(14), avr.bottom - UIS(14), avr.right + UIS(6), avr.bottom + UIS(6));
             fill_round(rt, mb, UIS(10), OC_COL_DANGER);
-            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), 0xFFFFFF);
+            draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 3, mb.top + 3, mb.right - 3, mb.bottom - 3), OC_COL_ON_ACCENT);
         }
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(rt, name, g_ui, rf(card.left + 8, ay + av + 6, card.right - 8, ay + av + UIS(28)), OC_COL_TEXT);
@@ -24133,18 +23850,12 @@ static void call_day_heading(uint64_t ms, char *out, size_t cap) {
     strftime(out, cap, "%B %Y", &b);
 }
 
-/* The list's rows, as drawn, for the dump: each call, the heading it fell
- * under, and its row. */
-static struct { uint64_t id; rectf r; char head[24]; } g_home_drawn[CH_ROWS_MAX];
-static int g_n_home_drawn;
-static float g_home_active_y, g_home_scroll_max;
+static float g_home_scroll_max;
 static rectf g_home_list;                 /* the list column, for the wheel */
 static uint64_t g_home_more_asked;        /* the oldest call older ones were asked before */
 static int g_home_filter;                 /* 0 all, 1 joined, 2 missed */
 static float g_cpage_scroll_max;
-static int g_strip_bars, g_strip_people;   /* the page's timeline strip, as drawn */
 static char g_page_heads[160];             /* the page's sections, in the order drawn */
-static rectf g_strip_rec;
 
 /* A call's row in the list: its faces, subject and line; Join, Decline or
  * Open while it runs; Call back on a missed one; selected while its page is
@@ -24215,7 +23926,6 @@ static void call_page_region(gfx *rt, const oc_model *m, rectf reg);   /* below 
  * under date headings, the filters, New call; and, on a wide window, the
  * selected call's page beside the list. */
 static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
-    g_n_home_drawn = 0;
     float W = reg.right - reg.left;
     int split = W >= UIS(720);
     g_home_split = split;
@@ -24230,7 +23940,6 @@ static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
     float x0 = body.left + 16, x1 = body.right - 16, rh = UIS(58);
     /* Active: pinned, never scrolled away. */
     float y = body.top + 10;
-    g_home_active_y = y;
     draw_text(rt, "Active", g_meta, rf(x0, y, x1, y + 20), OC_COL_FAINT);
     y += 24;
     if (!m->n_calls) {
@@ -24266,7 +23975,7 @@ static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
             fill_round(rt, fb, UIS(13), g_home_filter == i ? OC_COL_ACCENT : OC_COL_INPUT);
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, FL[i], g_meta, fb, g_home_filter == i ? 0xFFFFFF : OC_COL_TEXT);
+            draw_text(rt, FL[i], g_meta, fb, g_home_filter == i ? OC_COL_ON_ACCENT : OC_COL_TEXT);
             g_meta->align = oa;
             char aid[32], an[48];
             snprintf(aid, sizeof aid, "calls.filter.%s", i == 0 ? "all" : i == 1 ? "joined" : "missed");
@@ -24313,12 +24022,6 @@ static void draw_calls_home(gfx *rt, const oc_model *m, rectf reg) {
         if (row.bottom > past.top && row.top < past.bottom) {
             call_list_row(rt, m, row, h->call_id, h->subject, line, h->faces, h->n_faces, 0, 0,
                           (h->flags & OC_CALL_HIST_RECORDING) != 0, missed);
-            if (g_n_home_drawn < CH_ROWS_MAX) {
-                g_home_drawn[g_n_home_drawn].id = h->call_id;
-                g_home_drawn[g_n_home_drawn].r = row;
-                snprintf(g_home_drawn[g_n_home_drawn].head, sizeof g_home_drawn[0].head, "%s", head);
-                g_n_home_drawn++;
-            }
         }
         py += rh;
         shown++;
@@ -24478,7 +24181,6 @@ static void call_page_region(gfx *rt, const oc_model *m, rectf reg) {
             if (k == nw) who[nw++] = p->stays[i].user_id;
         }
         float stop = y;
-        g_strip_bars = 0;
         for (int k = 0; k < nw; k++) {
             const char *nm = oc_model_user_name(m, who[k]);
             float ry = y + (float)k * rowh;
@@ -24492,11 +24194,9 @@ static void call_page_region(gfx *rt, const oc_model *m, rectf reg) {
                 float bx1 = lx + (rx - lx) * (float)(b2 - t0) / (float)(t1 - t0);
                 if (bx1 < bx0 + 3) bx1 = bx0 + 3;
                 fill_round(rt, rf(bx0, ry + (rowh - bh) / 2, bx1, ry + (rowh + bh) / 2), bh / 2, OC_COL_ACCENT);
-                g_strip_bars++;
             }
         }
         float sbot = y + (float)nw * rowh;
-        g_strip_rec = rf(0, 0, 0, 0);
         for (uint16_t i = 0; i < p->n_recordings; i++) {
             uint64_t a = p->recordings[i].started_at, b2 = p->recordings[i].stopped_at ? p->recordings[i].stopped_at : t1;
             if (a < t0) a = t0;
@@ -24507,9 +24207,7 @@ static void call_page_region(gfx *rt, const oc_model *m, rectf reg) {
             fill(rt, rf(rx0, stop - 6, rx1, stop - 3), REC_RED);
             fill(rt, rf(rx0, stop - 6, rx0 + 1, sbot), REC_RED);
             fill(rt, rf(rx1 - 1, stop - 6, rx1, sbot), REC_RED);
-            if (!i) g_strip_rec = rf(rx0, stop - 6, rx1, sbot);
         }
-        g_strip_people = nw;
         y = sbot + 6;
     }
     PAGE_HEAD("People");
@@ -24626,7 +24324,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
             fill_round(rt, rf(rb.left + UIS(12), (rb.top + rb.bottom) / 2 - UIS(5), rb.left + UIS(22),
                               (rb.top + rb.bottom) / 2 + UIS(5)), UIS(5), REC_RED);
             draw_text(rt, rl, g_ui, rf(rb.left + UIS(28), rb.top, rb.right - 6, rb.bottom),
-                      m->call.recording ? 0xFFFFFF : OC_COL_TEXT);
+                      m->call.recording ? OC_COL_ON_ACCENT : OC_COL_TEXT);
             call_btn_add(rb, CC_RECORD, "call.record", m->call.recording ? "Recording: on. Stop recording"
                                                                           : "Recording: off. Record the call");
             cb = rb;
@@ -24670,7 +24368,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     if ((in || back) ? m->call.recording : v && v->recording) {
         uint64_t by = (in || back) ? m->call.rec_by : v->rec_by;
         float w = rec_mark_w(m, by, 1, in);
-        g_rec_mark = draw_rec_mark(rt, m, body.right - 24 - w, body.top + 6 + UIS(12), by, 1, in, "call");
+        draw_rec_mark(rt, m, body.right - 24 - w, body.top + 6 + UIS(12), by, 1, in, "call");
     }
     /* A recorded call, before joining it -- or joined, and nothing sent yet:
      * the notice, and Join, which says it was seen. */
@@ -24699,7 +24397,6 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         call_button(rt, cb2, -1, gated ? "Leave" : "Cancel", 0, 0);
         call_btn_add(cb2, gated ? CC_LEAVE : CC_REC_CANCEL, gated ? "call.rec.leave" : "call.rec.cancel",
                      gated ? "Leave" : "Cancel");
-        g_rec_notice_on = 1;
         return;
     }
 
@@ -25225,7 +24922,7 @@ static void draw_newcall(gfx *rt, const oc_model *m, rectf body) {
             rectf box = rf(row.left + 6, row.top + 7, row.left + 24, row.top + 25);
             if (g_cpick_on[i]) fill_round(rt, box, 3, OC_COL_ACCENT);
             else stroke_round(rt, box, 3, OC_COL_BORDER, 1.5f);
-            if (g_cpick_on[i]) draw_text(rt, "✓", g_meta, rf(box.left + 3, box.top, box.right, box.bottom), 0xFFFFFF);
+            if (g_cpick_on[i]) draw_text(rt, "✓", g_meta, rf(box.left + 3, box.top, box.right, box.bottom), OC_COL_ON_ACCENT);
             const char *nm = oc_model_user_name(m, g_cpick_uid[i]);
             draw_user_avatar(rt, m, g_cpick_uid[i], nm ? nm : "", rf(row.left + 32, row.top + 4, row.left + 54, row.top + 26), g_meta);
             draw_text(rt, nm && nm[0] ? nm : "someone", g_ui, rf(row.left + 62, row.top, row.right - 8, row.bottom), OC_COL_TEXT);
@@ -25448,7 +25145,7 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
         }
         if (!g_threads_unread) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, lbl, g_meta, b, g_threads_unread ? 0xFFFFFF : OC_COL_MUTED);
+        draw_text(rt, lbl, g_meta, b, g_threads_unread ? OC_COL_ON_ACCENT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         g_threads_unread_btn = b;
     }
@@ -25532,7 +25229,7 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
                 fill_round(rt, pill, OC_R_PILL, OC_COL_ACCENT);
                 { int oa = g_micro->align;
                   g_micro->align = ST_ALIGN_CENTER;
-                  draw_text(rt, up, g_micro, pill, 0xFFFFFF);
+                  draw_text(rt, up, g_micro, pill, OC_COL_ON_ACCENT);
                   g_micro->align = oa; }
             }
         }
@@ -26148,9 +25845,6 @@ static void paint(oc_win *hwnd) {
      * transcript above it, the popovers anchored to it. */
     if (main_is_conversation()) composer_refit(hwnd);
     gfx_begin(rt, OC_COL_BASE);
-    /* The frame owns the tally: it is a fact about what was just drawn, and the
-     * dump that reports it runs long after the frame ended. */
-    g_clip_n = 0; g_clip_worst = 0; g_clip_first[0] = 0;
     g_msglist_drawn = 0;
     /* The hover strip belongs to the frame that drew it. draw_msglist clears and
      * refills it whenever it runs, so the only way it goes stale is a frame where
@@ -26159,11 +25853,8 @@ static void paint(oc_win *hwnd) {
      * is empty unless this frame put something in it. */
     g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
-    memset(g_atag_n, 0, sizeof g_atag_n);
-    g_via_n = 0;
     g_n_timehits = 0;
     g_n_replierhits = 0;
-    g_n_emojiboxes = 0;
     /* The reader's clock, which the model's excerpts use too. */
     if (m) oc_model_set_clock12((oc_model *)m, !g_pref_time24);
     g_n_splhits = 0;
@@ -26197,7 +25888,6 @@ static void paint(oc_win *hwnd) {
  *     an explicit WM_PRINTCLIENT arm was added for it).
  *   - custom emoji, mention highlighting and eventually rich text (REQ-220) in
  *     the field, all of which need a layout we own.
- *   - a surface the harness can drive and a screenshot can see.
  *
  * There is no child window: the text is part of the drawn scene and the MAIN
  * window owns the keyboard while `g_ed_focus` is set. That is what makes the
@@ -27684,8 +27374,7 @@ static int ed_lines(float w) {
  * but never shown -- the drawn caret is the one people see). The composer
  * comes through ed_caret_sync, every other drawn field through field_draw.
  * `g_caret_owned`, `g_caret_at` and `g_caret_h` are our own record of having
- * done so and where, so an unchanged caret is not re-sent; the dump reports
- * it beside what the platform says it has (oc_plat_text_caret_at). */
+ * done so and where, so an unchanged caret is not re-sent. */
 /* g_caret_placed (declared above, with the paint pass that clears it): a caret
  * nobody placed this frame belongs to a field that is no longer on screen, and
  * ed_caret_kill forgets it -- otherwise it would stay wherever it was last put.
@@ -27886,11 +27575,6 @@ static size_t    g_pch_pic_len;
 static char      g_pch_ext[8];
 static int       g_pch_focus;                /* the choice Enter takes */
 static rectf     g_pch_btn[PCH_N], g_pch_panel;
-/* Test hooks: what a sheet would put on the clipboard beside the text, which a
- * harness cannot put there itself on every platform. NULL / 0 asks the
- * platform as ever. */
-static char     *g_test_clip_html;
-static int       g_test_clip_pic;
 
 static void pastechoice_close(void) {
     if (!g_pch_open && !g_pch_text) return;
@@ -27914,18 +27598,8 @@ static void pastechoice_open(const char *text, oc_table *t) {
      * offers no Image. */
     g_pch_ext[0] = '\0';
     if (g_view != VIEW_NEWMSG && g_client && g_sel) {
-        if (g_test_dir[0] && g_test_clip_pic) {
-            static const uint8_t PNG[] = {
-                0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x04,
-                0x00,0x00,0x00,0x04,0x08,0x02,0x00,0x00,0x00,0x26,0x93,0x09,0x29,0x00,0x00,0x00,0x10,0x49,0x44,0x41,
-                0x54,0x78,0xDA,0x63,0xD0,0xAA,0xBA,0x01,0x47,0x0C,0xC4,0x71,0x00,0x5E,0xF2,0x17,0xC1,0xF9,0x2C,0x71,
-                0x9D,0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,0xAE,0x42,0x60,0x82 };
-            g_pch_pic = malloc(sizeof PNG);
-            if (g_pch_pic) { memcpy(g_pch_pic, PNG, sizeof PNG); g_pch_pic_len = sizeof PNG; snprintf(g_pch_ext, sizeof g_pch_ext, "png"); }
-        } else {
-            g_pch_pic = oc_plat_clipboard_picture(&g_pch_pic_len, g_pch_ext);
-            if (g_pch_pic && !g_pch_pic_len) { free(g_pch_pic); g_pch_pic = NULL; }
-        }
+        g_pch_pic = oc_plat_clipboard_picture(&g_pch_pic_len, g_pch_ext);
+        if (g_pch_pic && !g_pch_pic_len) { free(g_pch_pic); g_pch_pic = NULL; }
     }
     g_pch_focus = PCH_TABLE;
     g_pch_open = 1;
@@ -28008,7 +27682,7 @@ static void pastechoice_pick(oc_win *hwnd, int k) {
     if (k == PCH_TABLE) {
         oc_table *t = g_pch_tsv;
         g_pch_tsv = NULL;
-        char *h = g_test_dir[0] && g_test_clip_html ? strdup(g_test_clip_html) : oc_plat_clipboard_html();
+        char *h = oc_plat_clipboard_html();
         if (h) {
             oc_table *ht = oc_table_from_html(h, strlen(h));
             if (ht && ht->rows == t->rows && ht->cols == t->cols) { oc_table_free(t); t = ht; }
@@ -28030,7 +27704,7 @@ static void pastechoice_pick(oc_win *hwnd, int k) {
          * -- the HTML's when it matches, so links and bold show. */
         if (!g_pch_pic) {
             oc_table *t = g_pch_tsv, *ht = NULL;
-            char *h = g_test_dir[0] && g_test_clip_html ? strdup(g_test_clip_html) : oc_plat_clipboard_html();
+            char *h = oc_plat_clipboard_html();
             if (h) {
                 ht = oc_table_from_html(h, strlen(h));
                 if (ht && t && (ht->rows != t->rows || ht->cols != t->cols)) { oc_table_free(ht); ht = NULL; }
@@ -28140,7 +27814,7 @@ static void draw_pastechoice(gfx *rt, float W, float H) {
         if (!on) stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         int was = g_ui->align;
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, LBL[k], g_ui, b, on ? 0xFFFFFF : OC_COL_TEXT);
+        draw_text(rt, LBL[k], g_ui, b, on ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_ui->align = was;
         g_pch_btn[k] = b;
         x = b.right + gap;
@@ -28321,10 +27995,10 @@ static void te_step(int dir) {
  * or last line of this one; Esc cancels. */
 static int te_key(field *f, int key, int ctrl, int shift) {
     if (!g_te_open || !g_te_t) return 0;
-    if (key == OCK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
+    if (key == OCK_ESCAPE) { modal_finish(0); return 1; }
     if (key == OCK_TAB) { te_step(shift ? -1 : 1); return 1; }
     if (key == OCK_RETURN) {
-        if (ctrl) { if (te_submit()) g_modal_closed_by = "save"; return 1; }
+        if (ctrl) { te_submit(); return 1; }
         if (shift) return 0;
         if (g_te_r >= g_te_t->rows) te_add_row();
         else te_focus(g_te_r + 1, g_te_c);
@@ -28570,7 +28244,7 @@ static void draw_table_editor(gfx *rt, rectf body) {
         if (t->header) {
             int oa = g_meta->align;
             g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, "\xE2\x9C\x93", g_meta, box, 0xFFFFFF);
+            draw_text(rt, "\xE2\x9C\x93", g_meta, box, OC_COL_ON_ACCENT);
             g_meta->align = oa;
         }
         draw_text(rt, hl, g_ui, rf(x + UIS(31.0f), y, x + UIS(31.0f) + text_width(hl, g_ui) + 4, y + UIS(30.0f)),
@@ -28776,7 +28450,7 @@ static int te_click(oc_win *hwnd, int x, int y) {
     return 0;
 }
 
-/* The editor's controls by number, for assistive technology and the dump. */
+/* The editor's controls by number, for assistive technology. */
 enum { TEA_MINUS = 0, TEA_PLUS, TEA_HEADER, TEA_ADDROW, TEA_ADDCOL, TEA_N,
        TEA_ALIGN = 100,                        /* + col * 3 + (0 left, 1 centre, 2 right) */
        TEA_RMCOL = 200,                        /* + col */
@@ -29274,8 +28948,7 @@ static void ed_mouse_up(void) {
 /* ---- double-click word selection --------------------------------
  * A native EDIT does this for free, which is why nothing here did it after
  * ARCH-98 replaced the RichEdit with a self-drawn field: the behaviour
- * left with the control and no test missed it, because the harness could not
- * express a gesture at all until `drag` was added alongside this.
+ * left with the control.
  *
  * Two things were needed. The window class never set CS_DBLCLKS, so Windows was
  * not sending WM_LBUTTONDBLCLK in the first place — a second click arrived as
@@ -29341,7 +29014,7 @@ static void ed_draw(gfx *rt, rectf box) {
     st_layout *tl = ed_layout(box.right - box.left);
     if (!tl) return;
 
-    /* An empty field shows the cue — in the SCENE, so a screenshot has it. */
+    /* An empty field shows the cue, drawn in the scene like the text. */
     if (!g_ed_len && !g_ed_comp_len) {
         char cue[160];
         composer_cue(model(), cue, sizeof cue);
@@ -29351,8 +29024,8 @@ static void ed_draw(gfx *rt, rectf box) {
         /* ONE LINE, measured, and ellipsized rather than wrapped. It was drawn
          * with the WRAPPING body format into a rect a fixed 20 DIP tall: past
          * about 150% the line box is taller than that, so the whole cue was cut
-         * away and the composer sat empty with no invitation in it at all --
-         * `chromefit`'s clipped= found it at 240 DPI. g_ui does not wrap, so a
+         * away and the composer sat empty with no invitation in it at all, at
+         * 240 DPI. g_ui does not wrap, so a
          * long channel name ends in an ellipsis instead of wrapping into a
          * second line there is no room for, and the rect is the line box, which
          * is what the glyphs actually need. */
@@ -29431,13 +29104,7 @@ static void ed_draw(gfx *rt, rectf box) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
             oc_motion_caret_lit(now_ms(), g_ed_blink, motion_reduced())) {
-            /* Declared transient for the audit: this bar is present in half the
-             * frames by design, so any check that asserts two frames are equal
-             * has to know not to compare it. Without the tag the consistency
-             * run reported a phase difference as a rendering disagreement. */
-            gfx_tag(rt, "transient:caret");
             fill(rt, cr, OC_COL_TEXT);
-            gfx_tag(rt, NULL);
         }
     }
     gfx_clip_pop(rt);
@@ -29527,7 +29194,7 @@ static void sched_menu_open(float x, float y) {
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
-/* --- the automation surface's identifiers (REQ-290) ----------------
+/* --- the accessibility tree's identifiers (REQ-290) ----------------
  *
  * An invoke token is what a press TURNS INTO, carried opaquely through a11y.c
  * and posted back to this thread. The high byte is the kind and the rest is its
@@ -29611,7 +29278,8 @@ enum {
     AT_MORE,          /* payload: index into g_morehits -- open that cut message */
     AT_THRDATE,       /* the thread pane's Jump to date */
     AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
-    AT_JUMPCAL        /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
+    AT_JUMPCAL,       /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
+    AT_PREFCHOICE     /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -29686,9 +29354,8 @@ static const char *view_aid(int act) {
     }
 }
 
-/* The published scene, kept at file scope so the harness can measure it.
- * It is already the app's own account of every element it drew and where — which
- * is exactly what a fit check needs, and it costs nothing to reuse. */
+/* The published scene, kept at file scope: the app's own account of every
+ * element it drew and where. */
 static oc_acc_item g_acc_items[OC_ACC_MAX];
 
 static void a11y_publish_scene(const oc_model *m) {
@@ -29700,10 +29367,9 @@ static void a11y_publish_scene(const oc_model *m) {
     g_acc_surface = rf(0, 0, 0, 0);
 
     /* A MODAL OWNS THE TREE. While a card covers the window, the shell's rows
-     * and buttons are unreachable by pointer and must be unreachable by AT and
-     * by the harness alike — publishing them invited a screen reader to invoke
-     * a message the user cannot see, and made chromefit compare a card's
-     * content against chrome underneath it. Skip straight to the modal block.
+     * and buttons are unreachable by pointer and must be unreachable by AT
+     * too — publishing them invited a screen reader to invoke a message the
+     * user cannot see. Skip straight to the modal block.
      * Signed out, there is no model and no shell: render_scene drew the sign-in
      * card and whatever it asks over itself, so only that block has anything
      * true to say, and nothing above it may read `m`. */
@@ -29730,7 +29396,6 @@ static void a11y_publish_scene(const oc_model *m) {
                         g_sub_panel.right, g_subrows[i].bot),
                      ATOK(AT_MENU, g_subrows[i].cmd));
         }
-        g_a11y_n = n;
         oc_a11y_publish(items, n, NULL, 0, 0);
         return;
     }
@@ -30493,10 +30158,7 @@ modal_items:
             snprintf(nm, sizeof nm, "%s %s", verb, g_sw[row].label);
             acc_push(items, &n, OC_ACC_BUTTON, aid, nm, b, ATOK(AT_WSMGR, i));
         }
-        /* The status dialog publishes its content, which is what lets
-         * chromefit PROVE the card fits — the defect this dialog had was a
-         * chip row clipped at the card's own edge, invisible to every
-         * rect-based check because the rects were never published. */
+        /* The status dialog publishes its content. */
         if (g_status_open) {
             acc_push(items, &n, OC_ACC_BUTTON, "status.emoji", "Status emoji",
                      g_status_emoji_btn, ATOK(AT_STATUSEMOJI, 0));
@@ -30630,6 +30292,33 @@ modal_items:
                     snprintf(aid, sizeof aid, "prefs.cat.%s", CATAID[i]);
                     acc_push(items, &n, OC_ACC_BUTTON, aid, PC_NAME[i], g_pref_cats[i], ATOK(AT_PREFCAT, (uint64_t)i));
                 }
+            /* The shown category's choices (REQ-269, REQ-290), each where it is
+             * drawn: a choice in a row of several is a tab, "<row>: <choice>",
+             * with ", selected" on the current one, as the sidebar's unreads chip
+             * carries its state; a row with one action is a button named for the
+             * row. The id is the row's fixed name and the value the choice
+             * stores, so neither wording nor layout moves it. Only what is on
+             * screen: the rects were clipped to the scroller (hit_visible), and
+             * acc_push drops an empty one. pref_row records a row right to left,
+             * so each row's run is published back to front, in drawn order. */
+            for (int i = 0; i < g_n_pref_hits && n < OC_ACC_MAX; ) {
+                int j = i;
+                while (j < g_n_pref_hits && g_pref_hits[j].row == g_pref_hits[i].row) j++;
+                const char *row_aid = pref_row_aid(g_pref_hits[i].row);
+                for (int k = j - 1; k >= i && row_aid && n < OC_ACC_MAX; k--) {
+                    char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+                    snprintf(aid, sizeof aid, "prefs.%s.%d", row_aid, g_pref_hits[k].val);
+                    uint64_t tok = ATOK(AT_PREFCHOICE, (uint64_t)g_pref_hits[k].row * 256u + (uint64_t)g_pref_hits[k].val);
+                    if (j - i == 1) {
+                        acc_push(items, &n, OC_ACC_BUTTON, aid, g_pref_hits[k].label, g_pref_hits[k].r, tok);
+                    } else {
+                        snprintf(nm, sizeof nm, "%s: %s%s", g_pref_hits[k].label, g_pref_hits[k].text,
+                                 g_pref_hits[k].on ? ", selected" : "");
+                        acc_push(items, &n, OC_ACC_TAB, aid, nm, g_pref_hits[k].r, tok);
+                    }
+                }
+                i = j;
+            }
             if (g_pref_cat == PC_AICLIENTS)
                 for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
                     acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
@@ -30659,7 +30348,6 @@ modal_items:
         }
     }
 
-    g_a11y_n = n;
     oc_a11y_publish(items, n, ctext, caret, anchor);
 }
 
@@ -30911,7 +30599,6 @@ static void preview_set(oc_win *hwnd, int on) {
  * laid out and drawn by the transcript's own renderer, as a message from you. */
 static void preview_draw(gfx *rt, rectf box) {
     g_ed_box = box;
-    g_preview_h = 0; g_preview_lines = 0; g_preview_tabs = 0;
     const oc_model *m = model();
     char *b = ed_md_all();
     static oc_msg msg;
@@ -30926,10 +30613,7 @@ static void preview_draw(gfx *rt, rectf box) {
         float cw = box.right - box.left;
         mlay_ent *e = body_layout(&msg, cw);
         if (e) {
-            g_preview_h = body_draw(rt, &msg, e, box.left, box.top, cw, box.right);
-            st_metrics mt;
-            if (e->lay) { st_layout_metrics(e->lay, &mt); g_preview_lines = mt.lines; }
-            g_preview_tabs = e->ntab;
+            body_draw(rt, &msg, e, box.left, box.top, cw, box.right);
         }
     }
     gfx_clip_pop(rt);
@@ -30958,8 +30642,7 @@ static void composer_cancel_edit(void) {
  * the PREVIOUS conversation's name ("Message bob" while you were reading alice)
  * until something unrelated forced a relayout. Caching a derived string means
  * every site that changes the inputs has to remember to refresh it, and one
- * never did. It is also why the value could not be trusted in the test dump.
- * Computed where it is used, it cannot be stale anywhere. */
+ * never did. Computed where it is used, it cannot be stale anywhere. */
 static void composer_cue(const oc_model *m, char *out, size_t cap) {
     /* In the New Message pane the field is not addressed to anything yet, so the
      * conversation cue below would name whichever channel happens to be
@@ -31128,9 +30811,8 @@ static void layout_composer(oc_win *hwnd) {
     composer_geom(bx0, bx1, (float)rc.bottom, NULL, &field, NULL);
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
-     * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's
-     * `re` flag (right > left) reports the composer as ABSENT — so the failure
-     * arrives as "the message box is gone" with no clue why. Collapse to empty
+     * silently: ed_hit matches nothing and ed_draw clips to nothing — so the
+     * failure arrives as "the message box is gone" with no clue why. Collapse to empty
      * instead, which every consumer already handles because it is what a
      * non-conversation view returns. */
     if (field.right <= field.left) {
@@ -31183,8 +30865,7 @@ static void find_changed(field *f) {
 }
 
 /* The Files view's "Search files" box. It is gated on its OWN view rather than
- * on any predicate that happens to be true there today, and it reports itself
- * in the test dump.
+ * on any predicate that happens to be true there today.
  *
  * g_file_search_box is measured during paint, so this runs from the paint path
  * (layout_natives) as well as on resize. */
@@ -31223,8 +30904,7 @@ static int efind_key(field *f, int key, int ctrl, int shift) {
 }
 
 /* The People pane's search box, written to the same rules as the Files one:
- * gated on its own view, never on a predicate that happens to be true there,
- * and reported in the dump. */
+ * gated on its own view, never on a predicate that happens to be true there. */
 static void dir_changed(field *f) {
     snprintf(g_dir_filter, sizeof g_dir_filter, "%s", f->buf);
     g_ovl_scroll = 0;          /* a new query starts at the top */
@@ -31385,7 +31065,6 @@ static int          g_vm_nscreens;
 static char         g_vm_src[256];
 static int          g_vm_corner = OC_CORNER_BR;
 static int          g_vm_nocam, g_vm_sound;
-static int          g_vm_gone;          /* the recorded window closed; the take stops there */
 static oc_win       g_recbar;           /* the recording bar, while a screen records */
 static int          g_recbar_excluded;  /* ... and kept out of the capture */
 static float        g_vm_volume = 1.0f;      /* 0..1, Up and Down in the player */
@@ -31471,7 +31150,6 @@ static void listen_drop_player(void) {
     g_listen_player = NULL;
     free(g_listen_bytes);
     g_listen_bytes = NULL;
-    g_listen_len = 0;
     g_listen_msg = 0;
 }
 
@@ -31528,7 +31206,6 @@ static void listen_tick(oc_win *hwnd, const oc_model *m) {
     uint64_t id = oc_model_listen_take_audio((oc_model *)m, &mp4, &len);
     if (!id) return;
     g_listen_bytes = mp4;
-    g_listen_len = len;
     g_listen_msg = id;
     g_listen_player = oc_player_open(mp4, len);
     if (!g_listen_player) {
@@ -31744,7 +31421,6 @@ static void preview_tick(const oc_model *m) {
     if (g_preview_asked_ms) {
         crumb("preview ready in %llu ms",
               (unsigned long long)(now_ms() - g_preview_asked_ms));
-        g_preview_wait_ms = (uint32_t)(now_ms() - g_preview_asked_ms);
         g_preview_asked_ms = 0;
     }
 }
@@ -31828,7 +31504,7 @@ static void bar_paint(oc_win *w, const char *line, const bar_btn *btns, int n) {
         fill_round(w->g, r, OC_R_CONTROL, i == 0 ? (hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT) : (hot ? OC_COL_HOVER : OC_COL_INPUT));
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(w->g, btns[i].label, g_ui, rf(r.left, r.top + 5, r.right, r.bottom),
-                  !btns[i].enabled ? OC_COL_FAINT : i == 0 ? 0xFFFFFF : OC_COL_TEXT);
+                  !btns[i].enabled ? OC_COL_FAINT : i == 0 ? OC_COL_ON_ACCENT : OC_COL_TEXT);
         g_ui->align = ST_ALIGN_LEFT;
         x -= bw + pad;
     }
@@ -31837,7 +31513,7 @@ static void bar_paint(oc_win *w, const char *line, const bar_btn *btns, int n) {
     gfx_end(w->g);
     g_txt_target = prev;
     /* The same line and buttons, as the bar window's own accessibility tree
-     * (REQ-269, REQ-290): what a screen reader reads and a test presses. A
+     * (REQ-269, REQ-290): what a screen reader reads and presses. A
      * switched-off button goes without its token. */
     oc_acc_item items[2];
     memset(items, 0, sizeof items);
@@ -32014,7 +31690,6 @@ static void rec_open_devices(oc_win *hwnd) {
     o.height = g_vm_quality;
     /* Within the workspace's own cap, which WORKSPACE_INFO told us (REQ-164). */
     o.max_bytes = oc_recorder_budget(model()->max_video_size);
-    g_vm_gone = 0;
     const oc_capture_device *src = vm_source();
     if (src) {
         o.screen_id = src->id;
@@ -32306,7 +31981,6 @@ static void vm_tick(oc_win *hwnd, const oc_model *m) {
     if (g_rec && (g_rec_phase == REC_RECORDING || g_rec_phase == REC_FINISHING)) {
         oc_rec_status st; oc_recorder_status(g_rec, &st);
         if (st.state == OC_REC_FINISHING) g_rec_phase = REC_FINISHING;
-        if (st.source_gone) g_vm_gone = 1;
         if (st.state == OC_REC_DONE && oc_recorder_take(g_rec, &g_rec_res) == 0) {
             /* The camera goes as soon as the take exists: review plays the
              * recording, not the camera (REQ-166). */
@@ -32332,7 +32006,7 @@ static void vm_btn(gfx *rt, rectf r, const char *label, int cmd, int primary, in
                        stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f); }
     g_ui->align = ST_ALIGN_CENTER;
     draw_text(rt, label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
-              primary ? 0xFFFFFF : danger ? OC_COL_DANGER : OC_COL_TEXT);
+              primary ? OC_COL_ON_ACCENT : danger ? OC_COL_DANGER : OC_COL_TEXT);
     g_ui->align = ST_ALIGN_LEFT;
     if (g_n_vm_btns < VM_MAX_BTNS) {
         g_vm_btns[g_n_vm_btns].r = r;
@@ -32406,7 +32080,6 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
         draw_text(rt, "\xC3\x97", g_ui, g_vm_close, OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         rectf vbox = rf(card.left + UIS(20), card.top + UIS(56), card.right - UIS(20), card.top + UIS(56) + vh);
-        g_vm_vbox = vbox;
         char errline[320];
         snprintf(errline, sizeof errline, "%s%s%s", rec_error_text(g_rec_err),
                  g_rec_detail[0] && g_rec_err == OC_REC_FAILED ? "  (" : "",
@@ -32571,8 +32244,8 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
                         if (o[i].on) fill_round(rt, b, UIS(3), OC_COL_ACCENT);
                         stroke_round(rt, b, UIS(3), o[i].on ? OC_COL_ACCENT : OC_COL_MUTED, 1.2f);
                         if (o[i].on) {
-                            gfx_line(rt, b.left + UIS(3), b.top + UIS(7), b.left + UIS(6), b.top + UIS(10), 1.6f, 0xFFFFFF, 1.0f);
-                            gfx_line(rt, b.left + UIS(6), b.top + UIS(10), b.right - UIS(3), b.top + UIS(4), 1.6f, 0xFFFFFF, 1.0f);
+                            gfx_line(rt, b.left + UIS(3), b.top + UIS(7), b.left + UIS(6), b.top + UIS(10), 1.6f, OC_COL_ON_ACCENT, 1.0f);
+                            gfx_line(rt, b.left + UIS(6), b.top + UIS(10), b.right - UIS(3), b.top + UIS(4), 1.6f, OC_COL_ON_ACCENT, 1.0f);
                         }
                         tx = b.right + UIS(8);
                     }
@@ -32772,11 +32445,11 @@ static void lb_play(oc_win *hwnd) {
 
 static void draw_lightbox(gfx *rt, float W, float H) {
     g_lb_prev = g_lb_next = g_lb_img = rf(0, 0, 0, 0);
-    g_lb_i = -1; g_lb_n = 0;
+    g_lb_i = -1;
     if (!g_lightbox) return;
     static lb_item it[512];
     int n = lb_items(it, 512), i = lb_index(it, n);
-    g_lb_i = i; g_lb_n = n;
+    g_lb_i = i;
     const lb_item *cur = i >= 0 ? &it[i] : NULL;
     /* A video shows its poster; an image itself, at the expanded rung -- and
      * meanwhile its inline rung, drawn larger, rather than nothing. */
@@ -32824,7 +32497,7 @@ static void draw_lightbox(gfx *rt, float W, float H) {
     }
 
     /* Not here yet: ask for it -- this one, once. */
-    if (lb_stand_in && want && !g_thumbs_off && !thumb_failed(want) && !g_thumb_pending && g_client) {
+    if (lb_stand_in && want && !thumb_failed(want) && !g_thumb_pending && g_client) {
         g_thumb_pending = want;
         g_thumb_deadline = now_ms() + 8000;
         if (cur && cur->video) oc_client_fetch_attachment(g_client, want);
@@ -32989,7 +32662,7 @@ static void si_ws_changed(field *f) { (void)f; layout_signin(g_main); }
 static void theme_restyle_children(void) { }
 
 /* Force a scale factor. Shared by SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, the
- * `dpi` test verb and the Advanced pane's override, because the text rasters and
+ * and the Advanced pane's override, because the text rasters and
  * every laid-out field carry the old DPI and forgetting one of them leaves the
  * window drawing at two scales at once. */
 static void dpi_set(oc_win *hwnd, unsigned dpi) {
@@ -33061,6 +32734,16 @@ static void theme_set(int mode) {
     palette_changed();
 }
 
+/* High contrast on or off, as the preference and the system now say, through
+ * palette_changed like any other palette change -- and only when the answer
+ * moved, so a focus change that finds the system as it was costs nothing. */
+static void contrast_apply(void) {
+    int on = contrast_on();
+    if (on == oc_theme_high_contrast()) return;
+    oc_theme_set_high_contrast(on);
+    palette_changed();
+}
+
 /* And every SCHEME switch through here, for the same reason. A scheme changes
  * the rail and the accent rather than the ink, so it has not yet been seen to
  * strand a raster -- but "has not yet" is the state the theme switch was in
@@ -33095,16 +32778,10 @@ static int reaction_is_mine(const oc_msg *msg, const char *emoji) {
     return 0;
 }
 
-/* What the client last put on the clipboard, kept under the test hook only:
- * a browser will not read its clipboard back unasked, so the dump reports the
- * text as it was handed over rather than as the platform returns it. */
-static char *g_clip_last;
-
 static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
     (void)hwnd;
     if (!utf8) return;
     oc_plat_clipboard_set_text(utf8);
-    if (g_test_dir[0]) { free(g_clip_last); g_clip_last = strdup(utf8); }
 }
 
 /* ---- Copy table (MARKDOWN.md §1a) -----------------------------------------
@@ -34293,6 +33970,76 @@ static void msg_open_cut(uint64_t mid, int kind) {
     invalidate();
 }
 
+/* Preferences' choice `v` of row `row` (PREF_ROW_*), as clicking its chip or
+ * swatch makes it: the one path the click and an accessibility invoke both
+ * take (REQ-269, ARCH-99). */
+static void pref_choose(oc_win *hwnd, int row, int v) {
+    switch (row) {
+    case PREF_ROW_THEME:   theme_set(v); break;
+    case PREF_ROW_TIME:    g_pref_time24 = v; break;
+    /* Applying it live as well as saving it: a preference you have to
+     * restart to see is indistinguishable from one that did nothing. */
+    case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
+    case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+    case PREF_ROW_EDITOR:
+        g_pref_richtext = v ? 1 : 0;
+        ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
+        if (composer_remeasure()) layout_composer(hwnd);
+        break;
+    case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
+    case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+    case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
+    case PREF_ROW_FLASH:   g_pref_flash = v; break;
+    case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
+    case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
+    case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
+        spoken_pref_set(row, v);
+        break;
+    case PREF_ROW_DELIVER: g_pref_deliver = v; break;
+    case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
+    case PREF_ROW_CLOSE:   g_pref_close = v; break;
+    case PREF_ROW_MINTRAY: g_pref_min_tray = v; break;
+    /* Applied immediately, not on Save: it is a registry fact rather
+     * than a value in the settings bucket, and a checkbox that lies
+     * until you press Save is worse than no checkbox. */
+    case PREF_ROW_STARTUP: startup_set(v); break;
+    /* Appearance applies LIVE while the sheet is open — a colour, a text
+     * size and a density are their own preview and cannot be judged from a
+     * label — and reverts with everything else on Cancel. */
+    case PREF_ROW_ACCENT:   scheme_set(v); break;
+    case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
+    case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
+    case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
+
+    case PREF_ROW_MOTION:   g_pref_motion = v; break;
+    case PREF_ROW_CONTRAST: g_pref_contrast = v; contrast_apply(); break;
+    case PREF_ROW_RESET:
+        /* Not persisted here: Save commits, like every other control on
+         * this card. Cancel puts the old values back from the snapshot. */
+        theme_set(OC_THEME_SYSTEM);
+        scheme_set(OC_SCHEME_MIDNIGHT);
+        g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
+        g_pref_notify = NOTIFY_FULL;
+        g_pref_motion = OC_MOTION_SYSTEM;
+        g_pref_contrast = OC_HC_SYSTEM;
+        contrast_apply();
+        g_pref_flash = FLASH_IDLE;
+        g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
+        g_pref_font = OC_TYPEFACE_DEFAULT;
+        snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
+        quick_rebuild();
+        scale_apply(hwnd);
+        break;
+    case PREF_ROW_NOTIFY + 100:
+        /* The notifications sheet, from here. modal_finish first, so this
+         * card's snapshot is committed rather than left half-open behind
+         * another modal. */
+        modal_finish(1);
+        modal_enter(hwnd, &g_notify_open);
+        break;
+    }
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Admin > Agents: each button, as it was drawn -- first, since the
@@ -35072,68 +34819,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 if (in_rect(g_agtbtns[i].r, x, y)) { agents_press(hwnd, g_agtbtns[i].kind, g_agtbtns[i].id); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
-            int v = g_pref_hits[i].val;
-            switch (g_pref_hits[i].row) {
-            case PREF_ROW_THEME:   theme_set(v); break;
-            case PREF_ROW_TIME:    g_pref_time24 = v; break;
-            /* Applying it live as well as saving it: a preference you have to
-             * restart to see is indistinguishable from one that did nothing. */
-            case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
-            case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
-            case PREF_ROW_EDITOR:
-                g_pref_richtext = v ? 1 : 0;
-                ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
-                if (composer_remeasure()) layout_composer(hwnd);
-                break;
-            case PREF_ROW_ENTER:   g_pref_enter_newline = v ? 1 : 0; break;
-            case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
-            case PREF_ROW_EMOTICONS: g_pref_emoticons = v ? 1 : 0; break;
-            case PREF_ROW_FLASH:   g_pref_flash = v; break;
-            case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
-            case PREF_ROW_SAY_SENDER: case PREF_ROW_SAY_TIME: case PREF_ROW_SAY_REACTIONS:
-            case PREF_ROW_SAY_REPLIES: case PREF_ROW_SAY_ORDER: case PREF_ROW_ANNOUNCE_NEW:
-                spoken_pref_set(g_pref_hits[i].row, v);
-                break;
-            case PREF_ROW_DELIVER: g_pref_deliver = v; break;
-            case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
-            case PREF_ROW_CLOSE:   g_pref_close = v; break;
-            case PREF_ROW_MINTRAY: g_pref_min_tray = v; break;
-            /* Applied immediately, not on Save: it is a registry fact rather
-             * than a value in the settings bucket, and a checkbox that lies
-             * until you press Save is worse than no checkbox. */
-            case PREF_ROW_STARTUP: startup_set(v); break;
-            /* Appearance applies LIVE while the sheet is open — a colour, a text
-             * size and a density are their own preview and cannot be judged from a
-             * label — and reverts with everything else on Cancel. */
-            case PREF_ROW_ACCENT:   scheme_set(v); break;
-            case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
-            case PREF_ROW_FONT:     g_pref_font = v; scale_apply(hwnd); break;
-            case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
-
-            case PREF_ROW_MOTION:   g_pref_motion = v; break;
-            case PREF_ROW_RESET:
-                /* Not persisted here: Save commits, like every other control on
-                 * this card. Cancel puts the old values back from the snapshot. */
-                theme_set(OC_THEME_SYSTEM);
-                scheme_set(OC_SCHEME_MIDNIGHT);
-                g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
-                g_pref_notify = NOTIFY_FULL;
-                g_pref_motion = OC_MOTION_SYSTEM;
-                g_pref_flash = FLASH_IDLE;
-                g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
-                g_pref_font = OC_TYPEFACE_DEFAULT;
-                snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
-                quick_rebuild();
-                scale_apply(hwnd);
-                break;
-            case PREF_ROW_NOTIFY + 100:
-                /* The notifications sheet, from here. modal_finish first, so this
-                 * card's snapshot is committed rather than left half-open behind
-                 * another modal. */
-                modal_finish(1);
-                modal_enter(hwnd, &g_notify_open);
-                return 1;
-            }
+            pref_choose(hwnd, g_pref_hits[i].row, g_pref_hits[i].val);
             /* No prefs_save() here. The footer's Save commits (modal_finish ->
              * spec->commit) and Cancel restores the snapshot; persisting on every
              * click is live-apply wearing a Save button, which is how Cancel
@@ -36966,7 +36652,6 @@ static void osn_withdraw_read(void) {
         snprintf(grp, sizeof grp, "w%llu", (unsigned long long)g_osn_track[i].ws);
         oc_osn_withdraw(tag, grp);
         g_osn_track[i].raised = 0;
-        g_osn_withdrawn++;
     }
 }
 
@@ -37387,7 +37072,7 @@ static void ws_save_active(void) {
 }
 
 /* Put slot `i` on screen, from wherever the request came: the rail's switcher,
- * Ctrl+<number>, or the harness. 1 if it went, 0 if there is no such workspace
+ * or Ctrl+<number>. 1 if it went, 0 if there is no such workspace
  * -- Ctrl+5 with three signed in does nothing rather than something surprising.
  * Announced, because a switch with no visible cursor movement is silent to a
  * screen reader (REQ-269). */
@@ -37458,13 +37143,6 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * command-line path that meant a window created hidden and never shown -- a live
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
-/* How many clients this process has started: connect_start, and the sign-in
- * card's attempts (signin_start, and the web client's resumed one). Observable by the
- * harness (tools/gui/features/startup.sh, via test_dump): a startup given a workspace
- * starts exactly one, and a second is the defect where two net threads shared a
- * workspace, each authenticating, with the first orphaned. */
-static int g_clients_started;
-
 static int connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
     if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
@@ -37481,7 +37159,6 @@ static int connect_start(const char *ws, const char *cred) {
     /* With the fingerprint the workspace published, if it did (ARCH-10). */
     g_client = oc_client_start_verified(key, g_host, g_port, g_cred, store_path(), g_secret,
                                         1, ep.fingerprint);
-    g_clients_started++;
 
     ws_register();
 
@@ -37780,7 +37457,6 @@ static void signin_start(oc_win *hwnd, const char *source_id, const char *invite
         invalidate();
         return;
     }
-    g_clients_started++;
     g_si_browser = 1;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -37831,7 +37507,6 @@ static void signin_resume(oc_win *hwnd, const char *ws, const char *token) {
                                                 g_si_remember, g_si_fp);
     oc_signin_wipe(verifier, sizeof verifier);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); invalidate(); return; }
-    g_clients_started++;
     g_si_browser = 0;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
@@ -37846,16 +37521,6 @@ static void signin_resume(oc_win *hwnd, const char *ws, const char *token) {
  * link in a message. */
 static void signin_open_url(const char *url) {
     if (!url || (SDL_strncasecmp(url, "https://", 8) && SDL_strncasecmp(url, "http://", 7))) return;
-    /* Under the automation hook the URL goes to a file instead: a harness plays
-     * the browser, and a test run never opens tabs on somebody's desktop. */
-    if (g_test_dir[0]) {
-        char path[600]; snprintf(path, sizeof path, "%s\\signin_url.txt", g_test_dir);
-        FILE *f = fopen(path, "wb");
-        if (f) { fputs(url, f); fclose(f); }
-        /* ...except where this application IS the browser: the page goes
-         * there, and the harness drives it in the sign-in page (WEB.md). */
-        if (strcmp(oc_plat_name(), "web") != 0) return;
-    }
     /* A browser that does not open -- none installed, a locked-down desktop, a
      * remote session -- leaves the person a link to copy (the card offers it
      * either way) and is told so rather than left waiting. */
@@ -37956,8 +37621,8 @@ static void signin_poll(oc_win *hwnd) {
  * reasoning was that the platform's focus, tab order and IME handling were worth
  * more than matching the palette. None of it held: sixteen call sites meant
  * sixteen grey Windows-95 boxes in the middle of a themed app, none of them
- * dismissible the way every other sheet is, none of them screenshot-comparable,
- * none of them reachable by the harness.
+ * dismissible the way every other sheet is, none of them in our own
+ * accessibility tree.
  *
  * So the frame is ours, and so are the fields: every one is drawn (field_init
  * in form_dialog for text, the painter for checks, choices and selects).
@@ -37978,8 +37643,8 @@ static void signin_poll(oc_win *hwnd) {
  * rule all come from the same place as every other modal. */
 /* Esc and Enter belong to the FRAME, but the focused text field gets the key
  * first. So each form field's `key` hook (this function) answers them, the way
- * the composer's key handling does. This was found by the smoke: Esc and Enter
- * were dead in the one modal where you are always typing. */
+ * the composer's key handling does. Without it Esc and Enter were dead in the
+ * one modal where you are always typing. */
 /* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
  * submitting moves to Ctrl+Enter there, as it does in every editor that has
  * both. Esc still cancels from anywhere. */
@@ -37991,32 +37656,9 @@ static int form_key(field *f, int key, int ctrl, int shift) {
     return 0;
 }
 
-/* Seeded by the harness's `formnext` verb: the NEXT form dialog answers with
- * these values instead of running its nested event loop.
- *
- * It exists because a modal form blocks the command poll loop — so every feature
- * reached through one (the keyword list, the schedule, the pause's custom time)
- * was undrivable, and therefore untested end to end, however carefully the rest
- * of the path was covered. The dialog's own rendering and keys are exercised by
- * the `form` verb; this covers the button -> dialog -> save -> server path that
- * the blocking loop hid. */
-static char g_form_seed[FORM_MAX_FIELDS][256];
-static int  g_form_seeded;      /* how many fields were seeded; 0 = not armed */
-static int  g_form_seed_cancel; /* seeded, but answer "cancel" */
-
 static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n) {
     if (!owner || !f || n <= 0) return 0;
     if (n > FORM_MAX_FIELDS) n = FORM_MAX_FIELDS;
-    if (g_form_seeded) {
-        int seeded = g_form_seeded, cancel = g_form_seed_cancel;
-        g_form_seeded = 0; g_form_seed_cancel = 0;
-        g_form_side.on = 0;
-        g_form_err_field = -1;
-        if (cancel) return 0;
-        for (int i = 0; i < n && i < seeded; i++)
-            snprintf(f[i].value, sizeof f[i].value, "%s", g_form_seed[i]);
-        return 1;
-    }
     if (g_form_open) return 0;              /* one at a time; see the header */
 
     g_form_f = f; g_form_n = n;
@@ -38209,7 +37851,6 @@ static void invite_people(oc_win *hwnd, uint8_t role) {
     oc_field f[2] = { { FF_TEXT, "Email address", hint, "" },
                       { FF_SELECT, "Who can use a token", INVITE_USES_OPTS, "0" } };
     for (;;) {
-        int seeded = g_form_seeded;
         if (!form_dialog(hwnd, role == OC_ROLE_ADMIN ? "Invite people as admin" : "Invite people",
                          f, ask_uses ? 2 : 1)) return;
         {   /* checked as it will be sent: without the spaces a paste brings along */
@@ -38225,9 +37866,7 @@ static void invite_people(oc_win *hwnd, uint8_t role) {
                           ? "That does not look like an email address." : NULL;
         if (!why) break;
         /* Said at the field, and the form asked again with what was typed: a
-         * problem with a value belongs on the value (REQ-263). A run the
-         * harness filled in has no second form to show, so it says so instead. */
-        if (seeded) { fb_failed(why); return; }
+         * problem with a value belongs on the value (REQ-263). */
         f[0].hint = why;
         g_form_err_field = 0;
     }
@@ -38305,25 +37944,6 @@ static void sw_book_load(void) {
     oc_store_set_secret(st, g_secret);
     oc_store_workspace_each(st, sw_book_cb, NULL);
     oc_store_close(st);
-}
-
-/* How many workspaces the device remembers, from the store itself rather than
- * the dialog's copy, which is only as fresh as its last load -- the test dump's
- * `wsbook=`, signed in or not. */
-static void ws_book_count_cb(void *ctx, const char *workspace, const char *label,
-                             const char *username, uint64_t last) {
-    (void)workspace; (void)label; (void)username; (void)last;
-    (*(int *)ctx)++;
-}
-static int ws_book_count(void) {
-    int n = 0;
-    const char *sp = store_path();
-    oc_store *st = sp ? oc_store_open(sp) : NULL;
-    if (!st) return 0;
-    oc_store_set_secret(st, g_secret);
-    oc_store_workspace_each(st, ws_book_count_cb, &n);
-    oc_store_close(st);
-    return n;
 }
 
 static void open_ws_menu(oc_win *hwnd) {
@@ -38530,7 +38150,7 @@ static void open_new_menu(oc_win *hwnd) {
     mi_item(7, "Upload a file");
     mi_sep();
     mi_item(4, "Search messages");
-    /* the palette had exactly two callers — Ctrl+K and the test hook. No
+    /* the palette had exactly one caller — Ctrl+K. No
      * menu entry, no button, nothing. ARCH-82 says this GUI is affordance-driven,
      * and the palette was the one surface reachable only by a keystroke. */
     mi_item(8, "Jump to  (Ctrl+K)");
@@ -38602,6 +38222,9 @@ static void prefs_save(void) {
         /* ...and Reduce motion: Off, On or Follow system. */
         at = strlen(enc);
         snprintf(enc + at, sizeof enc - at, ";M:%d", g_pref_motion);
+        /* ...and High contrast: Off, On or Follow system. */
+        at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";H:%d", g_pref_contrast);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
     oc_client_set_setting(g_client, EMOTICONS_SETTING_KEY, g_pref_emoticons ? "on" : "off");
@@ -38615,6 +38238,7 @@ static void prefs_load(const oc_model *m) {
     int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
     int nl = 0;   /* no `N:` (an older build wrote it): Enter sends */
     int mo = OC_MOTION_SYSTEM;   /* no `M:`: follow the system */
+    int hc = OC_HC_SYSTEM;       /* no `H:`: follow the system */
     /* No `R:` or `A:` (an older build wrote it): read as the client always has. */
     oc_spoken_opts spk = oc_spoken_defaults();
     int an = 1;
@@ -38660,6 +38284,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'S') g_selfview = val >= 0 && val <= 2 ? val : 0;
             else if (k == 'N') nl = val ? 1 : 0;
             else if (k == 'M') mo = (val < 0 || val >= OC_MOTION_PREF_COUNT) ? OC_MOTION_SYSTEM : val;
+            else if (k == 'H') hc = (val < 0 || val >= OC_HC_PREF_COUNT) ? OC_HC_SYSTEM : val;
             else if (k == 'R') spk = oc_spoken_from_bits((unsigned)strtoul(p + 2, NULL, 10) & 31u);
             else if (k == 'A') an = val ? 1 : 0;
             else if (k == 'F') font = (val < 0 || val >= OC_TYPEFACE_COUNT) ? OC_TYPEFACE_DEFAULT : val;
@@ -38686,6 +38311,9 @@ static void prefs_load(const oc_model *m) {
     g_pref_daysep  = d ? 1 : 0;
     g_pref_enter_newline = nl;
     g_pref_motion = mo;
+    g_pref_contrast = hc;
+    /* Before theme_set, which applies the palette: high contrast decides which. */
+    oc_theme_set_high_contrast(contrast_on());
     g_pref_spoken = spk;
     g_pref_announce_new = an;
     g_pref_font = font;
@@ -39086,7 +38714,6 @@ static void call_join_id(oc_win *hwnd, uint64_t id, int seen) {
     if (!g_client || !id || !m) return;
     /* Every join goes through the pre-join screen; its Join comes back here. */
     if (!seen) { prejoin_open(hwnd, id); return; }
-    g_rec_notice_id = 0;
     g_rec_ack_id = id;                     /* whatever was shown there was seen */
     call_take_microphone(hwnd);
     call_claim();
@@ -39858,7 +39485,6 @@ static void call_cmd(oc_win *hwnd, int cmd) {
         if (!g_nc_err) g_pj_cam = !g_pj_cam;
         break;
     case CC_REC_CANCEL:
-        g_rec_notice_id = 0;
         call_open_home(hwnd);
         return;
     case CC_PAGE_OPEN:
@@ -40274,8 +39900,6 @@ static void notify_call(const char *title, const char *body, const char *source,
         g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
         oc_osn n = { title, body, source, tag, grp, arg, snd, NULL, labels, args, 2 };
         if (oc_osn_show(&n) == OC_OSN_SHOWN) {
-            g_toasts_raised++;
-            g_delivered_by = DELIVERED_WINRT;
             return;
         }
     }
@@ -40330,13 +39954,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         free(body);
         break; }
     case 91:     /* the poll composer's Post poll / Save */
-        if (g_pc_open && poll_compose_submit()) g_modal_closed_by = "save";
+        if (g_pc_open) poll_compose_submit();
         break;
     case 93:     /* the table editor's Insert / Save (MARKDOWN.md §6) */
-        if (g_te_open && te_submit()) g_modal_closed_by = "save";
+        if (g_te_open) te_submit();
         break;
     case 92:     /* the poll composer's Close poll now */
-        if (g_pc_open && poll_compose_close_now()) g_modal_closed_by = "save";
+        if (g_pc_open) poll_compose_close_now();
         break;
     case 1: {   /* the wire has always carried is_public; now so does the UI. */
         oc_field f[2] = {
@@ -40499,7 +40123,6 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         {
             uint64_t cid = g_jc_cid, parent = g_jc_parent, day = sch_ms(g_jc_y, g_jc_m, g_jc_d, 0);
             modal_finish(0);
-            g_modal_closed_by = "save";
             date_jump(cid, parent, day);
         }
         break;
@@ -40509,7 +40132,6 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
             uint64_t rs, re;
             if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) { invalidate(); break; }
             modal_finish(0);
-            g_modal_closed_by = "save";
             summarize_start(hwnd, g_sr_cid, OC_SUM_RANGE, rs, re);
         }
         break;
@@ -40518,7 +40140,6 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         {
             uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
             modal_finish(0);
-            g_modal_closed_by = "save";
             g_sch_insert = 0;
             time_insert_commit(hwnd, at);
         }
@@ -40529,7 +40150,6 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
             uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
             if (!sch_future(at)) { g_sch_err = 1; invalidate(); break; }
             modal_finish(0);
-            g_modal_closed_by = "save";
             sched_at(hwnd, at);
         }
         break;
@@ -41195,7 +40815,6 @@ static int kb_msg_cmd(int key) {
 static void kb_msg_key(oc_win *hwnd, int key) {
     const oc_model *m = model();
     int cmd = kb_msg_cmd(key);
-    g_kb_ran = 0;
     if (!m || !cmd || !g_kb_mid) return;
     int row = -1;
     for (int i = 0; i < g_n_msgrows; i++)
@@ -41208,7 +40827,6 @@ static void kb_msg_key(oc_win *hwnd, int key) {
         if (g_mi[i].kind == MK_ITEM && g_mi[i].cmd == cmd) { offered = 1; break; }
     g_menu = MENU_NONE; g_menu_hover = -1;
     if (!offered) return;
-    g_kb_ran = cmd;
     msg_menu_run(hwnd, cmd);
     if (g_menu) menu_move(1);            /* Remind me's choices, ready for Enter */
 }
@@ -41275,3592 +40893,6 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
         }
         break;
     }
-}
-
-/* ---- test/automation hook ------------------------------------------------ */
-
-/* Write a top-down 32bpp BGRA buffer as a BMP (no encoder deps; PIL reads it). */
-static int write_bmp(const char *path, int w, int h, const void *bgra) {
-    uint32_t rowbytes = (uint32_t)w * 4, imgsize = rowbytes * (uint32_t)h, off = 54;
-    uint8_t fh[14] = {0}, ih[40] = {0};
-    uint32_t total = off + imgsize; int32_t bw = w, bh = -h; uint16_t planes = 1, bpp = 32;
-    fh[0] = 'B'; fh[1] = 'M';
-    memcpy(fh + 2, &total, 4); memcpy(fh + 10, &off, 4);
-    uint32_t hsz = 40; memcpy(ih, &hsz, 4);
-    memcpy(ih + 4, &bw, 4); memcpy(ih + 8, &bh, 4);
-    memcpy(ih + 12, &planes, 2); memcpy(ih + 14, &bpp, 2);
-    memcpy(ih + 20, &imgsize, 4);
-    FILE *f = fopen(path, "wb"); if (!f) return 0;
-    fwrite(fh, 1, 14, f); fwrite(ih, 1, 40, f); fwrite(bgra, 1, imgsize, f);
-    fclose(f); return 1;
-}
-
-/* Render the whole UI to a BMP for the harness: the scene drawn through the
- * window's renderer and read back (gfx_readback). Thumbnail FETCHES are held
- * off for the duration; thumbnails already decoded still draw. */
-/* ---- composited snapshots ------------------------------------------------ */
-
-/* One image of the whole window: the scene rendered and read back. Every
- * field is drawn now, so what the renderer holds is the whole application. */
-static int test_shot(oc_win *hwnd, const char *path) {
-    irect rc; client_rect(hwnd, &rc);
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0 || !g_gfx) return 0;
-    gfx_begin(g_gfx, OC_COL_BASE);
-    scene_scale_apply();
-    g_thumbs_off = 1;      /* do not FETCH during a capture */
-    render_scene(g_gfx, model(), DIPF(w), DIPF(h));
-    g_thumbs_off = 0;
-    unsigned char *rgba = malloc((size_t)w * h * 4), *bgra = malloc((size_t)w * h * 4);
-    int ok = 0;
-    /* gfx_readback returns straight RGBA; the BMP wants BGRX. */
-    if (rgba && bgra && gfx_readback(g_gfx, rgba, w, h)) {
-        for (size_t i = 0; i < (size_t)w * h; i++) {
-            bgra[i * 4 + 0] = rgba[i * 4 + 2];
-            bgra[i * 4 + 1] = rgba[i * 4 + 1];
-            bgra[i * 4 + 2] = rgba[i * 4 + 0];
-            bgra[i * 4 + 3] = 0xFF;
-        }
-        ok = write_bmp(path, w, h, bgra);
-    }
-    free(rgba); free(bgra);
-    gfx_end(g_gfx);
-    return ok;
-}
-
-/* `s` on one line in quotes, as the clipboard line writes it (\t \r \n \" \\). */
-static void dump_q(FILE *f, const char *s) {
-    fputc('"', f);
-    for (int nq = 0; s && *s && nq < 4000; s++, nq++) {
-        if      (*s == '\t') fputs("\\t", f);
-        else if (*s == '\r') fputs("\\r", f);
-        else if (*s == '\n') fputs("\\n", f);
-        else if (*s == '"' || *s == '\\') { fputc('\\', f); fputc(*s, f); }
-        else fputc(*s, f);
-    }
-    fputc('"', f);
-}
-
-static char te_align_ch(uint8_t al) {
-    return al == OC_RT_ALIGN_CENTER ? 'c' : al == OC_RT_ALIGN_RIGHT ? 'r' : al == OC_RT_ALIGN_LEFT ? 'l' : '-';
-}
-
-/* The tables in the field, the table editor and the paste chooser (MARKDOWN.md
- * §6): what each holds and where its controls are. A card's md= is the
- * Markdown it will be sent as. */
-static void dump_tables_ui(FILE *f) {
-    int nc = 0;
-    for (int i = 0; i < g_ed_len; i++) if (ed_is_tab(g_ed[i])) nc++;
-    /* The field's text as it reads: each card "[table]", never its pipes. */
-    /* The completion popover: its rows, the chosen one, and where each is, so a
-     * script can take one by Enter, Tab or a click and read what it inserts. */
-    fprintf(f, "ac n=%d sel=%d\n", g_n_ac, g_ac_sel);
-    for (int i = 0; i < g_n_ac; i++)
-        fprintf(f, "  acrow %d repl=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n", i, g_ac[i].repl,
-                g_ac_rows[i].left, g_ac_rows[i].top, g_ac_rows[i].right, g_ac_rows[i].bottom);
-    fprintf(f, "composer tables=%d text=", nc);
-    {
-        static char shown[ED_MAX * 3 + ED_TAB_SLOTS * 8 + 1];
-        size_t o = 0;
-        for (int i = 0; i < g_ed_len && o + 9 < sizeof shown; ) {
-            if (ed_is_tab(g_ed[i])) { memcpy(shown + o, "[table]", 7); o += 7; i++; continue; }
-            int j = i;
-            while (j < g_ed_len && !ed_is_tab(g_ed[j])) j++;
-            o += (size_t)to_u8n(g_ed + i, j - i, shown + o, sizeof shown - o);
-            i = j;
-        }
-        shown[o] = '\0';
-        dump_q(f, shown);
-    }
-    fputc('\n', f);
-    for (int i = 0; i < g_ed_len; i++) {
-        const oc_table *t = ed_tab_at(g_ed[i]);
-        if (!t) continue;
-        const ed_cardhit *h = NULL;
-        for (int k = 0; k < g_n_ed_chit; k++) if (g_ed_chit[k].ch == g_ed[i]) h = &g_ed_chit[k];
-        rectf r = h ? h->vis : rf(0, 0, 0, 0), e = h ? h->edit : rf(0, 0, 0, 0), x = h ? h->rm : rf(0, 0, 0, 0);
-        char al[OC_TABLE_MAX_COLS * 2 + 1]; size_t o = 0;
-        for (uint8_t k = 0; k < t->cols; k++) { if (k) al[o++] = ','; al[o++] = te_align_ch(t->align[k]); }
-        al[o] = '\0';
-        fprintf(f, "  ctable slot=%d at=%d rows=%u cols=%u header=%u align=%s r=%.0f,%.0f,%.0f,%.0f "
-                   "edit=%.0f,%.0f,%.0f,%.0f remove=%.0f,%.0f,%.0f,%.0f md=",
-                g_ed[i] - ED_TAB_BASE, i, (unsigned)t->rows, (unsigned)t->cols, (unsigned)t->header, al,
-                r.left, r.top, r.right, r.bottom, e.left, e.top, e.right, e.bottom, x.left, x.top, x.right, x.bottom);
-        char *md = oc_table_to_markdown(t);
-        dump_q(f, md ? md : "");
-        free(md);
-        fputc('\n', f);
-    }
-    {
-        rectf ok = rf(0, 0, 0, 0), can = rf(0, 0, 0, 0);
-        for (int k = 0; k < g_n_modal_btns && g_te_open; k++) {
-            if (g_modal_btns[k].cmd == 93) ok = g_modal_btns[k].r;
-            if (g_modal_btns[k].cmd == MODAL_CANCEL) can = g_modal_btns[k].r;
-        }
-        const oc_table *t = g_te_open ? g_te_t : NULL;
-        char al[OC_TABLE_MAX_COLS * 2 + 1]; size_t o = 0;
-        for (uint8_t k = 0; t && k < t->cols; k++) { if (k) al[o++] = ','; al[o++] = te_align_ch(t->align[k]); }
-        al[o] = '\0';
-        fprintf(f, "tableeditor open=%d mode=%s slot=%d cols=%u rows=%u header=%u focus=%u,%u align=%s "
-                   "fieldfocus=%d view=%.0f,%.0f,%.0f,%.0f scroll=%.0f/%.0f,%.0f/%.0f "
-                   "minus=%.0f,%.0f,%.0f,%.0f plus=%.0f,%.0f,%.0f,%.0f header_r=%.0f,%.0f,%.0f,%.0f "
-                   "addrow=%.0f,%.0f,%.0f,%.0f addcol=%.0f,%.0f,%.0f,%.0f ok=%.0f,%.0f,%.0f,%.0f "
-                   "cancel=%.0f,%.0f,%.0f,%.0f err=",
-                g_te_open, g_te_mode ? "edit" : "new", g_te_ch ? g_te_ch - ED_TAB_BASE : -1,
-                t ? (unsigned)t->cols : 0u, t ? (unsigned)t->rows : 0u, t ? (unsigned)t->header : 0u,
-                (unsigned)g_te_r, (unsigned)g_te_c, al, g_te_open && g_focus == &g_te_field,
-                g_te_view.left, g_te_view.top, g_te_view.right, g_te_view.bottom,
-                g_te_sx, g_te_sxmax, g_te_sy, g_te_symax,
-                g_te_minus.left, g_te_minus.top, g_te_minus.right, g_te_minus.bottom,
-                g_te_plus.left, g_te_plus.top, g_te_plus.right, g_te_plus.bottom,
-                g_te_hdr.left, g_te_hdr.top, g_te_hdr.right, g_te_hdr.bottom,
-                g_te_addrow.left, g_te_addrow.top, g_te_addrow.right, g_te_addrow.bottom,
-                g_te_addcol.left, g_te_addcol.top, g_te_addcol.right, g_te_addcol.bottom,
-                ok.left, ok.top, ok.right, ok.bottom, can.left, can.top, can.right, can.bottom);
-        dump_q(f, g_te_open && g_te_err ? g_te_err : "");
-        fputc('\n', f);
-        for (uint32_t r = 0; t && r <= t->rows; r++)
-            for (uint8_t k = 0; k < t->cols; k++) {
-                rectf b = rf(0, 0, 0, 0);
-                for (int i = 0; i < g_n_te_cells; i++)
-                    if (g_te_cells[i].r == r && g_te_cells[i].c == k) b = g_te_cells[i].b;
-                fprintf(f, "  tecell row=%u col=%u r=%.0f,%.0f,%.0f,%.0f text=", (unsigned)r, (unsigned)k,
-                        b.left, b.top, b.right, b.bottom);
-                dump_q(f, oc_table_cell(t, r, k));
-                fputc('\n', f);
-            }
-        for (uint8_t k = 0; t && k < t->cols; k++)
-            fprintf(f, "  tecol col=%u left=%.0f,%.0f,%.0f,%.0f center=%.0f,%.0f,%.0f,%.0f right=%.0f,%.0f,%.0f,%.0f "
-                       "remove=%.0f,%.0f,%.0f,%.0f\n", (unsigned)k,
-                    g_te_align[k][0].left, g_te_align[k][0].top, g_te_align[k][0].right, g_te_align[k][0].bottom,
-                    g_te_align[k][1].left, g_te_align[k][1].top, g_te_align[k][1].right, g_te_align[k][1].bottom,
-                    g_te_align[k][2].left, g_te_align[k][2].top, g_te_align[k][2].right, g_te_align[k][2].bottom,
-                    g_te_rmcol[k].left, g_te_rmcol[k].top, g_te_rmcol[k].right, g_te_rmcol[k].bottom);
-        for (int i = 0; t && i < g_n_te_rmrow; i++)
-            fprintf(f, "  terow row=%u remove=%.0f,%.0f,%.0f,%.0f\n", (unsigned)g_te_rmrow[i].r,
-                    g_te_rmrow[i].b.left, g_te_rmrow[i].b.top, g_te_rmrow[i].b.right, g_te_rmrow[i].b.bottom);
-    }
-    {
-        static const char *const PF[PCH_N] = { "table", "image", "text" };
-        fprintf(f, "pastechoice open=%d focus=%s rows=%u cols=%u", g_pch_open, PF[g_pch_focus % PCH_N],
-                g_pch_open && g_pch_tsv ? (unsigned)g_pch_tsv->rows + 1u : 0u,
-                g_pch_open && g_pch_tsv ? (unsigned)g_pch_tsv->cols : 0u);
-        for (int k = 0; k < PCH_N; k++) {
-            rectf b = g_pch_open && pastechoice_offered(k) ? g_pch_btn[k] : rf(0, 0, 0, 0);
-            fprintf(f, " %s=%.0f,%.0f,%.0f,%.0f", PF[k], b.left, b.top, b.right, b.bottom);
-        }
-        fputc('\n', f);
-    }
-}
-
-/* A harness argument with `\n` `\t` `\r` `\\` read as the characters. */
-static void test_unesc(const char *in, char *out, size_t cap) {
-    size_t o = 0;
-    for (const char *q = in; q && *q && o + 1 < cap; q++) {
-        if (q[0] == '\\' && q[1] == 'n')       { out[o++] = '\n'; q++; }
-        else if (q[0] == '\\' && q[1] == 't')  { out[o++] = '\t'; q++; }
-        else if (q[0] == '\\' && q[1] == 'r')  { out[o++] = '\r'; q++; }
-        else if (q[0] == '\\' && q[1] == '\\') { out[o++] = '\\'; q++; }
-        else out[o++] = *q;
-    }
-    out[o] = '\0';
-}
-
-static void test_ack(const char *msg) {
-    char p[600]; snprintf(p, sizeof p, "%s\\ack", g_test_dir);
-    FILE *f = fopen(p, "wb"); if (f) { fputs(msg ? msg : "ok", f); fclose(f); }
-}
-
-
-static void *devlist_thread(void *arg) {
-    int *n = arg;
-    oc_capture_device c[8]; oc_audio_device m[8];
-    n[0] = oc_capture_list(c, 8); n[1] = oc_audio_list(1, m, 8); n[2] = oc_audio_list(0, m, 8);
-    return NULL;
-}
-
-/* The open confirmation, and which one: the harness answers some of them
- * (tools/gui/harness/win32/drive.sh trust_dev_cert, lib.sh sign_in_card), signed in or not. */
-static void test_dump_confirm(FILE *f) {
-    fprintf(f, "confirm open=%d act=%d url=\"%s\" emoji=\"%s\" title=\"%s\"\n", g_confirm_open, g_confirm_act,
-            g_confirm_url, g_confirm_emoji, g_confirm_title);
-}
-
-/* THE TREE ITSELF, one line per element, so a check outside the client
- * can ask questions this loop cannot. The one it exists for: does
- * anything actually get DRAWN inside each of these rects? An element
- * published at coordinates nothing painted is a phantom — the stale
- * transcript rows were exactly that, and were invisible to every check
- * here because they were internally consistent. Comparing the published
- * tree against the paint ledger catches the whole class rather than the
- * instance. It is also where the harness finds a button to press. */
-static void test_dump_a11y(FILE *f) {
-    for (int i = 0; i < g_a11y_n; i++) {
-        const oc_acc_item *a = &g_acc_items[i];
-        fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
-                a->l, a->t, a->r, a->b);
-    }
-    /* What each message on the transcript says to a screen reader, under the
-     * person's settings (Preferences > Accessibility): one line each, a line
-     * break in it read as a space. */
-    for (int i = 0; i < g_a11y_n; i++) {
-        const oc_acc_item *a = &g_acc_items[i];
-        if (a->kind != OC_ACC_MESSAGE) continue;
-        fprintf(f, "a11yname %s \"", a->aid[0] ? a->aid : "-");
-        for (const char *q = a->name; *q; q++) fputc(*q == '\n' || *q == '\r' ? ' ' : *q, f);
-        fprintf(f, "\"\n");
-    }
-}
-
-/* Whether the caret of the field with the keys is lit now (Reduce motion):
- * the message box, New message's To: box, or a drawn field; 0 with none. */
-static int caret_lit_now(void) {
-    const int red = motion_reduced();
-    const uint64_t now = now_ms();
-    if (ed_focused()) return oc_motion_caret_lit(now, g_ed_blink, red);
-    if (g_view == VIEW_NEWMSG && g_nm_to_focus) return oc_motion_caret_lit(now, g_tgt_blink, red);
-    if (g_focus) return oc_motion_caret_lit(now, g_focus->blink, red);
-    return 0;
-}
-
-static void test_dump(const char *path) {
-    const oc_model *m = model();
-    FILE *f = fopen(path, "wb"); if (!f) return;
-    if (!m) {
-        /* Not signed in: the sign-in card's state is what there is to see --
-         * and whatever it asks over itself. A self-signed certificate is put to
-         * the person before sign-in, and the harness answers it from the
-         * confirmation, the button's rectangle and the DPI to scale it by; a
-         * dump without them left every Windows script stuck at launch. */
-        fprintf(f, "no model\nview=%d wsbook=%d dpi=%u\nsignin step=%d browser=%d connecting=%d err=%s\n",
-                g_view, ws_book_count(), g_dpi, g_si_step, g_si_browser, g_si_connecting, g_si_err);
-        const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
-        if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
-        /* The two lines a signed-in dump has that say how a start went, here
-         * too: a start that never signed in is the case they are most needed
-         * for (tools/gui/features/startup.sh). The error is the sign-in attempt's. */
-        fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
-                win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
-        fprintf(f, "error_seq=%u last_error=\"%s\"\n",
-                sm ? (unsigned)sm->error_seq : 0u, sm ? sm->last_error : "");
-        fprintf(f, "cursor kind=%s\n", cursor_kind_name());
-        test_dump_confirm(f);
-        test_dump_a11y(f);
-        fclose(f); return;
-    }
-    fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
-    fprintf(f, "cursor kind=%s\n", cursor_kind_name());
-    fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
-            m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
-    /* Whether the DM picker is open (`dmcompose 0|1`), so a harness waits for
-     * the state it asked for rather than the view, which both share. */
-    fprintf(f, "dm_compose=%d\n", g_dm_compose);
-    /* The open conversation's member list has arrived: until it has, the panel
-     * says "Loading…", and a picture taken then is of the wait. */
-    fprintf(f, "chanmem_ready=%d\n", m->chanmem_channel == g_sel && !m->chanmem_loading);
-    fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u server_build=\"%s\"\n",
-            oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m),
-            oc_model_server_build(m));
-    /* The roster, by name. A harness that names people ("group-DM bob,carol",
-     * "@al completes to alice") cannot otherwise tell "the feature is broken"
-     * from "this daemon has never heard of bob" — and it once reported the
-     * former for three runs while the latter was true. Capped: a dump is read by
-     * a person, and 500 names is not read by anyone. */
-    /* The accessibility surface (ARCH-99). `avail` is whether the UIA entry
-     * points resolved at all; `items` is what the last paint described. Neither
-     * proves a client can SEE the tree — tools/gui/harness/win32/uia_probe.ps1 does that, from
-     * outside the process — but a zero here localises the failure to this side. */
-    fprintf(f, "unres seq=%u n=%u can_add=%u priv=%u names=\"%s\"\n",
-            m->unresolved.seq, (unsigned)m->unresolved.n_peers,
-            m->unresolved.can_add, m->unresolved.is_private, m->unresolved.names);
-    fprintf(f, "a11y avail=%d items=%d announced=%u\n",
-            oc_a11y_available(), g_a11y_n, oc_a11y_announced());
-    /* What a message says to a screen reader, as chosen (REQ-269). */
-    fprintf(f, "spoken sender=%d time=%d reactions=%d replies=%d text_first=%d announce_new=%d\n",
-            g_pref_spoken.sender, g_pref_spoken.time, g_pref_spoken.reactions,
-            g_pref_spoken.replies, g_pref_spoken.text_first, g_pref_announce_new);
-    /* Reduce motion (REQ-269): the preference (0 Off, 1 On, 2 Follow system),
-     * the system's answer as the client takes it (`sysmotion` included), the
-     * setting in force, and whether the focused field's caret is lit now. */
-    fprintf(f, "motion pref=%d sys=%d reduced=%d caretlit=%d\n",
-            g_pref_motion, motion_sys(), motion_reduced(), caret_lit_now());
-    /* The system caret (ARCH-99). Reported because it is invisible by design —
-     * the app paints its own — so the only way to tell it exists is to ask. A
-     * screen reader that cannot follow typing looks exactly like one that can. */
-    {
-        /* `sys=` and after: what the platform says it has, read back from it
-         * (on Windows, the thread's caret), not our record of having asked. */
-        SDL_Rect sr = { 0, 0, 0, 0 };
-        int sys = oc_plat_text_caret_at(g_win, &sr);
-        fprintf(f, "caret owned=%d x=%ld y=%ld sys=%d sx=%d sy=%d sh=%d\n",
-                g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y,
-                sys, sys ? sr.x : 0, sys ? sr.y : 0, sys ? sr.h : 0);
-    }
-    /* The last error the core reported, and its monotonic sequence. Without this
-     * a failed intent is indistinguishable from an intent that was never sent —
-     * both look like "nothing happened" from a dump — and `error_seq` is here
-     * rather than the string alone because the string is CLEARED on reconnect
-     * (tests/TESTING.md records the same trap costing a flaky assertion). */
-    fprintf(f, "error_seq=%u last_error=\"%s\"\n",
-            (unsigned)m->error_seq, m->last_error);
-    /* The group-DM picker's hit-boxes. Reported for the same reason as
-     * the preference chips: measuring them off a screenshot was wrong the first
-     * time I tried it, and the app already knows where it drew them. */
-    fprintf(f, "pick n=%d chosen=%d go=%.0f,%.0f,%.0f,%.0f\n",
-            g_n_pickrows, g_n_chosen,
-            g_pick_go.left, g_pick_go.top, g_pick_go.right, g_pick_go.bottom);
-    for (int i = 0; i < g_n_pickrows; i++)
-        fprintf(f, "  pickrow uid=%llu chk=%.0f,%.0f,%.0f,%.0f row=%.0f,%.0f,%.0f,%.0f\n",
-                (unsigned long long)g_pickrows[i].uid,
-                g_pickrows[i].chk.left, g_pickrows[i].chk.top,
-                g_pickrows[i].chk.right, g_pickrows[i].chk.bottom,
-                g_pickrows[i].r.left, g_pickrows[i].r.top,
-                g_pickrows[i].r.right, g_pickrows[i].r.bottom);
-    /* WHO is signed in. Absent until 2026-07-31, which made any two-account test
-     * unfalsifiable: a stored session token silently re-auths the previous user,
-     * and every other line in this dump looks identical either way. */
-    fprintf(f, "me id=%llu name=\"%s\"", (unsigned long long)m->user_id,
-            oc_model_user_name(m, m->user_id) ? oc_model_user_name(m, m->user_id) : "");
-    /* Own status, so a test can WAIT for the set-status round trip instead of
-     * guessing at it — the dialog's reopen-prefill is only as fresh as this. */
-    for (size_t i = 0; i < m->n_users; i++)
-        if (m->users[i].user_id == m->user_id) {
-            fprintf(f, " status=\"%s|%s\" status_exp=%llu",
-                    m->users[i].status_emoji, m->users[i].status_text,
-                    (unsigned long long)m->users[i].status_expires);
-            break;
-        }
-    fprintf(f, "\n");
-    fprintf(f, "users n=%u names=\"", (unsigned)m->n_users);
-    for (size_t i = 0; i < m->n_users && i < 32; i++)
-        fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
-    fprintf(f, "%s\"\n", m->n_users > 32 ? ",…" : "");
-    /* User groups (REQ-307-309): each with its size, the open channel's, whether
-     * this user is in it through one (so cannot leave), and whether its newest
-     * message names this user -- by name or by a group. */
-    fprintf(f, "groups n=%u", (unsigned)m->n_groups);
-    for (size_t i = 0; i < m->n_groups && i < 32; i++)
-        fprintf(f, " @%s:%u", m->groups[i]->handle, (unsigned)m->groups[i]->n_members);
-    fprintf(f, "\n");
-    /* The shared picker: whose it is, whether it has the keys, what is chosen
-     * and what is offered. */
-    fprintf(f, "grppick host=%d focus=%d chanfocus=%d memmode=%d sel=%llu chips=\"", g_tgt_host,
-            g_grp_pick_focus, g_chan_pick_focus, g_mem_mode, (unsigned long long)g_grp_sel);
-    for (int i = 0; i < g_n_tgt_chip; i++)
-        fprintf(f, "%s%s%s", i ? "," : "", g_tgt_chip[i].is_channel ? "#" : "", g_tgt_chip[i].name);
-    fprintf(f, "\" matches=\"");
-    for (int i = 0; i < g_n_tgt; i++)
-        fprintf(f, "%s%s%s", i ? "," : "", g_tgt[i].is_channel ? "#" : "", g_tgt[i].name);
-    fprintf(f, "\"\n");
-    /* The members pane's group buttons, group rows' Removes and the hovered
-     * row's Remove, in DIPs as `click` takes them (0 0 0 0 when not drawn). */
-    fprintf(f, "memgrp plus=%.0f,%.0f,%.0f,%.0f memrm=%llu:%.0f,%.0f,%.0f,%.0f rows=",
-            g_grp_plus.left, g_grp_plus.top, g_grp_plus.right, g_grp_plus.bottom,
-            (unsigned long long)g_memrm.uid, g_memrm.rm.left, g_memrm.rm.top, g_memrm.rm.right, g_memrm.rm.bottom);
-    for (int i = 0; i < g_n_memgrprows; i++)
-        fprintf(f, "%s%llu:%.0f,%.0f,%.0f,%.0f", i ? ";" : "", (unsigned long long)g_memgrprows[i].gid,
-                g_memgrprows[i].rm.left, g_memgrprows[i].rm.top, g_memgrprows[i].rm.right, g_memgrprows[i].rm.bottom);
-    fprintf(f, "\n");
-    /* The header's Add people, the pane's Add person, the picker's Add and
-     * Cancel while it is open, and which icon's tooltip is up (g_chtip's values:
-     * 0 none, 1 Add people, 2 Add a group, 5 the pane's Add person). */
-    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f paneadd=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f pickcancel=%.0f,%.0f,%.0f,%.0f tip=%d\n",
-            g_addppl_btn.left, g_addppl_btn.top, g_addppl_btn.right, g_addppl_btn.bottom,
-            g_mem_addppl.left, g_mem_addppl.top, g_mem_addppl.right, g_mem_addppl.bottom,
-            g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom,
-            g_mem_pick_cancel.left, g_mem_pick_cancel.top, g_mem_pick_cancel.right, g_mem_pick_cancel.bottom,
-            g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS ? g_chtip : 0);
-    {
-        const oc_channel *gc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        const oc_group_view *vg = gc ? oc_model_group(m, oc_model_via_group(m, g_sel, m->user_id)) : NULL;
-        int named = 0;
-        if (gc && gc->n_msgs && gc->msgs[gc->n_msgs - 1].body)
-            named = oc_model_mentions_me(m, gc->msgs[gc->n_msgs - 1].body, strlen(gc->msgs[gc->n_msgs - 1].body));
-        fprintf(f, "chgroups sel=%llu n=%u", (unsigned long long)g_sel, gc ? (unsigned)gc->n_groups : 0u);
-        for (uint16_t i = 0; gc && i < gc->n_groups; i++) fprintf(f, " %llu", (unsigned long long)gc->groups[i]);
-        fprintf(f, " via=\"%s\" last_names_me=%d joined=%d\n", vg ? vg->handle : "", named,
-                gc ? (int)gc->joined : -1);
-    }
-    {
-        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
-            for (int k = 0; k < dc->msgs[i].n_attach; k++)
-                fprintf(f, "  attach msg=%llu id=%llu name=\"%s\" mime=\"%s\" recl=%d\n",
-                        (unsigned long long)dc->msgs[i].message_id,
-                        (unsigned long long)dc->msgs[i].attach[k].id,
-                        dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
-                        dc->msgs[i].attach[k].reclaimed);
-    }
-    /* Actions in the open conversation (REQ-058): the record the daemon sent,
-     * and the line the transcript draws from it -- the two a harness compares. */
-    {
-        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
-            if (dc->msgs[i].action.present)
-                fprintf(f, "  action msg=%llu start=%u len=%u actor=\"%s\" line=\"%s\" grouped=%d\n",
-                        (unsigned long long)dc->msgs[i].message_id,
-                        dc->msgs[i].action.start, dc->msgs[i].action.len,
-                        dc->msgs[i].action.actor_name, body_text(&dc->msgs[i]),
-                        i ? groups_with(&dc->msgs[i - 1], &dc->msgs[i]) : 0);
-        if (dc) fprintf(f, "preview action=%d text=\"%s\"\n", dc->preview_action, dc->preview);
-    }
-    /* Polls in the open conversation (REQ-225): what the daemon said, and each
-     * option's row as drawn -- r= is where to press, 0,0,0,0 off screen or
-     * closed -- and where "See who voted" is. */
-    {
-        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        if (dc) for (size_t i = 0; i < dc->n_msgs; i++) {
-            const oc_poll_view *pv = dc->msgs[i].poll;
-            if (!pv) continue;
-            uint64_t mid = dc->msgs[i].message_id;
-            rectf who = rf(0, 0, 0, 0), ed = rf(0, 0, 0, 0);
-            for (int k = 0; k < g_n_pollwho; k++) if (g_pollwho[k].mid == mid) who = g_pollwho[k].r;
-            for (int k = 0; k < g_n_polledit; k++) if (g_polledit[k].mid == mid) ed = g_polledit[k].r;
-            fprintf(f, "  poll msg=%llu multi=%d anon=%d closes=%llu closed=%d voters=%u mine=%u opts=%u "
-                       "who=%.0f,%.0f,%.0f,%.0f edit=%.0f,%.0f,%.0f,%.0f question=\"%s\"\n",
-                    (unsigned long long)mid, (pv->flags & OC_POLL_MULTI) != 0, (pv->flags & OC_POLL_ANONYMOUS) != 0,
-                    (unsigned long long)pv->close_at_ms, poll_closed(pv), (unsigned)pv->voters,
-                    (unsigned)pv->mine, (unsigned)pv->n_options, who.left, who.top, who.right, who.bottom,
-                    ed.left, ed.top, ed.right, ed.bottom, dc->msgs[i].body ? dc->msgs[i].body : "");
-            for (uint8_t o = 0; o < pv->n_options; o++) {
-                rectf r = rf(0, 0, 0, 0);
-                for (int k = 0; k < g_n_pollhits; k++)
-                    if (g_pollhits[k].mid == mid && g_pollhits[k].idx == o) r = g_pollhits[k].r;
-                fprintf(f, "    pollopt msg=%llu i=%u label=\"%s\" count=%u mine=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                        (unsigned long long)mid, (unsigned)o, pv->labels[o], (unsigned)pv->counts[o],
-                        (pv->mine >> o) & 1, r.left, r.top, r.right, r.bottom);
-            }
-        }
-    }
-    /* To-do lists in the open conversation: what the daemon said, and where
-     * each part is drawn -- a task's box, "Add a task" and Rename, each r= where
-     * to press, 0,0,0,0 when it is not drawn -- and whether the body shows. */
-    {
-        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        if (dc) for (size_t i = 0; i < dc->n_msgs; i++) {
-            const oc_todo_view *tv = dc->msgs[i].deleted ? NULL : dc->msgs[i].todo;
-            if (!tv) continue;
-            uint64_t mid = dc->msgs[i].message_id;
-            rectf add = rf(0, 0, 0, 0), ren = rf(0, 0, 0, 0);
-            unsigned done = 0;
-            for (int k = 0; k < g_n_todohits; k++) {
-                if (g_todohits[k].mid != mid) continue;
-                if (g_todohits[k].task == -1) add = g_todohits[k].r;
-                if (g_todohits[k].task == -2) ren = g_todohits[k].r;
-            }
-            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) done += tv->tasks[t].done != 0;
-            fprintf(f, "  todo msg=%llu author=%llu total=%u done=%u body=%d add=%.0f,%.0f,%.0f,%.0f "
-                       "rename=%.0f,%.0f,%.0f,%.0f title=\"%s\"\n",
-                    (unsigned long long)mid, (unsigned long long)tv->author_id, (unsigned)tv->total, done,
-                    msg_has_body(&dc->msgs[i]), add.left, add.top, add.right, add.bottom,
-                    ren.left, ren.top, ren.right, ren.bottom, tv->title ? tv->title : "");
-            for (uint16_t t = 0; t < tv->total && t < tv->cap; t++) {
-                const oc_todo_task_view *tk = &tv->tasks[t];
-                rectf r = rf(0, 0, 0, 0);
-                for (int k = 0; k < g_n_todohits; k++)
-                    if (g_todohits[k].mid == mid && g_todohits[k].task == (int)t) r = g_todohits[k].r;
-                const char *by = tk->done_by ? oc_model_user_name((oc_model *)m, tk->done_by) : "";
-                fprintf(f, "    todotask msg=%llu i=%u done=%d by=%llu byname=\"%s\" r=%.0f,%.0f,%.0f,%.0f "
-                           "name=\"%s\" desc=\"%s\"\n",
-                        (unsigned long long)mid, (unsigned)t, tk->done != 0, (unsigned long long)tk->done_by,
-                        by ? by : "", r.left, r.top, r.right, r.bottom, tk->name ? tk->name : "", tk->desc ? tk->desc : "");
-            }
-        }
-    }
-    /* Tables in the open conversation (MARKDOWN.md §1a): each as the dialect
-     * read it -- rows (the header not counted), columns, whether it has a
-     * header row, each column's alignment (l, c, r, or n for none) -- and as it
-     * was drawn: r= the part of its frame on screen (0,0,0,0 when not drawn),
-     * scroll= how far across it is and can go, w= h= the whole grid, laid= the
-     * rows laid out, more= the rows said as "+N more rows" and body= the top
-     * and bottom of its message's body as drawn, text included. Then its first
-     * rows' cells, the header as row 0: the text as it reads and the cell's
-     * box, where it is now drawn, scrolled or not. */
-    {
-        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        for (size_t i = 0; dc && i < dc->n_msgs; i++) {
-            const oc_msg *tm = &dc->msgs[i];
-            /* How the dialect read the body, for a script to tell a quote from a
-             * spoiler at the start of a line. */
-            if (!tm->deleted && tm->body) {
-                const char *mb = body_text(tm);
-                size_t mlen = strlen(mb), ml = body_lead(tm), mq = 0;
-                if (ml > mlen) ml = mlen;
-                oc_rt_span qs[OC_RT_MAX];
-                size_t qn = oc_rt_scan(mb + ml, mlen - ml, qs, OC_RT_MAX);
-                if (qn > OC_RT_MAX) qn = OC_RT_MAX;
-                for (size_t q = 0; q < qn; q++) if (qs[q].style == OC_RT_QUOTE) mq++;
-                fprintf(f, "  marks msg=%llu quotes=%zu spoilers=%zu\n", (unsigned long long)tm->message_id, mq,
-                        oc_rt_spoilers(mb + ml, mlen - ml, NULL, 0));
-            }
-            oc_rt_table rts[MTAB_MAX];
-            int nt = msg_tables(tm, rts, MTAB_MAX);
-            const char *b = nt ? body_text(tm) : NULL;
-            for (int k = 0; k < nt; k++) {
-                const tabhit *th = tabhit_find(tm->message_id, k, 0);
-                mlay_ent *l = th ? body_layout(tm, th->cw) : NULL;
-                const mtab *t = l && k < l->ntab ? &l->tab[k] : NULL;
-                char al[3 * OC_RT_TABLE_MAX_COLS + 1] = "";
-                for (uint8_t c = 0; c < rts[k].cols; c++) {
-                    static const char AL[4] = { 'n', 'l', 'c', 'r' };
-                    size_t o = strlen(al);
-                    snprintf(al + o, sizeof al - o, "%s%c", c ? "," : "", AL[rts[k].align[c] & 3]);
-                }
-                rectf vr = th ? th->vis : rf(0, 0, 0, 0);
-                fprintf(f, "  table msg=%llu i=%d rows=%u cols=%u header=%u align=%s r=%.0f,%.0f,%.0f,%.0f "
-                           "scroll=%.0f/%.0f w=%.0f h=%.0f laid=%u more=%u body=%.0f,%.0f\n",
-                        (unsigned long long)tm->message_id, k, (unsigned)rts[k].rows, (unsigned)rts[k].cols,
-                        (unsigned)rts[k].header, al, vr.left, vr.top, vr.right, vr.bottom,
-                        th ? th->scroll : 0.0f, th ? th->max : 0.0f, t ? t->w : 0.0f, t ? t->h : 0.0f,
-                        t ? (unsigned)t->nrows : 0u, t ? (unsigned)t->more : 0u,
-                        th ? th->btop : 0.0f, th ? th->bbot : 0.0f);
-                for (uint32_t r = 0; t && t->rowy && r < t->nrows && r < 8; r++) {
-                    uint32_t row = r + (t->rt.header ? 0 : 1);
-                    for (uint8_t c = 0; c < t->rt.cols; c++) {
-                        const mcell *cl = &t->cell[r * t->rt.cols + c];
-                        char v[256], e[600];
-                        size_t o = 0;
-                        tcell_plain(b, cl->start, cl->len, cl->spl, cl->nspl, v, sizeof v);
-                        for (const char *q = v; *q && o + 3 < sizeof e; q++) {
-                            if (*q == '\n')      { e[o++] = '\\'; e[o++] = 'n'; }
-                            else if (*q == '"') { e[o++] = '\\'; e[o++] = '"'; }
-                            else e[o++] = *q;
-                        }
-                        e[o] = '\0';
-                        float gx = th->frame.left - th->scroll, gy = th->frame.top;
-                        fprintf(f, "    tcell msg=%llu i=%d row=%u col=%u text=\"%s\" th=%.0f "
-                                   "r=%.0f,%.0f,%.0f,%.0f\n",
-                                (unsigned long long)tm->message_id, k, (unsigned)row, (unsigned)c, e,
-                                cl->lay ? cl->h : 0.0f, gx + t->colx[c], gy + t->rowy[r],
-                                gx + t->colx[c + 1], gy + t->rowy[r + 1]);
-                    }
-                }
-            }
-        }
-    }
-    /* The poll composer (REQ-225): what the card holds and where its controls
-     * are. deadline= is the instant it stands for (0 none, or no time read);
-     * err= the refusal said at errat=. */
-    {
-        static const char *const AT[4] = { "none", "question", "options", "time" };
-        rectf sub = rf(0, 0, 0, 0), can = rf(0, 0, 0, 0), clo = rf(0, 0, 0, 0);
-        for (int k = 0; k < g_n_modal_btns && g_pc_open; k++) {
-            if (g_modal_btns[k].cmd == 91) sub = g_modal_btns[k].r;
-            if (g_modal_btns[k].cmd == MODAL_CANCEL) can = g_modal_btns[k].r;
-            if (g_modal_btns[k].cmd == 92) clo = g_modal_btns[k].r;
-        }
-        char when[160] = ""; int bad = 0;
-        if (g_pc_open) pc_when_text(when, sizeof when, &bad);
-        fprintf(f, "pollcomposer open=%d mode=%s mid=%llu rows=%d multi=%d anon=%d dl=%d deadline=%llu "
-                   "locked=%d errat=%s err=\"%s\" when=\"%s\" q=\"%s\" time=\"%s\" "
-                   "add=%.0f,%.0f,%.0f,%.0f submit=%.0f,%.0f,%.0f,%.0f cancel=%.0f,%.0f,%.0f,%.0f "
-                   "close=%.0f,%.0f,%.0f,%.0f\n",
-                g_pc_open, g_pc_mode ? "edit" : "new", (unsigned long long)g_pc_mid, g_pc_n, g_pc_multi, g_pc_anon,
-                g_pc_dl, (unsigned long long)(g_pc_open ? pc_close_at() : 0), g_pc_locked,
-                AT[g_pc_err_at & 3], g_pc_err_at && g_pc_err ? g_pc_err : "", when,
-                g_pc_q ? g_pc_q->buf : "", g_pc_time ? g_pc_time->buf : "",
-                g_pc_add.left, g_pc_add.top, g_pc_add.right, g_pc_add.bottom,
-                sub.left, sub.top, sub.right, sub.bottom, can.left, can.top, can.right, can.bottom,
-                clo.left, clo.top, clo.right, clo.bottom);
-        for (int i = 0; i < g_pc_n && g_pc_open; i++)
-            fprintf(f, "  pcrow i=%d text=\"%s\" enabled=%d r=%.0f,%.0f,%.0f,%.0f rm=%.0f,%.0f,%.0f,%.0f\n",
-                    i, g_pc_opt[i]->buf, g_pc_opt[i]->enabled,
-                    g_pc_orect[i].left, g_pc_orect[i].top, g_pc_orect[i].right, g_pc_orect[i].bottom,
-                    g_pc_rm[i].left, g_pc_rm[i].top, g_pc_rm[i].right, g_pc_rm[i].bottom);
-    }
-    dump_tables_ui(f);
-    /* Talking mode (REQ-291-295). `has_audio` is the line that matters: a player
-     * that opened no speaker still runs, still ends, and still moves on to the
-     * next message, so a machine where the device would not open looks from
-     * every other line exactly like one that is reading a channel aloud. */
-    {
-        oc_player_status ls = { 0 };
-        if (g_listen_player) oc_player_status_get(g_listen_player, &ls);
-        fprintf(f, "listen ch=%llu queued=%u playing=%llu skipped=%u player=%d"
-                   " state=%d has_audio=%d pos=%u/%u msg=%llu bytes=%zu\n",
-                (unsigned long long)oc_model_listening_channel(m),
-                oc_model_listen_queued(m),
-                (unsigned long long)oc_model_listen_playing(m),
-                oc_model_listen_skipped(m), g_listen_player != NULL,
-                (int)ls.state, ls.has_audio, ls.position_ms, ls.duration_ms,
-                (unsigned long long)g_listen_msg, g_listen_len);
-    }
-    /* Calls (REQ-150, REQ-301-305): the call this client is in as the model has
-     * it, the engine's side of it -- sent, keep-alives, the sending key's epoch --
-     * and, for each other person, what arrived and whether it decrypted. Then the
-     * Calls section, as listed. */
-    {
-        oc_call_stats cs;
-        memset(&cs, 0, sizeof cs);
-        if (g_call_engine) oc_call_engine_stats(g_call_engine, &cs);
-        fprintf(f, "call in=%d ch=%llu id=%llu epoch=%u starter=%llu parts=%u invited=%u pending=%llu"
-                   " err=%u err_seq=%u view=%llu engine=%d active=%d muted=%d ptt=%d speaking=%d"
-                   " mic_level=%d sent=%u keepalives=%u transport=%s tx_epoch=%u loss=%d target_ms=%d mic_err=%d spk_err=%d"
-                   " ns=%d cap=%u self=%llu slot=%u inview=%d hdr=%.0f,%.0f,%.0f,%.0f strip=%.0f,%.0f,%.0f,%.0f"
-                   " stripmute=%.0f,%.0f,%.0f,%.0f stripleave=%.0f,%.0f,%.0f,%.0f\n",
-                m->in_call, (unsigned long long)m->call.from_channel, (unsigned long long)m->call.call_id,
-                m->call.epoch, (unsigned long long)m->call.starter, (unsigned)m->call.n_parts,
-                (unsigned)m->call.n_invited, (unsigned long long)m->call_pending, (unsigned)m->call_error,
-                m->call_error_seq, (unsigned long long)g_call_view_ch, g_call_engine != NULL, cs.active,
-                cs.muted, cs.ptt, cs.speaking, cs.mic_level, cs.sent, cs.keepalives,
-                cs.transport ? "tcp" : "udp", cs.epoch, cs.loss_pct,
-                cs.target_ms, cs.mic_error, cs.speaker_error, g_call_ns, (unsigned)m->call_max,
-                (unsigned long long)cs.self_user, (unsigned)cs.slot, g_view == VIEW_CALL,
-                g_call_hdr_btn.left, g_call_hdr_btn.top, g_call_hdr_btn.right, g_call_hdr_btn.bottom,
-                g_cstrip.left, g_cstrip.top, g_cstrip.right, g_cstrip.bottom,
-                g_cstrip_mute.left, g_cstrip_mute.top, g_cstrip_mute.right, g_cstrip_mute.bottom,
-                g_cstrip_leave.left, g_cstrip_leave.top, g_cstrip_leave.right, g_cstrip_leave.bottom);
-        for (int i = 0; i < cs.n_peers; i++)
-            fprintf(f, "call.peer uid=%llu slot=%u keyed=%d speaking=%d muted=%d level=%d packets=%u lost=%u"
-                       " late=%u fec=%u plc=%u undecryptable=%u volume=%d\n",
-                    (unsigned long long)cs.peers[i].user_id, (unsigned)cs.peers[i].slot, cs.peers[i].keyed,
-                    cs.peers[i].speaking, cs.peers[i].muted, cs.peers[i].level, cs.peers[i].packets,
-                    cs.peers[i].lost, cs.peers[i].late, cs.peers[i].fec, cs.peers[i].plc,
-                    cs.peers[i].undecryptable,
-                    (int)(oc_call_engine_volume(g_call_engine, cs.peers[i].user_id) * 100 + 0.5f));
-        /* Screen sharing (REQ-161): who shares, this device's share, and the
-         * picture of someone else's -- its size, the synthetic screen's frame
-         * number read from its pixels, and the luma at its centre. */
-        {
-            int fpx = g_share_frame.width ? oc_capture_synthetic_frame_number(&g_share_frame) : -1;
-            int centre = g_share_frame.width
-                ? g_share_frame.plane[0][(size_t)(g_share_frame.height / 2) * (size_t)g_share_frame.stride[0] +
-                                         (size_t)(g_share_frame.width / 2)] : -1;
-            fprintf(f, "share sharer=%llu on=%d state=%d taken=%d err=%d src=\"%s\" w=%d h=%d fps=%d kbps=%d"
-                       " frames=%u keyframes=%u resent=%u nacks_in=%u plis_in=%u reports=%u"
-                       " view=%dx%d view_frames=%u view_fno=%u view_nacks=%u view_plis=%u view_skipped=%u"
-                       " view_errors=%d tex=%dx%d px_fno=%d centre=%d full=%d actual=%d"
-                       " stage=%.0f,%.0f,%.0f,%.0f bar=%d excluded=%d border=%d\n",
-                    (unsigned long long)(m->in_call ? m->call.sharer : 0), g_share_on, cs.share_state,
-                    cs.share_taken, cs.share_error, g_share_name, cs.share_width, cs.share_height,
-                    cs.share_fps, cs.share_kbps, cs.share_frames, cs.share_keyframes, cs.share_resent,
-                    cs.share_nacks, cs.share_plis, cs.share_reports, cs.view_width, cs.view_height,
-                    cs.view_frames, cs.view_frame_no, cs.view_nacks, cs.view_plis, cs.view_skipped,
-                    (int)cs.view_errors, g_share_tw, g_share_th, fpx, centre, g_share_full, g_share_actual,
-                    g_share_stage.left, g_share_stage.top, g_share_stage.right, g_share_stage.bottom,
-                    g_sharebar.sdl != NULL, g_sharebar_excluded, g_shareborder.sdl != NULL && win_visible(&g_shareborder));
-        }
-        /* Cameras (REQ-160): this device's, the layout, whose cameras the view
-         * takes, each card or tile the call view drew -- whether it showed a
-         * camera, and the synthetic camera's frame number read from it -- and
-         * each other person's camera as the engine receives it. */
-        {
-            char subs[OC_MAX_CALL_PARTICIPANTS * 21 + 1] = "";
-            for (int i = 0; i < g_cam_sub_n; i++) {
-                size_t at = strlen(subs);
-                snprintf(subs + at, sizeof subs - at, "%s%llu", i ? "," : "", (unsigned long long)g_cam_sub[i]);
-            }
-            fprintf(f, "camera on=%d state=%d err=%d shown_err=%d w=%d h=%d fps=%d kbps=%d step=%d frames=%u"
-                       " cams=%d chosen=%u layout=%s speaker=%llu sub_all=%d subs=%s drawn=%d\n",
-                    g_cam_on, cs.camera_state, cs.camera_error, now_ms() < g_cam_err_until ? g_cam_err : 0,
-                    cs.camera_width, cs.camera_height, cs.camera_fps, cs.camera_kbps, cs.camera_step,
-                    cs.camera_frames, g_ncams, g_cam_h, g_call_layout ? "speaker" : "grid",
-                    (unsigned long long)g_call_speaker, g_cam_sub_all, subs[0] ? subs : "-", g_n_cam_drawn);
-            for (int i = 0; i < g_n_cam_drawn; i++)
-                fprintf(f, "camera.tile uid=%llu cam=%d big=%d fno=%d rect=%.0f,%.0f,%.0f,%.0f\n",
-                        (unsigned long long)g_cam_drawn[i].uid, g_cam_drawn[i].cam, g_cam_drawn[i].big,
-                        g_cam_drawn[i].fno, g_cam_drawn[i].r.left, g_cam_drawn[i].r.top,
-                        g_cam_drawn[i].r.right, g_cam_drawn[i].r.bottom);
-            for (int i = 0; i < cs.n_peers; i++)
-                fprintf(f, "camera.peer uid=%llu on=%d subscribed=%d frames=%u dropped=%u w=%d h=%d\n",
-                        (unsigned long long)cs.peers[i].user_id, cs.peers[i].camera_on, cs.peers[i].camera_subscribed,
-                        cs.peers[i].cam_frames, cs.peers[i].cam_dropped, cs.peers[i].cam_width, cs.peers[i].cam_height);
-        }
-        /* Missed calls, as the transcripts hold them (REQ-304). */
-        {
-            size_t ne = 0;
-            uint64_t lch = 0;
-            const char *lb = "";
-            for (size_t ci = 0; ci < m->n_channels; ci++)
-                for (size_t mi = 0; mi < m->channels[ci].n_msgs; mi++)
-                    if (m->channels[ci].msgs[mi].kind == OC_MSG_KIND_CALL) {
-                        ne++;
-                        lch = m->channels[ci].channel_id;
-                        lb = m->channels[ci].msgs[mi].body ? m->channels[ci].msgs[mi].body : "";
-                    }
-            fprintf(f, "callevents n=%zu last_ch=%llu last=\"%s\"\n", ne, (unsigned long long)lch, lb);
-        }
-        /* The call's interface as a person meets it: the conversation's banner,
-         * the call view's side panel and settings, what the header's phone and
-         * Mute say on hover, and a missed call read from this reader's side. */
-        {
-            irect crc; client_rect(g_main, &crc);
-            const char *said = "";
-            char saidb[160];
-            for (size_t ci = 0; ci < m->n_channels; ci++) {
-                const oc_channel *ch = &m->channels[ci];
-                if (ch->channel_id != g_sel) continue;
-                for (size_t mi = 0; mi < ch->n_msgs; mi++)
-                    if (ch->msgs[mi].kind == OC_MSG_KIND_CALL) {
-                        const char *wn = oc_model_user_name(m, ch->msgs[mi].author_id);
-                        if (ch->msgs[mi].author_id == m->user_id) snprintf(saidb, sizeof saidb, "Nobody joined your call");
-                        else snprintf(saidb, sizeof saidb, "You missed a call from %s", (wn && wn[0]) ? wn : "someone");
-                        said = saidb;
-                    }
-            }
-            fprintf(f, "callui banner=%d chat=%d chat_x=%.0f settings=%d hdrtip=\"%s\" mutetip=\"%s\" missed=\"%s\"\n",
-                    g_call_banner_on, call_chat_left(DIPF(crc.right)) > 0, call_chat_left(DIPF(crc.right)),
-                    g_call_settings, call_hdr_words(m), call_mute_words(), said);
-        }
-        /* The member picker, when a start or an invitation has more people than
-         * the call has room for: who is offered, in order, and who is ticked. */
-        if (g_cpick_open) {
-            fprintf(f, "callpick ch=%llu invite=%d n=%d subject=\"%s\" on=", (unsigned long long)g_cpick_from,
-                    g_cpick_invite, g_cpick_n, g_cpick_subject ? g_cpick_subject->buf : "");
-            for (int i = 0; i < g_cpick_n; i++)
-                fprintf(f, "%s%llu:%d", i ? "," : "", (unsigned long long)g_cpick_uid[i], g_cpick_on[i]);
-            fprintf(f, "\n");
-            fprintf(f, "newcall q=\"%s\" ticked=%d room=%d msg=\"%s\" preview=%d preview_err=%d level=%d results=%d"
-                       " focus_subject=%d focus_q=%d\n",
-                    g_cpick_q ? g_cpick_q->buf : "", newcall_ticked(), newcall_room(m), g_cpick_msg,
-                    g_nc_tex != NULL && g_nc_tw > 0, g_nc_err, g_nc_level, g_n_nc_res,
-                    g_focus == g_cpick_subject, g_focus == g_cpick_q);
-            for (int i = 0; i < g_n_nc_res; i++)
-                fprintf(f, "newcall.res kind=%s id=%llu\n", g_nc_res[i].kind == NCR_USER ? "user" :
-                        g_nc_res[i].kind == NCR_GROUP ? "group" : "conv", (unsigned long long)g_nc_res[i].id);
-        }
-        {
-            const oc_call_view *pjv = g_pj_open ? oc_model_call(m, g_pj_id) : NULL;
-            fprintf(f, "prejoin open=%d id=%llu recorded=%d mic=%d cam=%d cam_err=%d preview=%d people=%u\n", g_pj_open,
-                    (unsigned long long)g_pj_id, pjv && pjv->recording, g_pj_mic, g_pj_cam, g_nc_err,
-                    g_nc_tex != NULL && g_nc_tw > 0, pjv ? (unsigned)pjv->n_parts : 0u);
-        }
-        for (int i = 0; i < g_n_rec_drawn; i++)
-            fprintf(f, "recmark where=%s label=\"%s\" stop=%d\n", g_rec_drawn[i].where, g_rec_drawn[i].label,
-                    g_rec_drawn[i].stop);
-        fprintf(f, "call.said n=%u", g_n_call_said);
-        for (unsigned i = g_n_call_said > 8 ? g_n_call_said - 8 : 0; i < g_n_call_said; i++)
-            fprintf(f, " \"%s\"", g_call_said[i % 8]);
-        fprintf(f, "\n");
-        {   /* ...and what the preferences the daemon holds say of it. */
-            const char *pv = oc_model_setting(m, PREFS_SETTING_KEY), *sp = pv ? strstr(pv, ";S:") : NULL;
-            fprintf(f, "selfview mode=%d small=%.0f,%.0f,%.0f,%.0f stored=%d\n", g_selfview, g_self_tile.left,
-                    g_self_tile.top, g_self_tile.right, g_self_tile.bottom, sp ? atoi(sp + 3) : -1);
-        }
-        fprintf(f, "callcards n=%d live_marks=%d", g_n_card_drawn, g_n_sb_live);
-        for (int i = 0; i < g_n_sb_live; i++) fprintf(f, " %s%llu", i ? "" : "marked=", (unsigned long long)g_sb_live[i]);
-        fprintf(f, "\n");
-        for (int i = 0; i < g_n_card_drawn; i++)
-            fprintf(f, "callcard id=%llu live=%d faces=%d play=%d\n", (unsigned long long)g_card_drawn[i].id,
-                    g_card_drawn[i].live, g_card_drawn[i].faces, g_card_drawn[i].rec);
-        /* Calls as objects (CALLS.md §1, §8): the call the view shows, its
-         * subject and chat; the Recording mark as drawn and the joiner's notice;
-         * whether the engine waits for the user to say they saw it. */
-        {
-            const oc_call_view *vv = view_call(m);
-            fprintf(f, "callobj view=%llu subject=\"%s\" chat=%llu recording=%d mark=%.0f,%.0f,%.0f,%.0f notice=%d"
-                       " notice_id=%llu gated=%d ack_pending=%llu rec_cap=%d\n",
-                    (unsigned long long)g_call_view_id, vv ? vv->subject : "", (unsigned long long)g_call_view_ch,
-                    vv ? vv->recording : 0, g_rec_mark.left, g_rec_mark.top, g_rec_mark.right, g_rec_mark.bottom,
-                    g_rec_notice_on, (unsigned long long)g_rec_notice_id,
-                    g_call_engine && oc_call_engine_recording_gated(g_call_engine), (unsigned long long)g_rec_ack_id,
-                    oc_model_has_capability(m, OC_CAP_CALL_RECORDING));
-            fprintf(f, "callhome loaded=%d more=%d hist=%zu rows=%d filter=%d split=%d scroll=%.0f max=%.0f"
-                       " active_y=%.0f missed=%zu missed_mark=%.0f,%.0f,%.0f,%.0f seen=%llu list=%.0f,%.0f,%.0f,%.0f"
-                       " pages=%u\n",
-                    m->call_hist_loaded, m->call_hist_more, m->n_call_hist, g_n_home, g_home_filter, g_home_split,
-                    g_home_scroll, g_home_scroll_max, g_home_active_y, m->n_call_missed,
-                    g_calls_missed_mark.left, g_calls_missed_mark.top, g_calls_missed_mark.right,
-                    g_calls_missed_mark.bottom, (unsigned long long)g_calls_seen_ms,
-                    g_home_list.left, g_home_list.top, g_home_list.right, g_home_list.bottom,
-                    (unsigned)m->call_hist_seq);
-            for (int i = 0; i < g_n_home_drawn; i++)
-                fprintf(f, "callrow id=%llu head=\"%s\" rect=%.0f,%.0f,%.0f,%.0f\n",
-                        (unsigned long long)g_home_drawn[i].id, g_home_drawn[i].head, g_home_drawn[i].r.left,
-                        g_home_drawn[i].r.top, g_home_drawn[i].r.right, g_home_drawn[i].r.bottom);
-            for (size_t i = 0; i < m->n_call_hist; i++) {
-                const oc_call_hist_view *h = &m->call_hist[i];
-                int row = -1;
-                for (int k = 0; k < g_n_home; k++) if (g_home_ids[k] == h->call_id) row = k;
-                fprintf(f, "callhist id=%llu subject=\"%s\" flags=%u people=%u ended=%d chat=%llu row=%d faces=%u\n",
-                        (unsigned long long)h->call_id, h->subject, (unsigned)h->flags, (unsigned)h->n_people,
-                        h->ended_at != 0, (unsigned long long)h->chat_channel, row, (unsigned)h->n_faces);
-            }
-            const oc_call_page_view *pg = m->call_page;
-            if (pg) {
-                fprintf(f, "callpage id=%llu shown=%llu subject=\"%s\" stays=%u invitees=%u events=%u recordings=%u"
-                           " transcript=%d lines=%u/%u chat=%llu\n",
-                        (unsigned long long)pg->call_id, (unsigned long long)g_cpage_id, pg->subject,
-                        (unsigned)pg->n_stays, (unsigned)pg->n_invitees, (unsigned)pg->n_events,
-                        (unsigned)pg->n_recordings, pg->has_transcript, pg->n_lines, pg->n_lines_total,
-                        (unsigned long long)pg->chat_channel);
-                for (uint16_t i = 0; i < pg->n_recordings; i++)
-                    fprintf(f, "callpage.rec id=%llu state=%u by=%llu ms=%u attach=%llu\n",
-                            (unsigned long long)pg->recordings[i].id, (unsigned)pg->recordings[i].state,
-                            (unsigned long long)pg->recordings[i].started_by, pg->recordings[i].duration_ms,
-                            (unsigned long long)pg->recordings[i].attachment_id);
-                for (uint16_t i = 0; i < pg->n_events; i++)
-                    fprintf(f, "callpage.ev kind=%u user=%llu\n", (unsigned)pg->events[i].kind,
-                            (unsigned long long)pg->events[i].user_id);
-                fprintf(f, "call.strip people=%d bars=%d rec=%.0f,%.0f,%.0f,%.0f heads=\"%s\"\n", g_strip_people, g_strip_bars,
-                        g_strip_rec.left, g_strip_rec.top, g_strip_rec.right, g_strip_rec.bottom, g_page_heads);
-            }
-        }
-        {   /* Encrypted DMs (PRIVATE-DM.md): the sessions; New message's box; and,
-             * for the conversation shown, whether it is one, what of the composer
-             * it offers, and its newest message as this device reads it. */
-            const oc_channel *ec = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-            const oc_msg *el = ec && ec->n_msgs ? &ec->msgs[ec->n_msgs - 1] : NULL;
-            fprintf(f, "pdms n=%zu seq=%u refused_seq=%u ask=%llu nm_box=%d nm_on=%d sel_e2e=%d attach=%d sched=%d "
-                       "files_tab=%d last=\"%.80s\"\n", m->n_pdms,
-                    m->pdm_seq, m->pdm_refused_seq, (unsigned long long)g_pdm_ask_peer,
-                    g_nm_e2e_r.right > g_nm_e2e_r.left, g_nm_e2e, ec && ec->e2e,
-                    g_attach_btn.right > g_attach_btn.left, g_sched_btn.right > g_sched_btn.left,
-                    g_tab_r[TAB_FILES].right > g_tab_r[TAB_FILES].left,
-                    el && el->body && !el->deleted ? el->body : "");
-            for (size_t i = 0; i < m->n_pdms; i++) {
-                const oc_pdm_view *pv = &m->pdms[i];
-                const oc_channel *pc = oc_model_channel((oc_model *)m, pv->id);
-                fprintf(f, "pdm id=%llu peer=%llu state=%u reason=%u chan=%d safety=\"%s\"\n",
-                        (unsigned long long)pv->id, (unsigned long long)pv->peer, pv->state, pv->reason,
-                        pc && pc->e2e && !pc->forgotten, pv->safety);
-            }
-        }
-        fprintf(f, "calls n=%zu rows=%d\n", m->n_calls, g_n_call_rows);
-        for (size_t i = 0; i < m->n_calls; i++) {
-            const oc_call_view *v = &m->calls[i];
-            float t = 0, b = 0;
-            for (int k = 0; k < g_n_call_rows; k++)
-                if (g_call_rows[k].ch == v->from_channel) { t = g_call_rows[k].r.top; b = g_call_rows[k].r.bottom; }
-            fprintf(f, "calls[%zu] ch=%llu id=%llu starter=%llu parts=%u invited=%u me_invited=%d row=%.0f-%.0f\n",
-                    i, (unsigned long long)v->from_channel, (unsigned long long)v->call_id,
-                    (unsigned long long)v->starter, (unsigned)v->n_parts, (unsigned)v->n_invited,
-                    oc_model_call_invited(v, m->user_id), t, b);
-        }
-    }
-    /* Voice input (REQ-296-300): the controls, the session, and what the daemon
-     * has answered. `sent` against `answered` is whether segments went anywhere. */
-    fprintf(f, "dictate avail=%d offered=%d free_offered=%d on=%d mode=%d hold=%d ch=%llu root=%llu "
-               "level=%d speaking=%d sent=%u answered=%u words=%u err_seq=%u err=%u max_ms=%u "
-               "mic=%.0f,%.0f,%.0f,%.0f freetalk=%.0f,%.0f,%.0f,%.0f\n",
-            oc_model_stt_available(m), dict_offered(), dict_free_offered(), g_dict != NULL,
-            g_dict ? (int)oc_dictate_mode(g_dict) : -1, g_dict_hold,
-            (unsigned long long)(g_dict ? oc_dictate_channel(g_dict) : 0),
-            (unsigned long long)(g_dict ? oc_dictate_thread_root(g_dict) : 0),
-            g_dict ? oc_dictate_level(g_dict) : 0, g_dict ? oc_dictate_speaking(g_dict) : 0,
-            g_dict ? oc_dictate_sent(g_dict) : 0, m->stt_answered, (unsigned)m->n_stt_words,
-            m->stt_error_seq, (unsigned)m->stt_error_code, m->stt_max_ms,
-            g_mic_btn.left, g_mic_btn.top, g_mic_btn.right, g_mic_btn.bottom,
-            g_freetalk_btn.left, g_freetalk_btn.top, g_freetalk_btn.right, g_freetalk_btn.bottom);
-    /* The toasts on screen: how a refusal is told, so a test can read it. */
-    for (int i = 0; i < g_fb.n; i++)
-        fprintf(f, "toast[%d] danger=%d kind=%d action=\"%s\" \"%s\"\n", i, g_fb.t[i].kind == OC_FB_FAILED,
-                g_fb.t[i].kind, g_fb.t[i].action, g_fb.t[i].text);
-    {
-        const oc_fb_banner *bn = oc_fb_banner_top(&g_fb);
-        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\" r=%.0f,%.0f,%.0f,%.0f\n", bn->id, bn->severity,
-                        bn->text, g_banner_r.left, g_banner_r.top, g_banner_r.right, g_banner_r.bottom);
-        /* The main pane's header: what it is titled and where, and whether it
-         * is the DMs view's person list (dm_index), which has a header of its own. */
-        fprintf(f, "header title=\"%s\" r=%.0f,%.0f,%.0f,%.0f dm_index=%d new=%.0f,%.0f,%.0f,%.0f\n",
-                g_hdr_title, g_hdr_r.left, g_hdr_r.top, g_hdr_r.right, g_hdr_r.bottom, dm_index_view(),
-                g_dms_new_btn.left, g_dms_new_btn.top, g_dms_new_btn.right, g_dms_new_btn.bottom);
-    }
-    if (g_cmp_hint[0]) fprintf(f, "hint error=%d \"%s\"\n", g_cmp_hint_err, g_cmp_hint);
-    /* A voice's audition (REQ-292): whether one is playing, and whether audio
-     * reaches a device -- the same distinction the listen line draws. */
-    {
-        oc_player_status ps = { 0 };
-        if (g_preview_player) oc_player_status_get(g_preview_player, &ps);
-        fprintf(f, "preview player=%d state=%d has_audio=%d pos=%u/%u wait_ms=%u busy=%d\n",
-                g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms,
-                g_preview_wait_ms, g_form_action_busy);
-    }
-    fprintf(f, "view=%d si_overlay=%d wsmgr=%d wsbook=%d\n", g_view, g_si_overlay, g_wsmgr_open, ws_book_count());
-    /* The Workspaces dialog's rows as they are listed: the filter's text, how
-     * many it admits of how many remembered, then each in order. */
-    fprintf(f, "wsunused open=%d err=\"%s\"\n", g_wsu_open, g_wsu_err ? g_wsu_err : "");
-    if (g_wsmgr_open) {
-        wsmgr_view();
-        fprintf(f, "wsmgr rows=%d of=%d focus=%d checking=%d filter=\"%s\"\n", g_n_swv, g_n_sw,
-                g_wsmgr_focus, wsp_busy(), g_wsm_q ? g_wsm_q->buf : "");
-        for (int v = 0; v < g_n_swv; v++) {
-            int i = g_swv[v];
-            char addr[300]; sw_addr(i, addr, sizeof addr);
-            fprintf(f, "  wsrow %d live=%d last=%llu addr=%s user=%s ws=%s\n", v, sw_live(i),
-                    (unsigned long long)g_sw[i].last_used, addr, g_sw[i].user[0] ? g_sw[i].user : "-", g_sw[i].ws);
-        }
-    }
-    /* How the client started (tools/gui/features/startup.sh). `visible` is whether the
-     * window is on screen at all -- a client that started and showed nothing
-     * looked, from here, exactly like one that never started. `started` counts
-     * clients connect_start began, and `si_err` is the reason the sign-in view
-     * gives, which was once dropped on the way to it. */
-    /* The New message pane, as one line: which field has the keys, who it is for,
-     * what the query holds and where its caret is, and whether a send is waiting
-     * for a conversation to exist. Every one of those was a defect that could not
-     * be asserted before it could be read. */
-    if (g_view == VIEW_NEWMSG || g_nm_pending) {
-        char chips[256] = "";
-        size_t used = 0;
-        for (int i = 0; i < g_n_tgt_chip && used + 24 < sizeof chips; i++)
-            used += (size_t)snprintf(chips + used, sizeof chips - used, "%s%s%s",
-                                     used ? "," : "", g_tgt_chip[i].is_channel ? "#" : "@",
-                                     g_tgt_chip[i].name);
-        fprintf(f, "newmsg focus=%s chips=\"%s\" q=\"%s\" caret=%d sel=%d matches=%d "
-                   "body=%d pending=%d\n",
-                g_nm_to_focus ? "to" : "body", chips, g_tgt_q.buf, g_tgt_q.caret,
-                g_tgt_sel, g_n_tgt, ed_len(), g_nm_pending ? 1 : 0);
-    }
-    fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
-            win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
-    /* Modal + the settings a form modal can change, so snapshot/commit/restore is
-     * assertable rather than eyeballed — Cancel silently behaving like Save is
-     * exactly the bug this design exists to prevent. */
-    fprintf(f, "host=\"%s\"\n", g_host);
-    /* The sign-in card's controls, in scene units, for a harness to click. */
-    fprintf(f, "signin step=%d connecting=%d browser=%d btn=%.0f,%.0f,%.0f,%.0f invite=%.0f,%.0f,%.0f,%.0f "
-               "reset=%.0f,%.0f,%.0f,%.0f copy=%.0f,%.0f,%.0f,%.0f openfail=%d copied=%d\n",
-            g_si_step, g_si_connecting, g_si_browser, g_si_btn.left, g_si_btn.top, g_si_btn.right, g_si_btn.bottom,
-            g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom,
-            g_si_reset_link.left, g_si_reset_link.top, g_si_reset_link.right, g_si_reset_link.bottom,
-            g_si_wait_copy.left, g_si_wait_copy.top, g_si_wait_copy.right, g_si_wait_copy.bottom,
-            g_si_open_failed, g_si_copied_at != 0);
-    fprintf(f, "signinsub \"%s\"\n", g_si_step == 2 ? g_si_sub : "");
-    fprintf(f, "profilemenu open=%d sub=%d\n",
-            g_menu == MENU_PROFILE, g_sub_open != 0);
-    for (int i = 0; i < g_n_mirows && g_menu; i++)
-        fprintf(f, "  menurow cmd=%d kind=%d r=%.0f,%.0f,%.0f,%.0f cut=%d\n",
-                g_mirows[i].cmd, g_mirows[i].kind,
-                g_menu_x, g_mirows[i].top, g_menu_x + g_menu_w, g_mirows[i].bot, g_mirows[i].cut);
-    for (int i = 0; i < g_n_subrows && g_sub_open; i++)
-        fprintf(f, "  subrow cmd=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                g_subrows[i].cmd, g_sub_panel.left, g_subrows[i].top,
-                g_sub_panel.right, g_subrows[i].bot);
-    for (int i = 0; i < g_n_selfcard_btn; i++)
-        fprintf(f, "  selfcardbtn cmd=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                g_selfcard_btn[i].cmd,
-                g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
-                g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
-    /* The members pane's rows, so a row can be pointed at by who it is. */
-    static const char *const PMARK_NAME[OC_PMARK_COUNT] = {
-        [OC_PMARK_ONLINE] = "online", [OC_PMARK_AWAY] = "away",
-        [OC_PMARK_OFFLINE] = "offline", [OC_PMARK_DND] = "dnd" };
-    /* The roster, and how far through it the pane is looking: rows= is what is
-     * DRAWN, n= what the channel has, so a harness can tell "the rest is below"
-     * from "the rest is not there". */
-    fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
-            m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
-    for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f mark=%s via=%d agent=%d\n",
-                (unsigned long long)g_memrows[i].uid,
-                g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
-                m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
-                    ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
-                g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
-                /* The shape the row's dot is drawn as (REQ-122), from the same
-                 * oc_presence_mark() the drawing asks. */
-                PMARK_NAME[m ? oc_presence_mark(oc_model_presence_of(m, g_memrows[i].uid),
-                                                oc_model_dnd_of(m, g_memrows[i].uid))
-                             : OC_PMARK_OFFLINE],
-                g_memrows[i].via, m ? oc_model_user_is_agent(m, g_memrows[i].uid) : 0);
-    /* Agents (docs/details/MCP.md §7): the members pane's label over its
-     * agents, and the tags each surface drew in the last frame. */
-    fprintf(f, "memagents label=%.0f,%.0f,%.0f,%.0f\n", g_mem_agents_label.left, g_mem_agents_label.top,
-            g_mem_agents_label.right, g_mem_agents_label.bottom);
-    fprintf(f, "agenttags transcript=%d members=%d mention=%d profile=%d search=%d summary=%d\n",
-            g_atag_n[ATAG_TRANSCRIPT], g_atag_n[ATAG_MEMBERS], g_atag_n[ATAG_MENTION], g_atag_n[ATAG_PROFILE],
-            g_atag_n[ATAG_SEARCH], g_atag_n[ATAG_SUMMARY]);
-    {   /* Admin > Webhooks: what it shows, never the secret itself. */
-        int hexok = g_wh_secret[0] != 0;
-        for (const char *p = g_wh_secret; *p; p++) hexok &= (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f');
-        fprintf(f, "webhookadmin shown=%d secret=%d secretlen=%u hex=%d have=%d count=%d note=%d\n",
-                g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS, g_wh_secret[0] != 0, (unsigned)strlen(g_wh_secret),
-                hexok, m ? m->outwhs_have : 0, m ? (int)m->n_outwhs : -1, g_wh_note[0] != 0);
-        for (uint8_t i = 0; m && i < m->n_outwhs; i++)
-            fprintf(f, "  whrow id=%llu enabled=%u channels=%u events=\"%s\" url=\"%s\"\n",
-                    (unsigned long long)m->outwhs[i].id, m->outwhs[i].enabled, m->outwhs[i].n_channels,
-                    m->outwhs[i].events, m->outwhs[i].url);
-        for (int i = 0; i < g_n_whbtns; i++)
-            fprintf(f, "  whbtn %s r=%.0f,%.0f,%.0f,%.0f\n", g_whbtns[i].aid, g_whbtns[i].r.left,
-                    g_whbtns[i].r.top, g_whbtns[i].r.right, g_whbtns[i].r.bottom);
-    }
-    {   /* Admin > Agents: what it shows, never the token itself. */
-        int descs = 0;
-        for (const char *p = g_agt_tok_scopes; *p; ) {
-            const char *e = strchr(p, ' ');
-            size_t len = e ? (size_t)(e - p) : strlen(p);
-            if (oc_scope_find(p, len)) descs++;
-            p = e ? e + 1 : p + len;
-        }
-        int live = 0;
-        for (size_t i = 0; m && i < m->n_users; i++) live += m->users[i].agent && !m->users[i].disabled;
-        fprintf(f, "connections shown=%d admin=%d open=%d client=\"%s\" decided=%d mine=%d all=%d life=%u vias=%d\n",
-                g_prefs_open && g_pref_cat == PC_AICLIENTS, g_view == VIEW_ADMIN && g_adm_tab == ADM_CONNECTIONS, m ? m->conn_req_open : 0, m ? m->conn_req_client : "",
-                m ? m->conn_decided : 0, m ? (int)m->n_my_conns : 0, m ? (int)m->n_all_conns : 0, g_cn_life, g_via_n);
-        for (size_t i = 0; m && i < m->n_all_conns; i++)
-            fprintf(f, "  conn id=%llu uid=%llu client=\"%s\"\n", (unsigned long long)m->all_conns[i].id,
-                    (unsigned long long)m->all_conns[i].user_id, m->all_conns[i].client_name);
-        fprintf(f, "agentadmin shown=%d sel=%llu token=%d prefixed=%d tokscopes=\"%s\" descs=%d atokens=%d agents=%d\n",
-                g_view == VIEW_ADMIN && g_adm_tab == ADM_AGENTS, (unsigned long long)g_agt_sel, g_agt_tok[0] != 0,
-                strncmp(g_agt_tok, OC_PRINCIPAL_TOKEN_PREFIX, strlen(OC_PRINCIPAL_TOKEN_PREFIX)) == 0,
-                g_agt_tok_scopes, descs, m && m->atokens_agent == g_agt_sel ? (int)m->n_atokens : -1, live);
-        for (int i = 0; i < g_n_agtbtns; i++)
-            fprintf(f, "  agentbtn %s r=%.0f,%.0f,%.0f,%.0f\n", g_agtbtns[i].aid, g_agtbtns[i].r.left,
-                    g_agtbtns[i].r.top, g_agtbtns[i].r.right, g_agtbtns[i].r.bottom);
-        for (size_t i = 0; m && i < m->n_users; i++)
-            if (m->users[i].agent)
-                fprintf(f, "  agent uid=%llu name=\"%s\" removed=%d\n", (unsigned long long)m->users[i].user_id,
-                        m->users[i].name, m->users[i].disabled);
-    }
-    {   /* The audit pane: its filters, the row the keyboard is on, and each row
-         * drawn with what it names and where it is (DIPs, as `rclick` takes). */
-        const oc_model *am = model();
-        if (am && am->audit_open) {
-            fprintf(f, "audit open=1 n=%zu focus=%d family=%d actor=%llu action=\"%s\"\n", am->n_audit,
-                    g_audit_focus, am->audit_family, (unsigned long long)am->audit_actor, am->audit_action);
-            for (int i = 0; i < g_n_audit_rowhits; i++) {
-                int k = g_audit_rowhits[i].idx;
-                if (k < 0 || (size_t)k >= am->n_audit) continue;
-                const oc_audit_view *a = &am->audit[k];
-                rectf r = g_audit_rowhits[i].row;
-                fprintf(f, "  auditrow %d actor=%llu channel=%llu target=%llu action=%s rect=%.0f,%.0f,%.0f,%.0f\n", k,
-                        (unsigned long long)a->actor_id, (unsigned long long)a->channel_id,
-                        (unsigned long long)a->target_id, a->action, r.left, r.top, r.right, r.bottom);
-            }
-        }
-    }
-    fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
-            (unsigned long long)g_lightbox);
-    /* The summary (REQ-310): the pane's state, what it drew, and the range card. */
-    if (m) {
-        uint64_t rs = 0, re = 0;
-        int ready = oc_sumcal_range(&g_sr_cal, &rs, &re) == 0;
-        fprintf(f, "summary open=%d loading=%d status=%d scope=%d position=%d topics=%zu posters=%zu count=%llu "
-                   "sources=%zu hits=%d hdrbtn=%.0f,%.0f,%.0f,%.0f rangecard=%d range=%llu..%llu\n",
-                m->summary_open, m->summary_loading, m->summary_status, m->summary_scope, (int)m->summary_position,
-                m->summary.n_topics, m->summary.n_posters, (unsigned long long)m->summary.count,
-                m->summary.n_sources, g_n_sumhits, g_sum_hdr_btn.left, g_sum_hdr_btn.top, g_sum_hdr_btn.right,
-                g_sum_hdr_btn.bottom, g_sr_open, (unsigned long long)(ready ? rs : 0), (unsigned long long)(ready ? re : 0));
-        fprintf(f, "sumnotices n=%zu", m->n_sum_notices);
-        for (size_t i = 0; i < m->n_sum_notices; i++)
-            fprintf(f, " %llu:%d", (unsigned long long)m->sum_notices[i].id, m->sum_notices[i].status);
-        fprintf(f, "\n");
-    }
-    fprintf(f, "lastclick %s\n", g_modal_lastclick);
-    /* The three scale inputs ARCH-97 keeps apart, plus the product the font table
-     * actually uses — so "the text did not change size" is one line to check. */
-    /* The scheme AND both of its colours: "the picker changed the accent but not the
-     * rail" is the failure this feature can have, and an index alone cannot show it.
-     *
-     * `railcol`/`accentcol`, not `rail`/`accent`: a field name that is a SUFFIX of
-     * another one silently matched twice in the smoke's extractor and produced a
-     * two-line "expected" value. Names in this dump are read by grep, so they have to
-     * be unambiguous to grep. */
-    /* The interface font: the family asked for (`fontpick`), the one the formats
-     * were built with (`fontfam`), whether the first is missing, and the figures
-     * the pins were derived from (0 = unreadable, Segoe UI's used). */
-    fprintf(f, "textsize=%d scale=%.3f dpi=%u density=%d "
-               "scheme=%d railcol=%06X accentcol=%06X "
-               "font=%d fontpick=\"%s\" fontfam=\"%s\" fontmissing=%d fontasc=%.4f fontcap=%.4f\n",
-            g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
-            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT,
-            g_pref_font, ui_family_asked(), ui_family(), g_font_missing,
-            (double)g_font_asc, (double)g_font_cap);
-    /* THE WHOLE PALETTE, by token name. The audit asks two questions this
-     * answers and nothing else can: is a colour on screen one the theme
-     * actually names (a literal that resolves to no token is a surface that
-     * will not follow the theme), and what is the contrast between a label and
-     * the surface behind it. Both need the names, not just the two colours the
-     * line above happens to expose. */
-    {
-        static const char *const TOK[TH_COUNT] = {
-            "accent", "accent_dim", "rail", "sidebar", "base", "header",
-            "input", "select", "hover", "border", "rail_icon", "text",
-            "muted", "faint", "danger", "notice", "online", "away"
-        };
-        fprintf(f, "palette mode=%d light=%d n=%d", oc_theme_mode(),
-                oc_theme_is_light(), (int)TH_COUNT);
-        for (int i = 0; i < TH_COUNT; i++)
-            fprintf(f, " %s=%06X", TOK[i], (unsigned)oc_theme[i]);
-        fprintf(f, "\n");
-    }
-    /* The sidebar AS BUILT, which is where the appear-once rule lives: a
-     * conversation in a custom section leaves Channels, a starred one leaves both.
-     * Counting a label in this list is the only way to assert that. */
-    for (int i = 0; i < g_n_rows; i++)
-        fprintf(f, "  sbrow sec=%d header=%d cid=%llu label=\"%s\"\n",
-                g_rows[i].sec, g_rows[i].header,
-                (unsigned long long)g_rows[i].cid, g_rows[i].label);
-    /* My own profile fields (REQ-240), so a harness can prove a save round-
-     * tripped through the daemon rather than inferring it from a screenshot.
-     * Read from the ROSTER entry, which is where a restarted client's copy
-     * comes from — the point being that it survived the process. */
-    {
-        const char *pfn = "", *ptl = "", *ppr = "", *pph = "", *ptz = "";
-        if (m) for (size_t i = 0; i < m->n_users; i++)
-            if (m->users[i].user_id == m->user_id) {
-                pfn = m->users[i].full_name; ptl = m->users[i].title;
-                ppr = m->users[i].pronouns;  pph = m->users[i].phone;
-                ptz = m->users[i].timezone;
-                break;
-            }
-        fprintf(f, "myprofile full=\"%s\" title=\"%s\" pronouns=\"%s\" phone=\"%s\" tz=\"%s\"\n",
-                pfn, ptl, ppr, pph, ptz);
-    }
-    fprintf(f, "myavatar=%llu profileuid=%llu rpmode=%d prof_dm=%.0f,%.0f,%.0f,%.0f\n",
-            (unsigned long long)avatar_of(m, m->user_id),
-            (unsigned long long)g_profile_uid, g_rp_mode,
-            g_prof_dm_btn.left, g_prof_dm_btn.top, g_prof_dm_btn.right, g_prof_dm_btn.bottom);
-    {
-        /* The whole draft, however long: a check that reads past its first few
-         * hundred characters (a draft of 66 spoilers) found nothing there. */
-        static char ed8[ED_MAX * 3 + 1];
-        ed8[0] = '\0';
-        static oc_wch edw[ED_MAX + 1];
-        int n = ed_get(edw, ED_MAX + 1);
-        if (n > 0) to_u8(edw, ed8, sizeof ed8);
-        {   /* The caret's own rect, so "is the caret on the text line" is a
-             * question the harness can ask. It could not, which is how a caret
-             * drawn below the line by a zero-height formatting run got out. */
-            rectf cr;
-            if (ed_caret_rect(g_ed_box, &cr))
-                fprintf(f, "edcaret %.1f,%.1f,%.1f,%.1f h=%.1f\n",
-                        cr.left, cr.top, cr.right, cr.bottom, cr.bottom - cr.top);
-            else fprintf(f, "edcaret none\n");
-        }
-        /* The box's height and the lines it holds at the width it is drawn at:
-         * a box sized for fewer lines than its text has clips the text. */
-        float box_w = g_ed_box.right - g_ed_box.left;
-        fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d composer_h=%.0f"
-                   " lines=%d fit_lines=%d edit=%llu text=\"%s\"\n",
-                ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
-                g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
-                g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
-                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0,
-                (unsigned long long)g_edit_msg, ed8);
-        /* The composer's Preview: whether it is shown, what the renderer made of
-         * the draft, and where its button is. */
-        /* frames: what this process has written, which previewing must not move.
-         * held: the images it did not ask for. draft: 0 nothing to write, 1 waiting
-         * out the debounce, 2 due, and held back by the preview. */
-        fprintf(f, "cpreview on=%d frames=%llu held=%d draft=%d h=%.0f lines=%d tables=%d btn=%.0f,%.0f,%.0f,%.0f\n",
-                g_preview, oc_client_frames_written(), g_preview_held,
-                !g_draft_dirty ? 0 : now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS ? 2 : 1,
-                g_preview_h, g_preview_lines, g_preview_tabs,
-                g_preview_btn.left, g_preview_btn.top, g_preview_btn.right, g_preview_btn.bottom);
-        /* What Enter does in the composer, and the key the shortcuts sheet
-         * names for sending. */
-        fprintf(f, "compose enter=%s send_key=\"%s\"\n",
-                g_pref_enter_newline ? "newline" : "send", compose_key_label(1));
-    }
-    /* The About tab's admin buttons, so a test can click the one it means rather
-     * than arithmetic that breaks the next time a button is added between them —
-     * which is exactly what adding the visibility button just did. */
-    fprintf(f, "aboutvis=%.0f,%.0f,%.0f,%.0f aboutarch=%.0f,%.0f,%.0f,%.0f\n",
-            g_about_visibility.left, g_about_visibility.top,
-            g_about_visibility.right, g_about_visibility.bottom,
-            g_about_archive.left, g_about_archive.top,
-            g_about_archive.right, g_about_archive.bottom);
-    fprintf(f, "cemoji=%zu\n", m->n_cemoji);
-    /* Admin > Custom emoji: what it lists, in order, and each Delete offered. */
-    {
-        const oc_custom_emoji *er[128];
-        int en = emoji_admin_rows(m, er, 128);
-        fprintf(f, "emojiadmin shown=%d q=\"%s\" n=%d dels=%d manage=%.0f,%.0f,%.0f,%.0f sel=%s searching=%d\n",
-                g_view == VIEW_ADMIN && g_adm_tab == ADM_EMOJI, g_emoji_q, en, g_n_emojirows,
-                g_pick_manage.left, g_pick_manage.top, g_pick_manage.right, g_pick_manage.bottom,
-                g_emoji_focus >= 0 && g_emoji_focus < en ? er[g_emoji_focus]->name : "-",
-                g_efind && g_focus == g_efind);
-        for (int i = 0; i < en; i++) {
-            rectf d = rf(0, 0, 0, 0);
-            for (int k = 0; k < g_n_emojirows; k++)
-                if (!strcmp(g_emojirows[k].name, er[i]->name)) d = g_emojirows[k].r;
-            fprintf(f, "  emojirow %s by=%llu del=%.0f,%.0f,%.0f,%.0f\n", er[i]->name,
-                    (unsigned long long)er[i]->created_by, d.left, d.top, d.right, d.bottom);
-        }
-    }
-    /* The time tokens the last frame drew (MARKDOWN.md §1c): the text each
-     * reads as, its full form, and which one the tooltip shows; and how many
-     * custom emoji it drew in the bodies and tables beside them. */
-    {
-        oc_rt_clock k;
-        oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
-        fprintf(f, "timetoks n=%d tz=%d time24=%d tip=%d emoji=%d\n", g_n_timehits, k.tz_min, k.time24,
-                time_tip_index(), g_n_emojiboxes);
-        for (int i = 0; i < g_n_timehits; i++) {
-            char sh[64], full[96];
-            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_SHORT, sh, sizeof sh);
-            oc_model_time_text(m, g_timehits[i].ms, OC_RT_TIME_FULL, full, sizeof full);
-            fprintf(f, "  timetok mid=%llu ms=%lld text=\"%s\" full=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n",
-                    (unsigned long long)g_timehits[i].mid, (long long)g_timehits[i].ms, sh, full,
-                    g_timehits[i].r.left, g_timehits[i].r.top, g_timehits[i].r.right, g_timehits[i].r.bottom);
-        }
-    }
-    /* The spoilers the last frame drew, covered or shown (MARKDOWN.md §1d). */
-    fprintf(f, "spoilers n=%d\n", g_n_splhits);
-    for (int i = 0; i < g_n_splhits; i++)
-        fprintf(f, "  spoiler mid=%llu k=%d shown=%d lines=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                (unsigned long long)g_splhits[i].mid, g_splhits[i].k, g_splhits[i].shown, g_splhits[i].lines,
-                g_splhits[i].r.left, g_splhits[i].r.top, g_splhits[i].r.right, g_splhits[i].r.bottom);
-    /* Cut messages the last frame drew (CLIENT.md "Long messages"). */
-    fprintf(f, "cutmsgs n=%d\n", g_n_morehits);
-    for (int i = 0; i < g_n_morehits; i++)
-        fprintf(f, "  cutmsg mid=%llu kind=%d r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_morehits[i].mid,
-                g_morehits[i].kind, g_morehits[i].r.left, g_morehits[i].r.top, g_morehits[i].r.right, g_morehits[i].r.bottom);
-    for (size_t i = 0; i < m->n_cemoji; i++)
-        fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
-                (unsigned long long)m->cemoji[i].attachment_id);
-    fprintf(f, "sections=%d\n", g_sb.n_custom);
-    for (int i = 0; i < g_sb.n_custom; i++) {
-        fprintf(f, "  section %d name=\"%s\" n=%u collapsed=%u ids=", i,
-                g_sb.custom[i].name, g_sb.custom[i].n_ids, g_sb.custom[i].collapsed);
-        for (uint8_t k = 0; k < g_sb.custom[i].n_ids; k++)
-            fprintf(f, "%s%llu", k ? "," : "", (unsigned long long)g_sb.custom[i].ids[k]);
-        fprintf(f, "\n");
-    }
-    fprintf(f, "prefcat=%d\n", g_pref_cat);
-    for (int i = 0; i < PC_COUNT; i++)
-        fprintf(f, "  prefcat %d name=%s r=%.0f,%.0f,%.0f,%.0f\n", i, PC_NAME[i],
-                g_pref_cats[i].left, g_pref_cats[i].top,
-                g_pref_cats[i].right, g_pref_cats[i].bottom);
-    for (int i = 0; i < g_n_pref_hits; i++)
-        fprintf(f, "  prefhit row=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                g_pref_hits[i].row, g_pref_hits[i].val, g_pref_hits[i].r.left,
-                g_pref_hits[i].r.top, g_pref_hits[i].r.right, g_pref_hits[i].r.bottom);
-    fprintf(f, "closed_by=%s card=%.0f,%.0f,%.0f,%.0f close=%.0f,%.0f,%.0f,%.0f nbtn=%d\n",
-            g_modal_closed_by, g_modal_card.left, g_modal_card.top,
-            g_modal_card.right, g_modal_card.bottom,
-            g_modal_close_btn.left, g_modal_close_btn.top,
-            g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
-    fprintf(f, "modal=%s picker=%d theme=%d time24=%d members=%d daysep=%d notify=%d\n",
-            g_prefs_open ? "prefs" : g_keys_open ? "keys" : g_about_open ? "about" :
-            g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
-            g_browse_open ? "browse" : g_confirm_open ? "confirm" :
-            g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
-            oc_plat_picker_open(),
-            oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
-    {   /* What's new: its card's state, the release, and how many items it lists. */
-        static const char *const WN[] = { "none", "loading", "shown", "notrelease", "failed" };
-        int items = 0;
-        for (int s = 0; g_wn_state == WN_SHOWN && s < g_wn.n_sections; s++) items += g_wn.sections[s].n_items;
-        fprintf(f, "whatsnew=%s open=%d release=%d items=%d\n", WN[g_wn_state], g_about_open && g_whatsnew,
-                g_wn_state == WN_SHOWN ? g_wn.release : 0, items);
-    }
-    /* The form's shape and its values, so a driven form is checkable: a
-     * screenshot of a field proves only that it is there. */
-    fprintf(f, "paneclose=%.0f,%.0f,%.0f,%.0f\n", g_pane_close.left, g_pane_close.top,
-            g_pane_close.right, g_pane_close.bottom);
-    fprintf(f, "form=%d nfields=%d title=\"%s\" last=%s\n",
-            g_form_open, g_form_n, g_form_title, g_form_last[0] ? g_form_last : "none");
-    {
-        const oc_model *sm = model();
-        fprintf(f, "formside on=%d avatar=%llu upload=%.0f,%.0f,%.0f,%.0f remove=%d\n",
-                g_form_side.on,
-                (unsigned long long)(g_form_side.on && sm ? avatar_of(sm, g_form_side.uid) : 0),
-                g_form_side.up_btn.left, g_form_side.up_btn.top,
-                g_form_side.up_btn.right, g_form_side.up_btn.bottom,
-                g_form_side.rm_btn.right > g_form_side.rm_btn.left);
-    }
-    for (int i = 0; i < g_form_n && g_form_f; i++) {
-        char cur[256]; snprintf(cur, sizeof cur, "%s", g_form_f[i].value);
-        if (g_form_edit[i]) snprintf(cur, sizeof cur, "%s", g_form_edit[i]->buf);
-        /* A SELECT has no text field, so `cur` is empty for one and the rect
-         * that matters is its own box: report both, or the harness cannot tell a
-         * select that is not drawn from one whose value it cannot read. */
-        rectf fr = (g_form_f[i].kind == FF_SELECT) ? g_form_sel_box[i] : g_form_erect[i];
-        if (g_form_f[i].kind == FF_SELECT)
-            sel_opt(g_form_f[i].hint, atoi(g_form_f[i].value), cur, sizeof cur);
-        fprintf(f, "  formfield %d kind=%d edit=%d r=%.0f,%.0f,%.0f,%.0f value=\"%s\"\n",
-                i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
-                fr.left, fr.top, fr.right, fr.bottom, cur);
-        /* A multi-line field's lines, as the field itself wraps them, against how
-         * many its box shows: "all of it is visible" is lines <= shown. */
-        if (g_form_f[i].kind == FF_MULTILINE && g_form_edit[i]) {
-            float lh = g_meta_w && g_meta_w->f ? st_line_height(g_st, g_meta_w->f) : UIS(18.0f);
-            fprintf(f, "  formlines %d lines=%d shown=%d first=%d\n", i,
-                    g_form_edit[i]->lines,
-                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 2 * FORM_BOX_PAD_Y) / (lh > 0 ? lh : 1)),
-                    (int)(g_form_edit[i]->scroll / (lh > 0 ? lh : 1)));
-        }
-    }
-    /* The rows against the body they scroll in: each row's drawn extent beside
-     * the height form_rowh gives it, so "measured as drawn" is checkable, and
-     * the scroll, so a row left undrawn is seen to be reachable. Unrounded: a
-     * pixel's rounding is the size of what is being checked. */
-    fprintf(f, "formscroll scroll=%.2f max=%.2f body=%.2f,%.2f,%.2f,%.2f\n",
-            g_form_open ? g_form_scroll : 0, g_form_open ? g_form_scroll_max : 0,
-            g_form_body.left, g_form_body.top, g_form_body.right, g_form_body.bottom);
-    for (int i = 0; i < g_form_n && g_form_f && g_form_open; i++)
-        fprintf(f, "  formrow %d top=%.2f bottom=%.2f h=%.2f\n", i, g_form_row_top[i], g_form_row_bot[i],
-                form_rowh(&g_form_f[i], g_form_body.right - g_form_body.left));
-    fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
-            g_form_sel_field >= 0, g_form_sel_field, g_form_sel_scroll, g_n_form_sel_rows,
-            g_form_sel_panel.left, g_form_sel_panel.top,
-            g_form_sel_panel.right, g_form_sel_panel.bottom);
-    for (int i = 0; i < g_n_form_sel_rows; i++)
-        fprintf(f, "  formselrow i=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                i, g_form_sel_rows[i].val, g_form_sel_rows[i].r.left, g_form_sel_rows[i].r.top,
-                g_form_sel_rows[i].r.right, g_form_sel_rows[i].r.bottom);
-    {
-        char stxt[128] = "";
-        if (g_status_edit) snprintf(stxt, sizeof stxt, "%s", g_status_edit->buf);
-        fprintf(f, "statusmodal open=%d emoji=\"%s\" text=\"%s\" clear=%d nsugg=%d "
-                   "btn=%.0f,%.0f,%.0f,%.0f erect=%.0f,%.0f,%.0f,%.0f\n",
-                g_status_open, g_status_emoji, stxt, g_status_clear, g_n_status_suggs,
-                g_status_emoji_btn.left, g_status_emoji_btn.top,
-                g_status_emoji_btn.right, g_status_emoji_btn.bottom,
-                g_status_erect.left, g_status_erect.top,
-                g_status_erect.right, g_status_erect.bottom);
-        for (int i = 0; i < g_n_status_suggs && g_status_open; i++)
-            fprintf(f, "  statussugg %d text=\"%s\" clear=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                    i, g_status_suggs[i].text, g_status_suggs[i].clear,
-                    g_status_suggs[i].r.left, g_status_suggs[i].r.top,
-                    g_status_suggs[i].r.right, g_status_suggs[i].r.bottom);
-        for (int k = 0; k < 5 && g_status_open; k++)
-            fprintf(f, "  statuschip %d r=%.0f,%.0f,%.0f,%.0f\n", k,
-                    g_status_chip_hits[k].left, g_status_chip_hits[k].top,
-                    g_status_chip_hits[k].right, g_status_chip_hits[k].bottom);
-        fprintf(f, "pickstate open=%d target=%d mid=%llu slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
-                g_pick_open, g_pick_target, (unsigned long long)g_pick_mid, g_pick_quick_slot,
-                g_pick_panel.left, g_pick_panel.top,
-                g_pick_panel.right, g_pick_panel.bottom);
-        /* The first cells, so a driven pick can click a real one and a
-         * test can check what the picker offered (no workspace emoji for a
-         * quick-reaction slot). */
-        for (int i = 0; i < g_n_pick_cells && i < 48 && g_pick_open; i++)
-            fprintf(f, "  pickcell %d emoji=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n", i,
-                    g_pick_cells[i].emoji, g_pick_cells[i].r.left, g_pick_cells[i].r.top,
-                    g_pick_cells[i].r.right, g_pick_cells[i].r.bottom);
-        fprintf(f, "quickset names=\"%s\" filled=%d\n", g_quick_names, quick_slots_filled());
-        {
-            uint64_t sat = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
-            int on_days = 0, on_times = 0;
-            for (int i = 0; i < g_n_sch_days; i++) on_days += g_sch_days[i].on;
-            for (int i = 0; i < g_n_sch_times; i++) on_times += g_sch_times[i].on;
-            fprintf(f, "schedcard open=%d view=%04d-%02d sel=%04d-%02d-%02d %02d:%02d at=%llu future=%d err=%d days_on=%d times_on=%d\n",
-                    g_sch_open, g_sch_vy, g_sch_vm + 1, g_sch_y, g_sch_m + 1, g_sch_d,
-                    g_sch_min / 60, g_sch_min % 60, (unsigned long long)sat,
-                    g_sch_open ? sch_future(sat) : 0, g_sch_err, on_days, on_times);
-            for (int i = 0; i < g_n_sch_days && g_sch_open; i++)
-                fprintf(f, "  schedday %04d%02d%02d on=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                        g_sch_days[i].y, g_sch_days[i].m + 1, g_sch_days[i].d, g_sch_days[i].on,
-                        g_sch_days[i].r.left, g_sch_days[i].r.top, g_sch_days[i].r.right, g_sch_days[i].r.bottom);
-            for (int i = 0; i < g_n_sch_times && g_sch_open; i++)
-                fprintf(f, "  schedtime %02d%02d on=%d r=%.0f,%.0f,%.0f,%.0f\n",
-                        g_sch_times[i].min / 60, g_sch_times[i].min % 60, g_sch_times[i].on,
-                        g_sch_times[i].r.left, g_sch_times[i].r.top, g_sch_times[i].r.right, g_sch_times[i].r.bottom);
-        }
-        for (int i = 0; i < QUICK_SLOTS; i++) {
-            char nm[40]; quick_slot_get(i, nm, sizeof nm);
-            fprintf(f, "  quickslot %d name=\"%s\" tile=%.0f,%.0f,%.0f,%.0f clear=%d\n", i, nm,
-                    g_quick_tile[i].left, g_quick_tile[i].top, g_quick_tile[i].right,
-                    g_quick_tile[i].bottom, g_quick_clear[i].right > g_quick_clear[i].left);
-        }
-    }
-    /* The who-reacted pane: the message it is about, and its chips as drawn --
-     * each one's emoji, how many reacted with it, whether you are one of them,
-     * and where it is. */
-    {
-        const oc_model *rm2 = model();
-        fprintf(f, "voters open=%d msg=%llu rows=%zu pane=%d\n",
-                rm2 ? rm2->voterlist_open : 0,
-                (unsigned long long)(rm2 ? rm2->voterlist_message : 0),
-                rm2 ? rm2->n_voters : (size_t)0, g_show_members && g_rp_mode == RP_VOTERS);
-        for (size_t i = 0; rm2 && i < rm2->n_voters; i++) {
-            const char *vn = oc_model_user_name(rm2, rm2->voters[i].user_id);
-            fprintf(f, "  voter option=%u name=\"%s\"\n", (unsigned)rm2->voters[i].option, vn ? vn : "");
-        }
-        fprintf(f, "reactors open=%d msg=%llu people=%zu chips=%d\n",
-                rm2 ? rm2->reactlist_open : 0,
-                (unsigned long long)(rm2 ? rm2->reactlist_message : 0),
-                rm2 ? rm2->n_reactors : (size_t)0, g_n_rxn_chip);
-        for (int i = 0; i < g_n_rxn_chip; i++)
-            fprintf(f, "  rxnchip %d emoji=\"%s\" count=%d mine=%d r=%.0f,%.0f,%.0f,%.0f\n", i,
-                    g_rxn_chip[i].emoji, g_rxn_chip[i].count, g_rxn_chip[i].mine,
-                    g_rxn_chip[i].r.left, g_rxn_chip[i].r.top, g_rxn_chip[i].r.right,
-                    g_rxn_chip[i].r.bottom);
-    }
-    /* The files list and its paging (REQ-143): how many rows are held, whether
-     * the daemon says more remain, and where "Load more" is. */
-    {
-        const oc_model *fm2 = model();
-        fprintf(f, "files n=%zu more=%d loading=%d rows=%d chan=%llu more_btn=%.0f,%.0f,%.0f,%.0f\n",
-                fm2 ? fm2->n_files : (size_t)0, fm2 ? fm2->files_more : 0,
-                fm2 ? fm2->filelist_loading : 0, g_n_filerows,
-                (unsigned long long)(fm2 ? fm2->filelist_channel : 0),
-                g_file_more_btn.left, g_file_more_btn.top, g_file_more_btn.right, g_file_more_btn.bottom);
-    }
-    /* The upload tray: its chips here, everything it holds, the posts still
-     * owed their text, and each chip's state as the tick reads it. */
-    {
-        const oc_model *tm = model();
-        fprintf(f, "ftray here=%d all=%d posts=%d height=%.0f more=%d\n",
-                ftray_count(), g_n_ftray, g_n_ftray_posts, composer_tray(), g_ftray_more);
-        for (int i = 0; i < g_n_ftray; i++) {
-            const ftray_chip *c = &g_ftray[i];
-            float frac = 0;
-            int st = c->tag && tm ? ftray_state(tm, c, &frac) : -1;
-            fprintf(f, "  fchip %d name=\"%s\" here=%d pic=%d tag=%llu ix=%d state=%d pct=%d shown=%.2f failed=%d done=%d "
-                       "r=%.0f,%.0f,%.0f,%.0f x=%.0f,%.0f,%.0f,%.0f\n",
-                    i, c->name, ftray_here(c), c->thumb && thumb_get(NULL, c->thumb, NULL, NULL) != NULL,
-                    (unsigned long long)c->tag, c->ix, st,
-                    (int)(frac * 100.0f + 0.5f), c->shown, c->failed, c->done_at != 0,
-                    c->r.left, c->r.top, c->r.right, c->r.bottom, c->x.left, c->x.top, c->x.right, c->x.bottom);
-        }
-    }
-    /* `forgetting`: a sign-out whose entry is deleted when it lands is still
-     * in flight (ws_forget_begin); a harness waits for 0 before it closes the
-     * client, or the entry outlives the forget. */
-    fprintf(f, "workspaces=%d active=%d elsewhere=%d forgetting=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere(),
-            g_logging_out || g_forget_after_logout);
-    for (int i = 0; i < g_n_wss; i++) {
-        int u = 0;
-        const oc_model *wm = g_wss[i].client ? oc_client_model(g_wss[i].client) : NULL;
-        if (wm) for (size_t c = 0; c < wm->n_channels; c++) u += wm->channels[c].unread;
-        fprintf(f, "  ws[%d] %s client=%p authed=%d unread=%d\n", i, g_wss[i].ws,
-                (void *)g_wss[i].client, wm ? wm->authed : 0, u);
-    }
-    /* The fields' visibility is reported here as well as drawn in `shot`, so a
-     * field shown in the wrong place, or not at all, is readable without
-     * comparing an image. */
-    fprintf(f, "sisuffix shown=%d\n", g_si_suffix_shown);
-    fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
-            (g_ed_box.right > g_ed_box.left), g_find && g_find->visible,
-            g_ffind && g_ffind->visible,
-            g_srch && g_srch->visible, g_pick_edit && g_pick_edit->visible,
-            g_pal_edit && g_pal_edit->visible,
-            g_si_e_ws && g_si_e_ws->visible,
-            sidebar_kind(), main_is_conversation(), window_is_covered());
-    /* The search boxes: whether each is shown, where its text sits against the
-     * chrome drawn for it (device pixels), and what it holds. */
-    {
-        struct { const char *name; field *w; rectf box; } sb[] = {
-            { "find",  g_find,      find_box() },
-            { "srch",  g_srch,      g_srch_box },
-            { "files", g_ffind,     g_file_search_box },
-            { "emoji", g_efind,     g_emoji_search_box },
-            { "wsmgr", g_wsm_q,     g_wsm_qbox },
-            { "people", g_dir_edit, g_dir_search_box },
-            { "pal",   g_pal_edit,  g_pal_box },
-            { "pick",  g_pick_edit, g_pick_box },
-        };
-        for (size_t i = 0; i < sizeof sb / sizeof sb[0]; i++) {
-            if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
-            rectf er = sb[i].w->box;
-            /* The fields are drawn with the UI format: its face and size are
-             * what the harness compares across the boxes (tools/gui/features/search_boxes.sh). */
-            fprintf(f, "searchbox %s made=1 vis=%d uifont=1 lf=%d face=\"%s\" lh=%d "
-                       "edit=%d,%d,%d,%d box=%d,%d,%d,%d text=\"%s\"\n",
-                    sb[i].name, sb[i].w->visible ? 1 : 0, PX(UIS(FONT_UI * g_text_scale)), ui_family(), PX(UIS(18.0f)),
-                    PX(er.left), PX(er.top), PX(er.right), PX(er.bottom),
-                    PX(sb[i].box.left), PX(sb[i].box.top), PX(sb[i].box.right), PX(sb[i].box.bottom),
-                    sb[i].w->buf);
-        }
-    }
-    /* Hit-box geometry, because a hit test that silently matches nothing looks
-     * exactly like a hit test that is never called. */
-    /* The composer cue, as text, so it is assertable without reading pixels. */
-    { char cue[160]; composer_cue(m, cue, sizeof cue);
-      fprintf(f, "composer_cue=\"%s\"\n", cue); }
-    /* The formatting toolbar's hit-boxes, so the smoke can CLICK the
-     * buttons rather than only fire the chords — they are two paths into
-     * ed_format() and a test of one is not a test of the other. */
-    /* Activity: which tab is selected, which question the server was
-     * asked for it, and how many rows survive act_passes() — the last is the
-     * only one an image could show, and only by counting pixels. */
-    {
-        int shown = 0;
-        if (m && g_view == VIEW_ACTIVITY)
-            for (size_t i = 0; i < m->n_activity; i++)
-                if (act_passes(&m->activity[i])) shown++;
-        fprintf(f, "acttab=%d actwire=%d actrows=%d\n",
-                g_act_filter, act_wire_filter(), shown);
-        /* The chips' hit-boxes, so a test CLICKS the tab rather than being given
-         * a verb that sets it — the click is the path that has broken. */
-        for (int i = 0; i < AF_COUNT; i++)
-            fprintf(f, "  actchip i=%d cx=%d cy=%d\n", i,
-                    (int)((g_act_filters[i].left + g_act_filters[i].right) / 2),
-                    (int)((g_act_filters[i].top + g_act_filters[i].bottom) / 2));
-    }
-    /* Drafts: how many the model holds, whether the rail is offering
-     * its destination, and whether THIS conversation has one — the three things
-     * a test would otherwise have to infer from pixels. */
-    {
-        int rail = 0;
-        for (int i = 0; i < g_n_shelf; i++)
-            if (g_shelf_rows[i].view == VIEW_DRAFTS) rail = 1;   /* the SHELF row now */
-        /* Distinct key names on purpose: the harness reads `key=value` from
-         * anywhere in the dump, so a generic `n=` would have matched msgrows'
-         * first — which it did, reporting a draft count of 0 in the same frame
-         * that said this conversation had one. */
-        fprintf(f, "draftn=%zu draftrail=%d drafthere=%d\n",
-                m ? m->n_drafts : (size_t)0, rail,
-                (m && g_sel) ? oc_model_has_draft(m, g_sel) : 0);
-        /* The Drafts tab's rows as drawn: each one's conversation, thread root and
-         * Delete button, and what the row menu last opened on. */
-        if (g_view == VIEW_DRAFTS && g_dtab == DTAB_DRAFTS) {
-            fprintf(f, "draftrows n=%d menu_cid=%llu", g_n_listrows, (unsigned long long)g_dmenu_cid);
-            for (int i = 0; i < g_n_listrows; i++)
-                fprintf(f, " %llu:%llu@%.0f,%.0f,%.0f,%.0f", (unsigned long long)g_listrows[i].cid,
-                        (unsigned long long)g_listrows[i].root, g_listrows[i].act.left, g_listrows[i].act.top,
-                        g_listrows[i].act.right, g_listrows[i].act.bottom);
-            fprintf(f, "\n");
-        }
-    }
-    /* The Drafts pane's tabs and its shelf row, so a test can click them
-     * without measuring a screenshot — pixels in a shot are DEVICE pixels and
-     * these are DIPs, which is exactly the confusion that wasted two clicks. */
-    fprintf(f, "dtab=%d", g_dtab);
-    for (int i = 0; i < DTAB_COUNT; i++)
-        fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_dtab_hit[i].left, g_dtab_hit[i].top,
-                g_dtab_hit[i].right, g_dtab_hit[i].bottom);
-    fprintf(f, "\n");
-    /* The New Message pane (REQ-229): where its two fields and its button are,
-     * which of them has the keys, and what the picker is offering — everything
-     * a test needs to drive it without measuring a screenshot. */
-    fprintf(f, "sched btn=%.0f,%.0f,%.0f,%.0f n=%zu failed=%zu\n",
-            g_sched_btn.left, g_sched_btn.top, g_sched_btn.right, g_sched_btn.bottom,
-            m ? m->n_scheds : (size_t)0, m ? oc_model_scheduled_failed(m) : (size_t)0);
-    fprintf(f, "newmsg to=%.0f,%.0f,%.0f,%.0f send=%.0f,%.0f,%.0f,%.0f tofocus=%d chips=%d cand=%d\n",
-            g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
-            g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
-            g_nm_to_focus, g_n_tgt_chip, g_n_tgt);
-    /* The first suggestion row, so a test can click a match rather than measure a
-     * screenshot for it -- the list floats over the composer, and a click landing
-     * in the composer instead is exactly the defect this makes assertable. */
-    fprintf(f, "newmsgrow0 %.0f,%.0f,%.0f,%.0f\n",
-            g_tgt_rows[0].left, g_tgt_rows[0].top, g_tgt_rows[0].right, g_tgt_rows[0].bottom);
-    /* Pausing (REQ-278): whether MY notifications are paused and until
-     * when, plus how many people the roster shows as not-to-be-disturbed — the
-     * fact is a drawn crescent, which no assertion could read from pixels. */
-    {
-        int others = 0;
-        if (m) for (size_t i = 0; i < m->n_users; i++)
-            if (m->users[i].user_id != m->user_id && oc_model_dnd_of(m, m->users[i].user_id))
-                others++;
-        fprintf(f, "presence=%d\n",
-                m ? oc_model_presence_of((oc_model *)m, m->user_id) : 0);
-        fprintf(f, "snoozed=%d snooze_until=%llu dnd_others=%d\n",
-                m ? oc_model_snoozed(m) : 0,
-                (unsigned long long)(m ? m->snooze_until_ms : 0), others);
-    }
-    /* CHROME FIT. Two invariants over the elements the app says it drew:
-     * nothing overlaps a sibling, and nothing leaves the surface that owns it. The
-     * defects this item exists for are both — the composer's text running into its
-     * own action row is an overlap, the modal's rows painting over the shell is an
-     * escape. A healthy layout is 0 0 at every scale.
-     *
-     * (The plan also named a `clipped` count for text wider than its rect. It is
-     * not here: the item's format is not published, and after the ellipsis change
-     * truncation is legible rather than broken, so it would report style, not a
-     * defect.) */
-    {
-        int overlaps = 0, outside = 0;
-        /* Name the first of each: a count alone is a hunt. */
-        #define contains(o, i) ((o)->l <= (i)->l && (o)->t <= (i)->t && \
-                                (o)->r >= (i)->r && (o)->b >= (i)->b)
-        char first_ov[96] = "", first_out[96] = "";
-        irect rcw; client_rect(g_main ? g_main : g_main, &rcw);
-        int md = modal_open();
-        int ml = PX(g_modal_card.left), mt = PX(g_modal_card.top);
-        int mr = PX(g_modal_card.right), mb = PX(g_modal_card.bottom);
-        for (int i = 0; i < g_a11y_n; i++) {
-            const oc_acc_item *a = &g_acc_items[i];
-            if (a->r <= a->l || a->b <= a->t) continue;
-            /* ENTIRELY outside, not merely straddling: a row half below the fold
-             * of a scrolling list is ordinary, and counting it made a healthy
-             * sidebar look broken at every large scale. Drawn where nobody can
-             * see it at all is the defect. */
-            if (a->r <= 0 || a->b <= 0 || a->l >= rcw.right || a->t >= rcw.bottom) {
-                outside++;
-                if (!first_out[0]) snprintf(first_out, sizeof first_out, "%s", a->aid);
-            /* HORIZONTALLY, straddling is a defect too, and the leniency above
-             * does not apply: nothing here scrolls sideways, so a rect running
-             * past the right edge is not "below the fold", it is chrome laid out
-             * where it cannot be reached.
-             *
-             * The drafts tab strip is why this is here. It ran 26 DIP past the
-             * pane at large text size — the Sent tab neither drawn nor clickable
-             * — and reported outside=0 for the whole time, because its LEFT edge
-             * was still on screen. A check with an exemption shaped like the bug
-             * is not a check; that lesson is already recorded two paragraphs
-             * below about the overlap test, and this is the same mistake on the
-             * other axis. */
-            } else if (a->r > rcw.right) {
-                outside++;
-                if (!first_out[0]) snprintf(first_out, sizeof first_out, "past-right:%s", a->aid);
-            } else if (md && (a->r <= ml || a->b <= mt || a->l >= mr || a->t >= mb)) {
-                /* EVERY element, not only the ones named `modal.`. A modal owns
-                 * the tree (a11y_publish_scene), so while one is open whatever is
-                 * published is the card's own content and belongs inside it. The
-                 * shell underneath is a different layer and is not in the tree at
-                 * all, which is also why the overlap test below needs no
-                 * exemption for it: a card's button cannot be paired with a
-                 * sidebar row that was never published. Matching on the prefix
-                 * left the status, schedule and form cards' content unchecked. */
-                outside++;
-                if (!first_out[0]) snprintf(first_out, sizeof first_out, "escaped:%s", a->aid);
-            }
-            for (int j = i + 1; j < g_a11y_n; j++) {
-                const oc_acc_item *b = &g_acc_items[j];
-                if (b->r <= b->l || b->b <= b->t) continue;
-                /* NESTING is not a collision — a message row contains its own
-                 * reaction chips, a card contains its buttons — so a rect wholly
-                 * inside another is skipped. PARTIAL overlap is a defect whatever
-                 * the two kinds are.
-                 *
-                 * This used to read `if (a->kind != b->kind) continue`, on the
-                 * theory that only like-with-like can collide. That excluded
-                 * exactly one pair worth having: the composer's text (COMPOSER)
-                 * against its own action icons (BUTTON) — the collision this whole
-                 * item exists for. The check reported 0 overlaps across the entire
-                 * scale matrix while the text was being drawn on top of the "+".
-                 * A check with an exemption shaped like the bug is not a check. */
-                if (contains(a, b) || contains(b, a)) continue;
-                /* LAYERS are not a collision either. A dropdown's rows cover the
-                 * field beneath them because that is what a dropdown does; the
-                 * recipient matches over the new-message box read as 21 overlaps
-                 * on a layout with nothing wrong in it, and a check that cries
-                 * wolf is the one that gets discounted. This is not the kind
-                 * test back again: the layer is declared by the code that draws
-                 * the popup, and within a layer every pair is still compared --
-                 * the matches against each other, the box against its icons. */
-                if (a->layer != b->layer) continue;
-                if (a->l < b->r && b->l < a->r && a->t < b->b && b->t < a->b) {
-                    overlaps++;
-                    if (!first_ov[0]) snprintf(first_ov, sizeof first_ov, "%s+%s", a->aid, b->aid);
-                }
-            }
-        }
-        #undef contains
-        /* IDS ARE UNIQUE (REQ-290), and until now nothing said so. An id is how
-         * a test, a screen reader and this audit all address an element; two
-         * elements answering to one name makes one of them unaddressable and
-         * the other ambiguous, which is the same failure the rail's three
-         * "more" rows had — found by reading the code rather than by any check,
-         * because there was no check. */
-        int dup = 0;
-        char first_dup[96] = "";
-        for (int i = 0; i < g_a11y_n && !first_dup[0]; i++)
-            for (int j = i + 1; j < g_a11y_n; j++)
-                if (!strcmp(g_acc_items[i].aid, g_acc_items[j].aid)) {
-                    dup++;
-                    if (!first_dup[0])
-                        snprintf(first_dup, sizeof first_dup, "%s", g_acc_items[i].aid);
-                    break;
-                }
-        fprintf(f, "chromefit overlaps=%d outside=%d dup=%d clipped=%d n=%d "
-                   "ov=\"%s\" out=\"%s\" dupid=\"%s\" clip=\"%s\" clippx=%.0f\n",
-                overlaps, outside, dup, g_clip_n, g_a11y_n,
-                first_ov, first_out, first_dup, g_clip_first, g_clip_worst);
-        test_dump_a11y(f);   /* the tree itself, one line per element */
-    }
-    /* ARCH-108: the pinned metrics, checked, not remembered — the live
-     * line_h/baseline pairs per token, plus a real render probe that the two
-     * UI weights lay out to the identical line box (the property that stops a
-     * bold swap moving a label). Uses the text cache; costs two lookups. */
-    {
-        txt_ent *ra = txt_get("Threads", g_ui,   400.0f, OC_COL_TEXT);
-        txt_ent *rb = txt_get("Threads", g_ui_b, 400.0f, OC_COL_TEXT);
-        fprintf(f, "textmetrics scale=%.2f display=%g/%g title=%g/%g body=%g/%g "
-                   "ui=%g/%g meta=%g/%g micro=%g/%g ui_mh_eq=%d\n",
-                (double)g_text_scale,
-                (double)g_display->line_h, (double)g_display->baseline,
-                (double)g_title->line_h,   (double)g_title->baseline,
-                (double)g_body->line_h,    (double)g_body->baseline,
-                (double)g_ui->line_h,      (double)g_ui->baseline,
-                (double)g_meta->line_h,    (double)g_meta->baseline,
-                (double)g_micro->line_h,   (double)g_micro->baseline,
-                (ra && rb && ra->mh == rb->mh) ? 1 : 0);
-    }
-    /* Whether this window actually HAS the keyboard, which is the condition the
-     * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
-     * the field declined it or the window never had it to give. */
-    /* Against the MAIN window, not g_main: when the app is not active
-     * both g_main and GetFocus() return NULL for this thread, so
-     * comparing them to each other reported "focused" in precisely the case that
-     * is broken — and the wait built on it waited for a condition that was
-     * already true. An instrument that reads 1 when the thing it measures is
-     * absent is worse than no instrument. */
-    /* Asked of the platform, not of our record of events: whether the window is
-     * the foreground one, and whether it holds the keyboard -- which a process
-     * can give its own window without owning the foreground (a client launched
-     * by the harness into a session nobody is looking at), so the two are
-     * different facts. */
-    fprintf(f, "wnd_active=%d wnd_focus=%d\n", oc_plat_window_is_front(g_main->sdl),
-            oc_plat_window_has_keyboard(g_main->sdl) && !g_focus);
-    /* Keywords and priority people (REQ-135), and the schedule (REQ-136): what
-     * the client believes, which is the half a server-side test cannot see. */
-    {
-        char kw[256] = "";
-        for (uint8_t i = 0; m && i < m->n_kw_terms; i++) {
-            if (kw[0]) strncat(kw, ",", sizeof kw - strlen(kw) - 1);
-            strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
-        }
-        fprintf(f, "schedmodes=%.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f\n",
-                (g_sched_mode_hit[0].left + g_sched_mode_hit[0].right) / 2,
-                (g_sched_mode_hit[0].top + g_sched_mode_hit[0].bottom) / 2,
-                (g_sched_mode_hit[1].left + g_sched_mode_hit[1].right) / 2,
-                (g_sched_mode_hit[1].top + g_sched_mode_hit[1].bottom) / 2,
-                (g_sched_mode_hit[2].left + g_sched_mode_hit[2].right) / 2,
-                (g_sched_mode_hit[2].top + g_sched_mode_hit[2].bottom) / 2,
-                (g_sched_mode_hit[3].left + g_sched_mode_hit[3].right) / 2,
-                (g_sched_mode_hit[3].top + g_sched_mode_hit[3].bottom) / 2);
-        /* The shared overlay scroll offset, its clamp, and the content height the
-         * notifications card measured. Published because "the card does not
-         * scroll" has three different causes — the wheel never reached it, the
-         * content height came out zero, or the offset is being reset every frame
-         * — and from outside they look identical. */
-        /* The About pane's, for the same three-causes-one-symptom reason. */
-        fprintf(f, "about tab=%d scroll=%.0f max=%.0f h=%.0f\n",
-                g_tab, g_about_scroll, g_about_max, g_about_h);
-        fprintf(f, "ovl kind=%d scroll=%.0f max=%.0f notifyh=%.0f\n",
-                g_ovl_kind, g_ovl_scroll, g_ovl_max, g_notify_content_h);
-        fprintf(f, "schedbase=%.0f,%.0f %.0f,%.0f tpopen=%d tprows=%d\n",
-                (g_sched_base_hit[0].left + g_sched_base_hit[0].right) / 2,
-                (g_sched_base_hit[0].top + g_sched_base_hit[0].bottom) / 2,
-                (g_sched_base_hit[1].left + g_sched_base_hit[1].right) / 2,
-                (g_sched_base_hit[1].top + g_sched_base_hit[1].bottom) / 2,
-                g_tp_open, g_n_tp_rows);
-        for (int d = 0; d < 7; d++)
-            fprintf(f, "  schedday d=%d chk=%.0f,%.0f t0=%.0f,%.0f t1=%.0f,%.0f\n", d,
-                    (g_sched_day_chk[d].left + g_sched_day_chk[d].right) / 2,
-                    (g_sched_day_chk[d].top + g_sched_day_chk[d].bottom) / 2,
-                    (g_sched_day_hit[d][0].left + g_sched_day_hit[d][0].right) / 2,
-                    (g_sched_day_hit[d][0].top + g_sched_day_hit[d][0].bottom) / 2,
-                    (g_sched_day_hit[d][1].left + g_sched_day_hit[d][1].right) / 2,
-                    (g_sched_day_hit[d][1].top + g_sched_day_hit[d][1].bottom) / 2);
-        fprintf(f, "kwbtn=%.0f,%.0f vipbtn=%.0f,%.0f\n",
-                (g_notify_kw_btn.left + g_notify_kw_btn.right) / 2,
-                (g_notify_kw_btn.top + g_notify_kw_btn.bottom) / 2,
-                (g_notify_vip_btn.left + g_notify_vip_btn.right) / 2,
-                (g_notify_vip_btn.top + g_notify_vip_btn.bottom) / 2);
-        fprintf(f, "keywords=\"%s\" nvip=%d schedmode=%d schedwin=%u-%u scheddays=%d\n",
-                kw, m ? m->n_pri_people : 0, m ? m->dnd_mode : 0,
-                m ? m->allow_start_min : 0, m ? m->allow_end_min : 0,
-                m ? m->n_sched_days : 0);
-        for (uint8_t i = 0; m && i < m->n_sched_days; i++)
-            fprintf(f, "  schedrow wd=%u on=%u win=%u-%u\n",
-                    m->sched_days[i].weekday, m->sched_days[i].enabled,
-                    m->sched_days[i].start_min, m->sched_days[i].end_min);
-    }
-    /* People (REQ-289): how many the filter shows and whether its search box is
-     * up — reported, as the Files box is, so it is assertable from the dump. */
-    {
-        int nvis = 0;
-        char low[80]; snprintf(low, sizeof low, "%s", g_dir_filter);
-        for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
-        if (m) for (size_t i = 0; i < m->n_users; i++)
-            if (dir_matches(&m->users[i], low, 0)) nvis++;
-        fprintf(f, "people n=%d q=\"%s\" box=%d\n", nvis, g_dir_filter,
-                g_dir_edit && g_dir_edit->visible);
-    }
-    /* Threads (REQ-062): what the list holds and what the pane offers. */
-    {
-        fprintf(f, "threads n=%zu unreadonly=%d totalunread=%u btn=%.0f,%.0f\n",
-                m ? m->n_threads : (size_t)0, g_threads_unread,
-                m ? oc_model_thread_unread(m) : 0u,
-                (g_threads_unread_btn.left + g_threads_unread_btn.right) / 2,
-                (g_threads_unread_btn.top + g_threads_unread_btn.bottom) / 2);
-        for (size_t i = 0; m && i < m->n_threads && i < 8; i++) {
-            /* The card's centre, so a test clicks the row rather than a guessed
-             * point — the lesson the view matrix learned when it drove views by
-             * number and the numbers moved. */
-            float cx = 0, cy = 0;
-            for (int k = 0; k < g_n_listrows; k++)
-                if (g_listrows[k].mid == m->threads[i].root_id) {
-                    cx = (g_listrows[k].row.left + g_listrows[k].row.right) / 2;
-                    cy = (g_listrows[k].row.top + g_listrows[k].row.bottom) / 2;
-                    break;
-                }
-            fprintf(f, "  thread root=%llu cid=%llu replies=%u unread=%u follow=%u at=%.0f,%.0f\n",
-                    (unsigned long long)m->threads[i].root_id,
-                    (unsigned long long)m->threads[i].channel_id,
-                    m->threads[i].reply_count, m->threads[i].unread,
-                    m->threads[i].following, cx, cy);
-        }
-    }
-    fprintf(f, "sbsel=%d\n", g_n_sbsel);
-    {   /* Navigation history: the entries, which is current, and where each is. */
-        const hist_place *hc = g_hist_pos >= 0 ? &g_hist[g_hist_pos] : NULL;
-        fprintf(f, "hist n=%d pos=%d restoring=%d back=%d fwd=%d cid=%llu thread=%llu mid=%llu scroll=%.0f btn=%.0f,%.0f,%.0f,%.0f\n",
-                g_hist_n, g_hist_pos, g_hist_restoring, hist_can(-1), hist_can(1),
-                (unsigned long long)(hc ? hc->cid : 0), (unsigned long long)(hc ? hc->thread : 0),
-                (unsigned long long)(hc ? hc->mid : 0), g_scroll,
-                g_hist_back_btn.left, g_hist_back_btn.top, g_hist_fwd_btn.right, g_hist_fwd_btn.bottom);
-        for (int i = 0; i < g_hist_n; i++)
-            fprintf(f, "  histent %d cid=%llu thread=%llu mid=%llu view=%d\n", i,
-                    (unsigned long long)g_hist[i].cid, (unsigned long long)g_hist[i].thread,
-                    (unsigned long long)g_hist[i].mid, g_hist[i].view);
-    }
-    fprintf(f, "sbunreads on=%d chip=%.0f,%.0f,%.0f,%.0f\n", g_sb.unreads_only,
-            g_sb_unread_chip.left, g_sb_unread_chip.top, g_sb_unread_chip.right, g_sb_unread_chip.bottom);
-    fprintf(f, "shelf n=%d", g_n_shelf);
-    for (int i = 0; i < g_n_shelf; i++)
-        fprintf(f, " %d:%.0f-%.0f", g_shelf_rows[i].view, g_shelf_rows[i].top, g_shelf_rows[i].bot);
-    fprintf(f, "\n");
-    fprintf(f, "fmtbar hover=%d", g_fmt_hover);
-    for (int i = 0; i < FMT_COUNT; i++)
-        fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_fmt_btn[i].left, g_fmt_btn[i].top,
-                g_fmt_btn[i].right, g_fmt_btn[i].bottom);
-    fprintf(f, "\n");
-    /* The action row, in ACT_* order, and the tooltip on screen now -- the name
-     * a tooltip is showing, or none: the two rows' buttons can be compared, and
-     * "does this button say what it is" asked, without a screenshot. */
-    {
-        uint64_t now = now_ms();
-        const char *tip = "";
-        if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT && now - g_fmt_hover_since >= FMT_TIP_MS)
-            tip = FMT_NAME[g_fmt_hover];
-        else if (g_act_hover >= 0 && now - g_act_hover_since >= FMT_TIP_MS)
-            tip = ACT_NAME[g_act_hover];
-        fprintf(f, "actrow hover=%d tip=\"%s\"", g_act_hover, tip);
-        for (int i = 0; i < ACT_COUNT; i++) {
-            rectf r = act_rect(i);
-            fprintf(f, " %.0f,%.0f,%.0f,%.0f", r.left, r.top, r.right, r.bottom);
-        }
-        fprintf(f, "\n");
-    }
-    /* The quick-reaction strip on the hovered message, as drawn. */
-    fprintf(f, "hoverreact mid=%llu n=%d", (unsigned long long)g_hrx_mid, g_n_hrx);
-    for (int i = 0; i < g_n_hrx; i++)
-        fprintf(f, " %s:%d@%.0f,%.0f,%.0f,%.0f", g_hrx[i].emoji, g_hrx[i].mine,
-                g_hrx[i].r.left, g_hrx[i].r.top, g_hrx[i].r.right, g_hrx[i].r.bottom);
-    fprintf(f, "\n");
-    /* Jump to a date: what is asked, the daemon's last answer, and the message
-     * the transcript is still to scroll to (0 once it has); the date dividers
-     * on screen, each its day's first time. */
-    {
-        const oc_model *dm = model();
-        fprintf(f, "datejump pending=%llu found=%llu exact=%d sel=%llu jump=%llu seps=%d parent=%llu thrjump=%llu cal=%d\n",
-                (unsigned long long)g_date_cid,
-                (unsigned long long)(dm ? dm->found_mid : 0), dm ? dm->found_exact : 0,
-                (unsigned long long)g_sel, (unsigned long long)g_jump_mid, g_n_sephits,
-                (unsigned long long)g_date_parent, (unsigned long long)g_thr_jump_mid, g_jc_open);
-    }
-    /* Snippets (REQ-226): each card drawn, whether its text is here, and the
-     * viewer -- open, on which, and how many coloured spans it holds. */
-    for (int i = 0; i < g_n_snip_hits; i++)
-        fprintf(f, "snipcard aid=%llu mid=%llu loaded=%d rect=%.0f,%.0f,%.0f,%.0f\n",
-                (unsigned long long)g_snip_hits[i].aid, (unsigned long long)g_snip_hits[i].mid,
-                snip_text(g_snip_hits[i].aid, NULL) != NULL,
-                g_snip_hits[i].r.left, g_snip_hits[i].r.top, g_snip_hits[i].r.right, g_snip_hits[i].r.bottom);
-    fprintf(f, "snipview open=%d aid=%llu lang=%d spans=%zu\n", g_sv_open,
-            (unsigned long long)g_sv_aid, g_sv_lang, g_sv_ntoks);
-    /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
-     * be readable for the keyboard route to the context menu to be testable at
-     * all (REQ-264). */
-    /* ran= is the message-menu command the last key press ran as a single key
-     * (kb_msg_key), 0 when it ran none: each key is tested by what it ran. */
-    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d ran=%d\n",
-            (unsigned long long)g_kb_mid, g_menu_hover,
-            (g_menu && g_menu_hover >= 0 && g_menu_hover < g_n_mi) ? g_mi[g_menu_hover].cmd : -1,
-            g_sub_hover, g_sub_open, g_kb_ran);
-    fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
-            g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
-            (unsigned long long)g_hover_mid, g_n_listrows);
-    /* Where each message's BODY actually is, and what is selected in it. Both
-     * are here because word selection needed them and neither existed: a test that
-     * wants to double-click a word had no way to find one, and no way to see
-     * what it got. */
-    for (int i = 0; i < g_n_msgrows; i++)
-        fprintf(f, "  msgrow %d mid=%llu body=%.0f,%.0f\n", i,
-                (unsigned long long)g_msgrows[i].mid, g_msgrows[i].bx, g_msgrows[i].by);
-    /* The link under the pointer. A screenshot cannot show a cursor
-     * shape or prove which bytes a click would open, so the address itself is
-     * reported: hovering a URL and reading this back is the only way the
-     * autolink boundary rules — where a trailing full stop or bracket stops —
-     * are checkable from outside the process. */
-    /* The About's buttons, so a test can click them rather than measure a
-     * screenshot, and what it knows of the description (REQ-034). */
-    {
-        const oc_channel *dc = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        fprintf(f, "about topic=%.0f,%.0f,%.0f,%.0f desc=%.0f,%.0f,%.0f,%.0f "
-                   "desc_known=%d desc_len=%zu\n",
-                g_about_topic.left, g_about_topic.top, g_about_topic.right, g_about_topic.bottom,
-                g_about_desc.left, g_about_desc.top, g_about_desc.right, g_about_desc.bottom,
-                dc ? dc->description_known : 0,
-                dc && dc->description ? strlen(dc->description) : (size_t)0);
-    }
-    fprintf(f, "link hover=\"%s\" labelled=%d chan=%llu\n", g_link_hover, g_link_hover_lab,
-            (unsigned long long)g_chan_hover);
-    test_dump_confirm(f);
-    /* What the client last put on the clipboard, escaped onto one line (\t \r
-     * \n \" \\): Copy table's TSV is only checkable as the bytes it handed
-     * over. */
-    fprintf(f, "clipboard set=\"");
-    int nq = 0;
-    for (const char *q = g_clip_last ? g_clip_last : ""; *q && nq < 4000; q++, nq++) {
-        if      (*q == '\t') fputs("\\t", f);
-        else if (*q == '\r') fputs("\\r", f);
-        else if (*q == '\n') fputs("\\n", f);
-        else if (*q == '"' || *q == '\\') { fputc('\\', f); fputc(*q, f); }
-        else fputc(*q, f);
-    }
-    fprintf(f, "\"\n");
-    fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,
-            (unsigned long long)g_sel_a_mid, g_sel_a_pos,
-            (unsigned long long)g_sel_f_mid, g_sel_f_pos);
-    fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
-            g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
-    /* WHICH backend carried the last one, not which was asked for: the chain
-     * falls back, and a test that cannot tell them apart is not testing it. */
-    /* Where the notification window actually IS, reported by the app rather
-     * than probed from outside: two attempts to read it with a P/Invoke came
-     * back all zeroes, and a screenshot of a window that lives eight seconds
-     * catches an empty screen as often as not. */
-    if (g_nt_win.sdl) {
-        int nx, ny, nw, nh; SDL_GetWindowPosition(g_nt_win.sdl, &nx, &ny); SDL_GetWindowSize(g_nt_win.sdl, &nw, &nh);
-        SDL_Rect wa = { 0, 0, 0, 0 };
-        SDL_DisplayID disp = SDL_GetDisplayForWindow(g_nt_win.sdl);
-        if (disp) SDL_GetDisplayUsableBounds(disp, &wa);
-        fprintf(f, "ntrect l=%d t=%d r=%d b=%d  work r=%d b=%d  "
-                   "right_gap=%d bottom_gap=%d dpi=%d vis=%d\n",
-                nx, ny, nx + nw, ny + nh, wa.x + wa.w, wa.y + wa.h,
-                wa.x + wa.w - (nx + nw), wa.y + wa.h - (ny + nh),
-                g_dpi, win_visible(&g_nt_win));
-        fprintf(f, "ntround set_hr=0x%08lX get_hr=0x%08lX pref=%lu\n",
-                (unsigned long)g_nt_round_hr, 0ul, (unsigned long)(g_nt_round_hr == 0 ? 2 : 0));
-    }
-    fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d withdrawn=%d\n",
-            g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
-            g_nt_shown, g_n_nt, g_snd_muted, g_osn_withdrawn);
-    fprintf(f, "hidden=%d visible=%d told=%d connected=%d\n",
-            g_hidden_to_tray,
-            win_visible(g_main),
-            g_close_to_tray_told,
-            (m && m->connected) ? 1 : 0);
-    /* `taskbar`: -1 the ITaskbarList3 could not be created, 0 not yet asked
-     * for, 1 live — because "badge=0" alone cannot distinguish "no unreads"
-     * from "the overlay never applied", and that ambiguity cost a smoke run. */
-    fprintf(f, "badge=%d flash_pref=%d flashes=%d taskbar=%d hr=0x%08lx\n",
-            g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
-            oc_plat_badge_status() ? -1 : (g_badge_shown >= 0 ? 1 : 0), (unsigned long)(unsigned)oc_plat_badge_status());
-    fprintf(f, "lightbox=%llu lightbox_pos=%d/%d prev=%d next=%d next_r=%.0f,%.0f,%.0f,%.0f thumb_hits=%d\n",
-            (unsigned long long)g_lightbox, g_lb_i + 1, g_lb_n, g_lb_prev.right > g_lb_prev.left,
-            g_lb_next.right > g_lb_next.left, g_lb_next.left, g_lb_next.top, g_lb_next.right, g_lb_next.bottom,
-            g_n_thumb_hits);
-    /* The video overlay (REQ-162/165): which card, its phase, and its buttons. */
-    {
-        oc_rec_status rs; memset(&rs, 0, sizeof rs);
-        if (g_rec) oc_recorder_status(g_rec, &rs);
-        oc_player_status ps; memset(&ps, 0, sizeof ps);
-        if (g_vplayer) oc_player_status_get(g_vplayer, &ps);
-        fprintf(f, "vm=%d recphase=%d recerr=%d rec_elapsed=%u rec_audio=%d take_ms=%u take_bytes=%zu "
-                   "play_aid=%llu play_loading=%d play_state=%d play_pos=%u play_dur=%u presented=%llu "
-                   "frame=%dx%d camera=%d post_tag=%llu detail=\"%s\"\n",
-                g_vm, g_rec_phase, g_rec_err, rs.elapsed_ms, rs.has_audio, g_rec_res.duration_ms,
-                g_rec_res.video_len, (unsigned long long)g_vplay_aid, g_vplay_loading, (int)ps.state,
-                ps.position_ms, ps.duration_ms, (unsigned long long)ps.presented, g_vm_tw, g_vm_th,
-                g_have_camera, (unsigned long long)g_vm_post_tag, g_rec_detail);
-        for (int i = 0; i < g_n_vm_btns; i++)
-            fprintf(f, "vmbtn[%d] cmd=%d \"%s\" %.0f %.0f %.0f %.0f\n", i, g_vm_btns[i].cmd, g_vm_btns[i].label,
-                    g_vm_btns[i].r.left, g_vm_btns[i].r.top, g_vm_btns[i].r.right, g_vm_btns[i].r.bottom);
-        fprintf(f, "video_btn %.0f %.0f %.0f %.0f\n", g_video_btn.left, g_video_btn.top,
-                g_video_btn.right, g_video_btn.bottom);
-        /* A screen recording (REQ-162): what is chosen, whether the card has
-         * stepped aside for the recording bar, and whether the bar is kept out of
-         * the capture. */
-        fprintf(f, "vmsrc src=\"%s\" corner=%d sound=%d nocam=%d nscreens=%d away=%d bar=%d excluded=%d gone=%d "
-                   "rec_w=%d rec_h=%d frame_w=%d frame_h=%d vbox=%.0f,%.0f,%.0f,%.0f\n",
-                g_vm_src, g_vm_corner, g_vm_sound, g_vm_nocam, g_vm_nscreens, g_vm_away, g_recbar.sdl != NULL,
-                g_recbar_excluded, g_vm_gone, g_rec_res.width, g_rec_res.height, g_vm_tw, g_vm_th,
-                g_vm_vbox.left, g_vm_vbox.top, g_vm_vbox.right, g_vm_vbox.bottom);
-        for (int i = 0; i < g_vm_nscreens; i++)
-            fprintf(f, "vmscreen[%d] kind=%d id=\"%s\" name=\"%s\"\n", i, g_vm_screens[i].kind,
-                    g_vm_screens[i].id, g_vm_screens[i].name);
-    }
-    fprintf(f, "thumb_hover=%llu thumb_tools=%d\n", (unsigned long long)g_thumb_hover, g_n_thumb_dl);
-    for (int i = 0; i < g_n_thumb_dl; i++)
-        fprintf(f, "  tool[%d] %s %.0f,%.0f %.0fx%.0f\n", i,
-                g_thumb_dl[i].attach_ix < 0 ? "kebab" : "download",
-                g_thumb_dl[i].r.left, g_thumb_dl[i].r.top,
-                g_thumb_dl[i].r.right - g_thumb_dl[i].r.left,
-                g_thumb_dl[i].r.bottom - g_thumb_dl[i].r.top);
-    for (int i = 0; i < g_n_thumb_hits; i++)
-        fprintf(f, "  thumbhit[%d] id=%llu %.0f,%.0f %.0fx%.0f\n", i,
-                (unsigned long long)g_thumb_hits[i].id,
-                g_thumb_hits[i].r.left, g_thumb_hits[i].r.top,
-                g_thumb_hits[i].r.right - g_thumb_hits[i].r.left,
-                g_thumb_hits[i].r.bottom - g_thumb_hits[i].r.top);
-    for (int i = 0; i < g_n_thumbs; i++)
-        fprintf(f, "  thumb %d id=%llu %ux%u\n", i, (unsigned long long)g_thumbs[i].id,
-                g_thumbs[i].w, g_thumbs[i].h);
-    for (int i = 0; i < g_n_thumb_missing; i++)
-        fprintf(f, "  thumbmiss %llu\n", (unsigned long long)g_thumb_missing[i]);
-    fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
-            (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing, g_thumbs_off);
-    for (int i = 0; i < g_n_thumbs; i++)
-        fprintf(f, "  thumb[%d] id=%llu tex=%p\n", i,
-                (unsigned long long)g_thumbs[i].id, (void *)g_thumbs[i].tex);
-    fprintf(f, "unread_from=%llu unread_chan=%llu unread_count=%d\n",
-            (unsigned long long)g_unread_from, (unsigned long long)g_unread_chan, g_unread_count);
-    for (size_t i = 0; i < m->n_channels; i++)
-        fprintf(f, "  marks ch %llu hw=%llu rm=%llu unread=%d\n",
-                (unsigned long long)m->channels[i].channel_id,
-                (unsigned long long)m->channels[i].high_water,
-                (unsigned long long)m->channels[i].read_marker, m->channels[i].unread);
-    fprintf(f, "channels=%zu\n", m->n_channels);
-    for (size_t i = 0; i < m->n_channels; i++) {
-        const oc_channel *c = &m->channels[i];
-        /* DMs have no name, so the old `continue` hid every one of them from the
-         * dump — which is why a DM-list bug could not be diagnosed from it. */
-        /* notify= so the Notifications form's Cancel is assertable: those levels
-         * live on the SERVER, so "restore" means re-sending them, and a revert
-         * that silently did nothing would look identical to one that worked. */
-        fprintf(f, "  ch %llu %s\"%s\" peers=%u pub=%d unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
-                (unsigned long long)c->channel_id,
-                c->kind == OC_CHANNEL_KIND_DM ? "DM " : "",
-                c->name ? c->name : "", (unsigned)c->n_peers, c->is_public, c->unread,
-                c->n_msgs, (unsigned)c->notify_level, c->preview,
-                (unsigned long long)c->preview_author,
-                c->channel_id == g_sel ? " *" : "");
-    }
-    fclose(f);
-}
-
-/* Poll <OPENCHIME_DEV_DIR>/cmd for one command per tick; write <dir>/ack. */
-static void test_poll(oc_win *hwnd);
-/* The hook alone, from inside a native dialog's modal loop (oc_plat_set_modal_tick). */
-static void test_modal_tick(void) { test_poll(g_main); }
-static void on_event(const SDL_Event *e);   /* fwd — the `keychar` verb's events */
-
-static void test_poll(oc_win *hwnd) {
-    if (!g_test_dir[0]) return;
-    char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
-    FILE *f = fopen(cmdpath, "rb"); if (!f) return;
-    char buf[4096]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
-    remove(cmdpath);
-    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-
-    char verb[32] = {0}; size_t i = 0;
-    while (buf[i] && buf[i] != ' ' && i < sizeof verb - 1) { verb[i] = buf[i]; i++; }
-    verb[i] = 0;
-    const char *arg = (buf[i] == ' ') ? buf + i + 1 : "";
-    crumb("hook %s %.40s", verb, arg);
-    const oc_model *m = model();
-
-    if (!strcmp(verb, "crashtest")) {
-        /* Prove the crash path works. An untested crash handler is the one piece
-         * of code guaranteed to be exercised for the first time at the worst
-         * possible moment. Only reachable via the hook. */
-        test_ack("ok");
-        crumb("crashtest: deliberate fault");
-        *(volatile int *)0 = 1;
-    } else if (!strcmp(verb, "shot")) {
-        test_ack(test_shot(hwnd, arg) ? "ok" : "err");
-    } else if (!strcmp(verb, "ledger")) {
-        /* The frame the window last painted, as a list of primitives. Repaint
-         * first (paint_now), so the dump describes the scene as it stands NOW
-         * rather than whatever was on screen when the previous verb happened to
-         * leave it — the trap `shot` documents.
-         *
-         * The ledger records whatever g_gfx last drew, and test_shot draws
-         * through the same gfx: repainting here also keeps a capture's frame
-         * from being the one described. */
-        paint_now();
-        test_ack(gfx_ledger_dump(g_gfx, arg) ? "ok" : "err");
-    } else if (!strcmp(verb, "send")) {
-        { oc_wch w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
-        test_ack("ok");
-    } else if (!strcmp(verb, "sendraw")) {
-        /* `send` for a body of several lines -- a table (MARKDOWN.md §1a) is
-         * nothing else: a command is one line, so `\n` is a newline, `\t` a
-         * tab and `\\` a backslash. */
-        static char raw[4096];
-        static oc_wch w[ED_MAX + 1];
-        size_t o = 0;
-        for (const char *q = arg; *q && o + 1 < sizeof raw; q++) {
-            if (q[0] == '\\' && q[1] == 'n')       { raw[o++] = '\n'; q++; }
-            else if (q[0] == '\\' && q[1] == 't')  { raw[o++] = '\t'; q++; }
-            else if (q[0] == '\\' && q[1] == '\\') { raw[o++] = '\\'; q++; }
-            else raw[o++] = *q;
-        }
-        raw[o] = '\0';
-        to_w(raw, w, ED_MAX + 1); ed_set(w); composer_send();
-        test_ack("ok");
-    } else if (!strcmp(verb, "copytable") || !strcmp(verb, "tscroll")) {
-        /* "copytable <mid> [i]": Copy table on table i (0) of that message, as
-         * its menu item does. "tscroll <mid> <i> <dx>": scroll that table
-         * across by dx DIPs, as the wheel does. mid 0 = the newest message in
-         * the conversation with a table. */
-        unsigned long long tmid = 0; int ti = 0; float tdx = 0;
-        if (!strcmp(verb, "copytable")) sscanf(arg, "%llu %d", &tmid, &ti);
-        else sscanf(arg, "%llu %d %f", &tmid, &ti, &tdx);
-        const oc_channel *tc = m && g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        const oc_msg *tmsg = NULL;
-        for (size_t k = tc ? tc->n_msgs : 0; k > 0 && !tmsg; k--)
-            if ((tmid && tc->msgs[k - 1].message_id == tmid) || (!tmid && msg_tables(&tc->msgs[k - 1], NULL, 0)))
-                tmsg = &tc->msgs[k - 1];
-        if (!tmsg || ti < 0 || ti >= msg_tables(tmsg, NULL, 0)) test_ack("err");
-        else if (!strcmp(verb, "copytable")) test_ack(copy_table(hwnd, tmsg, ti) ? "ok" : "err");
-        else {
-            const tabhit *th = tabhit_find(tmsg->message_id, ti, 0);
-            float *sp = tscroll_ref(tmsg->message_id, ti, 1);
-            *sp += tdx;
-            if (*sp < 0) *sp = 0;
-            if (th && *sp > th->max) *sp = th->max;
-            invalidate();
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "channel")) {
-        /* By NAME, or by id when the argument is a number — a DM has no name at all
-         * and a group DM (REQ-056) has none either, so "select that conversation" was
-         * undrivable for exactly the conversations whose titles are computed. */
-        uint64_t byid = (arg[0] >= '1' && arg[0] <= '9') ? strtoull(arg, NULL, 10) : 0;
-        if (byid && m && oc_model_channel((oc_model *)m, byid)) select_channel(byid);
-        else if (m) for (size_t k = 0; k < m->n_channels; k++)
-            if (m->channels[k].name && !strcmp(m->channels[k].name, arg)) {
-                select_channel(m->channels[k].channel_id); break;
-            }
-        test_ack("ok");
-    } else if (!strcmp(verb, "mousedown") || !strcmp(verb, "mouseup")) {
-        /* The two halves of a click, apart: a HELD button (the microphone's hold
-         * to talk) is only testable with time between them. */
-        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        synth_mouse(hwnd, !strcmp(verb, "mousedown") ? 0 : 2, x, y);
-        test_ack("ok");
-    } else if (!strcmp(verb, "click")) {
-        /* A REAL button down/up pair through on_event, not a direct on_click:
-         * the composer is a self-drawn field now and its caret placement
-         * lives in the button handler, so a verb that jumped straight to on_click could not click into
-         * the one control users click into most. */
-        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        synth_mouse(hwnd, 0, x, y);
-        synth_mouse(hwnd, 2, x, y);
-        test_ack("ok");
-    } else if (!strcmp(verb, "dblclick") || !strcmp(verb, "tripleclick")) {
-        /* A real double-click: the second button-down carries clicks=2, as SDL
-         * reports the second press of a pair — driving two `click`s instead
-         * would test the thing that was already happening and passing. The
-         * triple sends the following down/up too, in one go, so the assertion
-         * does not depend on the harness beating 500u. */
-        int x = 0, y = 0;
-        if (sscanf(arg, "%d %d", &x, &y) == 2) {
-            synth_mouse(hwnd, 0, x, y); synth_mouse(hwnd, 2, x, y);
-            synth_mouse(hwnd, 3, x, y); synth_mouse(hwnd, 2, x, y);
-            if (verb[0] == 't') { synth_mouse(hwnd, 0, x, y); synth_mouse(hwnd, 2, x, y); }
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "drag")) {
-        /* Press, move, release — the gesture that SELECTS, and until now the one
-         * gesture the harness could not make. `click` sends a down/up pair at one
-         * point, so every selection path in the app (the composer's, the
-         * transcript's) was reachable only by hand. Intermediate moves are sent,
-         * not just the endpoint, because a drag handler that tracks state per
-         * move is exactly the kind that passes a teleport and fails a drag. */
-        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-        if (sscanf(arg, "%d %d %d %d", &x0, &y0, &x1, &y1) == 4) {
-            synth_mouse(hwnd, 0, x0, y0);
-            for (int s = 1; s <= 4; s++)
-                synth_mouse(hwnd, 1, x0 + (x1 - x0) * s / 4, y0 + (y1 - y0) * s / 4);
-            synth_mouse(hwnd, 2, x1, y1);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "rclick")) {
-        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_rclick(hwnd, x, y); test_ack("ok");
-    } else if (!strcmp(verb, "members")) {
-        g_show_members = !g_show_members; layout_composer(hwnd); test_ack("ok");
-    } else if (!strcmp(verb, "scroll")) {
-        int d = 0; sscanf(arg, "%d", &d); g_scroll += (float)d;
-        if (g_scroll < 0) g_scroll = 0;
-        if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
-        test_ack("ok");
-    } else if (!strcmp(verb, "size")) {
-        int w = 0, h = 0; sscanf(arg, "%d %d", &w, &h);
-        if (w > 0 && h > 0) SDL_SetWindowSize(hwnd->sdl, w, h);
-        test_ack("ok");
-    } else if (!strcmp(verb, "min")) {
-        /* Really minimise: the taskbar flash is gated on not being the
-         * foreground window, and only losing it for real exercises that. */
-        SDL_MinimizeWindow(hwnd->sdl);
-        test_ack("ok");
-    } else if (!strcmp(verb, "close")) {
-        /* A close request through the real path, so what the harness drives
-         * is what a click on the title bar's X does. `close quit` is the
-         * deliberate exit. */
-        if (!strcmp(arg, "quit")) app_quit(hwnd);
-        else on_close_request(hwnd);
-        test_ack("ok");
-    } else if (!strcmp(verb, "traymenu")) {
-        /* The right-click path without a right click: the tray icon is outside
-         * the window, so no click verb can reach it. */
-        show_and_focus(hwnd); tray_menu_open();
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "restore")) {
-        show_and_focus(hwnd);
-        test_ack("ok");
-    } else if (!strcmp(verb, "find")) {
-        snprintf(g_find_filter, sizeof g_find_filter, "%s", arg);
-        for (char *p = g_find_filter; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
-        test_ack("ok");
-    } else if (!strcmp(verb, "type")) {
-        /* Put text in the composer WITHOUT sending, caret at the end, so the
-         * autocomplete popover sees the same state as live typing. */
-        {
-            oc_wch w[1024]; to_w(arg, w, 1024);
-            ed_set(w);
-            ac_rebuild();
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "typekeys")) {
-        /* Through the REAL character path (text input -> ed_char), one keystroke
-         * at a time — unlike `type`, which SETS the buffer. The rich-mode
-         * typing rules (pending styles, continuation across spaces, whitespace
-         * stepping outside a closer) live in ed_char, so only this verb can
-         * exercise them; `type` bypasses everything they exist to do. */
-        {
-            oc_wch w[1024]; to_w(arg, w, 1024);
-            for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "keychar")) {
-        /* One printable key as a person types it: the key going down, the text
-         * the platform sends for that press, and the key coming up, all through
-         * on_event. Only this shows a key a shortcut claims is NOT typed
-         * (g_claimed_text): `key` sends no text and `typekeys` no key. An
-         * upper-case letter is pressed with Shift. */
-        char c = arg[0];
-        if (c > ' ' && c < 0x7f && !arg[1]) {
-            int upper = c >= 'A' && c <= 'Z';
-            SDL_Event e; memset(&e, 0, sizeof e);
-            e.type = SDL_EVENT_KEY_DOWN;
-            e.key.windowID = SDL_GetWindowID(hwnd->sdl);
-            e.key.key = (SDL_Keycode)(upper ? c + 32 : c);
-            e.key.mod = upper ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE;
-            e.key.down = true;
-            on_event(&e);
-            SDL_Event t; memset(&t, 0, sizeof t);
-            t.type = SDL_EVENT_TEXT_INPUT;
-            t.text.windowID = e.key.windowID;
-            t.text.text = arg;
-            on_event(&t);
-            e.type = SDL_EVENT_KEY_UP; e.key.down = false;
-            on_event(&e);
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "dirfind")) {
-        /* Drive the People pane's search box (REQ-289). Through the field, so
-         * the change hook the user's typing fires is the one under test — the
-         * palette verb sets its box the same way. */
-        if (g_dir_edit) { field_set(g_dir_edit, arg); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "attach")) {
-        /* Into the upload tray, as picking the file would, without the dialog. */
-        int had = g_n_ftray;
-        ftray_add(hwnd, arg);
-        test_ack(g_n_ftray > had ? "ok" : "err");
-    } else if (!strcmp(verb, "picker")) {
-        /* "cancel" | "pick <path>": answer the real file dialog the composer's
-         * "+" opened, as a person would, so what it returns goes through the
-         * same path as theirs. The hook is answered while the dialog is up
-         * because the dialog's modal loop runs it (test_modal_tick). "none"
-         * when no dialog is open. */
-        if (!oc_plat_picker_open()) test_ack("none");
-        else if (!strcmp(arg, "cancel")) test_ack(oc_plat_picker_answer(NULL) ? "ok" : "err");
-        else if (!strncmp(arg, "pick ", 5) && arg[5]) test_ack(oc_plat_picker_answer(arg + 5) ? "ok" : "err");
-        else test_ack("err");
-    } else if (!strcmp(verb, "upload")) {
-        /* Bypass the file dialog so an attachment can be posted from the harness. */
-        if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "jumpdate")) {
-        /* "<date>": jump the open conversation to that day, as the calendar's
-         * field does with the same words typed; in the open thread when one is,
-         * as Ctrl+Shift+J does. */
-        uint64_t day = parse_day(arg);
-        const oc_model *jm = model();
-        uint64_t parent = jm && jm->thread_open && jm->thread_channel == g_sel ? jm->thread_parent : 0;
-        if (g_sel && day) { date_jump(g_sel, parent, day); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "snippet")) {
-        /* "<title>|<language>|<text>", \n for a newline: a snippet into the
-         * open conversation, as Create snippet posts one (REQ-226). */
-        char t[OC_SNIPPET_TITLE_MAX + 1] = "", l[OC_SNIPPET_LANG_MAX + 1] = "";
-        const char *a = strchr(arg, '|'), *b = a ? strchr(a + 1, '|') : NULL;
-        if (!a || !b || !g_client || !g_sel) { test_ack("err"); }
-        else {
-            snprintf(t, sizeof t, "%.*s", (int)(a - arg), arg);
-            snprintf(l, sizeof l, "%.*s", (int)(b - a - 1), a + 1);
-            char *body = malloc(strlen(b) + 1);
-            size_t k = 0;
-            for (const char *q = b + 1; body && *q; q++) {
-                if (q[0] == '\\' && q[1] == 'n') { body[k++] = '\n'; q++; }
-                else body[k++] = *q;
-            }
-            if (body) body[k] = '\0';
-            test_ack(body && oc_client_post_snippet(g_client, g_sel, 0, t, l, body) ? "ok" : "err");
-            free(body);
-        }
-    } else if (!strcmp(verb, "palette")) {
-        palette_open(hwnd);
-        if (arg[0] && g_pal_edit) field_set(g_pal_edit, arg);
-        test_ack("ok");
-    } else if (!strcmp(verb, "wsadd")) {
-        /* "<workspace>": an ADDITIONAL workspace -- its stored session, else its
-         * sign-in card (the harness presses Sign in and plays the browser). */
-        char ws[256] = "";
-        sscanf(arg, "%255s", ws);
-        if (!ws[0]) test_ack("err");
-        else {
-            char key[288]; ws_key(ws, key, sizeof key);
-            if (have_stored_token(key)) switch_workspace(hwnd, ws, "");
-            else { ws_save_active(); close_overlays(); g_view = VIEW_SIGNIN; signin_begin(hwnd, ws, NULL); layout_signin(hwnd); invalidate(); }
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "shotfull")) {
-        /* Kept as an alias: `shot` is now the composited capture, so there is
-         * exactly one way to take a picture and it is the complete one. */
-        test_ack(test_shot(hwnd, arg) ? "ok" : "err");
-    } else if (!strcmp(verb, "wheel")) {
-        /* A real wheel step at a point (window DIPs; 120 = one notch) into
-         * on_wheel, as the mouse's own reaches it. The `scroll` verb only
-         * moves the transcript's own offset, so every other scrollable region
-         * — the sidebar, the overlay panes, and now Files and Later — had no
-         * way to be tested at all. */
-        int x = 0, y = 0, d = 0;
-        sscanf(arg, "%d %d %d", &x, &y, &d);
-        synth_wheel(hwnd, x, y, d);
-        test_ack("ok");
-    } else if (!strcmp(verb, "chars")) {
-        /* Real typed characters, one per character. `type` SETS the text; this
-         * TYPES it, which is the path that exercises insertion, the caret, the
-         * typing indicator and the autocomplete — the code a user actually runs. */
-        oc_wch w[512]; int n = to_w(arg, w, 512);
-        for (int i = 0; i < n; i++) synth_char(hwnd, w[i]);
-        test_ack("ok");
-    } else if (!strcmp(verb, "pdm")) {
-        /* Encrypted DMs (PRIVATE-DM.md), through the commands the controls send:
-         * `pdm box` (New message's checkbox, as a click), `pdm accept|decline` (the
-         * first invitation), `pdm close|trust|safety|forget` (the conversation
-         * shown). Starting one is New message with the box ticked. */
-        char sc[32] = "";
-        sscanf(arg, "%31s", sc);
-        oc_model *pm = (oc_model *)model();
-        int ok = pm != NULL;
-        int inv = -1;
-        for (size_t i = 0; ok && i < pm->n_pdms && inv < 0; i++)
-            if (pm->pdms[i].state == OC_PDM_EV_INVITED) inv = (int)i;
-        if (ok && !strcmp(sc, "box")) {
-            ok = nm_e2e_offered();
-            if (ok) { g_nm_e2e = !g_nm_e2e; newmsg_flush(); }
-        } else if (ok && (!strcmp(sc, "accept") || !strcmp(sc, "decline"))) {
-            ok = inv >= 0;
-            if (ok) pdm_cmd(hwnd, (!strcmp(sc, "accept") ? PD_ACCEPT0 : PD_DECLINE0) + inv);
-        } else if (ok && (!strcmp(sc, "close") || !strcmp(sc, "trust") || !strcmp(sc, "safety") ||
-                          !strcmp(sc, "forget"))) {
-            ok = conv_is_e2e();
-            if (ok) pdm_cmd(hwnd, !strcmp(sc, "close") ? PD_CLOSE : !strcmp(sc, "safety") ? PD_SAFETY
-                                : !strcmp(sc, "forget") ? PD_FORGET : PD_TRUST);
-        } else ok = 0;
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "call")) {
-        /* Calls through the calls the controls make (REQ-150, REQ-301-305):
-         *   call start [ch] | join [ch] | open [ch] | leave | end | end-press | decline [ch]
-         *   call banner-join | banner-decline | settings | chat | callback | row-join <i>
-         *   call mute | unmute | ptt-down | ptt-up | ns on|off
-         *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go
-         *   call share <device id or name> | share pick | share stop | share full | share actual
-         *   call camera on | off | pick | <device id or name> | layout grid | speaker
-         *   call home | new | page <id> | join-id <id> | open-id <id> | decline-id <id> | subject <text>
-         *   call record on|off | rec-join | rec-cancel | play <i> | more | tmore | row-open <i> */
-        char sc[32] = "", rest[256] = "";
-        sscanf(arg, "%31s %255[^\n]", sc, rest);
-        const oc_model *cm = model();
-        uint64_t ch = rest[0] ? strtoull(rest, NULL, 10) : g_sel;
-        uint64_t rid = strtoull(rest, NULL, 10);
-        int ok = cm != NULL;
-        if (!ok) {}
-        else if (!strcmp(sc, "start"))    call_start_here(hwnd, ch);
-        else if (!strcmp(sc, "join"))     call_join_here(hwnd, ch);
-        else if (!strcmp(sc, "open"))     { uint64_t id = call_id_from(cm, ch); ok = id != 0; if (ok) call_open_view(hwnd, id); }
-        else if (!strcmp(sc, "home"))     call_cmd(hwnd, CC_HOME_OPEN);
-        else if (!strcmp(sc, "new"))      call_cmd(hwnd, CC_HOME_NEW);
-        else if (!strcmp(sc, "page"))     { ok = rid != 0; if (ok) call_open_page(hwnd, rid); }
-        else if (!strcmp(sc, "join-id"))  { ok = rid != 0; if (ok) call_join_id(hwnd, rid, 0); }
-        else if (!strcmp(sc, "open-id"))  { ok = rid != 0; if (ok) call_open_view(hwnd, rid); }
-        else if (!strcmp(sc, "decline-id")) { ok = rid != 0; if (ok) oc_client_call_decline(g_client, rid); }
-        else if (!strcmp(sc, "subject"))  { ok = g_cpick_open && g_cpick_subject; if (ok) field_set(g_cpick_subject, rest); }
-        else if (!strcmp(sc, "pick-search")) { ok = g_cpick_open && g_cpick_q; if (ok) { field_set(g_cpick_q, rest); invalidate(); } }
-        else if (!strcmp(sc, "record"))   {
-            ok = call_here(cm);
-            if (ok && cm->call.recording != !strcmp(rest, "on")) call_cmd(hwnd, CC_RECORD);
-        }
-        else if (!strcmp(sc, "rec-join") || !strcmp(sc, "prejoin-join")) { ok = g_pj_open || g_rec_notice_on; call_cmd(hwnd, CC_REC_JOIN); }
-        else if (!strcmp(sc, "prejoin-mic")) { ok = g_pj_open; if (ok) call_cmd(hwnd, CC_PJ_MIC); }
-        else if (!strcmp(sc, "prejoin-cam")) { ok = g_pj_open; if (ok) call_cmd(hwnd, CC_PJ_CAM); }
-        else if (!strcmp(sc, "rec-cancel")) call_cmd(hwnd, CC_REC_CANCEL);
-        else if (!strcmp(sc, "play"))     { int i = atoi(rest); ok = i >= 0 && i < 16; if (ok) call_cmd(hwnd, CH_PLAY0 + i); }
-        else if (!strcmp(sc, "more"))     call_cmd(hwnd, CH_MORE);
-        else if (!strcmp(sc, "tmore"))    call_cmd(hwnd, CH_TMORE);
-        else if (!strcmp(sc, "row-open")) { int i = atoi(rest); ok = i >= 0 && i < g_n_home; if (ok) call_cmd(hwnd, CH_ROW0 + i); }
-        else if (!strcmp(sc, "filter-reset")) { g_home_filter = 0; g_home_scroll = 0; }
-        else if (!strcmp(sc, "leave"))    call_cmd(hwnd, CC_LEAVE);
-        /* `end` is the request End for everyone's confirmation makes, so a
-         * script can see the daemon's answer to it; `end-press` presses the
-         * button, which asks first (answered with Enter or Esc). */
-        else if (!strcmp(sc, "end"))      { ok = call_here(cm); if (ok) oc_client_call_end(g_client, cm->call.call_id); }
-        else if (!strcmp(sc, "end-press")) call_cmd(hwnd, CC_END);
-        /* The interface's other presses, each as its button makes it. */
-        else if (!strcmp(sc, "banner-join"))    call_cmd(hwnd, CC_BANNER_JOIN);
-        else if (!strcmp(sc, "banner-decline")) call_cmd(hwnd, CC_BANNER_DECLINE);
-        else if (!strcmp(sc, "settings"))       call_cmd(hwnd, CC_SETTINGS);
-        else if (!strcmp(sc, "chat"))           call_cmd(hwnd, CC_CHAT);
-        else if (!strcmp(sc, "callback"))       call_cmd(hwnd, CC_CALLBACK);
-        else if (!strcmp(sc, "row-join"))       { int i = atoi(rest); ok = i >= 0 && i < g_n_home; if (ok) call_cmd(hwnd, CH_JOIN0 + i); }
-        else if (!strcmp(sc, "decline"))  oc_client_call_decline(g_client, call_id_from(cm, ch));
-        else if (!strcmp(sc, "pick-go"))  call_cmd(hwnd, CC_PICK_GO);
-        else if (!strcmp(sc, "mute") || !strcmp(sc, "unmute")) {
-            ok = g_call_engine && call_here(cm);
-            if (ok && oc_call_engine_muted(g_call_engine) != !strcmp(sc, "mute")) call_cmd(hwnd, CC_MUTE);
-        }
-        else if (!strcmp(sc, "ptt-down")) ok = call_ptt(hwnd, 1);
-        else if (!strcmp(sc, "ptt-up"))   ok = call_ptt(hwnd, 0);
-        else if (!strcmp(sc, "ns")) {
-            int on = !strcmp(rest, "on");
-            if (on != g_call_ns) call_cmd(hwnd, CC_NS);
-        }
-        else if (!strcmp(sc, "invite")) {
-            uint64_t ids[OC_MAX_CALL_INVITES]; int n = 0;
-            for (char *t = strtok(rest, " "); t && n < (int)OC_MAX_CALL_INVITES; t = strtok(NULL, " "))
-                ids[n++] = strtoull(t, NULL, 10);
-            ok = call_here(cm) && n > 0;
-            if (ok) oc_client_call_invite(g_client, cm->call.call_id, ids, n);
-        }
-        else if (!strcmp(sc, "share")) {
-            if (!strcmp(rest, "pick"))        call_cmd(hwnd, CC_SHARE);
-            else if (!strcmp(rest, "stop"))   { ok = g_share_on; call_cmd(hwnd, CC_SHARE_STOP); }
-            else if (!strcmp(rest, "full"))   { ok = share_other(cm) != 0; call_cmd(hwnd, CC_SHARE_FULL); }
-            else if (!strcmp(rest, "actual")) call_cmd(hwnd, CC_SHARE_ACTUAL);
-            else {
-                g_share_nsrcs = oc_capture_list_screens(g_share_srcs, CC_MAX_SRC);
-                int k = -1;
-                for (int i = 0; i < g_share_nsrcs; i++)
-                    if (!strcmp(g_share_srcs[i].id, rest) || !strcmp(g_share_srcs[i].name, rest)) k = i;
-                ok = k >= 0 && !g_share_on && share_begin(hwnd, g_share_srcs[k].id, g_share_srcs[k].name);
-            }
-        }
-        else if (!strcmp(sc, "camera")) {
-            /* The button, the picker, or a camera by id or name from it. */
-            if (!strcmp(rest, "on") || !strcmp(rest, "off")) {
-                ok = call_here(cm);
-                if (ok && g_cam_on != !strcmp(rest, "on")) call_cmd(hwnd, CC_CAMERA);
-            } else if (!strcmp(rest, "pick")) {
-                ok = call_here(cm);
-                call_cmd(hwnd, CC_CAMMENU);
-            } else {
-                call_devices_refresh();
-                int k = -1;
-                for (int i = 0; i < g_ncams; i++) if (!strcmp(g_cams[i].id, rest) || !strcmp(g_cams[i].name, rest)) k = i;
-                ok = k >= 0;
-                if (ok) call_cmd(hwnd, CC_CAM0 + k);
-            }
-        }
-        else if (!strcmp(sc, "layout")) {
-            ok = !strcmp(rest, "grid") || !strcmp(rest, "speaker");
-            if (ok && g_call_layout != !strcmp(rest, "speaker")) call_cmd(hwnd, CC_LAYOUT);
-        }
-        else if (!strcmp(sc, "volume")) {
-            unsigned long long uid = 0; int pct = 100;
-            ok = sscanf(rest, "%llu %d", &uid, &pct) == 2 && g_call_engine;
-            if (ok) oc_call_engine_set_volume(g_call_engine, uid, (float)pct / 100.0f);
-        }
-        else ok = 0;
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "dictate")) {
-        /* Voice input through the same calls the controls make: the microphone
-         * button's press and release, and the free-talk toggle. */
-        if      (!strcmp(arg, "ptt-down")) { dict_ptt_down(hwnd, DH_MOUSE); test_ack(g_dict ? "ok" : "err"); }
-        else if (!strcmp(arg, "ptt-up"))   { dict_ptt_up(hwnd, DH_MOUSE); test_ack("ok"); }
-        else if (!strcmp(arg, "free-on") || !strcmp(arg, "free-off")) {
-            int on = !strcmp(arg, "free-on");
-            if (on != (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE)) dict_freetalk_toggle(hwnd);
-            test_ack(on == (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE) ? "ok" : "err");
-        } else test_ack("err");
-        invalidate();
-    } else if (!strcmp(verb, "key") || !strcmp(verb, "keyup")) {
-        /* A raw key through the path a real key takes (synth_key), so Esc/Enter/Tab
-         * behaviour is drivable at all — without this, every keyboard rule in the
-         * app was verifiable only by hand. Names for the ones used most, so a test
-         * reads `key esc` rather than `key 27`. */
-        /* `key ctrl+k`, `key alt+shift+up`, `key esc`, `key 27`. Modifiers matter:
-         * the app's shortcuts are dispatched from the loop and read mod_down,
-         * so a chord cannot be tested by sending a bare key — and
-         * until this existed, no chord in the app was testable at all. */
-        unsigned want = 0;
-        const char *k = arg;
-        for (;;) {
-            if (!strncmp(k, "ctrl+", 5))  { want |= AM_CTRL;  k += 5; continue; }
-            if (!strncmp(k, "alt+", 4))   { want |= AM_ALT;   k += 4; continue; }
-            if (!strncmp(k, "shift+", 6)) { want |= AM_SHIFT; k += 6; continue; }
-            break;
-        }
-        int vk = oc_key_from_name(k);
-        /* Modifiers are read with mod_down, which answers from g_synth_mods
-         * while it is set: the chord is held for this one key, without touching
-         * the OS's key state or the user's physical keyboard. */
-        g_synth_mods = (int)want;
-        /* `keyup` lets the key go: the release a held key (the talk key) waits for. */
-        int up = !strcmp(verb, "keyup");
-        synth_key(hwnd, vk, up, (want & AM_ALT) != 0);
-        g_synth_mods = -1;
-        test_ack("ok");
-    } else if (!strcmp(verb, "move")) {
-        /* A real mouse-motion event, so hover goes through the same path the mouse
-         * does rather than a test-only shortcut that could drift from it. */
-        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        synth_mouse(hwnd, 1, x, y);
-        test_ack("ok");
-    } else if (!strcmp(verb, "nav")) {
-        int d = 0, u = 0; sscanf(arg, "%d %d", &d, &u);
-        nav_conversation(hwnd, d, u); test_ack("ok");
-    } else if (!strcmp(verb, "dpi")) {
-        /* Force a scale factor so the layout can be checked without a scaled
-         * display attached. Same path SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED
-         * takes. */
-        int d = atoi(arg);
-        if (d >= 48 && d <= 480) { dpi_set(hwnd, (unsigned)d); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "wsforget")) {
-        /* The removal itself, minus the confirmation dialog a harness cannot
-         * dismiss reliably: the code path the button takes after OK, which for
-         * the active workspace signs out first and forgets when that lands --
-         * a harness waits for authed=0 before it kills the client. */
-        ws_forget_begin(arg);
-        test_ack("ok");
-    } else if (!strcmp(verb, "wsbook")) {
-        /* "<workspace> <user> [<days>]" — a book entry with no sign-in behind it,
-         * so the Workspaces dialog can be given more rows than fit; last used
-         * <days> ago, now when not given. */
-        char ws[256] = "", user[80] = "";
-        int days = 0;
-        sscanf(arg, "%255s %79s %d", ws, user, &days);
-        if (days < 0) days = 0;
-        const char *sp = store_path();
-        oc_store *st = (sp && ws[0]) ? oc_store_open(sp) : NULL;
-        if (st) {
-            oc_store_set_secret(st, g_secret);
-            oc_store_workspace_remember(st, ws, NULL, user, ((uint64_t)time(NULL) - (uint64_t)days * 86400) * 1000);
-            oc_store_close(st);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "wsgo")) {
-        test_ack(ws_go(hwnd, atoi(arg)) ? "ok" : "err");
-    } else if (!strcmp(verb, "toast")) {
-        /* Through the real chain, so the harness exercises what a message does
-         * -- including which backend actually carried it. */
-        /* Same SHAPE a real message uses -- conversation on top, "who: what"
-         * below -- so what the harness renders is what a user sees. */
-        notify_deliver("bob", arg[0] ? arg : "test notification", "#general", 0, 0,
-                       sound_choice_for(0, 0));
-        test_ack("ok");
-    } else if (!strcmp(verb, "toastaction")) {
-        /* toastaction reply|0|1|<newline>text  -- the exact string Windows
-         * hands the activator. The activator itself is COM-driven and so
-         * undrivable; this is the same code path from the same input. */
-        char pay[1200]; snprintf(pay, sizeof pay, "%s", arg);
-        for (char *q = pay; *q; q++) if (*q == '~') *q = '\n';   /* the cmd file is one line */
-        toast_action_perform(pay);
-        test_ack("ok");
-    } else if (!strcmp(verb, "deliver")) {
-        /* deliver 0|1|2 -- Windows / OpenChime's own / off. Drivable because the
-         * three backends are the thing under test and a preference the harness
-         * cannot set is a backend the harness cannot reach. */
-        int v = atoi(arg);
-        if (v >= 0 && v <= 2) { g_pref_deliver = v; prefs_save(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "withdraw")) {
-        /* withdraw <ws>|<channel> -- take back that conversation's notification;
-         * withdraw <ws> -- every one of that workspace's (osnotify.h). */
-        unsigned long long ws = strtoull(arg, NULL, 10), cid = 0;
-        const char *bar = strchr(arg, '|');
-        if (bar) cid = strtoull(bar + 1, NULL, 10);
-        char tag[64], grp[64];
-        snprintf(tag, sizeof tag, "c%llu", cid);
-        snprintf(grp, sizeof grp, "w%llu", ws);
-        test_ack((bar ? oc_osn_withdraw(tag, grp) : oc_osn_withdraw_group(grp)) ? "ok" : "err");
-    } else if (!strcmp(verb, "wintoast")) {
-        /* wintoast 0|1 -- 0 behaves as if the WinRT toast could not be set up, so
-         * the next `toast` falls to the tray balloon through the real chain. The
-         * balloon is the fallback nobody can otherwise reach on a machine where
-         * toasts work, which is every machine it has been developed on. 1 puts
-         * back whatever initialisation actually found. Nothing is saved. */
-        static int real = -1;
-        if (real < 0) real = g_wintoast_ok;
-        oc_osn_test_unavailable(!atoi(arg));
-        g_wintoast_ok = atoi(arg) ? real : 0;
-        test_ack("ok");
-    } else if (!strcmp(verb, "notify")) {
-        modal_enter(hwnd, &g_notify_open);
-        oc_client_list_notify_prefs(g_client); test_ack("ok");
-    } else if (!strcmp(verb, "keys")) {
-        modal_enter(hwnd, &g_keys_open); test_ack("ok");
-    } else if (!strcmp(verb, "about")) {
-        /* About OpenChime; the ack is the text Copy puts on the clipboard. */
-        char t[256];
-        about_text(model(), t, sizeof t);
-        g_whatsnew = 0;
-        modal_enter(hwnd, &g_about_open); test_ack(t);
-    } else if (!strcmp(verb, "whatsnew")) {
-        /* What's new, as its menu item opens it; "open" presses its "Open on
-         * openchime.io", whose address goes where every URL the hook opens goes. */
-        if (!strcmp(arg, "open")) menu_dispatch(hwnd, WN_CMD_OPEN);
-        else menu_dispatch(hwnd, ABOUT_CMD_WHATSNEW);
-        test_ack("ok");
-    } else if (!strcmp(verb, "open")) {
-        /* `open <cmd>` -- `menu`, acked FIRST, as `clickform` is: a command that
-         * opens a dialog runs its nested loop inside the dispatch, and the verbs
-         * that follow (dump, ledger, shot, formtype, key) are answered there. */
-        test_ack("ok");
-        menu_dispatch(hwnd, atoi(arg));
-    } else if (!strcmp(verb, "menu")) {
-        /* Drive a workspace/new-menu command directly. Modal forms block this
-         * poll loop until dismissed, so the ack lands after the dialog closes. */
-        menu_dispatch(hwnd, atoi(arg)); test_ack("ok");
-    } else if (!strcmp(verb, "profile")) {
-        /* Through profile_open, so the verb takes the same path a click does — it
-         * used to set the id WITHOUT switching the pane, so the profile never drew
-         * and the harness could not have caught this bug. */
-        close_overlays(); g_view = VIEW_HOME;
-        test_ack(profile_open(strtoull(arg, NULL, 10)) ? "ok" : "err");
-    } else if (!strcmp(verb, "formnext")) {
-        /* formnext <v1>|<v2>|... — arm the next form dialog with these values, or
-         * `cancel` to have it refuse. See g_form_seed. */
-        g_form_seeded = 0; g_form_seed_cancel = 0;
-        if (!strcmp(arg, "cancel")) { g_form_seed_cancel = 1; g_form_seeded = 1; }
-        else {
-            const char *p2 = arg;
-            while (*p2 && g_form_seeded < FORM_MAX_FIELDS) {
-                const char *e = strchr(p2, '|');
-                size_t len = e ? (size_t)(e - p2) : strlen(p2);
-                if (len > sizeof g_form_seed[0] - 1) len = sizeof g_form_seed[0] - 1;
-                memcpy(g_form_seed[g_form_seeded], p2, len);
-                g_form_seed[g_form_seeded][len] = '\0';
-                g_form_seeded++;
-                if (!e) break;
-                p2 = e + 1;
-            }
-        }
-        test_ack("ok");
-    } else if (!strcmp(verb, "clickform")) {
-        /* `clickform x y` -- `click`, acked FIRST: for a click that opens a real
-         * form, whose nested event loop would hold an ack sent afterwards until
-         * the dialog closed. The commands that follow run inside that loop, so a
-         * harness fills the open dialog (`formtype`) and answers it (`key enter`)
-         * as a person does -- where `formnext` answers it without ever opening it,
-         * and so cannot see what opening it does to the window behind. */
-        int x = 0, y = 0;
-        if (sscanf(arg, "%d %d", &x, &y) != 2) { test_ack("err"); }
-        else {
-            test_ack("ok");
-            synth_mouse(hwnd, 0, x, y);
-            synth_mouse(hwnd, 2, x, y);
-        }
-    } else if (!strcmp(verb, "formtype")) {
-        /* `formtype <field> <text>` -- into the open form's field, through the
-         * control, as the dirfind verb sets its box. */
-        int fi = -1, used = 0;
-        if (sscanf(arg, "%d %n", &fi, &used) < 1 || !g_form_open || fi < 0 ||
-            fi >= FORM_MAX_FIELDS || !g_form_edit[fi]) { test_ack("err"); }
-        else {
-            field_set(g_form_edit[fi], arg + used);
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "form")) {
-        /* Drive the generic form. The ack goes FIRST, because the form runs
-         * a nested event loop: acking afterwards would make the harness wait for a
-         * dialog it has not been told about yet, which is the trap the `menu` verb
-         * documents above. The OUTCOME lands in the dump instead. */
-        test_ack("ok");
-        {
-            static const char *TITLES[3] = { "Test form", "Test form", "Test form" };
-            oc_field f[3] = {
-                { FF_TEXT,   "Text",   "A hint under the field.", "" },
-                { FF_CHECK,  "A checkbox", "", "" },
-                { FF_CHOICE, "A choice", "One|Two|Three", "" },
-            };
-            int nf = arg[0] ? atoi(arg) : 3;
-            if (nf < 1) nf = 1;
-            if (nf > 3) nf = 3;
-            snprintf(f[0].value, sizeof f[0].value, "initial");
-            snprintf(f[1].value, sizeof f[1].value, "0");
-            snprintf(f[2].value, sizeof f[2].value, "1");
-            int okp = form_dialog(hwnd, TITLES[0], f, nf);
-            snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
-                     okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
-        }
-    } else if (!strcmp(verb, "emoji_add")) {
-        /* REQ-072. `emoji_add <name> <windows path>` — the menu path opens a form and
-         * an OS file dialog, neither of which a harness can drive. */
-        char nm[48] = ""; char pth[512] = "";
-        if (sscanf(arg, "%47s %511[^\n]", nm, pth) != 2 || !g_client) { test_ack("err"); }
-        else {
-            uint64_t up = 0;
-            const oc_model *em = model();
-            if (em) for (size_t i = 0; i < em->n_channels; i++)
-                if (em->channels[i].kind == OC_CHANNEL_KIND_DM &&
-                    em->channels[i].peer_id == em->user_id) { up = em->channels[i].channel_id; break; }
-            if (!up) up = g_sel;
-            if (!up) test_ack("err");
-            else { oc_client_upload_emoji(g_client, up, nm, pth); test_ack("ok"); }
-        }
-    } else if (!strcmp(verb, "grpbtn")) {
-        /* REQ-307. `grpbtn new|back|add|<n>` presses a button in Admin > Groups
-         * through the same handler a click reaches: the n-th action button, or a
-         * named one. Seed its form first with `formnext`; the ack goes first,
-         * as for `form`, since the form runs its own loop. */
-        rectf r = !strcmp(arg, "new") ? g_grp_new_btn : !strcmp(arg, "back") ? g_grp_back_btn
-                : !strcmp(arg, "add") ? g_grp_add_btn
-                : (atoi(arg) >= 0 && atoi(arg) < g_n_grpacts) ? g_grpacts[atoi(arg)].r : rf(0, 0, 0, 0);
-        test_ack(r.right > r.left ? "ok" : "err");
-        if (r.right > r.left && model())
-            groups_click(hwnd, model(), (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
-    } else if (!strcmp(verb, "grppick")) {
-        /* `grppick <query> [row]`: Add people -- Admin > Groups', or the members
-         * pane's, whichever is open -- through the real key paths: the field
-         * takes the keys, the query is typed a character at a time, Down moves
-         * to the row (0 = the first), Enter accepts it. An empty query is
-         * `grppick -`. Enter again with nothing typed adds. */
-        char q[128] = ""; int row = 0;
-        sscanf(arg, "%127s %d", q, &row);
-        int grp = g_grp_sel && g_tgt_host == TGT_HOST_GROUP, chan = chan_pick_live();
-        if (!grp && !chan) { test_ack("err"); }
-        else {
-            if (grp) g_grp_pick_focus = 1; else g_chan_pick_focus = 1;
-            tgt_rebuild();
-            if (strcmp(q, "-")) {
-                oc_wch w[128]; to_w(q, w, 128);
-                for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
-            }
-            for (int i = 0; i < row; i++) synth_key(hwnd, OCK_DOWN, 0, 0);
-            synth_key(hwnd, OCK_RETURN, 0, 0);
-            test_ack("ok");
-        }
-    } else if (!strcmp(verb, "chmenu")) {
-        /* `chmenu <cmd>` runs a channel-menu command on the open channel, as
-         * choosing it from the channel's context menu does (REQ-309: 8 add a
-         * group, 9 remove one). Ack first: some open a form. */
-        test_ack(g_sel ? "ok" : "err");
-        if (g_sel) { g_menu_target = g_sel; channel_menu_run(hwnd, atoi(arg)); }
-    } else if (!strcmp(verb, "preview")) {
-        /* `preview`: the composer's Preview toggle, as its button. */
-        if (g_sel && g_view != VIEW_NEWMSG) { preview_set(hwnd, !g_preview); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "timeinsert")) {
-        /* `timeinsert <YYYY>-<MM>-<DD> <HH>:<MM>`, in this machine's zone: Insert
-         * a time's card opened, that moment picked on it, and Insert pressed. */
-        int y = 0, mo = 0, d = 0, hh = 0, mi = 0;
-        if (g_sel && sscanf(arg, "%d-%d-%d %d:%d", &y, &mo, &d, &hh, &mi) == 5) {
-            time_insert_open(hwnd);
-            g_sch_y = y; g_sch_m = mo - 1; g_sch_d = d; g_sch_min = hh * 60 + mi;
-            menu_dispatch(hwnd, 305);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "emoji_del")) {
-        oc_client_delete_emoji(g_client, arg); test_ack("ok");
-    } else if (!strcmp(verb, "emoji_add")) {
-        /* `emoji_add <name> <path>`: upload the image into the open conversation
-         * and register it as :name:, as Add custom emoji does past its dialogs. */
-        char nm[48] = "";
-        const char *sp = strchr(arg, ' ');
-        if (g_client && g_sel && sp && sp > arg && (size_t)(sp - arg) < sizeof nm) {
-            memcpy(nm, arg, (size_t)(sp - arg)); nm[sp - arg] = 0;
-            oc_client_upload_emoji(g_client, g_sel, nm, sp + 1);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "emoji_find")) {
-        /* `emoji_find <text>|-`: type into Admin > Custom emoji's search box. */
-        if (g_efind) { field_set(g_efind, strcmp(arg, "-") ? arg : ""); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "groupdm")) {
-        /* REQ-056. `groupdm <name>,<name>[,...]` — the menu item opens a form the
-         * harness would have to type into and dismiss; this is the call underneath. */
-        const oc_model *gm = model();
-        uint64_t ids[8]; int n = 0;
-        char buf[256]; snprintf(buf, sizeof buf, "%s", arg);
-        for (char *tok = strtok(buf, ","); tok && gm && n < 8; tok = strtok(NULL, ",")) {
-            while (*tok == ' ') tok++;
-            uint64_t uid = oc_model_user_id(gm, tok);
-            if (uid && uid != gm->user_id) ids[n++] = uid;
-        }
-        if (n < 2) test_ack("err");
-        else { oc_client_open_group_dm(g_client, ids, n); test_ack("ok"); }
-    } else if (!strcmp(verb, "avatar")) {
-        /* `avatar <windows path>` uploads and claims it; `avatar 0` clears.
-         * The menu item opens an OS file dialog, which a harness cannot drive at all,
-         * so the verb goes at the client call underneath it. */
-        if (!strcmp(arg, "0")) { oc_client_set_avatar(g_client, 0); test_ack("ok"); }
-        else {
-            uint64_t up = 0;
-            const oc_model *um = model();
-            if (um) for (size_t i = 0; i < um->n_channels; i++)
-                if (um->channels[i].kind == OC_CHANNEL_KIND_DM &&
-                    um->channels[i].peer_id == um->user_id) { up = um->channels[i].channel_id; break; }
-            if (!up) up = g_sel;
-            if (!up) { test_ack("err"); }
-            else { oc_client_upload_avatar(g_client, up, arg); test_ack("ok"); }
-        }
-    } else if (!strcmp(verb, "section")) {
-        /* `section add <name>` | `section put <cid> <idx>` | `section rm <idx>`
-         * | `section clear <cid>`. The menus that reach these open a modal form, and a
-         * form inside a menu inside the harness is three layers of driving for what is
-         * one call — so the verb goes at the model, and the smoke asserts the sidebar
-         * that comes out of it. */
-        char what[16] = ""; char rest[128] = "";
-        sscanf(arg, "%15s %127[^\n]", what, rest);
-        if (!strcmp(what, "add"))        { test_ack(oc_sidebar_section_add(&g_sb, rest) >= 0 ? "ok" : "err"); }
-        else if (!strcmp(what, "put"))   {
-            unsigned long long cid = 0; int idx = -1;
-            sscanf(rest, "%llu %d", &cid, &idx);
-            test_ack(oc_sidebar_assign(&g_sb, (uint64_t)cid, idx) ? "ok" : "err");
-        }
-        else if (!strcmp(what, "clear")) {
-            unsigned long long cid = strtoull(rest, NULL, 10);
-            oc_sidebar_assign(&g_sb, (uint64_t)cid, -1); test_ack("ok");
-        }
-        else if (!strcmp(what, "rm"))    { oc_sidebar_section_remove(&g_sb, atoi(rest)); test_ack("ok"); }
-        /* `section expand <n>` — collapse state is per-user state that PERSISTS on the
-         * server, so a test that assumes a section is open passes only until somebody
-         * collapses it. This lets a run assert the state it needs instead of
-         * inheriting one. */
-        else if (!strcmp(what, "expand")) { oc_sb_set_collapsed(&g_sb, atoi(rest), 0); test_ack("ok"); }
-        else if (!strcmp(what, "collapse")) { oc_sb_set_collapsed(&g_sb, atoi(rest), 1); test_ack("ok"); }
-        else                             { test_ack("err"); }
-        sidebar_opts_save();
-        invalidate();
-    } else if (!strcmp(verb, "textsize")) {
-        /* 0 Small .. 3 Largest (ARCH-97). Drivable because the scaling paths are
-         * where fixed-height chrome fails, and a review that cannot set the size
-         * can only ever check the one it happens to be at. */
-        int v = atoi(arg);
-        if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "spoken")) {
-        /* `spoken <sender> <time> <reactions> <replies> <text_first>
-         * <announce_new>`, each 0 or 1: Accessibility's six rows, set through
-         * the path their clicks take, and saved as Save saves them. */
-        int v[6];
-        static const int ROWS[6] = { PREF_ROW_SAY_SENDER, PREF_ROW_SAY_TIME, PREF_ROW_SAY_REACTIONS,
-                                     PREF_ROW_SAY_REPLIES, PREF_ROW_SAY_ORDER, PREF_ROW_ANNOUNCE_NEW };
-        int ok = sscanf(arg, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6;
-        for (int i = 0; ok && i < 6; i++) if (v[i] != 0 && v[i] != 1) ok = 0;
-        if (ok) {
-            for (int i = 0; i < 6; i++) spoken_pref_set(ROWS[i], v[i]);
-            prefs_save();
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "font")) {
-        /* `font <n>`: the interface font, by its index in the list (ARCH-97),
-         * applied and saved as the Appearance row and Save do. */
-        int v = atoi(arg);
-        if (arg[0] >= '0' && arg[0] <= '9' && v >= 0 && v < OC_TYPEFACE_COUNT) {
-            g_pref_font = v; scale_apply(hwnd); prefs_save(); test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "fontfam")) {
-        /* `fontfam <family>`, test-only: ask for a family by name, outside the
-         * list, so the harness can ask for one no system has and read that it
-         * fell back. Never saved. `fontfam` alone goes back to the preference. */
-        snprintf(g_font_test_family, sizeof g_font_test_family, "%s", arg);
-        scale_apply(hwnd);
-        test_ack("ok");
-    } else if (!strcmp(verb, "prefs")) {
-        /* `prefs [category]` — the category by INDEX, because the alternative
-         * is clicking a row whose y moves with the DPI and the text size, and
-         * the audit's whole job is to walk those. A scene that can only be
-         * reached at one scale cannot be checked at the others. */
-        modal_enter(hwnd, &g_prefs_open);
-        if (arg[0]) {
-            int cat = atoi(arg);
-            if (cat >= 0 && cat < PC_COUNT) g_pref_cat = cat;
-        }
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "theme")) {
-        theme_set(atoi(arg)); prefs_save(); test_ack("ok");
-    } else if (!strcmp(verb, "enter")) {
-        /* `enter send|newline`: the Messages preference "When I press Enter",
-         * saved as its row saves it, so a restart can be asked what it kept. */
-        if (!strcmp(arg, "send") || !strcmp(arg, "newline")) {
-            g_pref_enter_newline = !strcmp(arg, "newline");
-            prefs_save();
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "motion")) {
-        /* `motion 0|1|2`: Reduce motion Off, On or Follow system, saved as the
-         * Appearance row and Save save it. */
-        if (arg[0] >= '0' && arg[0] <= '2' && !arg[1]) {
-            g_pref_motion = arg[0] - '0';
-            prefs_save();
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "sysmotion")) {
-        /* `sysmotion 0|1|-1`, test-only: what the client takes the system's
-         * reduce-motion setting to be, so Follow system can be checked both
-         * ways on any machine. -1 goes back to what the system said. Never
-         * saved. */
-        if (!strcmp(arg, "0") || !strcmp(arg, "1") || !strcmp(arg, "-1")) {
-            g_sys_motion_test = atoi(arg);
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "emoji")) {
-        picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
-        test_ack("ok");
-    } else if (!strcmp(verb, "banner")) {
-        /* "demo|off": the public demo's notice, as a demo daemon's sign-in
-         * raises it, so a script can see where a banner sits in any view. */
-        g_test_demo_banner = !strcmp(arg, "demo");
-        invalidate();
-        test_ack(!strcmp(arg, "demo") || !strcmp(arg, "off") ? "ok" : "err");
-    } else if (!strcmp(verb, "actab")) {
-        ac_accept(); test_ack("ok");
-    } else if (!strcmp(verb, "search")) {
-        search_open(hwnd);
-        if (arg[0]) { field_set(g_srch, arg); search_submit(); }
-        test_ack("ok");
-    } else if (!strcmp(verb, "pin")) {
-        /* Kept once the kebab became drivable: this exercises the client call
-         * without depending on menu geometry, which is the right level for a test
-         * that cares about pinning rather than about where the item sits. */
-        uint64_t mid = strtoull(arg, NULL, 10);
-        const oc_model *pm = model();
-        const oc_channel *pc = pm && g_sel ? oc_model_channel((oc_model *)pm, g_sel) : NULL;
-        if (!mid && pc && pc->n_msgs) mid = pc->msgs[pc->n_msgs - 1].message_id;
-        const oc_msg *pmsg = find_msg(pc, mid);
-        oc_client_pin(g_client, g_sel, mid, (pmsg && pmsg->pinned) ? OC_PIN_REMOVE : OC_PIN_ADD);
-        test_ack("ok");
-    } else if (!strcmp(verb, "mkchan")) {
-        /* Bypass the modal New-channel dialog, as "upload" bypasses the file
-         * dialog: the harness cannot drive a modal. */
-        /* `mkchan <name> [public]`, public defaulting to 1 — and it means what it
-         * says. It used to pass `pub == 0` as is_public, so asking for a PUBLIC
-         * channel created a private one; the argument's name and its effect were
-         * opposites, which is a trap for anyone writing a test with it. */
-        char nm[64] = {0}; int pub = 1;
-        sscanf(arg, "%63s %d", nm, &pub);
-        if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub != 0); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "status")) {
-        /* `status <emoji> <text...>`, empty clears. Bypasses the modal form for the
-         * same reason mkchan and upload do. */
-        char emo[32] = {0}; const char *txt = "";
-        if (arg[0]) {
-            size_t k = 0;
-            while (arg[k] && arg[k] != ' ' && k + 1 < sizeof emo) { emo[k] = arg[k]; k++; }
-            emo[k] = 0;
-            txt = arg[k] == ' ' ? arg + k + 1 : "";
-        }
-        oc_client_set_status(g_client, emo, txt, 0);
-        test_ack("ok");
-    } else if (!strcmp(verb, "die")) {
-        /* Force one class of death, to prove the evidence path rather than wait
-         * for the real thing. Each is a way a process has actually been seen to
-         * vanish: `av` runs the exception filter; `abort` and `badparam` go
-         * through the CRT, which never reaches a filter; `fastfail` bypasses
-         * every handler by design and is the case only the memory-mapped ring
-         * can report. Test hook only — reachable solely through
-         * OPENCHIME_DEV_DIR. */
-        crumb("die %s requested", arg);
-        test_ack("ok");
-        if      (!strcmp(arg, "av"))       { *(volatile int *)0 = 1; }
-        else if (!strcmp(arg, "abort"))    { abort(); }
-        /* Passing NULL IS the test: this hook exists to prove the crash
-         * handler catches an invalid-parameter fault. The null goes through a
-         * volatile pointer so the call is still the one being tested but the
-         * compiler can no longer prove the argument is null, and the call goes
-         * through a plain function pointer, which carries no format attribute
-         * for clang's -Wformat-security to check -- diagnostics that are
-         * correct about the code and wrong about the intent. A pragma cannot
-         * go here: it would split the else-if chain. */
-        else if (!strcmp(arg, "badparam")) { const char *volatile nofmt = NULL; int (*volatile pf)(const char *, ...) = printf; pf(nofmt); }
-        else if (!strcmp(arg, "fastfail")) { crash_fastfail(); }
-        else if (!strcmp(arg, "kill"))     { _Exit(3); }
-    } else if (!strcmp(verb, "mute")) {
-        /* `mute <channel_id> <0|1>` — bypasses the channel context menu, which
-         * needs a right-click on a specific row and a menu target the harness
-         * cannot set. Same reason mkchan and emoji_add exist: without it the
-         * badge rules mute participates in are unassertable. */
-        unsigned long long cid = 0; int on = 1;
-        if (sscanf(arg, "%llu %d", &cid, &on) >= 1 && g_client && cid) {
-            oc_client_set_mute(g_client, (uint64_t)cid, on ? 1 : 0);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "profile_set")) {
-        /* `profile_set <tz>|<full name>|<title>|<pronouns>|<phone>` — pipe
-         * separated because every field but the timezone may contain spaces,
-         * and a positional split on spaces could not tell where one ends.
-         * Trailing fields may be omitted; each defaults to empty. */
-        char buf[512]; snprintf(buf, sizeof buf, "%s", arg);
-        const char *pf[5] = { "", "", "", "", "" };
-        int np = 0; pf[np++] = buf;
-        for (char *q = buf; *q && np < 5; q++)
-            if (*q == '|') { *q = '\0'; pf[np++] = q + 1; }
-        oc_client_set_profile(g_client, pf[1], pf[2], pf[3], pf[4], pf[0], "");
-        test_ack("ok");
-    } else if (!strcmp(verb, "mkhook")) {
-        /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
-         * harness cannot drive a modal form_dialog (that is the form harness's job). */
-        if (g_client && g_sel && arg[0]) {
-            oc_client_create_webhook(g_client, g_sel, arg);
-            g_await_webhook = 1;
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "hooks")) {
-        /* Open the webhook list for the selected channel. */
-        if (g_client && g_sel) { close_overlays(); oc_client_webhooks(g_client, g_sel); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "del")) {
-        /* Delete a message without the modal menu; mid 0 = the newest. */
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_model *dm = model();
-        const oc_channel *dc = dm && g_sel ? oc_model_channel((oc_model *)dm, g_sel) : NULL;
-        if (!mid && dc && dc->n_msgs) mid = dc->msgs[dc->n_msgs - 1].message_id;
-        /* Through the menu's own path, so what the harness does is what a click
-         * does -- the delete and its Undo. */
-        if (g_client && mid) { g_menu_target = mid; g_menu_target2 = g_sel; msg_menu_run(hwnd, 22); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "reactors")) {
-        /* Open the who-reacted pane for a message; mid 0 = the newest. The menu
-         * item it stands in for needs a click at a measured point in a menu. */
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_model *wm2 = model();
-        const oc_channel *wc = wm2 && g_sel ? oc_model_channel((oc_model *)wm2, g_sel) : NULL;
-        if (!mid && wc && wc->n_msgs) mid = wc->msgs[wc->n_msgs - 1].message_id;
-        if (g_client && mid) {
-            close_overlays();
-            oc_client_list_reactions(g_client, g_sel, (uint64_t)mid);
-            rp_push(RP_REACTORS);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "vote")) {
-        /* "<mid> <option>": press that option of the poll, as a click does --
-         * the same toggle. mid 0 = the newest poll in the conversation. */
-        unsigned long long mid = 0; unsigned opt = 0;
-        sscanf(arg, "%llu %u", &mid, &opt);
-        const oc_model *vm = model();
-        const oc_channel *vc = vm && g_sel ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
-        for (size_t i = vc ? vc->n_msgs : 0; !mid && i > 0; i--)
-            if (vc->msgs[i - 1].poll) mid = vc->msgs[i - 1].message_id;
-        const oc_poll_view *pv = vm && mid ? oc_model_poll(vm, msg_channel_of(mid), mid) : NULL;
-        if (pv && opt < pv->n_options && !poll_closed(pv)) { poll_toggle((uint64_t)mid, (uint8_t)opt); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "voters")) {
-        /* "<mid>": who voted on that poll, in the context pane; 0 = the newest. */
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_model *vm = model();
-        const oc_channel *vc = vm && g_sel ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
-        for (size_t i = vc ? vc->n_msgs : 0; !mid && i > 0; i--)
-            if (vc->msgs[i - 1].poll) mid = vc->msgs[i - 1].message_id;
-        if (g_client && mid) { close_overlays(); poll_voters_open((uint64_t)mid); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "tablenew")) {
-        /* The table editor for a new table, as Insert table on the formatting
-         * toolbar opens it (MARKDOWN.md §6). */
-        if (!g_te_open) ed_format(FMT_TABLE);
-        test_ack(g_te_open && !g_te_mode ? "ok" : "err");
-    } else if (!strcmp(verb, "tableedit") || !strcmp(verb, "tableremove")) {
-        /* "<slot>": that card's Edit or Remove, as its buttons do; none, or
-         * -1, the first card in the field. */
-        int slot = arg[0] ? atoi(arg) : -1;
-        oc_wch ch = 0;
-        if (slot < 0) { for (int i = 0; i < g_ed_len && !ch; i++) if (ed_is_tab(g_ed[i])) ch = g_ed[i]; }
-        else if (slot < ED_TAB_SLOTS && ed_tab_index((oc_wch)(ED_TAB_BASE + slot)) >= 0) ch = (oc_wch)(ED_TAB_BASE + slot);
-        int ok = 0;
-        if (ch && !strcmp(verb, "tableedit")) { if (!g_te_open) te_open(hwnd, ch); ok = g_te_open && g_te_mode; }
-        else if (ch) ok = ed_card_remove(hwnd, ch);
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "tablecols")) {
-        test_ack(g_te_open && te_set_cols(atoi(arg)) ? "ok" : "err");
-    } else if (!strcmp(verb, "tableheader")) {
-        if (g_te_open) { te_set_header(atoi(arg) != 0); test_ack("ok"); } else test_ack("err");
-    } else if (!strcmp(verb, "tablealign")) {
-        /* "<col> <l|c|r>", as the column's alignment buttons set it. */
-        int col = -1; char a = 0;
-        if (g_te_open && sscanf(arg, "%d %c", &col, &a) == 2 && col >= 0 && col < g_te_t->cols &&
-            (a == 'l' || a == 'c' || a == 'r')) {
-            g_te_t->align[col] = (uint8_t)(a == 'l' ? OC_RT_ALIGN_LEFT : a == 'c' ? OC_RT_ALIGN_CENTER : OC_RT_ALIGN_RIGHT);
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "tablecell") || !strcmp(verb, "tablefocus")) {
-        /* "tablecell <row> <col> <text>": that cell typed into, through the
-         * field and its change hook, as a click there and typing would --
-         * `\n` a line break, `\t` a tab, `\\` a backslash. Row 0 is the
-         * header. "tablefocus <row> <col>": the field moved there. */
-        int row = -1, col = -1, at = 0;
-        static char txt[2048];
-        if (g_te_open && sscanf(arg, "%d %d%n", &row, &col, &at) >= 2 && row >= 0 && col >= 0 &&
-            (uint32_t)row <= g_te_t->rows && col < g_te_t->cols && (row > 0 || g_te_t->header)) {
-            te_focus((uint32_t)row, col);
-            if (!strcmp(verb, "tablecell")) {
-                const char *q = arg + at;
-                if (*q == ' ') q++;
-                test_unesc(q, txt, sizeof txt);
-                field_set(&g_te_field, txt);
-            }
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "tableaddrow")) {
-        test_ack(g_te_open && te_add_row() ? "ok" : "err");
-    } else if (!strcmp(verb, "tableaddcol")) {
-        test_ack(g_te_open && te_add_col() ? "ok" : "err");
-    } else if (!strcmp(verb, "tablermrow")) {
-        test_ack(g_te_open && te_rm_row((uint32_t)atoi(arg)) ? "ok" : "err");
-    } else if (!strcmp(verb, "tablermcol")) {
-        test_ack(g_te_open && te_rm_col(atoi(arg)) ? "ok" : "err");
-    } else if (!strcmp(verb, "tableok")) {
-        /* As Insert / Save is pressed: "err" when the editor refused, and
-         * stays open with the reason under the grid. */
-        int ok = g_te_open && te_submit();
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "tablecancel")) {
-        if (g_te_open) { modal_finish(0); invalidate(); test_ack("ok"); } else test_ack("err");
-    } else if (!strcmp(verb, "clipset")) {
-        /* "<text>": the clipboard's text, as another program would leave it --
-         * `\t` `\n` `\r` `\\` escaped -- and no HTML or picture beside it
-         * unless cliphtml / clippicture say so after. */
-        static char txt[4096];
-        test_unesc(arg, txt, sizeof txt);
-        free(g_test_clip_html); g_test_clip_html = NULL;
-        g_test_clip_pic = 0;
-        oc_plat_clipboard_set_text(txt);
-        test_ack("ok");
-    } else if (!strcmp(verb, "cliphtml")) {
-        /* "<html>": what a sheet puts on the clipboard as HTML beside its
-         * text, which Paste as Table reads its links and bold from. */
-        free(g_test_clip_html);
-        g_test_clip_html = arg[0] ? strdup(arg) : NULL;
-        test_ack("ok");
-    } else if (!strcmp(verb, "clippicture")) {
-        /* "[0|1]": a picture of the cells beside the text, as Excel copies
-         * them -- a small PNG the client carries for the purpose. */
-        g_test_clip_pic = arg[0] ? atoi(arg) != 0 : 1;
-        test_ack("ok");
-    } else if (!strcmp(verb, "paste")) {
-        /* Into the composer at its caret, as Ctrl+V there does. */
-        if (!g_ed_focus) ed_focus(hwnd);
-        ed_clip_paste(hwnd);
-        ed_changed(hwnd);
-        test_ack("ok");
-    } else if (!strcmp(verb, "pastechoose")) {
-        /* "table|image|text|cancel": the paste chooser answered. */
-        int k = !strcmp(arg, "table") ? PCH_TABLE : !strcmp(arg, "image") ? PCH_IMAGE : !strcmp(arg, "text") ? PCH_TEXT : -1;
-        int ok = g_pch_open && (k < 0 ? !strcmp(arg, "cancel") : pastechoice_offered(k));
-        if (ok && k < 0) pastechoice_close();
-        else if (ok) pastechoice_pick(hwnd, k);
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "editmsg")) {
-        /* "<mid>": the composer on that message, as its Edit does; 0 = your
-         * newest in the conversation. */
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_channel *ec = m && g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        const oc_msg *em = NULL;
-        for (size_t i = ec ? ec->n_msgs : 0; i > 0 && !em; i--) {
-            const oc_msg *c = &ec->msgs[i - 1];
-            if (c->deleted || c->author_id != m->user_id || c->poll || c->todo) continue;   /* a list is not edited */
-            if (!mid || c->message_id == mid) em = c;
-        }
-        if (em) { composer_begin_edit(em); invalidate(); test_ack("ok"); } else test_ack("err");
-    } else if (!strcmp(verb, "pollnew")) {
-        /* The poll composer, for a new poll in the open conversation, as
-         * "Create a poll" opens it. */
-        if (!g_pc_open) poll_compose_open(hwnd, g_sel, 0);
-        test_ack(g_pc_open && !g_pc_mode ? "ok" : "err");
-    } else if (!strcmp(verb, "polledit")) {
-        /* "<mid>": the composer on that poll, as its Edit does; 0 = the newest. */
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_model *vm = model();
-        const oc_channel *vc = vm && g_sel ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
-        for (size_t i = vc ? vc->n_msgs : 0; !mid && i > 0; i--)
-            if (vc->msgs[i - 1].poll) mid = vc->msgs[i - 1].message_id;
-        if (mid && !g_pc_open) poll_compose_open(hwnd, msg_channel_of(mid), (uint64_t)mid);
-        test_ack(g_pc_open && g_pc_mode && g_pc_mid == mid ? "ok" : "err");
-    } else if (!strcmp(verb, "polltype")) {
-        /* "<q|time|0..9> <text>": what a field of the composer holds, as typed
-         * -- through its change hook, so a time is read as it would be. */
-        char which[8] = ""; int at = 0;
-        sscanf(arg, "%7s %n", which, &at);
-        const char *txt = at > 0 ? arg + at : "";
-        field *f = NULL;
-        if (!strcmp(which, "q")) f = g_pc_q;
-        else if (!strcmp(which, "time")) f = g_pc_time;
-        else if (which[0] >= '0' && which[0] <= '9') {
-            int i = atoi(which);
-            if (i < g_pc_n && !g_pc_locked) f = g_pc_opt[i];
-        }
-        if (g_pc_open && f) { field_set(f, txt); invalidate(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "polladd")) {
-        test_ack(g_pc_open && pc_add_row() ? "ok" : "err");
-    } else if (!strcmp(verb, "pollrm")) {
-        test_ack(g_pc_open && pc_remove_row(atoi(arg)) ? "ok" : "err");
-    } else if (!strcmp(verb, "pollcheck")) {
-        /* "<multi|anon> <0|1>". */
-        char which[8] = ""; int on = 0;
-        if (g_pc_open && !g_pc_locked && sscanf(arg, "%7s %d", which, &on) == 2 &&
-            (!strcmp(which, "multi") || !strcmp(which, "anon"))) {
-            if (!strcmp(which, "multi")) g_pc_multi = on != 0; else g_pc_anon = on != 0;
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "polldeadline")) {
-        /* "none", or "<YYYY-MM-DD> <time>" in local time, the time as it
-         * would be typed ("14:37", "2:37 PM"). */
-        int yy = 0, mo = 0, dd = 0, at = 0, ok = 0;
-        if (g_pc_open && !strcmp(arg, "none")) {
-            g_pc_dl = 0; g_pc_dl_moved = 1; ok = 1;
-        } else if (g_pc_open && sscanf(arg, "%d-%d-%d %n", &yy, &mo, &dd, &at) == 3 && at > 0 &&
-                   mo >= 1 && mo <= 12 && dd >= 1 && dd <= sch_days_in(yy, mo - 1)) {
-            g_pc_y = yy; g_pc_m = mo - 1; g_pc_d = dd;
-            g_pc_vy = yy; g_pc_vm = mo - 1;
-            field_set(g_pc_time, arg + at);   /* through pc_changed: a deadline, read */
-            ok = g_pc_min >= 0;
-        }
-        invalidate();
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "pollclose")) {
-        test_ack(g_pc_open && poll_compose_close_now() ? "ok" : "err");
-    } else if (!strcmp(verb, "pollsubmit")) {
-        /* As Post poll / Save is pressed: "err" when the card refused, and
-         * stays open with the reason at its field. */
-        int sent = g_pc_open && poll_compose_submit();
-        invalidate();
-        test_ack(sent ? "ok" : "err");
-    } else if (!strcmp(verb, "pollcancel")) {
-        if (g_pc_open) { modal_finish(0); invalidate(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "react")) {
-        /* "<mid> <emoji>"; mid 0 = the newest message. Bypasses the modal menu. */
-        unsigned long long mid = 0; char emo[40] = {0};
-        sscanf(arg, "%llu %39s", &mid, emo);
-        const oc_model *rm = model();
-        const oc_channel *rc = rm && g_sel ? oc_model_channel((oc_model *)rm, g_sel) : NULL;
-        if (!mid && rc && rc->n_msgs) mid = rc->msgs[rc->n_msgs - 1].message_id;
-        const oc_msg *rmsg = find_msg(rc, (uint64_t)mid);
-        if (g_client && mid && emo[0]) {
-            oc_client_react(g_client, g_sel, (uint64_t)mid, emo,
-                            (rmsg && reaction_is_mine(rmsg, emo)) ? OC_REACT_REMOVE : OC_REACT_ADD);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "save")) {
-        unsigned long long mid = strtoull(arg, NULL, 10);
-        const oc_model *sm2 = model();
-        const oc_channel *sc2 = sm2 && g_sel ? oc_model_channel((oc_model *)sm2, g_sel) : NULL;
-        if (!mid && sc2 && sc2->n_msgs) mid = sc2->msgs[sc2->n_msgs - 1].message_id;
-        if (g_client && mid) { oc_client_save_item(g_client, (uint64_t)mid, OC_SAVE_ADD); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "forward")) {
-        /* forward <to-channel-id> [message-id] — the destination the palette
-         * would have picked, plus the message the kebab would have chosen
-         * (default: the newest in the open channel). Through forward_send, so
-         * the verb takes the same path the menu does. */
-        unsigned long long to_cid = 0, mid = 0;
-        sscanf(arg, "%llu %llu", &to_cid, &mid);
-        const oc_model *fm = model();
-        const oc_channel *fc = fm && g_sel ? oc_model_channel((oc_model *)fm, g_sel) : NULL;
-        if (!mid && fc && fc->n_msgs) mid = fc->msgs[fc->n_msgs - 1].message_id;
-        if (g_client && to_cid && mid) {
-            g_fwd_mid = (uint64_t)mid; g_fwd_cid = g_sel;
-            forward_send(hwnd, (uint64_t)to_cid);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "view")) {
-        /* By NAME as well as by number. The numbers are enum positions, so
-         * inserting a view renumbers every one after it — which has now twice
-         * turned "go to Admin" into "go to whatever is there today" and failed
-         * a matrix that looked correct. Names cannot drift. */
-        int v = !strcmp(arg, "home")     ? VIEW_HOME :
-                !strcmp(arg, "dms")      ? VIEW_DMS :
-                !strcmp(arg, "activity") ? VIEW_ACTIVITY :
-                !strcmp(arg, "files")    ? VIEW_FILES :
-                !strcmp(arg, "later")    ? VIEW_LATER :
-                !strcmp(arg, "threads")  ? VIEW_THREADS :
-                !strcmp(arg, "people")   ? VIEW_DIRECTORY :
-                !strcmp(arg, "drafts")   ? VIEW_DRAFTS :
-                !strcmp(arg, "newmsg")   ? VIEW_NEWMSG :
-                !strcmp(arg, "call")     ? VIEW_CALL :
-                !strcmp(arg, "admin")    ? VIEW_ADMIN : atoi(arg);
-        if (v >= 0 && v < VIEW_COUNT) {
-            if (g_view == VIEW_ADMIN && v != VIEW_ADMIN) {
-                const oc_model *am = model();   /* see the rail-item comment */
-                if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
-                if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
-            }
-            g_view = v; layout_composer(hwnd);
-            if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
-            if (v == VIEW_THREADS)  oc_client_list_threads(g_client,
-                                        g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
-            if (v == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
-            if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
-                                    oc_client_list_files(g_client, 0);
-                                    oc_client_list_file_channels(g_client); }
-            if (v == VIEW_ADMIN)    admin_select(admin_entry_tab(model()));
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "chup")) {
-        /* Bypass the modal form, as "mkchan" and "upload" do. */
-        int op = 0; char val[256] = {0};
-        sscanf(arg, "%d %255[^\n]", &op, val);
-        if (g_client && g_sel) { oc_client_update_channel(g_client, g_sel, (uint8_t)op, val); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "tab")) {
-        select_tab(atoi(arg));
-        test_ack("ok");
-    } else if (!strcmp(verb, "editor")) {
-        /* Switch the composer between the rich editor and plain text,
-         * as the Messages preference does. A verb so BOTH modes can be asserted:
-         * a preference with one tested path is a preference with an untested
-         * path, and this one changes how every keystroke behaves. */
-        g_pref_richtext = !strcmp(arg, "rich") ? 1 : 0;
-        ed_mode_changed();
-        if (composer_remeasure()) layout_composer(hwnd);
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "voicepreview")) {
-        /* Ask for a voice's audition and time it. The answer is `preview
-         * wait_ms=` in the dump: what the button's "Playing…" state costs, which
-         * is the number the warm cache exists to change. */
-        if (g_client && arg[0]) {
-            preview_drop();
-            g_preview_asked_ms = now_ms();
-            g_preview_wait_ms = 0;
-            oc_client_voice_preview(g_client, arg);
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "newmsg")) {
-        /* Open the New Message pane exactly as its entry points do (REQ-229) —
-         * a verb rather than a click at a measured coordinate, because the
-         * pencil moves with the sidebar. */
-        open_new_message(hwnd);
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "dmcompose")) {
-        /* Toggle the "New direct message" picker, as its sidebar button does.
-         * A verb rather than a click at a measured coordinate: the button moves
-         * with the sidebar, and a test that misses it would pass by asserting
-         * about the view it failed to leave. */
-        /* "1" or "0" sets it, as a run that starts from a client already in
-         * either state needs; nothing toggles, as the button does. */
-        g_dm_compose = arg[0] == '1' ? 1 : arg[0] == '0' ? 0 : !g_dm_compose;
-        layout_composer(hwnd);
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "summenu")) {
-        /* The header's Summarize menu, open (REQ-310). */
-        if (g_sel && g_sum_hdr_btn.right > g_sum_hdr_btn.left) {
-            sum_menu_open(g_sum_hdr_btn, g_sel);
-            invalidate();
-            test_ack("ok");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "sumrange")) {
-        /* "sumrange" opens the custom range card; "sumrange <first> <last>"
-         * picks those days in it, as two clicks would. */
-        if (!g_sr_open && g_sel) sumrange_open(hwnd, g_sel);
-        char a1[16] = "", a2[16] = "";
-        uint64_t d1, d2;
-        if (sscanf(arg, "%15s %15s", a1, a2) == 2 && oc_summary_date_parse(a1, &d1) == 0 &&
-            oc_summary_date_parse(a2, &d2) == 0) {
-            oc_sumcal_pick(&g_sr_cal, d1);
-            oc_sumcal_pick(&g_sr_cal, d2);
-            sr_fields_show();
-        }
-        invalidate();
-        test_ack(g_sr_open ? "ok" : "err");
-    } else if (!strcmp(verb, "sumtoggle")) {
-        /* "sumtoggle <topic>" shows or hides a topic's details. */
-        const oc_model *tm2 = model();
-        if (tm2 && tm2->summary_open) { sum_toggle(tm2, atoi(arg)); invalidate(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "sumnotify") || !strcmp(verb, "sumcancel")) {
-        /* The waiting pane's Notify me when ready / Cancel, as clicked. */
-        int want = !strcmp(verb, "sumnotify") ? SH_NOTIFY : SH_CANCEL, done = 0;
-        for (int i = 0; i < g_n_sumhits && !done; i++)
-            if (g_sumhits[i].kind == want) { summary_hit_run(hwnd, i); done = 1; }
-        invalidate();
-        test_ack(done ? "ok" : "err");
-    } else if (!strcmp(verb, "sumopen")) {
-        /* "sumopen <notice>" opens a summary notice, as its toast's View does;
-         * "sumopen" alone, the newest the model holds. */
-        const oc_model *om = model();
-        uint64_t id = (uint64_t)strtoull(arg, NULL, 10);
-        const oc_summary_notice *sn = NULL;
-        if (om && !id && om->n_sum_notices) sn = &om->sum_notices[om->n_sum_notices - 1];
-        else if (om) sn = oc_model_summary_notice(om, id);
-        if (sn) { summary_open_notice(hwnd, sn->id, sn->channel_id, sn->scope); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "sumcite")) {
-        /* "sumcite <n> hover" shows citation n's card as the pointer would;
-         * "sumcite <n>" goes to its message; "sumcite 0" clears the hover. */
-        int num = atoi(arg);
-        g_sum_force_cite = strstr(arg, "hover") ? num : 0;
-        if (!strstr(arg, "hover"))
-            for (int i = 0; i < g_n_sumhits; i++)
-                if (g_sumhits[i].kind == SH_CITE && g_sumhits[i].num == num) { summary_hit_run(hwnd, i); break; }
-        invalidate();
-        test_ack("ok");
-    } else if (!strcmp(verb, "summary")) {
-        /* "summary <scope>" asks for this conversation's summary over that span
-         * (0 unread, 4 today, 3 since yesterday, 1 last 7 days), bypassing the
-         * menu as "chup" does; "summary close" closes it. */
-        if (!strcmp(arg, "close")) { if (g_rp_mode == RP_SUMMARY) rp_pop(); test_ack("ok"); }
-        else if (g_client && g_sel) {
-            summarize_start(hwnd, g_sel, (uint8_t)atoi(arg), 0, 0);
-            test_ack(g_rp_mode == RP_SUMMARY ? "ok" : "err");
-        } else test_ack("err");
-    } else if (!strcmp(verb, "pins")) {
-        const oc_model *pm = model();
-        if (pm && pm->pinlist_open) oc_client_close_pins(g_client);
-        else if (g_sel)             oc_client_list_pins(g_client, g_sel);
-        test_ack("ok");
-    } else if (!strcmp(verb, "vm")) {
-        /* Drive the video overlay by name: open, record, stop, discard, retake,
-         * send, play (play/pause), mute, close, seek <ms>. */
-        static const struct { const char *name; int cmd; } VMV[] = {
-            { "open", VMC_OPEN }, { "record", VMC_RECORD }, { "stop", VMC_STOP },
-            { "discard", VMC_DISCARD }, { "retake", VMC_RETAKE }, { "send", VMC_SEND },
-            { "play", VMC_PLAYPAUSE }, { "mute", VMC_MUTE }, { "close", VMC_CLOSE },
-        };
-        int done = 0;
-        if (!strncmp(arg, "seek ", 5) && g_vplayer) { oc_player_seek(g_vplayer, (uint32_t)atol(arg + 5)); done = 1; }
-        /* A screen recording's choices (REQ-162): `source camera|<id>` (an id from
-         * the dump's vmscreen lines), `corner br|bl|tr|tl`, `sound on|off`,
-         * `nocam on|off` -- through the same menu commands the card uses. */
-        if (!done && !strncmp(arg, "source ", 7)) {
-            const char *id = arg + 7;
-            if (!strcmp(id, "camera")) { menu_dispatch(hwnd, 2000); done = 1; }
-            else {
-                g_vm_nscreens = oc_capture_list_screens(g_vm_screens, 24);
-                for (int i = 0; i < g_vm_nscreens; i++)
-                    if (!strcmp(g_vm_screens[i].id, id)) { menu_dispatch(hwnd, 2001 + i); done = 1; break; }
-            }
-        }
-        if (!done && !strncmp(arg, "corner ", 7)) {
-            static const char *C[4] = { "br", "bl", "tr", "tl" };
-            for (int c = 0; c < 4; c++) if (!strcmp(arg + 7, C[c])) { menu_dispatch(hwnd, 2040 + c); done = 1; }
-        }
-        if (!done && !strncmp(arg, "sound ", 6)) {
-            int on = !strcmp(arg + 6, "on");
-            if (on != g_vm_sound) vm_command(hwnd, VMC_SOUND);
-            done = 1;
-        }
-        if (!done && !strncmp(arg, "nocam ", 6)) {
-            if (!strcmp(arg + 6, "on")) menu_dispatch(hwnd, 958);
-            else if (g_vm_nocam) vm_pick_device(hwnd, 1, g_vm_cam);
-            done = 1;
-        }
-        for (size_t i = 0; !done && i < sizeof VMV / sizeof VMV[0]; i++)
-            if (!strcmp(arg, VMV[i].name)) { vm_command(hwnd, VMV[i].cmd); done = 1; }
-        test_ack(done ? "ok" : "err");
-    } else if (!strcmp(verb, "sttest")) {
-        /* The text layer's Unicode behaviour, through the API the views use
-         * (sdltext.h): right-to-left runs placed in visual order, clusters
-         * hit-tested whole, lines broken where UAX #14 allows. The same
-         * checks on every backend; acks "ok n=<checks>" or the first failure. */
-        const char *bad = NULL; int n = 0;
-        #define STT(cond, why) do { n++; if (!bad && !(cond)) bad = why; } while (0)
-        st_format *f = g_body ? g_body->f : NULL;
-        if (!f) bad = "no format";
-        if (!bad) {
-            /* Hebrew alone: the first letter sits at the right of the last. */
-            const char *heb = "\xD7\x90\xD7\x91\xD7\x92";
-            st_layout *l = st_layout_create(g_st, f, heb, strlen(heb), 400, 0, ST_ALIGN_LEFT);
-            st_metrics m; st_layout_metrics(l, &m);
-            st_rect a = st_hit_pos(l, 0, false), z = st_hit_pos(l, 4, false);
-            STT(m.lines == 1 && m.w > 0, "hebrew: one line");
-            STT(a.x > z.x, "hebrew: first letter right of the last");
-            STT(a.w > 0 && z.w > 0, "hebrew: letters have width");
-            bool in, tr; size_t hit = st_hit_point(l, a.x + a.w / 2, m.h / 2, &in, &tr);
-            STT(hit == 0, "hebrew: a point on the first letter hits offset 0");
-            st_layout_destroy(l);
-            /* Latin, Hebrew, Latin: the Latin keeps its order, the Hebrew run is reversed in place. */
-            const char *mix = "ab \xD7\x90\xD7\x91 cd";            /* a b sp alef bet sp c d: bytes 0 1 2 3-4 5-6 7 8 9 */
-            l = st_layout_create(g_st, f, mix, strlen(mix), 400, 0, ST_ALIGN_LEFT);
-            st_rect pa = st_hit_pos(l, 0, false), pc = st_hit_pos(l, 8, false), palef = st_hit_pos(l, 3, false), pbet = st_hit_pos(l, 5, false);
-            STT(pc.x > pa.x, "mixed: c right of a");
-            STT(palef.x > pbet.x, "mixed: alef right of bet");
-            STT(palef.x > pa.x && pc.x > palef.x, "mixed: the hebrew run sits between");
-            st_layout_destroy(l);
-            /* An emoji family is one cluster: the caret never lands inside it. */
-            const char *fam = "x\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7y";
-            l = st_layout_create(g_st, f, fam, strlen(fam), 400, 0, ST_ALIGN_LEFT);
-            st_rect pf = st_hit_pos(l, 1, false), pmid = st_hit_pos(l, 8, false), py = st_hit_pos(l, 19, false);
-            STT(pmid.x == pf.x, "family: an offset inside the cluster snaps to its start");
-            STT(py.x >= pf.x + pf.w - 0.5f && pf.w > 0, "family: the cluster's caret width spans it");
-            hit = st_hit_point(l, pf.x + pf.w * 0.3f, 1, &in, &tr);
-            STT(hit == 1 && !tr, "family: a point inside the cluster is its start, leading");
-            st_layout_destroy(l);
-            /* Ideographs break anywhere: three fit a line that is three wide. */
-            const char *cjk = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E";
-            float three = st_text_width(g_st, f, cjk, 9);
-            l = st_layout_create(g_st, f, cjk, strlen(cjk), three + 1.0f, 0, ST_ALIGN_LEFT);
-            st_layout_metrics(l, &m);
-            STT(m.lines == 2, "cjk: six ideographs in a line of three wrap to two lines");
-            st_layout_destroy(l);
-            /* No break before a comma: "ab," stays together when only it fits. */
-            const char *comma = "ab, cd";
-            float w3 = st_text_width(g_st, f, comma, 3);
-            l = st_layout_create(g_st, f, comma, strlen(comma), w3 + 1.0f, 0, ST_ALIGN_LEFT);
-            st_line lines[4]; int nl = st_layout_lines(l, lines, 4);
-            STT(nl == 2 && lines[0].len >= 3 && lines[1].off == 4, "comma: the line breaks after \"ab,\" not before the comma");
-            st_layout_destroy(l);
-            /* A no-break space holds: "ab\u00a0cd" in a width for "ab" alone is cut, not broken at the space. */
-            const char *nb = "ab\xC2\xA0" "cd";
-            l = st_layout_create(g_st, f, nb, strlen(nb), st_text_width(g_st, f, nb, 2) + 1.0f, 0, ST_ALIGN_LEFT);
-            nl = st_layout_lines(l, lines, 4);
-            STT(nl >= 2 && lines[0].len != 4, "nbsp: the line does not break at the no-break space");
-            st_layout_destroy(l);
-        }
-        #undef STT
-        char ack[200];
-        if (bad) snprintf(ack, sizeof ack, "err %s", bad); else snprintf(ack, sizeof ack, "ok n=%d", n);
-        test_ack(ack);
-    } else if (!strcmp(verb, "devlist")) {
-        /* The device lists from this thread and from another, which on the
-         * web must agree (devices_web.h): "cams=N mics=N spks=N thread=N/N/N". */
-        int cams, mics, spks;
-        { oc_capture_device c[8]; oc_audio_device m[8]; cams = oc_capture_list(c, 8); mics = oc_audio_list(1, m, 8); spks = oc_audio_list(0, m, 8); }
-        int other[3] = { -1, -1, -1 };
-        oc_thread_t th;
-        if (oc_thread_create(&th, devlist_thread, other) == 0) oc_thread_join(th);
-        char a[96]; snprintf(a, sizeof a, "cams=%d mics=%d spks=%d thread=%d/%d/%d", cams, mics, spks, other[0], other[1], other[2]);
-        test_ack(a);
-    } else if (!strcmp(verb, "dump")) {
-        test_dump(arg); test_ack("ok");
-    /* Sign-in drivers. Setting the field's text directly is deterministic, where
-     * synthesised keystrokes depend on the window being foreground — which it
-     * is not when the harness drives it from WSL. */
-    } else if (!strcmp(verb, "siws") || !strcmp(verb, "siuser") || !strcmp(verb, "sipass")) {
-        field *e = !strcmp(verb, "siws")  ? g_si_e_ws
-                 : !strcmp(verb, "siuser") ? g_si_e_user : g_si_e_pass;
-        if (e) { field_set(e, arg); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "devenv")) {
-        /* `devenv OPENCHIME_DEV_<NAME> <value>`: one development input changed
-         * in the running client -- a camera refused, say -- so a script tests
-         * it without starting another. Development mode and those names only. */
-        char name[64] = "", val[200] = "";
-        int ok = sscanf(arg, "%63s %199s", name, val) >= 1 && oc_env_is_dev() &&
-                 !strncmp(name, "OPENCHIME_DEV_", 14);
-#ifdef _WIN32
-        if (ok) ok = _putenv_s(name, val) == 0;
-#else
-        if (ok) ok = (val[0] ? setenv(name, val, 1) : unsetenv(name)) == 0;
-#endif
-        test_ack(ok ? "ok" : "err");
-    } else if (!strcmp(verb, "siadv")) {
-        signin_set_advanced(hwnd, !g_si_advanced); test_ack("ok");
-    } else if (!strcmp(verb, "sisubmit")) {
-        signin_submit(hwnd); test_ack("ok");
-    } else if (!strcmp(verb, "sicopy")) {     /* the card's Copy sign-in link */
-        signin_copy_link(); test_ack("ok");
-    } else if (!strcmp(verb, "siremember")) {
-        g_si_remember = atoi(arg); test_ack("ok");
-    } else {
-        test_ack("unknown");
-    }
-    invalidate();
 }
 
 /* The pointer, spoken through SDL (SDL owns the cursor over the client
@@ -44985,8 +41017,7 @@ static void fields_create(void) {
  *
  * One dispatcher over SDL's queue. Each handler below is the body the Win32
  * message had, with the message's arguments already turned into DIPs and
- * key names; the harness drives the same handlers with synthetic events, so
- * what it tests is what a user runs. A handler's `return 0` means "handled",
+ * key names. A handler's `return 0` means "handled",
  * as the window procedure's did. */
 
 /* The tick (every TICK_MS): every client is ticked, the model is read, and
@@ -45841,7 +41872,6 @@ static int on_tick(oc_win *hwnd) {
             }
             invalidate();
         }
-        test_poll(hwnd);   /* automation channel (no-op unless enabled) */
         return 0;
 }
 
@@ -45943,12 +41973,8 @@ static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) 
          * below claim the wheel on shell state that survives underneath an open
          * modal — the sidebar claims an x range a card is drawn over, and an open
          * thread claims it everywhere — so the wheel scrolled the shell BEHIND
-         * the modal while the modal's own content sat unreachable below the fold.
-         *
-         * Found by the smoke rather than by hand, and only because the suite
-         * opens a thread earlier in the run: scrolling the notifications card
-         * worked in every interactive session I tried and failed in the suite,
-         * which is the difference between the two. */
+         * the modal while the modal's own content sat unreachable below the fold,
+         * whenever a thread had been opened before the card. */
         /* The table editor's grid scrolls itself, across with Shift. */
         if (g_te_open && in_rect(g_te_view, (float)wpt.x, (float)wpt.y)) {
             if (mod_down(OCK_SHIFT)) g_te_sx -= dy; else g_te_sy -= dy;
@@ -46731,6 +42757,18 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         case AT_PREFCAT:
             if (g_prefs_open && arg < PC_COUNT) { pref_cat_select((int)arg); invalidate(); }
             break;
+        case AT_PREFCHOICE:
+            /* Only a choice the shown category has on screen, as a click could
+             * reach it: the token outlives the frame that published it. */
+            if (g_prefs_open)
+                for (int i = 0; i < g_n_pref_hits; i++)
+                    if ((uint64_t)g_pref_hits[i].row * 256u + (uint64_t)g_pref_hits[i].val == arg &&
+                        g_pref_hits[i].r.right > g_pref_hits[i].r.left) {
+                        pref_choose(hwnd, g_pref_hits[i].row, g_pref_hits[i].val);
+                        invalidate();
+                        break;
+                    }
+            break;
         case AT_WEBHOOKBTN:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_WEBHOOKS && (int)arg < g_n_whbtns)
                 webhooks_press(hwnd, g_whbtns[arg].kind, g_whbtns[arg].id);
@@ -46863,6 +42901,8 @@ static int on_focus_gained(oc_win *hwnd) {
         /* The system's reduce-motion setting may have changed while the
          * window was in the background: asked again (REQ-269). */
         motion_sys_read();
+        /* ...and so may its high-contrast setting (REQ-262). */
+        contrast_sys_read();
         /* The window has the keyboard again, so the composer is typeable
          * again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
@@ -46913,7 +42953,6 @@ static int on_close_request(oc_win *hwnd) {
          * the fallback rather than being deleted. */
         if (g_tray_live && !g_quitting && g_pref_close == CLOSE_HIDES) {
             SDL_HideWindow(hwnd->sdl);
-            g_hidden_to_tray = 1;
             if (!g_close_to_tray_told) {
                 g_close_to_tray_told = 1;
                 prefs_save();
@@ -46986,7 +43025,7 @@ static void on_handoff(oc_win *hwnd, char *s) {
 
 /* The tray icon is a control. Left click shows the window; right click shows
  * it AND opens the app's own menu inside it (ARCH-98 bans the platform's
- * popup menu: it runs its own modal loop, which the harness cannot drive). */
+ * popup menu: it runs its own modal loop, which stops the app's tick). */
 static void on_tray(oc_win *hwnd, int what) {
     if (what == OC_TRAY_CLICK) {
         show_and_focus(hwnd);
@@ -47095,6 +43134,8 @@ static void handle_event(const SDL_Event *e) {
             thumbs_drop();
             invalidate();
         }
+        /* Windows raises this when a contrast theme goes on or off too. */
+        contrast_sys_read();
         return;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
         if (win == hwnd) on_focus_gained(hwnd);
@@ -47107,7 +43148,6 @@ static void handle_event(const SDL_Event *e) {
          * because they are separate wishes. */
         if (win == hwnd && g_pref_min_tray && g_tray_live) {
             SDL_HideWindow(hwnd->sdl);
-            g_hidden_to_tray = 1;
         }
         return;
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
@@ -47278,69 +43318,20 @@ static void pump(void) {
 /* Paint now, for the few places that need the frame before they go on. */
 static void paint_now(void) { g_dirty = 0; paint(g_main); }
 
-/* Synthetic input, for the harness: the same handlers the pointer reaches. */
-static void synth_mouse(oc_win *hwnd, int kind, int x_dip, int y_dip) {
-    SDL_Event e; memset(&e, 0, sizeof e);
-    float d = SDL_GetWindowPixelDensity(hwnd->sdl);
-    float x = (float)PX(x_dip) / d, y = (float)PX(y_dip) / d;
-    e.common.timestamp = SDL_GetTicksNS();
-    if (kind == 1) {
-        e.type = SDL_EVENT_MOUSE_MOTION; e.motion.windowID = SDL_GetWindowID(hwnd->sdl);
-        e.motion.x = x; e.motion.y = y;
-    } else {
-        e.type = kind == 2 ? SDL_EVENT_MOUSE_BUTTON_UP : SDL_EVENT_MOUSE_BUTTON_DOWN;
-        e.button.windowID = SDL_GetWindowID(hwnd->sdl);
-        e.button.button = SDL_BUTTON_LEFT; e.button.down = kind != 2;
-        e.button.clicks = (Uint8)(kind == 3 ? 2 : 1);
-        e.button.x = x; e.button.y = y;
-    }
-    on_event(&e);
-}
-static void synth_key(oc_win *hwnd, int key, int up, int alt) {
-    (void)hwnd;
-    g_claimed_text = 0;
-    if (accel_dispatch(hwnd, key, up, alt, 0)) return;
-    if (up) { if (key == OCK_BACK) g_tgt_chip_armed = 0; return; }
-    if (g_form_open && key == OCK_TAB) { form_focus_step(hwnd, mod_down(OCK_SHIFT) ? -1 : 1); invalidate(); return; }
-    if (g_form_open && g_form_focus >= 0 && form_focus_key(hwnd, key)) { invalidate(); return; }
-    if (g_focus) {
-        if (field_key(g_focus, key, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) return;
-        if ((key == OCK_ESCAPE || key == OCK_RETURN) && modal_open() && modal_key(hwnd, key)) { invalidate(); return; }
-        return;
-    }
-    on_key_down(hwnd, key);
-}
-static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta) {
-    on_wheel(hwnd, PX(x_dip), PX(y_dip), (float)delta / 120.0f, delta / 120);
-}
-static void synth_char(oc_win *hwnd, oc_wch ch) {
-    wsm_claim_text();
-    if (g_focus) {
-        char u8[8]; oc_wch w[2] = { ch, 0 };
-        to_u8(w, u8, sizeof u8);
-        field_text_input(g_focus, u8);
-        return;
-    }
-    ed_char(hwnd, ch);
-}
-
 /* ==== main ================================================================== */
 
 int main(int argc, char *argv[]) {
+    /* The build, and nothing else: what a package's check and a person asking
+     * which client is installed read, as the TUI's and the daemon's say it. */
+    if (argc >= 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-V"))) {
+        printf("openchime %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
+        return 0;
+    }
     /* Before anything else, so a crash during startup is reported too. */
     oc_plat_boot();
 
-    /* Automation hook (development mode only): OPENCHIME_DEV_DIR enables the
-     * file command channel. Any other client has no hook to enable. */
-    { const char *td = oc_env_dev("OPENCHIME_DEV_DIR");
-      if (td) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
-    /* While a native file dialog holds the thread in its own loop, the hook
-     * still answers (the picker verb drives that dialog). */
-    if (g_test_dir[0]) oc_plat_set_modal_tick(test_modal_tick);
-
-    /* AFTER the test dir is known, because that is where a report belongs when
-     * the harness is driving -- and reporting the last run has to happen before
-     * this one starts overwriting anything. */
+    /* Reporting the last run has to happen before this one starts
+     * overwriting anything. */
     crumbs_start();
     crumb("start");
 
@@ -47405,6 +43396,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* SYSTEM by default: match the desktop unless the user says otherwise. */
+    oc_theme_set_system_query(oc_plat_prefers_light);
     oc_theme_apply(OC_THEME_SYSTEM);
     char startup_err[sizeof g_si_err] = "";
     if (direct && !connect_start(aws, acred)) {
@@ -47429,11 +43421,15 @@ int main(int argc, char *argv[]) {
     /* A window shown by a process that does not own the foreground is not
      * activated, and SDL_RaiseWindow declines to force it unless asked: this
      * client shows late by design when it auto-connects (it waits for its
-     * geometry), and the harness launches it from another process. */
+     * geometry). */
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     oc_plat_after_sdl_init();
     motion_sys_read();   /* Reduce motion's Follow system (REQ-269) */
+    /* High contrast's (REQ-262). Set directly rather than through
+     * contrast_apply: there is no window yet to repaint. */
+    g_sys_contrast = oc_plat_high_contrast();
+    oc_theme_set_high_contrast(contrast_on());
     /* The quick reactions from the start, the default set until preferences
      * say otherwise: an account that has never saved any would otherwise have
      * none, and the hover strip and the menu's emoji row with them. */
@@ -47476,7 +43472,6 @@ int main(int argc, char *argv[]) {
         unsigned tray_id = 0;
         void *th = oc_plat_tray_notify_handle(&tray_id);
         oc_osn_init(g_aumid, "OpenChime", th, tray_id, toast_action_cb);
-        g_wintoast_ok = (oc_osn_caps() & OC_OSN_CAP_ACTIONS) != 0;
     }
     /* So a toast's click has somewhere to land. Written on every start rather
      * than at install time only: a developer build, a portable copy and an

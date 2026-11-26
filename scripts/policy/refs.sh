@@ -68,9 +68,9 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git ls-files -z --cached --others --exclude-standard -- ':!:third_party/*' > "$list"
 else
     # What .gitignore keeps out of a checkout: build output, fetched libraries
-    # and the harness's installed packages.
+    # and the browser tool's output.
     find . \( -path ./.git -o -path ./third_party -o -path ./build -o -path ./dist -o -path ./tts \
-               -o -path ./stt -o -path ./web -o -path ./image -o -name node_modules -o -name __pycache__ \
+               -o -path ./stt -o -path ./web -o -path ./image -o -name __pycache__ \
                -o -name .playwright-mcp \) -prune \
         -o -type f ! -name '*.o' ! -name '*.db' ! -name '*.db-*' ! -path ./openchimed -print0 \
         | sed -z 's|^\./||' > "$list"

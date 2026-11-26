@@ -56,34 +56,4 @@ static inline int oc_key_from_sdl(SDL_Keycode k) {
     }
 }
 
-/* The harness names keys; the same names here and in tools/gui/harness/win32/drive.sh. */
-static inline int oc_key_from_name(const char *k) {
-    if (!k || !k[0]) return OCK_NONE;
-    if (!k[1]) {
-        if (k[0] >= '0' && k[0] <= '9') return k[0];
-        if (k[0] >= 'a' && k[0] <= 'z') return k[0] - 32;
-        if (k[0] >= 'A' && k[0] <= 'Z') return k[0];
-        if (k[0] == '=') return OCK_PLUS;
-        if (k[0] == '-') return OCK_MINUS;
-        if (k[0] == ',') return OCK_COMMA;
-    }
-    static const struct { const char *n; int key; } T[] = {
-        { "enter", OCK_RETURN }, { "return", OCK_RETURN }, { "esc", OCK_ESCAPE }, { "escape", OCK_ESCAPE },
-        { "tab", OCK_TAB }, { "up", OCK_UP }, { "down", OCK_DOWN }, { "left", OCK_LEFT }, { "right", OCK_RIGHT },
-        { "home", OCK_HOME }, { "end", OCK_END }, { "pgup", OCK_PRIOR }, { "pageup", OCK_PRIOR },
-        { "pgdn", OCK_NEXT }, { "pagedown", OCK_NEXT }, { "space", OCK_SPACE }, { "slash", OCK_SLASH },
-        { "backslash", OCK_BACKSLASH },
-        { "back", OCK_BACK }, { "backspace", OCK_BACK }, { "del", OCK_DELETE }, { "delete", OCK_DELETE },
-        { "menu", OCK_APPS }, { "apps", OCK_APPS }, { "plus", OCK_PLUS }, { "equals", OCK_PLUS },
-        { "minus", OCK_MINUS }, { "comma", OCK_COMMA },
-    };
-    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++)
-        if (!SDL_strcmp(T[i].n, k)) return T[i].key;
-    if (k[0] == 'f' && k[1] >= '1' && k[1] <= '9') {
-        int n = SDL_atoi(k + 1);
-        if (n >= 1 && n <= 12) return OCK_F1 + n - 1;
-    }
-    return OCK_NONE;
-}
-
 #endif /* OC_KEYS_H */

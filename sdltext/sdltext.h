@@ -5,8 +5,9 @@
  * The GUI draws every pixel itself, and text is the one primitive a portable
  * renderer cannot supply: correct shaping, wrapping, fonts and caret geometry
  * are platform services. This library is the seam — one API, implemented per
- * platform (DirectWrite on Windows; FreeType/fontconfig when the Linux client
- * lands), so the application layer above it is written once.
+ * platform (DirectWrite on Windows, the canvas in a browser, FreeType with
+ * HarfBuzz and fontconfig on Linux), so the application layer above it is
+ * written once.
  *
  * Three contracts, stated here because every caller depends on them:
  *
@@ -25,7 +26,8 @@
  *   the system's font collection and nothing is ever bundled.
  *
  * A context is created by a backend-specific constructor (st_dwrite.h on
- * Windows); this header never names a platform type.
+ * Windows, st_canvas.h in a browser, st_ft.h on Linux); this header never
+ * names a platform type.
  */
 
 #ifndef SDLTEXT_H
@@ -64,8 +66,8 @@ typedef struct {
 /* Where a backend delivers pixels: `bgra` is premultiplied, `stride` bytes a
  * row, (px_w, px_h) pixels; (dip_x, dip_y) is where st_draw was asked to place
  * the layout, in DIPs. The buffer is valid for the call only. A backend is
- * created by its own constructor (st_dwrite.h, st_canvas.h); the platform
- * layer chooses which. */
+ * created by its own constructor (st_dwrite.h, st_canvas.h, st_ft.h); the
+ * platform layer chooses which. */
 typedef struct {
     void *user;
     void (*blit)(void *user, const void *bgra, int stride,

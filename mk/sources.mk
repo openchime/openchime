@@ -121,7 +121,7 @@ FUZZ_RUNS_jwt      := 50000
 FUZZ_RUNS_webauthn := 33000
 FUZZ_RUNS_idtoken  := 20000
 FUZZ_RUNS_image    := 6000
-TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/testsignin_main.c,$(wildcard tests/*.c)) \
+TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/linux_gui_test.c,$(wildcard tests/*.c)) \
             $(FUZZ_HARNESS_SRC)
 TEST_BIN := build/tests
 
@@ -226,7 +226,9 @@ TTSKIT_INC := -Ittskit $(NNKIT_INC)
 # One text API for every graphical client: layout, measurement, hit-testing,
 # byte-offset range styling. The portable core (the byte<->UTF-16 offset map)
 # compiles everywhere and is covered by `make test`; the DirectWrite backend
-# compiles only into Windows builds. See sdltext/sdltext.h.
+# compiles only into Windows builds, the FreeType one only into the Linux GUI
+# (make linux-gui) and the programs that test it (build/sdltext_test,
+# build/linux_gui_test). See sdltext/sdltext.h.
 # The portable application layer of the GUI (ARCH-80): every graphical client
 # compiles it over its platform directory (client/gui/platform/<os>/).
 APP_GUI_SRC := $(wildcard client/gui/app/*.c)
@@ -235,18 +237,37 @@ UTF8PROC    := third_party/utf8proc/utf8proc.c
 # for a backend that lays text out itself; DirectWrite links it too, unused.
 SDLTEXT_COMMON := sdltext/st_common.c $(UTF8PROC)
 SDLTEXT_WIN    := sdltext/st_common.c sdltext/st_dwrite.c $(UTF8PROC)
+SDLTEXT_FT     := sdltext/st_common.c sdltext/st_ft.c $(UTF8PROC)
 SDLTEXT_INC    := -Isdltext
+# The FreeType backend's system packages (docs/details/VENDORS.md §3), asked of
+# pkg-config only when a recipe that links them runs: these are recursively
+# expanded and named in recipes alone, so `make` and `make test` never need
+# them. A rule that does starts with oc_need_pkgs, which names what is missing.
+FT_PKGS   := freetype2 harfbuzz fontconfig
+FT_CFLAGS  = $(shell pkg-config --cflags $(FT_PKGS) 2>/dev/null)
+FT_LIBS    = $(shell pkg-config --libs $(FT_PKGS) 2>/dev/null)
+#   $(call oc_need_pkgs,<target>,<pkg-config names>[,<pkg-config command>])
+#   a recipe's first line: fails, naming each package pkg-config cannot find,
+#   before anything compiles. The command is pkg-config unless a sysroot's is
+#   given (mk/linux.mk, LINUX_PKG_CONFIG).
+oc_need_pkgs = @missing=; for p in $(2); do $(or $(3),pkg-config) --exists $$p 2>/dev/null || missing="$$missing $$p"; done; \
+    if [ -n "$$missing" ]; then echo "openchime: $(1) needs the development packages of:$$missing (pkg-config names)" >&2; exit 1; fi
 # motion.c is GUI source compiled into the tests the same way: the arithmetic
 # of what moves on screen, and what "Reduce motion" stills, is asserted by
 # `make test` (tests/test_motion.c).
 MOTION_SRC := client/gui/app/motion.c
 # theme.c is GUI source and is compiled into the tests anyway: it is colour
-# arithmetic with one Windows call behind an #ifdef, and the contrast guarantee
+# arithmetic, asking the desktop only through the function the application hands
+# it (oc_theme_set_system_query), and the contrast guarantee
 # it carries has to be asserted somewhere that RUNS.
 THEME_SRC := client/gui/app/theme.c
 # typeface.c, the same way: the font list, its resolution and ARCH-108's pin
 # are pure, and asserted by `make test` (tests/test_typeface.c).
 TYPEFACE_SRC := client/gui/app/typeface.c
+# SDL3, committed in third_party/SDL3 (docs/details/VENDORS.md §1): the version
+# every build of it is named for, natively (mk/linux.mk), for Windows
+# (mk/windows.mk) and for the browser (mk/web.mk).
+SDL3_VERSION := 3.4.14
 # The drawing layer (client/gui/gfx): fills, rounded rects, clips, lines,
 # textures and the Lucide stroke tessellator over an SDL3 renderer.
 GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c

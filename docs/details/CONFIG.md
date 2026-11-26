@@ -125,7 +125,7 @@ the public demo by this setting alone. The daemon and every client read it.
 | Mode | For | What it changes |
 |---|---|---|
 | `normal` (the default) | every deployment, self-hosted or managed | Nothing: the constants hold, and a development input refuses the daemon's start (a client ignores one). |
-| `development` | the tests, CI, the GUI and web harnesses, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, a per-address connection cap that can be lifted, and the clients' synthetic devices, test hook and sign-in typing. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
+| `development` | the tests, CI, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, a per-address connection cap that can be lifted, and the clients' synthetic devices; a client keeps its sign-ins in a credential store of its own (`openchime-dev`), apart from the person's. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
 | `demo` | the public demo workspace | A development input refuses the start, as in `normal`. Needs `OPENCHIME_AUTH=local,relay`. Visitors sign up with central's signed invite; daily limits per person and per workspace; one-day sessions; sample content at first start; every client says it is a public demo (AUTH.md §8.12). |
 
 Nothing that ships sets `development`: `make test` checks that no release
@@ -136,12 +136,11 @@ in every binary and does nothing outside development mode.
 
 **The web client takes its mode from the daemon that serves it.** A browser
 has no environment, so the page builds one, and its own address is not a
-source the mode may come from: a link must not be able to turn the harness on
-in a visitor's browser. The daemon writes its mode into the page it serves at
+source the mode may come from: a link must not be able to turn the development
+inputs on in a visitor's browser. The daemon writes its mode into the page it serves at
 `/app/`; only a page from a development daemon (or from
-`tools/web/serve.py`, which serves one the same way) honours `?env=`,
-`?hook=`, `?cmd=`, `?shot=` and `?mic=`, and `?env=` never sets
-`OPENCHIME_MODE`.
+`tools/web/serve.py`, which serves one the same way) honours `?env=`, and
+`?env=` never sets `OPENCHIME_MODE`.
 
 ---
 
@@ -244,19 +243,14 @@ Read by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.m
 | `OPENCHIME_DEV_LOOPBACK` | `off` | Listen on 127.0.0.1 only (the protocol, health and call-audio ports), as `make run` does, so a development daemon and its fixed passwords are not reachable from the network. `on` or `off`. |
 | `OPENCHIME_DEV_SEND_RATE` | `30` | Messages one connection may send in 3 seconds; 0 is no cap, for a fixture that seeds many at once. Integer 0..1000000. |
 | `OPENCHIME_DEV_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
-| `OPENCHIME_DEV_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
 | `OPENCHIME_DEV_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |
-| `OPENCHIME_DEV_MIC` | *(unset)* | Clients: a WAV the synthetic microphone speaks. |
-| `OPENCHIME_DEV_MIC_LEAD_MS` | *(unset)* | Clients: silence before the WAV, in ms. |
-| `OPENCHIME_DEV_TONE` | *(unset)* | Clients: the synthetic microphone's tone in Hz (20 to 7000; 440 unset). |
+| `OPENCHIME_DEV_MIC_LEAD_MS` | *(unset)* | Clients: silence before the synthetic microphone's tone, in ms. |
 | `OPENCHIME_DEV_MIC_ECHO` | *(unset)* | Clients: the speaker echoed into the microphone (`1`), or alone (`only`). |
 | `OPENCHIME_DEV_CAPTURE` | *(unset)* | Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`. |
 | `OPENCHIME_DEV_SCREEN_GONE_MS` | *(unset)* | Clients: the synthetic screen ends after this many ms. |
-| `OPENCHIME_DEV_CALL_HISTORY_PAGE` | *(unset)* | Clients: how many calls a page of the call history asks for (1 to 50; 50 unset), so a test reaches the next page with a few calls. |
 | `OPENCHIME_DEV_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
 | `OPENCHIME_DEV_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
 | `OPENCHIME_DEV_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |
-| `OPENCHIME_DEV_SIGNIN` | *(unset)* | Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md). |
 
 ## No longer read
 
@@ -338,18 +332,14 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_DEMO_SCHED_MS` | nothing read it: scheduled messages are swept every fifteen seconds |
 | `OPENCHIME_DEMO_PRIVATE_UNFURL` | nothing read it: the unfurl fetcher never reaches a private address |
 | `OPENCHIME_DEMO_OS_ROOTS` | nothing read it: the operating system's roots, with OPENCHIME_EXTRA_CA beside them |
-| `OPENCHIME_TEST_DIR` | renamed OPENCHIME_DEV_DIR (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_AUDIO` | renamed OPENCHIME_DEV_AUDIO (OPENCHIME_MODE=development) |
-| `OPENCHIME_TEST_MIC` | renamed OPENCHIME_DEV_MIC (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_MIC_LEAD_MS` | renamed OPENCHIME_DEV_MIC_LEAD_MS (OPENCHIME_MODE=development) |
-| `OPENCHIME_TEST_TONE` | renamed OPENCHIME_DEV_TONE (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_MIC_ECHO` | renamed OPENCHIME_DEV_MIC_ECHO (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_CAPTURE` | renamed OPENCHIME_DEV_CAPTURE (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_SCREEN_GONE_MS` | renamed OPENCHIME_DEV_SCREEN_GONE_MS (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_VIDEO_CAP_MS` | renamed OPENCHIME_DEV_VIDEO_CAP_MS (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_CALL_TIMERS` | renamed OPENCHIME_DEV_CALL_TIMERS (OPENCHIME_MODE=development) |
 | `OPENCHIME_TEST_SUFFIX` | renamed OPENCHIME_DEV_SUFFIX (OPENCHIME_MODE=development) |
-| `OPENCHIME_TEST_SIGNIN` | renamed OPENCHIME_DEV_SIGNIN (OPENCHIME_MODE=development) |
 | `OPENCHIME_SUFFIX` | the service suffix is built in; a client in development mode reads OPENCHIME_DEV_SUFFIX |
 | `OPENCHIME_RECOVER_MB` | nothing read it |
 | `OPENCHIME_BLOB_BACKEND` | OPENCHIME_S3 set is S3; unset is local disk |

@@ -41,7 +41,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON); client app-core (`client/core/summary.c`) | https://github.com/zserge/jsmn | MIT |
 | **picohttpparser** | commit-pinned | HTTP/1.1 request line and header parsing for the daemon's one HTTP stack (ARCH-32) | Daemon (`daemon/http.c`) | https://github.com/h2o/picohttpparser | MIT (or the Perl licence; we use it under MIT) |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire on the desktops (the browser's is `client/gui/platform/web/audio_web.c`, not miniaudio) | Client media library (`client/core/media/audio_ma.c`, the desktop backend under `audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
-| **stb_image_write**, **stb_image**, **stb_truetype** | commit-pinned (stb_truetype v1.28) | JPEG encode of a video message's poster, and PNG encode in the app (stb_image_write); decoding avatars (PNG and JPEG only) and drawing names in a call's recording (stb_image, stb_truetype, CALLS.md §8) | Client media library (`client/core/media/recorder.c`), `client/gui/app/app.c`, and the daemon's `daemon/callrec_render.c` | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
+| **stb_image_write**, **stb_image**, **stb_truetype** | commit-pinned (stb_truetype v1.28) | JPEG encode of a video message's poster, and PNG encode in the app (stb_image_write); decoding avatars (PNG and JPEG only) and drawing names in a call's recording (stb_image, stb_truetype, CALLS.md §8); GIF and BMP in the Linux GUI's image decoding (stb_image, behind ARCH-137's caps) | Client media library (`client/core/media/recorder.c`), `client/gui/app/app.c`, `client/gui/platform/linux/plat_linux.c`, and the daemon's `daemon/callrec_render.c` | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 | **Noto Sans** Regular | commit-pinned (unhinted TTF, SHA-256 `f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8`) | The font a call's recording names people in: Latin, Greek and Cyrillic; compiled into the daemon as data (`build/gen/callrec_font.c`) | `daemon/callrec_render.c` | https://github.com/notofonts/latin-greek-cyrillic | SIL Open Font License 1.1 (`third_party/fonts/OFL.txt`) |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a C library on its own) | Voice input in the graphical clients, Win32 and web (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
 | **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, central, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
@@ -52,11 +52,11 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **libavc** | 1.10.0 | H.264 encode (Constrained Baseline), the encoder and the common code it uses | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://github.com/ittiam-systems/libavc | Apache-2.0 |
 | **LAME** | 3.100 | MP3 encode (`libmp3lame` alone) | Daemon, built with `EXPORT=1`: the export of a video message (ARCH-135) | https://lame.sourceforge.io | LGPL-2.0-or-later |
 | **Mbed TLS** | 3.6.7 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
-| **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx), Windows and web | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
-| **libjpeg-turbo** | 3.2.1 | JPEG decode and encode, the libjpeg API alone, for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://github.com/libjpeg-turbo/libjpeg-turbo | IJG, BSD-3-Clause and zlib (`LICENSE.md`) |
-| **libspng** | 0.7.4 | PNG decode and encode, for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://github.com/randy408/libspng | BSD-2-Clause |
-| **miniz** | 3.1.2 | The zlib libspng inflates and deflates with (`SPNG_USE_MINIZ`), so no system zlib is linked | Daemon, inside libspng | https://github.com/richgel999/miniz | MIT |
-| **libwebp** | 1.6.0 | WebP decode and encode (libwebp and libsharpyuv), for image previews (ARCH-137) | Daemon (`daemon/preview.c`) | https://chromium.googlesource.com/webm/libwebp | BSD-3-Clause (with a separate patent grant) |
+| **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx), Windows, Linux and web | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
+| **libjpeg-turbo** | 3.2.1 | JPEG decode and encode, the libjpeg API alone, for image previews (ARCH-137) | Daemon (`daemon/preview.c`); the Linux GUI's image decoding (`client/gui/platform/linux/plat_linux.c`) | https://github.com/libjpeg-turbo/libjpeg-turbo | IJG, BSD-3-Clause and zlib (`LICENSE.md`) |
+| **libspng** | 0.7.4 | PNG decode and encode, for image previews (ARCH-137) | Daemon (`daemon/preview.c`); the Linux GUI's image decoding (`client/gui/platform/linux/plat_linux.c`) | https://github.com/randy408/libspng | BSD-2-Clause |
+| **miniz** | 3.1.2 | The zlib libspng inflates and deflates with (`SPNG_USE_MINIZ`), so no system zlib is linked | Daemon and the Linux GUI, inside libspng | https://github.com/richgel999/miniz | MIT |
+| **libwebp** | 1.6.0 | WebP decode and encode (libwebp and libsharpyuv), for image previews (ARCH-137) | Daemon (`daemon/preview.c`); the Linux GUI's image decoding (`client/gui/platform/linux/plat_linux.c`) | https://chromium.googlesource.com/webm/libwebp | BSD-3-Clause (with a separate patent grant) |
 
 **speexdsp** is committed in `third_party/speexdsp/` as Xiph's 1.2.1 release
 tarball, unmodified, its `COPYING` with it. `scripts/build/speexdsp.sh` builds
@@ -111,7 +111,9 @@ and `miniz.h` (the release zip's SHA-256
 `f0446d863f9c19926ad9483c523fdc42e42b8d4a6a431d27e09d49c79a140d9a`);
 `scripts/build/libspng.sh` compiles the two single files as plain C into one
 static `libspng.a`, libspng pointed at miniz's zlib API, so no system zlib is
-linked. Every daemon links all three; no client links any. stb_image is
+linked. Every daemon links all three, and so does the Linux GUI, whose images
+(`oc_plat_image_decode`) decode through them behind the same caps; no other
+client links any. stb_image is
 deliberately **not** used for previews, whatever it already decodes for avatars
 in the call recording: it is convenient and historically weak on malformed
 input, and these decoders run on whatever anyone uploads.
@@ -232,11 +234,15 @@ unit, `audio_ma.c`, with only device I/O enabled. `.gitignore` ignores
 `android-project/`). Every platform's sources stay, so a Linux client builds the same tree.
 `scripts/build/sdl3_windows.sh` cross-builds a **static-only** `libSDL3.a` from it with
 llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and `make build` links it;
-`scripts/build/sdl3_wasm.sh` builds the web client's copy into `build/wasm/sdl3/`. Both run
+`scripts/build/sdl3_wasm.sh` builds the web client's copy into `build/wasm/sdl3/`, and
+`scripts/build/sdl3_linux.sh` builds the Linux GUI's natively, static, into
+`third_party/sdl3-3.4.14/` (gitignored) for `make linux-gui`, with both the X11 and the Wayland
+video backends: SDL opens their client libraries itself when it starts, so the binary links
+neither, and the build stops, naming the backend, if the headers of either are missing. All three run
 SDL's own CMake out of tree, so the committed source is only read -- the same arrangement as
 invoking mbedTLS's make: the dependency's build system stays its own business, and this
 tree's stays make. Nothing is downloaded; `scripts/test/fast/vendored.sh` holds the tree, the
-makefile and both scripts to one version. Bumping it is replacing the tree in one pull
+makefile and the scripts to one version. Bumping it is replacing the tree in one pull
 request. zlib-licensed: no notice needs to travel with a shipped binary, so
 `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
@@ -258,12 +264,45 @@ has moved.
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **gcc 12** (Ubuntu 22.04's `gcc-12` and `g++-12`, with `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross` for arm64; not the default gcc 11, which leaves read-aloud's kernels unvectorised) | the distribution's 12.3 | none: installed from Ubuntu's packages on the runner (`release-candidate.yml`, `stage`) | the release's Linux daemon against glibc 2.35 (`make RELEASE=1`) and the arm64 daemon cross-built from x86 (`make ARCH=aarch64`) | GPL-3.0 with the GCC Runtime Library Exception |
+| **gcc 12** (Ubuntu 22.04's `gcc-12` and `g++-12`, with `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross` for arm64; not the default gcc 11, which leaves read-aloud's kernels unvectorised; the same packages of Ubuntu 24.04 for the Linux client) | the distribution's 12.3 (22.04), 12.4 (24.04) | none: installed from Ubuntu's packages on the runner (`release-candidate.yml`, `stage`; `test-all.yml` for the Linux client) | the release's Linux daemon against glibc 2.35 (`make RELEASE=1`) and the arm64 daemon cross-built from x86 (`make ARCH=aarch64`); the Linux client's packages (`make build-all PART=linux-client`), against the sysroots below | GPL-3.0 with the GCC Runtime Library Exception |
 | **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make build/web/openchime.js`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-all`) | MIT / NCSA |
 | **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make build`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 | **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
 | **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
 | **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
+
+**The Linux client's sysroots** are fetched this way too, pinned, into
+`third_party/` (gitignored), by a script each, and never installed on the
+machine: no foreign architecture is added to dpkg, nothing goes through apt,
+and no Flatpak runtime lands in the machine's or the user's installation. Each
+is a directory the compiler is pointed at (`make linux-gui
+LINUX_SYSROOT=<dir>`, `mk/linux.mk`, "Sysroots"), which its script marks
+whole with a `.pinned` file and lays out again when its pin moves. Both
+architectures are built on one x86 machine with no emulation: arm64 is
+cross-compiled with the gcc 12 above, and its binaries are read, not run
+(ARCHITECTURE.md, ARCH-20).
+
+| Input | Version | Script, and its pin | What builds against it | License |
+|-------|---------|---------------------|------------------------|---------|
+| **Freedesktop SDK and runtime** (`org.freedesktop.Sdk`, `org.freedesktop.Platform`) | branch 26.08, one commit per architecture for each | `scripts/build/freedesktop_sdk.sh <x86_64\|aarch64>`; the branch and the four commits in `packaging/linux-client/freedesktop-runtime.conf`, which make also reads | the Flatpak's client, against the SDK (`third_party/freedesktop-sdk-26.08-<arch>/`); `flatpak build-init` reads the SDK and the runtime, and the Flatpak runs on the runtime | each of the SDK's and the runtime's components under its own free licence |
+| **Ubuntu 24.04 arm64 packages** (glibc 2.39 and the development packages of what the client links, with their dependencies) | noble's release pocket, each package by version | `scripts/build/sysroot_ubuntu_arm64.sh`; each package's version, sha256 and pool path in `scripts/build/sysroot_ubuntu_arm64.list` beside it | the arm64 `.deb`'s and `.rpm`'s client (`third_party/sysroot-ubuntu-24.04-arm64/`), the default `LINUX_SYSROOT` of `make ARCH=aarch64 linux-gui` on x86 | each package's own (Ubuntu's archive) |
+
+The Freedesktop SDK and runtime come from Flathub through `flatpak` itself,
+which is the only client Flathub serves its objects to, into a Flatpak
+installation of the tree's own, `third_party/flatpak-freedesktop-26.08/`
+(`FLATPAK_USER_DIR`), at exactly the pinned commit: an OSTree commit is named
+by the checksum of everything in it, so a commit checked after the fetch is
+the files pinned. The sysroot is the SDK's files checked out again from that
+installation as hard links, about 950 MB per architecture. A bump is the
+branch and the four commits, which `flatpak remote-info flathub
+runtime/org.freedesktop.<Sdk|Platform>/<arch>/<branch>` prints. The Ubuntu
+packages are downloaded from Ubuntu's ports mirror
+(`https://ports.ubuntu.com/ubuntu-ports/`), each checked against its pinned
+sha256 and unpacked with `dpkg-deb -x` into a merged-`/usr` tree whose
+absolute links are made relative, about 37 MB; the versions are noble's
+release pocket, which the archive never removes. A bump is the list, read
+again from the release pocket's signed index. CI keeps both by their pins,
+one cache each (`test-all.yml`).
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
@@ -468,19 +507,42 @@ container image; their versions track the OS, not this repo.
 |---------|---------|---------|------|--------|---------|
 | **glibc `resolv`** (`libresolv`) | DNS **SRV** lookup for workspace resolution (REQ-010) | TUI only (Linux) | `-lresolv` | glibc | LGPL-2.1 (glibc) |
 | **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc | LGPL-2.1 |
-| **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
-| **GLib** *(optional)* | Pulled in transitively by libsecret | TUI (only when libsecret present) | via libsecret | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1 |
+| **libsecret** | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI (optional) and Linux GUI (required) credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
+| **GLib / GIO** | D-Bus, spoken directly through GDBus: desktop notifications (`client/shared/osnotify_linux.c`), the AT-SPI accessibility provider (`client/gui/platform/linux/a11y_atspi.c`), and the desktop portals for capture and settings (`client/core/media/cap_portal.c`, `plat_linux.c`); for the TUI, only what libsecret pulls in | Linux GUI; TUI (only when libsecret present) | `pkg-config gio-2.0` (GUI); via libsecret (TUI) | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1-or-later |
+| **FreeType** | Glyph rasterization: sdltext's Linux backend (`sdltext/st_ft.c`, ARCH-106) | Linux GUI, `build/sdltext_test` | `pkg-config freetype2` | https://freetype.org | FreeType License (BSD-style, with credit) or GPL-2.0, at our choice; we use the FTL |
+| **HarfBuzz** | Text shaping, each run of sdltext's Linux layout | Linux GUI, `build/sdltext_test` | `pkg-config harfbuzz` | https://github.com/harfbuzz/harfbuzz | MIT ("Old MIT") |
+| **fontconfig** | System font families (ARCH-97, `system-ui`) and the fallback face for a character the family lacks | Linux GUI, `build/sdltext_test` | `pkg-config fontconfig` | https://www.freedesktop.org/wiki/Software/fontconfig/ | MIT-style (HPND) |
+| **libpipewire** | Reading the camera's and the screen's frames from the PipeWire stream the Camera and ScreenCast portals open (`client/core/media/cap_portal.c`) | Linux GUI | `pkg-config libpipewire-0.3` | https://pipewire.org | MIT |
 
-`libsecret`/`glib` are **optional and dynamically linked**: the Linux TUI's build detects
+`libsecret`/`glib` are **dynamically linked**, and optional for the TUI: the Linux TUI's build detects
 libsecret via `pkg-config` and compiles the keyring backend, else compiles a stub
-and that machine then persists no credential at all (headless / no D-Bus). They are
-*not* linked into the daemon or the test binary.
+and that machine then persists no credential at all (headless / no D-Bus).
+
+**The Linux GUI's packages** — FreeType, HarfBuzz, fontconfig, GIO, libsecret
+and libpipewire — are **required and dynamically linked**, the system's own
+copies, as every Linux desktop has them. They are found with `pkg-config`,
+lazily: only `make linux-gui`, `build/sdltext_test` (FreeType, HarfBuzz and
+fontconfig alone) and `build/linux_gui_test` ask for them, each stopping
+before it compiles with the `pkg-config` names it cannot find, so `make build`
+and `make test` never need them. None of them is linked into the
+daemon or the test binary. The client's `.deb` and `.rpm` depend on the
+distribution's packages of all six, Ubuntu 24.04's for the build (arm64's
+from the pinned sysroot, §2); the Flatpak links the same libraries from the
+Freedesktop runtime (§2), libsecret included, so it adds no module of its
+own: in the sandbox libsecret reaches the desktop's Secret Service over the
+session bus, as the packages' does. SDL3's own X11 and Wayland client libraries are
+not linked at all: SDL opens them when it starts (§1, "SDL3"), so only their
+development headers are needed, to build it.
 
 - **Local build headers:** `libsecret-1-dev` for the keyring backend. SQLite needs
   none — it is compiled from the committed amalgamation.
 - **CI installs:** `bzip2`, `nasm` and `xz-utils` (and `gdb`, and `ffmpeg` for
   `ffprobe`, neither linked); every compiler but the runner's own gcc is
-  fetched by make (the toolchains above). The Windows TUI and GUI (`make build`) need
+  fetched by make (the toolchains above). For the full suite's Linux GUI
+  build and tests, `test-all.yml` installs the development packages of the
+  group above, the X11, Wayland, xkbcommon, EGL, OpenGL and libdecor headers
+  SDL3's Linux build needs, `fonts-dejavu-core`, `dbus`, `pipewire` and
+  `wireplumber` (DEVELOPMENT.md, "The Linux GUI"). The Windows TUI and GUI (`make build`) need
   neither libsecret nor libresolv: the mingw build reaches DNS through
   `DnsQuery` and the credential store through Credential Manager.
 
@@ -530,7 +592,8 @@ is the upstream's own stability contract for a base OS.
 - **make** — the only build system (no CMake/autotools for OpenChime itself).
 - **bash, curl, tar, bzip2, xz, git, python3, cmake** — used by the
   `scripts/build/*.sh` fetch scripts; cmake and python3 by SDL3's own builds.
-- **pkg-config** — detects libsecret for the TUI.
+- **pkg-config** — detects libsecret for the TUI, and finds the Linux GUI's
+  packages (§3).
 - **Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
   `make build` and a `make openchimed` of the host's daemon use the system cc;
   the release uses Ubuntu 22.04's `gcc-12`, and for arm64 Ubuntu's
@@ -597,7 +660,7 @@ paths ship; nothing is fetched at runtime.
 | **MIT** | Moonshine Tiny Streaming (the recognizer) | Converted and committed (`sttkit/data/`), shipped as data, **daemon only** (ARCH-112) |
 | **Apache-2.0** | Qwen3.5 2B (the summary model) | Fetched from Qwen and converted by the daemon on first start, never shipped; its licence kept beside it (ARCH-116) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
-| **MIT / Public Domain** | stb_image_write, stb_image, stb_truetype | Vendored, committed; stb_image_write in the client, stb_image and stb_truetype in the daemon's call recordings |
+| **MIT / Public Domain** | stb_image_write, stb_image, stb_truetype | Vendored, committed; stb_image_write in the client, stb_image in the Linux GUI (GIF and BMP), stb_image and stb_truetype in the daemon's call recordings |
 | **SIL OFL 1.1** | Noto Sans Regular | Vendored, committed; compiled into the daemon as data, for a call recording's names |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
@@ -605,20 +668,23 @@ paths ship; nothing is fetched at runtime.
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the graphical clients, Win32 and web (ARCH-112): speexdsp committed and static-linked, libfvad vendored and compiled in; **client only** |
 | **BSD-2-style** | CMUdict (ttskit's pronunciation data) | Generated data, committed with its notice; daemon only |
 | **Apache-2.0** | Kitten TTS mini (data) | Converted and committed (`ttskit/data/voice.bin`, its licence `ttskit/data/VOICE-LICENSE`), shipped beside the daemon |
-| **zlib** | SDL3 | Vendored, committed; static-linked; graphical clients only |
-| **IJG, BSD-3-Clause and zlib** | libjpeg-turbo | Committed and static-linked, **daemon only**: image previews (ARCH-137). Its notices travel with the daemon |
-| **BSD-2-Clause** | libspng | Committed and static-linked, **daemon only**: image previews (ARCH-137) |
-| **MIT** | miniz | Committed, compiled into libspng, **daemon only** |
-| **BSD-3-Clause** | libwebp (and libsharpyuv) | Committed and static-linked, **daemon only**: image previews (ARCH-137); its patent grant beside its licence |
+| **zlib** | SDL3 | Vendored, committed; static-linked; graphical clients only (Windows, Linux and web) |
+| **IJG, BSD-3-Clause and zlib** | libjpeg-turbo | Committed and static-linked: the daemon's image previews (ARCH-137) and the Linux GUI's image decoding. Its notices travel with the daemon |
+| **BSD-2-Clause** | libspng | Committed and static-linked: the daemon's image previews (ARCH-137) and the Linux GUI's image decoding |
+| **MIT** | miniz | Committed, compiled into libspng: the daemon and the Linux GUI |
+| **BSD-3-Clause** | libwebp (and libsharpyuv) | Committed and static-linked: the daemon's image previews (ARCH-137) and the Linux GUI's image decoding; its patent grant beside its licence |
 | **MPL-2.0** | Mozilla CA roots (data) | Generated, compiled in; daemon and every client. File-level copyleft |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
-| **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
+| **LGPL-2.1** | libsecret, glib (GIO), glibc (resolv/pthreads) | Dynamically linked; libsecret and GIO required by the Linux GUI, optional for the TUI — LGPL satisfied by dynamic linking |
+| **FreeType License (BSD-style)** | FreeType | System package, dynamically linked; Linux GUI only (dual-licensed with GPL-2.0; we use the FTL) |
+| **MIT** | HarfBuzz, fontconfig (HPND-style), libpipewire | System packages, dynamically linked; Linux GUI only |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 | **Apache-2.0 WITH LLVM-exception** | llvm-mingw | Toolchain runtime; static in the Windows clients; the exception waives binary attribution |
 | **GPL-3.0 with GCC Runtime Library Exception** | libgcc | Toolchain runtime of every Linux build, the release's included; the exception permits linking it into the daemon |
 
-**Bottom line:** every third-party dependency in the shipped daemon and TUI is
-permissively licensed (MIT, BSD, Apache-2.0, CC0, ISC, zlib, Public Domain, plus
-optional dynamic LGPL), except the CA roots' data under MPL-2.0, a file-level
+**Bottom line:** every third-party dependency in the shipped daemon and TUI, and
+in the Linux GUI built from source, is
+permissively licensed (MIT, BSD, Apache-2.0, CC0, ISC, zlib, the FreeType
+License, Public Domain, plus dynamic LGPL), except the CA roots' data under MPL-2.0, a file-level
 copyleft; all of them are compatible with the AGPL-3.0-or-later terms our own code carries.
 No third-party AGPL code exists anywhere in the build.

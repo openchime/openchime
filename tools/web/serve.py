@@ -7,7 +7,7 @@ A static server with the two headers a page needs to run WebAssembly threads
 (cross-origin isolation, for SharedArrayBuffer), which python's own server
 does not send. Development only; a deployment serves the files from the
 daemon's origin. The page is served in development mode, as a development
-daemon serves it (daemon/webapp.c), so the harness's inputs work.
+daemon serves it (daemon/webapp.c), so the development inputs work.
 """
 import http.server
 import os

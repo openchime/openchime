@@ -399,10 +399,12 @@ static void *denied_open(const char *id, int w, int h, int fps, int *err) {
 
 const oc_capture_backend oc_capture_denied = { syn_list, denied_open, syn_start, syn_next, syn_stop, syn_close };
 
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && !defined(OC_HAVE_PORTAL_CAPTURE)
 /* Built with each platform's client (docs/details/VIDEO-MESSAGES.md §3.2): Windows in
- * cap_mf.c and cap_wgc.c, the browser in client/gui/platform/web/cap_web.c;
- * none yet elsewhere. */
+ * cap_mf.c and cap_wgc.c, the browser in client/gui/platform/web/cap_web.c,
+ * the Linux GUI in cap_portal.c (which its build defines
+ * OC_HAVE_PORTAL_CAPTURE for); none in a build without a GUI, the TUI's and
+ * the tests'. */
 const oc_capture_backend *oc_capture_platform(void) { return NULL; }
 const oc_capture_backend *oc_capture_screen_platform(void) { return NULL; }
 #endif

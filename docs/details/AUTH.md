@@ -1026,15 +1026,13 @@ says which half of a credential was wrong.
 `step-on`, `step-off`, `passkey-added`), and a refusal's kind on its message,
 `data-oc-error` (`pw-mismatch`, `pw-short`, `bad-credentials`, `code-wrong`,
 `rate-limited`, … — `oc_page_err` in `daemon/webpages.h`). These are stable: a
-harness or a test reads them, never the words, which are for the person and
+test reads them, never the words, which are for the person and
 may be reworded. The client's loopback answer page carries the same on its
 heading: `data-oc-result` `signed-in`, `refused` or `pending`
 (`client/core/signin.h`).
 
-**No password in a frame** (§2). The test suites and the GUI harness sign in
-as a person does: a helper plays the
-browser against the page (`tests/testsignin.h`; `play_browser` in
-`tools/gui/harness/lib.sh`; `OPENCHIME_DEV_SIGNIN` for the web client) and the client
+**No password in a frame** (§2). The test suites sign in as a person does: a
+helper plays the browser against the page (`tests/testsignin.h`) and the client
 presents the token the page ends with (TESTING.md).
 
 **The terminal client** signs in to a local account with a device code (§8.11),

@@ -32,11 +32,6 @@
  * and a mismatch is the failure that looks like nothing happening. */
 int oc_wintoast_init(const char *aumid);
 
-/* Did init succeed? Answers the same question after the fact, for the delivery
- * chain and for the test dump — so the harness can assert WHICH backend ran
- * rather than inferring it from a screenshot. */
-int oc_wintoast_available(void);
-
 /* Raise one toast. `tag` and `group` replace an earlier toast with the same
  * pair rather than stacking — one line per conversation, not one per message.
  * `arg` is handed back to the activator when the toast is clicked, and is how

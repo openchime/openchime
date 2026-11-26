@@ -8,7 +8,7 @@
  *
  *   win32/   Windows: the reference implementation
  *   web/     the browser, under Emscripten
- *   linux/   (next) FreeType/fontconfig text, AT-SPI, libsecret, portals
+ *   linux/   Linux: FreeType text, AT-SPI, libsecret, the desktop portals
  *   mac/     (next) Core Text, NSAccessibility, the Keychain
  *
  * A function a platform cannot provide answers "not available" (0, NULL, an
@@ -124,29 +124,19 @@ void  oc_plat_text_input_area(SDL_Window *w, const SDL_Rect *r);
  * the caret people see. A platform whose caret is the text input area itself
  * (a browser's hidden input element) does nothing more here. */
 void  oc_plat_text_caret(SDL_Window *w, const SDL_Rect *r);
-/* Where the platform's own caret is, read back from the platform (the dump
- * reports it): 1 with its rect in `out`, 0 when there is none. */
-int   oc_plat_text_caret_at(SDL_Window *w, SDL_Rect *out);
 /* Bring the window forward and give it the keyboard, however the platform
  * lets a process that does not own the foreground do that. */
 void  oc_plat_window_front(SDL_Window *w);
-/* Whether the platform says this window is the foreground one (the dump reports it). */
-int   oc_plat_window_is_front(SDL_Window *w);
-/* Whether this window holds the keyboard in the platform's own accounting: a
- * process can give its window the keyboard without owning the foreground. */
-int   oc_plat_window_has_keyboard(SDL_Window *w);
 /* The caption follows the theme (what the application does not paint). */
 void  oc_plat_window_caption_dark(SDL_Window *w, int dark);
-/* Round a popup's corners the platform's way. 0 when honoured, else the
- * platform's error code (the test dump reports it). */
-int   oc_plat_window_round(SDL_Window *w);
+/* Round a popup's corners the platform's way. */
+void  oc_plat_window_round(SDL_Window *w);
 /* Keep a window out of screen captures and recordings. 1 when honoured. */
 int   oc_plat_window_capture_exclude(SDL_Window *w, int on);
 /* Clicks pass through the window to what is under it. */
 void  oc_plat_window_click_through(SDL_Window *w, int on);
 /* The taskbar/dock badge: 0 clears, -1 a plain dot, n the count. 1 when applied. */
 int   oc_plat_badge(SDL_Window *w, int count, uint32_t rgb);   /* rgb: the disc's colour */
-int   oc_plat_badge_status(void);          /* the last failure's code, for the dump */
 /* Upload progress on the taskbar button: total 0 clears. */
 void  oc_plat_progress(SDL_Window *w, uint64_t done, uint64_t total);
 /* The rectangle on screen of a share source ("screen:N", "window:HEX"), in
@@ -167,15 +157,6 @@ void *oc_plat_tray_notify_handle(unsigned *tray_id);
  * paths picked are written NUL-separated and double-NUL-terminated; returns how
  * many, 0 when cancelled or when the platform has no picker. */
 int   oc_plat_pick_files(SDL_Window *owner, const char *filter, int multi, char *out, size_t cap);
-/* What runs while a native file dialog's own modal loop holds the thread, so the
- * test hook still answers (tools/gui/README.md, "Driving the Win32 GUI"); NULL for
- * nothing. Only that: the rest of the client waits for the dialog as before. */
-void  oc_plat_set_modal_tick(void (*fn)(void));
-/* 1 while the file picker is open. */
-int   oc_plat_picker_open(void);
-/* Answer the open file picker as a person would: `path` into its file name box
- * and OK, or, NULL, its Cancel. 1 when there was one to answer, else 0. */
-int   oc_plat_picker_answer(const char *path);
 /* A save-as picker; `suggested` is the file name offered. 1 with the path in `out`. */
 int   oc_plat_pick_save(SDL_Window *owner, const char *suggested, char *out, size_t cap);
 /* The application has finished writing the file a save-as picker named: a
@@ -197,6 +178,17 @@ uint32_t oc_plat_idle_ms(void);
  * animations", a browser's prefers-reduced-motion. Read at start and whenever
  * the window gains focus, which is when a change made elsewhere can show. */
 int      oc_plat_reduce_motion(void);
+/* Whether the person has asked the system for high contrast (REQ-262): 1 on,
+ * 0 off, -1 when the platform cannot say. Windows' high contrast
+ * (SPI_GETHIGHCONTRAST), a browser's prefers-contrast: more. Read at start,
+ * whenever the window gains focus and when the system's theme changes. */
+int      oc_plat_high_contrast(void);
+/* Whether the person has asked the system for light apps rather than dark: 1
+ * light, 0 dark, -1 when the platform cannot say. Windows' "Choose your app
+ * mode" (AppsUseLightTheme), the desktop portal's color-scheme on Linux; a
+ * browser answers -1. Read whenever the SYSTEM theme is resolved (theme.c), so
+ * a change made elsewhere shows with the next repaint that resolves it. */
+int      oc_plat_prefers_light(void);
 
 /* ---- the clipboard beyond reading text (that is SDL's) --------------------- */
 

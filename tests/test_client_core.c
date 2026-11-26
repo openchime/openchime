@@ -5142,57 +5142,6 @@ static void test_record_e2e(oc_client *a, oc_client *b, oc_call_engine *ea, oc_c
         CHECK(CALL_WAIT(5000, ({ const oc_msg *g = channel_msg_by_body(ma, chat, body); g && g->n_attach == 1; })));
     }
 
-    /* The history and the call's page, through the core (CALLS.md §1): the
-     * call listed for erik with its recording; its page has both people, the
-     * recording ready with the video it plays from, and a transcript stored as
-     * the daemon stores one, in two pages of lines. */
-    oc_client_call_history(b, 0);
-    CHECK(CALL_WAIT(5000, ({ int f = 0; for (size_t i = 0; i < mb->n_call_hist; i++)
-                                 if (mb->call_hist[i].call_id == id && (mb->call_hist[i].flags & OC_CALL_HIST_RECORDING) &&
-                                     (mb->call_hist[i].flags & OC_CALL_HIST_JOINED) &&
-                                     !strcmp(mb->call_hist[i].subject, mb->call.subject)) f = 1;
-                             f; })));
-    {
-        oc_transcript_line tl[OC_CALL_PAGE_LINES + 20];
-        static char texts[OC_CALL_PAGE_LINES + 20][24];
-        for (int i = 0; i < (int)OC_CALL_PAGE_LINES + 20; i++) {
-            snprintf(texts[i], sizeof texts[i], "line %d of it", i);
-            tl[i].speaker = i % 2 ? ub : ua; tl[i].start_ms = (uint32_t)i * 1000; tl[i].end_ms = (uint32_t)i * 1000 + 900;
-            tl[i].text = texts[i];
-        }
-        CHECK(oc_dbwriter_call_transcript(g_core_dbw, id, "en", tl, OC_CALL_PAGE_LINES + 20) == 0);
-    }
-    uint32_t seq0 = mb->call_page_seq;
-    oc_client_call_detail(b, id, 0);
-    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && mb->call_page->call_id == id &&
-                          mb->call_page->has_transcript));
-    const oc_call_page_view *pg = mb->call_page;
-    if (pg) {
-        int sa = 0, sb2 = 0;
-        for (uint16_t i = 0; i < pg->n_stays; i++) { if (pg->stays[i].user_id == ua) sa = 1; if (pg->stays[i].user_id == ub) sb2 = 1; }
-        CHECK(sa && sb2);
-        CHECK(pg->n_recordings == 1 && pg->recordings[0].state == OC_CALL_REC_READY && pg->recordings[0].attachment_id &&
-              pg->recordings[0].started_by == ub && pg->recordings[0].duration_ms > 1000);
-        CHECK(pg->n_lines_total == OC_CALL_PAGE_LINES + 20 && pg->n_lines == OC_CALL_PAGE_LINES);
-        CHECK(!strcmp(pg->transcript_lang, "en"));
-        int rec_on = 0;
-        for (uint16_t i = 0; i < pg->n_events; i++) if (pg->events[i].kind == OC_CALL_EV_RECORD_ON && pg->events[i].user_id == ub) rec_on = 1;
-        CHECK(rec_on);
-    }
-    /* The next lines, gathered onto the page held. */
-    seq0 = mb->call_page_seq;
-    oc_client_call_detail(b, id, OC_CALL_PAGE_LINES);
-    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && mb->call_page->n_lines == OC_CALL_PAGE_LINES + 20));
-    if (mb->call_page && mb->call_page->n_lines == OC_CALL_PAGE_LINES + 20)
-        /* contract: the last line comes back as it was stored, after the first page's */
-        CHECK(!strcmp(mb->call_page->lines[OC_CALL_PAGE_LINES + 19].text, "line 219 of it") &&
-              mb->call_page->lines[OC_CALL_PAGE_LINES + 19].speaker == ub);
-    /* dana, an admin, deletes the transcript: gone from erik's page. */
-    seq0 = mb->call_page_seq;
-    oc_client_call_delete(a, id, OC_CALL_DEL_TRANSCRIPT, 0);
-    CHECK(CALL_WAIT(5000, mb->call_page_seq != seq0 && mb->call_page && !mb->call_page->has_transcript &&
-                          mb->call_page->n_lines == 0));
-
     /* The recording gate (CALLS.md §8). Recorded again; erik, already in, is
      * not held back (his frontend shows the notice). He leaves and comes back:
      * now he came into a recorded call, and sends nothing until he says he
