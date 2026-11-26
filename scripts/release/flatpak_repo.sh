@@ -5,6 +5,7 @@
 # the same verbs, the same rule that nothing is deleted.
 #
 #   flatpak_repo.sh prepare <work> <source> <bundle>...
+#   flatpak_repo.sh resign  <work> <source>
 #   flatpak_repo.sh upload  <work> <dest>
 #   flatpak_repo.sh verify  <dest> <expect>
 #
@@ -19,23 +20,37 @@
 # commits, and its signatures. Flatpak reads the indexed summary (summary.idx,
 # summaries/), OSTree and older Flatpak the plain one (summary); both are
 # signed with the repository signing key, the apt and rpm repositories' key.
+# Each commit is signed with the same key, in its detached metadata
+# (<commit>.commitmeta, beside the commit object; signing adds it and leaves
+# the commit's ID as it was): the .flatpakrepo and .flatpakref carry the key,
+# so a remote added from them verifies every commit it pulls, and refuses one
+# with no signature from the key.
 #
 # `prepare` reads the source, writes nothing to it, and builds in
 # <work>/repo exactly what is to be uploaded: the published refs at their
-# commits (the commit objects alone), each bundle imported
-# (`flatpak build-import-bundle`), and the summary regenerated and signed
+# commits (the commit objects alone, with their signatures), each bundle
+# imported (`flatpak build-import-bundle`) and its commit signed
+# (`flatpak build-sign`), and the summary regenerated and signed
 # (`flatpak build-update-repo --gpg-sign`), with
 # io.openchime.OpenChime.flatpakrepo and .flatpakref beside it. It prints,
 # and writes to <work>/expect, the commit each architecture's ref is at once
 # it is published ("aarch64=<commit> x86_64=<commit>"). No static deltas: a
 # delta from a release's parent needs the parent's objects, which are not
 # fetched, and the client is small enough to pull object by object.
+# `resign` repairs a published repository whose commits are not signed, as
+# one published before commits were signed is: it fetches what `prepare`
+# fetches, signs each commit the summary lists that has no valid signature
+# from the key, and regenerates and signs the summary, the refs at the same
+# commits; <work>/expect names them, and its output is uploaded and verified
+# as a release's is (VERSION the release the refs are at). Over a repository
+# already signed it adds no object.
 # `upload` copies <work>/repo to one bucket: the objects and the indexed
 # summary's parts first, then the refs, then the summaries, their signatures
 # last, so no client ever reads a summary naming a commit not yet there.
 # `rclone copy`, never sync: nothing is ever deleted. `verify` reads the
 # published summaries back, checks their signatures, and checks the refs are
-# at <expect>'s commits, each commit there and this release's (VERSION).
+# at <expect>'s commits, each commit there, this release's (VERSION), and
+# signed with the key.
 #
 # The witnesses `prepare` refuses on, before anything is written:
 #   - the listing must succeed: only rclone's "directory not found" reads as
@@ -55,7 +70,11 @@
 #     second copy of the version, and the release stops; at this release's
 #     commit, it is a re-run, and left as it is;
 #   - the new summary, read back with the key, lists every ref the old one
-#     did, and this release's at its commits.
+#     did, and this release's at its commits;
+#   - each commit the new summary lists has a valid signature from the key
+#     (one left unsigned by an earlier publish is `resign`'s to repair).
+# `resign` refuses on the same witnesses of the published repository, and
+# when the new summary does not list every ref at the commit the old one did.
 #
 # Environment: VERSION (the release number), GPG_KEY_ID (the imported
 # REPO_SIGNING_KEY; the keyring is gpg's own, GNUPGHOME if set), and for
@@ -154,50 +173,121 @@ print(f"objects/{meta.hex()[:2]}/{meta.hex()[2:]}.dirmeta")
 PY
 }
 
-cmd_prepare() {   # <work> <source> <bundle>...
-  local W="$1" src="$2" b a ref c n old old_c f
-  shift 2
-  : "${VERSION:?VERSION}" "${GPG_KEY_ID:?GPG_KEY_ID}" "${DIST_BASE_URL:?DIST_BASE_URL}"
-  for b in "$@"; do [ -f "$b" ] || die "no bundle $b"; done
-  rm -rf "$W" && mkdir -p "$W"
-  W=$(cd "$W" && pwd)
+# The commits of a repository, checked as a client checks them before it
+# takes one: a scratch repository's OSTree remote at file://<repo>, verifying
+# commits against <key> alone, which pulls a commit and its detached metadata
+# (<commit>.commitmeta) and nothing below them.
+sig_remote() {   # <repo> <key> <scratch>
+  rm -rf "$3"
+  ostree --repo="$3" init --mode=archive-z2
+  ostree --repo="$3" remote add --set=gpg-verify=true --set=gpg-verify-summary=false \
+    --gpg-import="$2" pub "file://$1" >/dev/null
+}
+commit_signed() {   # <scratch> <commit>: whether it has a valid signature from the key
+  ostree --repo="$1" pull --commit-metadata-only pub "$2" > "$1.log" 2>&1
+}
+
+# A ref's commit signed with the key and the keyring the summary is signed
+# with (`flatpak build-sign`; the commit's ID is unchanged).
+gpg_home=()
+[ -z "${GNUPGHOME:-}" ] || gpg_home=(--gpg-homedir="$GNUPGHOME")
+sign_ref() {   # <repo> <ref>
+  local kind id a br
+  local -a runtime=()
+  IFS=/ read -r kind id a br <<<"$2"
+  [ "$kind" != runtime ] || runtime=(--runtime)
+  flatpak build-sign "${runtime[@]}" --arch="$a" --gpg-sign="$GPG_KEY_ID" "${gpg_home[@]}" "$1" "$id" "$br" > "$W/sign.log" 2>&1 \
+    || { cat "$W/sign.log" >&2; die "cannot sign $2's commit with $GPG_KEY_ID"; }
+}
+
+# A fresh <work>, its repository <work>/repo, and the signing key's public
+# half beside it.
+init_work() {   # <work>
+  rm -rf "$1" && mkdir -p "$1"
+  W=$(cd "$1" && pwd)
   public_key "$W/key.gpg"
   R="$W/repo"
   ostree --repo="$R" init --mode=archive-z2
+}
 
-  # The published repository: its summary, signature, config and refs.
+# The published repository taken into <work>/repo: its config, and its refs
+# at the commits the signed summary lists, each commit object with its
+# signature and its root directory, and nothing below it. <work>/old is the
+# summary's refs ("ref<TAB>commit"), empty for an empty prefix.
+fetch_published() {   # <source>
+  local src="$1" ref c f
   list_all "$src" "$W/all"
   : > "$W/old"
   if [ ! -s "$W/all" ]; then
     echo "::notice::no Flatpak repository at $src; treating as first publish"
-  else
-    for f in summary summary.sig config; do
-      grep -qxF "$f" "$W/all" || die "$src holds $(wc -l < "$W/all") object(s) and no $f: a publish that did not finish, or a listing that did not complete"
-    done
-    mkdir -p "$W/published"
-    printf '%s\n' summary summary.sig config > "$W/fetch"
-    grep '^refs/heads/' "$W/all" >> "$W/fetch" || true
-    rclone copy "$src" "$W/published" --files-from-raw "$W/fetch" --fast-list
-    summary_refs "$W/published" "$W/key.gpg" "$W/check-old" "$W/old" \
-      || die "$src: the published summary does not verify against the signing key"
-    cp "$W/published/config" "$R/config"
-    # The commit each ref is at and its root directory: what the new summary
-    # is made from, and nothing below it.
-    while IFS=$'\t' read -r ref c; do
-      grep -qxF "$(obj "$c")" "$W/all" || die "$src: the summary lists $ref at $c, which is not there"
-      obj "$c"
-    done < "$W/old" > "$W/commits"
-    if [ -s "$W/commits" ]; then
-      rclone copy "$src" "$R" --files-from-raw "$W/commits" --fast-list
-      while read -r f; do root_objects "$R/$f" || die "$src: $f does not read as a commit"; done < "$W/commits" | sort -u > "$W/roots"
-      [ -z "$(comm -23 "$W/roots" "$W/all")" ] || die "$src: the published commits' root directories are not all there"
-      rclone copy "$src" "$R" --files-from-raw "$W/roots" --fast-list
-    fi
-    while IFS=$'\t' read -r ref c; do
-      ostree --repo="$R" refs --create="$ref" "$c"
-    done < "$W/old"
-    note "$src: the signed summary lists $(wc -l < "$W/old") ref(s), each commit present"
+    return 0
   fi
+  for f in summary summary.sig config; do
+    grep -qxF "$f" "$W/all" || die "$src holds $(wc -l < "$W/all") object(s) and no $f: a publish that did not finish, or a listing that did not complete"
+  done
+  mkdir -p "$W/published"
+  printf '%s\n' summary summary.sig config > "$W/fetch"
+  grep '^refs/heads/' "$W/all" >> "$W/fetch" || true
+  rclone copy "$src" "$W/published" --files-from-raw "$W/fetch" --fast-list
+  summary_refs "$W/published" "$W/key.gpg" "$W/check-old" "$W/old" \
+    || die "$src: the published summary does not verify against the signing key"
+  cp "$W/published/config" "$R/config"
+  # The commit each ref is at and its root directory: what the new summary
+  # is made from, and nothing below it. A commit's signature, where it has
+  # one, comes with it.
+  while IFS=$'\t' read -r ref c; do
+    grep -qxF "$(obj "$c")" "$W/all" || die "$src: the summary lists $ref at $c, which is not there"
+    obj "$c"
+  done < "$W/old" > "$W/commits"
+  if [ -s "$W/commits" ]; then
+    rclone copy "$src" "$R" --files-from-raw "$W/commits" --fast-list
+    while read -r f; do root_objects "$R/$f" || die "$src: $f does not read as a commit"; done < "$W/commits" | sort -u > "$W/roots"
+    [ -z "$(comm -23 "$W/roots" "$W/all")" ] || die "$src: the published commits' root directories are not all there"
+    sed 's/\.commit$/.commitmeta/' "$W/commits" | sort | comm -12 - "$W/all" >> "$W/roots"
+    rclone copy "$src" "$R" --files-from-raw "$W/roots" --fast-list
+  fi
+  while IFS=$'\t' read -r ref c; do
+    ostree --repo="$R" refs --create="$ref" "$c"
+  done < "$W/old"
+  note "$src: the signed summary lists $(wc -l < "$W/old") ref(s), each commit present"
+}
+
+# The summary regenerated and signed, then read back as a client will read
+# it: signed, every old ref still there, <work>/new's refs at their commits,
+# and every commit it lists signed with the key.
+update_summary() {
+  local ref c n
+  flatpak build-update-repo --no-update-appstream --gpg-sign="$GPG_KEY_ID" "${gpg_home[@]}" "$R" > "$W/update.log" 2>&1 \
+    || { cat "$W/update.log" >&2; die "flatpak build-update-repo failed"; }
+  summary_refs "$R" "$W/key.gpg" "$W/check-new" "$W/got" || die "the new summary does not verify"
+  [ -z "$(comm -23 <(cut -f1 "$W/old") <(cut -f1 "$W/got"))" ] || die "the new summary dropped refs the old one listed"
+  while IFS=$'\t' read -r ref c n; do
+    grep -qxF "$ref"$'\t'"$c" "$W/got" || die "the new summary does not list $ref at $c"
+  done < "$W/new"
+  indexed_refs "$R" "$W/key.gpg" "$W/check-idx" "$W/got-idx" || die "the new indexed summary does not verify"
+  while IFS=$'\t' read -r ref c n; do
+    grep -qxF "$ref"$'\t'"${c:0:12}" "$W/got-idx" || die "the new indexed summary does not list $ref at $c"
+  done < "$W/new"
+  sig_remote "$R" "$W/key.gpg" "$W/check-sig"
+  while IFS=$'\t' read -r ref c; do
+    commit_signed "$W/check-sig" "$c" \
+      || { cat "$W/check-sig.log" >&2; die "the new summary lists $ref at $c, which has no valid signature from $GPG_KEY_ID"; }
+  done < "$W/got"
+}
+
+# <work>/expect: the commit each architecture's ref is at once published.
+write_expect() {
+  awk -F'\t' '{ split($1, p, "/"); print p[3] "=" $2 }' "$W/new" | sort | tr '\n' ' ' | sed 's/ $//' > "$W/expect"
+}
+
+cmd_prepare() {   # <work> <source> <bundle>...
+  local src="$2" b a ref c n old old_c f
+  W="$1"
+  shift 2
+  : "${VERSION:?VERSION}" "${GPG_KEY_ID:?GPG_KEY_ID}" "${DIST_BASE_URL:?DIST_BASE_URL}"
+  for b in "$@"; do [ -f "$b" ] || die "no bundle $b"; done
+  init_work "$W"
+  fetch_published "$src"
 
   # Each bundle, in a scratch repository of its own first: the one ref it
   # holds and its commit are read from it, not from what the import prints.
@@ -243,6 +333,7 @@ cmd_prepare() {   # <work> <source> <bundle>...
     fi
     ostree --repo="$R" pull-local "$W/bundle-$n" "$ref" > "$W/pull-$n.log" 2>&1 \
       || { cat "$W/pull-$n.log" >&2; die "cannot take $ref from its bundle"; }
+    sign_ref "$R" "$ref"
     added+=1
   done < "$W/new"
   # The ref files a summary lists and this release does not replace are
@@ -253,26 +344,40 @@ cmd_prepare() {   # <work> <source> <bundle>...
     [ -z "$f" ] || [ "$f" = "$c" ] || die "$src: refs/heads/$ref is $f, and the summary lists $c"
   done < "$W/old"
 
-  local -a gpg_home=()
-  [ -z "${GNUPGHOME:-}" ] || gpg_home=(--gpg-homedir="$GNUPGHOME")
-  flatpak build-update-repo --no-update-appstream --gpg-sign="$GPG_KEY_ID" "${gpg_home[@]}" "$R" > "$W/update.log" 2>&1 \
-    || { cat "$W/update.log" >&2; die "flatpak build-update-repo failed"; }
-
-  # The new summary, read back as a client will read it: signed, every old
-  # ref still there, this release's at its commits.
-  summary_refs "$R" "$W/key.gpg" "$W/check-new" "$W/got" || die "the new summary does not verify"
-  [ -z "$(comm -23 <(cut -f1 "$W/old") <(cut -f1 "$W/got"))" ] || die "the new summary dropped refs the old one listed"
-  while IFS=$'\t' read -r ref c n; do
-    grep -qxF "$ref"$'\t'"$c" "$W/got" || die "the new summary does not list $ref at $c"
-  done < "$W/new"
-  indexed_refs "$R" "$W/key.gpg" "$W/check-idx" "$W/got-idx" || die "the new indexed summary does not verify"
-  while IFS=$'\t' read -r ref c n; do
-    grep -qxF "$ref"$'\t'"${c:0:12}" "$W/got-idx" || die "the new indexed summary does not list $ref at $c"
-  done < "$W/new"
-
+  update_summary
   write_refs "$R"
-  awk -F'\t' '{ split($1, p, "/"); print p[3] "=" $2 }' "$W/new" | sort | tr '\n' ' ' | sed 's/ $//' > "$W/expect"
+  write_expect
   note "ready to upload, $added ref(s) moved; once published the repository lists $(cat "$W/expect")"
+  cat "$W/expect"
+}
+
+cmd_resign() {   # <work> <source>
+  local src="$2" ref c a
+  W="$1"
+  : "${GPG_KEY_ID:?GPG_KEY_ID}"
+  init_work "$W"
+  fetch_published "$src"
+  [ -s "$W/old" ] || die "$src holds no Flatpak repository to re-sign"
+  for a in $ARCHES; do
+    grep -q "^app/$APP_ID/$a/$BRANCH"$'\t' "$W/old" || die "$src: the summary does not list app/$APP_ID/$a/$BRANCH"
+  done
+  sig_remote "$R" "$W/key.gpg" "$W/check-old-sig"
+  local -i signed=0
+  while IFS=$'\t' read -r ref c; do
+    if commit_signed "$W/check-old-sig" "$c"; then
+      note "$ref is at $c, signed; left as it is"
+      continue
+    fi
+    sign_ref "$R" "$ref"
+    signed+=1
+  done < "$W/old"
+  # The refs stay where they are: the new summary lists each at its old commit.
+  cp "$W/old" "$W/new"
+  update_summary
+  [ "$(cat "$W/got")" = "$(cat "$W/old")" ] || die "the new summary does not list exactly the refs the old one did"
+  grep "^app/$APP_ID/[^/]*/$BRANCH"$'\t' "$W/old" > "$W/new"
+  write_expect
+  note "ready to upload, $signed commit(s) signed; once published the repository lists $(cat "$W/expect")"
   cat "$W/expect"
 }
 
@@ -348,20 +453,30 @@ cmd_verify() {   # <dest> <expect>
   got=${got% }
   [ "$got" = "$expect" ] || die "$dest: the summary lists $got, expected $expect"
   # Each commit is this release's.
+  # Each commit is this release's, and signed with the key: its detached
+  # metadata there, and read as a client reads it.
   ostree --repo="$W/commits" init --mode=archive-z2
-  for c in $expect; do obj "${c#*=}"; done > "$W/commits.list"
+  for c in $expect; do
+    c=${c#*=}
+    grep -qxF "$(obj "$c" commitmeta)" "$W/all" || die "$dest: $c is not signed (no $(obj "$c" commitmeta))"
+    obj "$c"; obj "$c" commitmeta
+  done > "$W/commits.list"
   rclone copy "$dest" "$W/commits" --files-from-raw "$W/commits.list" --fast-list
+  sig_remote "$W/commits" "$W/key.gpg" "$W/check-sig"
   for c in $expect; do
     c=${c#*=}
     [ "$(subject "$W/commits" "$c")" = "OpenChime $VERSION" ] || die "$dest: $c is '$(subject "$W/commits" "$c")', not OpenChime $VERSION"
+    commit_signed "$W/check-sig" "$c" \
+      || { cat "$W/check-sig.log" >&2; die "$dest: $c has no valid signature from $GPG_KEY_ID"; }
   done
-  note "$dest lists $got, OpenChime $VERSION, both summaries signed"
+  note "$dest lists $got, OpenChime $VERSION, both summaries and each commit signed"
 }
 
 verb="${1:-}"; shift || true
 case "$verb" in
   prepare) [ "$#" -ge 3 ] || die "usage: prepare <work> <source> <bundle>..."; cmd_prepare "$@" ;;
+  resign)  [ "$#" -eq 2 ] || die "usage: resign <work> <source>"; cmd_resign "$@" ;;
   upload)  [ "$#" -eq 2 ] || die "usage: upload <work> <dest>"; cmd_upload "$@" ;;
   verify)  [ "$#" -eq 2 ] || die "usage: verify <dest> <expect>"; cmd_verify "$@" ;;
-  *) echo "usage: flatpak_repo.sh prepare|upload|verify ..." >&2; exit 2 ;;
+  *) echo "usage: flatpak_repo.sh prepare|resign|upload|verify ..." >&2; exit 2 ;;
 esac

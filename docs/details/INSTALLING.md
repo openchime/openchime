@@ -169,9 +169,10 @@ flatpak install openchime io.openchime.OpenChime
 ```
 
 The second command needs Flathub as a remote too, for the runtime. The
-repository is the project's own, not Flathub, and its summary is signed with
-the same archive signing key as the apt and dnf repositories; the files that
-add it carry the key. Each release also attaches the client as single-file
+repository is the project's own, not Flathub, and its summary and each of
+its commits are signed with the same archive signing key as the apt and dnf
+repositories; the files that add it carry the key, and Flatpak checks both
+signatures before it installs or updates the client. Each release also attaches the client as single-file
 bundles, `io.openchime.OpenChime-<N>-x86_64.flatpak` and `-aarch64.flatpak`
 (`flatpak install <file>`), which take their runtime from Flathub; a client
 installed from one is not updated by `flatpak update`. In the sandbox the client reaches the network, the display
