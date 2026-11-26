@@ -1273,7 +1273,7 @@ where one exists.
 
 - **REQ-150.** A user has been able to start a server-relayed audio call, from
   Calls home or from a channel, a direct message or a group DM, and to join one
-  they were asked to (REQ-301/302), from the Win32 and web clients. No
+  they were asked to (REQ-301/302), from the graphical clients: Win32, Linux and web. No
   peer-to-peer or ICE negotiation path has existed (ARCH-18).
 - **REQ-151.** Audio has been encoded with Opus by the client — 16 kHz, in-band
   FEC and DTX, through the echo canceller and noise suppression — and relayed
@@ -2642,7 +2642,7 @@ choose — which makes each one a per-frontend *obligation*.*
 
   **The graphical clients have offered high contrast**, Off, On or Follow
   system, the default; Follow system is on when the system asks for it
-  (Windows' high contrast, a browser's `prefers-contrast: more`). On, light or
+  (Windows' high contrast, a browser's `prefers-contrast: more`, the Linux desktop's `contrast` appearance setting). On, light or
   dark still follows the theme, and a fixed palette of the client's own
   replaces the colour scheme, in which every text ink has cleared **7:1** and
   every control ink **4.5:1** against every surface it is drawn on, asserted
