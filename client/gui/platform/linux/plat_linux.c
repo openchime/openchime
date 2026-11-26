@@ -84,12 +84,16 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
-/* The application's name on disk, in the runtime directory and to the
- * desktop: lower case, as the XDG directories' other residents are. */
+/* The application's name on disk and in the runtime directory: lower case,
+ * as the XDG directories' other residents are. To the desktop it is the
+ * application ID the packages install its .desktop file under
+ * (packaging/linux-client/), which the compositor matches the window to and
+ * the autostart entry is named for. The URL scheme's entry has a name of its
+ * own: one in the user's directory named like the package's would hide it. */
 #define OC_APP_DIR      "openchime"
-#define OC_APP_ID       "openchime"
+#define OC_APP_ID       "io.openchime.OpenChime"
 #define OC_SOCKET_NAME  "openchime.sock"
-#define OC_AUTOSTART    "openchime.desktop"
+#define OC_AUTOSTART    OC_APP_ID ".desktop"
 #define OC_URL_DESKTOP  "openchime-url.desktop"
 /* What a second launch may hand over: a URL or a notification's action is a
  * few hundred bytes; anything past this is not one. */

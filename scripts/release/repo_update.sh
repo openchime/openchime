@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Add a release's packages to the apt and rpm repositories in object storage,
-# downloading only the indexes, not the pool (ARCH-20).
+# downloading only the indexes, not the pool (ARCH-20). A release has a
+# package per name per architecture: the daemon's, `openchimed`, and the
+# Linux client's, `openchime`, in the same repositories.
 #
 #   repo_update.sh prepare apt|rpm <work> <source> <mirror> <package>...
 #   repo_update.sh upload  apt|rpm <work> <dest>
@@ -13,15 +15,17 @@
 # `prepare` reads the source (the primary bucket), writes nothing to it, and
 # builds in <work>/tree exactly what is to be uploaded: the indexes, extended
 # by the new packages, signed; and the new packages. It prints, and writes to
-# <work>/expect, how many versions each architecture's index lists once it is
-# published ("amd64=4 arm64=4"). Before anything is published it reconciles
+# <work>/expect, how many versions of each package name each architecture's
+# index lists once it is published ("openchime:amd64=2 openchimed:amd64=5
+# ..."). Before anything is published it reconciles
 # the mirror bucket to the source's pool, copying any package the
 # mirror lacks, so the index uploaded to both names nothing either is missing.
 # `upload` copies <work>/tree to one bucket: packages first, then the indexes,
 # the signed top file last, so no client ever reads an index naming a package
 # not yet there. `rclone copy`, never sync: nothing is ever deleted. `verify`
 # reads a published index back and checks it lists <expect> versions per
-# architecture, this release's exactly once, and only objects that exist.
+# package name and architecture, this release's exactly once, and only
+# objects that exist.
 #
 # The witnesses `prepare` refuses on, before anything is written:
 #   - the listing must succeed: an auth failure or a 5xx stops it, and only
@@ -34,8 +38,8 @@
 #   - a new package already in the index is the same file (a re-run), or the
 #     release stops: two packages sharing a version is what apt cannot
 #     recover from;
-#   - the new index lists every old package plus exactly one new one per
-#     architecture.
+#   - the new index lists every old package plus exactly one new version per
+#     package name per architecture.
 #
 # Two methods. `incremental`, the default: fetch only dists/ or repodata/,
 # append the new debs' stanzas, or sign only the new rpms and run createrepo_c
@@ -54,7 +58,6 @@ set -euo pipefail
 export LC_ALL=C
 
 APT_ARCHES="amd64 arm64"
-APT_POOL="pool/main/o/openchimed"
 
 die()  { echo "::error::repo_update: $*" >&2; exit 1; }
 note() { echo "repo_update: $*" >&2; }
@@ -272,26 +275,27 @@ sign_repomd() {   # <repodata>
 # rpm's version-release is N-<release>.
 IS_V='function isv(x) { return x == v || index(x, v "-") == 1 }'
 
-# Per architecture, how many entries an index holds, as "arch=n ..." sorted.
-counts() {   # <rows file: path TAB arch ...>
-  awk -F'\t' '{ n[$2]++ } END { for (a in n) print a "=" n[a] }' "$1" | sort | tr '\n' ' ' | sed 's/ $//'
+# Per package name and architecture, how many entries an index holds, as
+# "name:arch=n ..." sorted.
+counts() {   # <rows file: path TAB arch TAB name ...>
+  awk -F'\t' '{ n[$3 ":" $2]++ } END { for (k in n) print k "=" n[k] }' "$1" | sort | tr '\n' ' ' | sed 's/ $//'
 }
 
 # The new index's own check: every old entry, plus exactly one entry of this
-# version for each architecture this release has a package for (read from the
-# packages given, <work>/new.arches, not from the index being checked).
-# Writes <work>/expect.
+# version for each package name and architecture this release has a package
+# for (read from the packages given, <work>/new.keys, not from the index being
+# checked). Writes <work>/expect.
 check_new_index() {   # <kind> <old rows> <new rows> <version string>
-  local kind="$1" old="$2" new="$3" ver="$4" a want got
+  local kind="$1" old="$2" new="$3" ver="$4" a n want got
   : > "$WORK/expect.parts"
-  for a in $(cat "$WORK/new.arches"); do
-    want=$(( $(awk -F'\t' -v a="$a" -v v="$ver" "$IS_V"' $2 == a && !isv($4)' "$old" | wc -l) + 1 ))
-    got=$(awk -F'\t' -v a="$a" '$2 == a' "$new" | wc -l)
-    [ "$got" -eq "$want" ] || { note "$kind $a: the new index lists $got, expected $want"; return 1; }
-    [ "$(awk -F'\t' -v a="$a" -v v="$ver" "$IS_V"' $2 == a && isv($4)' "$new" | wc -l)" -eq 1 ] \
-      || { note "$kind $a: the new index does not list version $ver exactly once"; return 1; }
-    echo "$a=$want" >> "$WORK/expect.parts"
-  done
+  while IFS=$'\t' read -r a n; do
+    want=$(( $(awk -F'\t' -v a="$a" -v n="$n" -v v="$ver" "$IS_V"' $2 == a && $3 == n && !isv($4)' "$old" | wc -l) + 1 ))
+    got=$(awk -F'\t' -v a="$a" -v n="$n" '$2 == a && $3 == n' "$new" | wc -l)
+    [ "$got" -eq "$want" ] || { note "$kind $n ($a): the new index lists $got, expected $want"; return 1; }
+    [ "$(awk -F'\t' -v a="$a" -v n="$n" -v v="$ver" "$IS_V"' $2 == a && $3 == n && isv($4)' "$new" | wc -l)" -eq 1 ] \
+      || { note "$kind $n ($a): the new index does not list version $ver exactly once"; return 1; }
+    echo "$n:$a=$want" >> "$WORK/expect.parts"
+  done < "$WORK/new.keys"
   # Nothing old is lost: every old path is still there.
   [ -z "$(comm -23 <(cut -f1 "$old" | sort) <(cut -f1 "$new" | sort))" ] \
     || { note "$kind: the new index dropped packages the old one listed"; return 1; }
@@ -299,8 +303,25 @@ check_new_index() {   # <kind> <old rows> <new rows> <version string>
 }
 
 # --- apt ----------------------------------------------------------------------
+# Where a deb lives in the pool: under its package's own directory, as
+# Debian's pools are laid out (pool/main/o/openchimed/, pool/main/o/openchime/).
+apt_path() {   # <deb>
+  local n
+  n=$(dpkg-deb -f "$1" Package)
+  echo "pool/main/${n:0:1}/$n/$(basename "$1")"
+}
+
 apt_rows() {   # <Packages> <arch>: its rows, the architecture that of the index
   py packages "$1" | awk -F'\t' -v a="$2" 'BEGIN { OFS = "\t" } { $2 = a; print }'
+}
+
+to_pool() {   # <tree> <deb>...: each deb copied to its place in the tree's pool
+  local t="$1" f p; shift
+  for f in "$@"; do
+    p=$(apt_path "$f")
+    mkdir -p "$t/$(dirname "$p")"
+    cp "$f" "$t/$p"
+  done
 }
 
 prepare_apt() {   # <source> <deb>...
@@ -308,6 +329,7 @@ prepare_apt() {   # <source> <deb>...
   local T="$WORK/tree" d f a base sha old_sha clash
   local -a publish=()
   d="$T/dists/stable"
+  mkdir -p "$WORK/scratch/pool"
   if [ "$MODE" = full ]; then
     if [ -s "$WORK/all" ]; then rclone copy "$src" "$T" --fast-list; fi
     [ -z "$( (cd "$T" && find pool -name '*.deb' 2>/dev/null || true) | sort | comm -3 - "$WORK/pool")" ] \
@@ -326,16 +348,16 @@ prepare_apt() {   # <source> <deb>...
 
   # Each new deb: published already (a re-run: the same file, by its sha256,
   # left as it is), or new.
-  mkdir -p "$WORK/scratch/$APT_POOL"
   for f in "$@"; do
-    base="$APT_POOL/$(basename "$f")"
+    base=$(apt_path "$f")
     sha=$(sha256sum "$f" | cut -d' ' -f1)
     old_sha=$(awk -F'\t' -v p="$base" '$1 == p { print $5 }' "$WORK/old.rows" | sort -u)
     if [ -n "$old_sha" ] && [ "$MODE" != full ]; then
       [ "$old_sha" = "$sha" ] || die "$base is in the index with sha256 $old_sha, and this release's is $sha"
       note "$base is already published, the same file; left as it is"
     else
-      cp "$f" "$WORK/scratch/$APT_POOL/"
+      mkdir -p "$WORK/scratch/$(dirname "$base")"
+      cp "$f" "$WORK/scratch/$base"
       publish+=("$f")
     fi
   done
@@ -362,8 +384,7 @@ prepare_apt() {   # <source> <deb>...
       f="$d/main/binary-$a/Packages"
       if [ "$MODE" = full ]; then
         # The method this replaced: every stanza regenerated from the whole pool.
-        mkdir -p "$T/$APT_POOL"
-        cp "${publish[@]}" "$T/$APT_POOL/"
+        to_pool "$T" "${publish[@]}"
         ( cd "$T" && apt-ftparchive --arch "$a" packages pool ) > "$f"
       elif [ -s "$WORK/new.$a" ]; then
         # Appended after the old stanzas, one blank line between, as
@@ -385,8 +406,7 @@ prepare_apt() {   # <source> <deb>...
   # A re-run that finds everything in place re-signs nothing and adds nothing.
   [ "${#publish[@]}" -gt 0 ] || return 0
   sign_apt "$d"
-  mkdir -p "$T/$APT_POOL"
-  cp "${publish[@]}" "$T/$APT_POOL/"
+  to_pool "$T" "${publish[@]}"
 }
 
 # --- rpm ----------------------------------------------------------------------
@@ -511,18 +531,23 @@ cmd_prepare() {   # <kind> <work> <source> <mirror> <package>...
   pkgs=()
   for f in "$@"; do pkgs+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done
   for f in "${pkgs[@]}"; do
-    if [ "$kind" = apt ]; then echo "$APT_POOL/$(basename "$f")"; else basename "$f"; fi
+    if [ "$kind" = apt ]; then apt_path "$f"; else basename "$f"; fi
   done | sort > "$WORK/new.paths"
   [ -z "$(uniq -d "$WORK/new.paths")" ] || die "two packages given share a file name"
-  # The architectures this release has a package for, from the packages.
+  # The package names and architectures this release has a package for, from
+  # the packages: architecture, a tab, name.
   for f in "${pkgs[@]}"; do
-    if [ "$kind" = apt ]; then dpkg-deb -f "$f" Architecture; else rpm -qp --nosignature --qf '%{ARCH}\n' "$f" 2>/dev/null; fi
-  done | sort > "$WORK/new.arches"
-  [ -z "$(uniq -d "$WORK/new.arches")" ] || die "more than one package for one architecture"
+    if [ "$kind" = apt ]; then
+      printf '%s\t%s\n' "$(dpkg-deb -f "$f" Architecture)" "$(dpkg-deb -f "$f" Package)"
+    else
+      rpm -qp --nosignature --qf '%{ARCH}\t%{NAME}\n' "$f" 2>/dev/null
+    fi
+  done | sort > "$WORK/new.keys"
+  [ -z "$(uniq -d "$WORK/new.keys")" ] || die "more than one package of one name for one architecture"
   if [ "$kind" = apt ]; then
-    while read -r f; do
+    while IFS=$'\t' read -r f _; do
       [[ " $APT_ARCHES " == *" $f "* ]] || die "a deb for $f, which the repository does not carry"
-    done < "$WORK/new.arches"
+    done < "$WORK/new.keys"
   fi
 
   list_all "$src" "$WORK/all"
@@ -570,7 +595,7 @@ cmd_upload() {   # <kind> <work> <dest>
 }
 
 cmd_verify() {   # <kind> <dest> <expect>
-  local kind="$1" dest="$2" expect="$3" v a got
+  local kind="$1" dest="$2" expect="$3" a n got
   : "${VERSION:?VERSION}"
   WORK=$(mktemp -d)
   trap 'rm -rf "$WORK"' EXIT
@@ -592,14 +617,14 @@ cmd_verify() {   # <kind> <dest> <expect>
     py primary "$WORK/repodata" > "$WORK/rows"
   fi
   got=$(counts "$WORK/rows")
-  [ "$got" = "$expect" ] || die "$dest: the $kind index lists $got, expected $expect (the previous count + 1 per architecture)"
-  for a in $(cut -f2 "$WORK/rows" | sort -u); do
-    [ "$(awk -F'\t' -v a="$a" -v v="$VERSION" "$IS_V"' $2 == a && isv($4)' "$WORK/rows" | wc -l)" -eq 1 ] \
-      || die "$dest: the $kind index does not list version $VERSION for $a exactly once"
-  done
+  [ "$got" = "$expect" ] || die "$dest: the $kind index lists $got, expected $expect (the previous count + 1 per package name and architecture)"
+  while IFS=$'\t' read -r a n; do
+    [ "$(awk -F'\t' -v a="$a" -v n="$n" -v v="$VERSION" "$IS_V"' $2 == a && $3 == n && isv($4)' "$WORK/rows" | wc -l)" -eq 1 ] \
+      || die "$dest: the $kind index does not list version $VERSION of $n for $a exactly once"
+  done < <(cut -f2,3 "$WORK/rows" | sort -u)
   missing=$(cut -f1 "$WORK/rows" | sort -u | comm -23 - "$WORK/pool")
   [ -z "$missing" ] || die "$dest: the $kind index names objects that are not there: $(tr '\n' ' ' <<<"$missing")"
-  note "$kind: $dest lists $got, version $VERSION once per architecture, every package present"
+  note "$kind: $dest lists $got, version $VERSION once per package name and architecture, every package present"
 }
 
 verb="${1:-}"; shift || true

@@ -43321,6 +43321,12 @@ static void paint_now(void) { g_dirty = 0; paint(g_main); }
 /* ==== main ================================================================== */
 
 int main(int argc, char *argv[]) {
+    /* The build, and nothing else: what a package's check and a person asking
+     * which client is installed read, as the TUI's and the daemon's say it. */
+    if (argc >= 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-V"))) {
+        printf("openchime %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
+        return 0;
+    }
     /* Before anything else, so a crash during startup is reported too. */
     oc_plat_boot();
 

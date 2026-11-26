@@ -17,13 +17,16 @@
 #      and the commit policy, which only warns, so one bad subject already on
 #      staging does not stop every later release-candidate -- and then the
 #      full suite's code tests (`make build-all` and `make test-all`,
-#      PART=plain then threads; docs/details/TESTING.md);
+#      PART=plain then threads; docs/details/TESTING.md), and the Linux
+#      client's .deb, .rpm and Flatpak for both architectures, built and
+#      checked there (PART=linux-client), on Ubuntu 24.04, the client's floor;
 #   2. `stage` (the `release` environment), only when they pass: the release
 #      credentials reported; everything a release ships -- both daemons with
 #      their data and their packages, the container images, the Windows
 #      clients and their installers -- with `make build-all` PART=packages,
 #      image and windows, each checked by `make test-all` with the same PART,
-#      stamped with the BUILD ID, the short commit; then stored by that id:
+#      stamped with the BUILD ID, the short commit; the Linux client's
+#      packages taken from `test` as they are; then stored by that id:
 #      the trees and binaries in the mirror bucket (DIST_MIRROR_BUCKET, which
 #      holds the apt/dnf mirror and the stored builds) under candidates/<id>/
 #      with a signed manifest, the images in the build repository
@@ -94,7 +97,8 @@ jobs:
   # Everything a release ships, built, checked and stored, in one job: the
   # release credentials reported; the amd64 and then the arm64 daemon with
   # their packages; the two images and the manifest list that indexes them;
-  # the Windows clients and their installers; and the build stored by its id.
+  # the Windows clients and their installers; the Linux client's packages,
+  # which `test` built and checked; and the build stored by its id.
   # In the `release` environment for the registry token and the signing key;
   # each secret is mapped into the one step that uses it.
   stage:
@@ -651,6 +655,32 @@ jobs:
           mkdir -p candidate/windows-x64
           cp build/openchime.exe build/openchime-tui.exe build/openchime.debug candidate/windows-x64/
           ls -l candidate/windows-x64
+
+      # --- The Linux client ----------------------------------------------------------
+      # The Linux client's .deb, .rpm and Flatpak bundle for each
+      # architecture, built and checked by `test` on Ubuntu 24.04, the
+      # client's floor (ARCH-20; make build-all PART=linux-client), and taken
+      # as they are, beside the daemon's packages: what the release publishes.
+      # Refused unless each is there under this build's release number, which
+      # `test` wrapped them under as `stage` wrapped the daemon's.
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-client
+          path: dist
+      - name: Keep the Linux client's packages
+        run: |
+          set -euo pipefail
+          n=$(cat candidate/number)
+          for arch in amd64 arm64; do
+            case "$arch" in amd64) a=x86_64 ;; arm64) a=aarch64 ;; esac
+            files=("dist/linux-${arch}/openchime_${n}_${arch}.deb" "dist/linux-${arch}/openchime-${n}-1.${a}.rpm"
+                   "dist/linux-${arch}/io.openchime.OpenChime-${n}-${a}.flatpak")
+            for f in "${files[@]}"; do
+              [ -f "$f" ] || { echo "::error::the Linux client from test has no ${f#dist/} (release-${n})"; exit 1; }
+            done
+            cp "${files[@]}" "candidate/linux-${arch}/packages/"
+            ls -l "candidate/linux-${arch}/packages"
+          done
 
       # --- The build, stored ----------------------------------------------------------
       # The build, stored by its build id: every tree and binary under

@@ -161,6 +161,38 @@ make build/linux_gui_test && dbus-run-session build/linux_gui_test
 Each exits with its failure count. Neither `make test` nor `make build` builds
 them; the full suite runs both.
 
+`build/openchime-gui --version` prints the build it is (`openchime <build id>
+(protocol <n>)`) and exits, opening no window, as the TUI and the daemon do.
+The desktop knows the client by its application ID, `io.openchime.OpenChime`,
+which also names its desktop entry, its icons and its AppStream metainfo
+(`packaging/linux-client/`), the Flatpak and the window's class; a package
+installs the binary as `openchime`.
+
+**Against a sysroot.** `make linux-gui LINUX_SYSROOT=<dir>` builds the GUI
+against the libraries in `<dir>` instead of the machine's: the compiler, the
+linker and `pkg-config` read the sysroot alone, and SDL3, the objects and the
+binary go into directories named for it (`build/<sysroot>/openchime-gui`).
+Two sysroots are fetched pinned into `third_party/`, each by its script, and
+neither installs anything on the machine (VENDORS.md §2):
+
+- `scripts/build/sysroot_ubuntu_arm64.sh` lays out Ubuntu 24.04's arm64
+  packages, pinned in `scripts/build/sysroot_ubuntu_arm64.list`, in
+  `third_party/sysroot-ubuntu-24.04-arm64/`. `make ARCH=aarch64 linux-gui`
+  on an x86 machine uses it by default, with Ubuntu's gcc 12 cross compiler
+  (`gcc-12-aarch64-linux-gnu`): the arm64 `.deb`'s and `.rpm`'s client.
+- `scripts/build/freedesktop_sdk.sh <x86_64|aarch64>` fetches the
+  Freedesktop SDK and runtime pinned in
+  `packaging/linux-client/freedesktop-runtime.conf` into a Flatpak
+  installation of the tree's own and lays the SDK out as
+  `third_party/freedesktop-sdk-<branch>-<arch>/`: the Flatpak's client
+  (`make linux-gui LINUX_SYSROOT=third_party/freedesktop-sdk-26.08-x86_64`).
+  It needs `flatpak` and `ostree`, and about 950 MB per architecture.
+
+make runs each script when the GUI is asked for against its sysroot and the
+sysroot is missing or its pin has moved. The client's packages themselves
+are the full build's (`make build-all PART=linux-client`, TESTING.md), made
+in CI only.
+
 ## Local development environment
 
 Nothing in this project runs in a container. Build the daemon and run it

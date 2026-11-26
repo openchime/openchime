@@ -13,6 +13,14 @@
 # are needed only here, and the build fails if either backend is left out.
 # XTest is not among them: SDL uses it only to warp the pointer, which this
 # client never does.
+#
+# OC_SYSROOT=<dir> builds it against a sysroot instead of the machine's own
+# headers, with make's CC (and OC_ARCH for another architecture), into
+# third_party/sdl3-<ver>-<sysroot's name>/: the client's arm64 packages
+# against the Ubuntu 24.04 arm64 sysroot (sysroot_ubuntu_arm64.sh), and its
+# Flatpak against the Freedesktop SDK (freedesktop_sdk.sh). The development
+# headers are then the sysroot's, found by pkg-config inside it; the programs
+# the build runs (wayland-scanner) are still the machine's.
 set -euo pipefail
 # One compile at a time (docs/details/TESTING.md, "One build at a time"): the build below
 # is given a literal one on its own command line, and no -j of a calling make
@@ -34,15 +42,30 @@ have="$(sed -n 's/^#define SDL_\(MAJOR\|MINOR\|MICRO\)_VERSION  *\([0-9]*\)$/\2/
 [ "${have}" = "${SDL3_VERSION}" ] || { echo "build_sdl3_linux: third_party/SDL3 is ${have}; this script builds ${SDL3_VERSION}" >&2; exit 1; }
 command -v cmake >/dev/null || { echo "build_sdl3_linux: cmake is not installed" >&2; exit 1; }
 
-DEST="sdl3-${SDL3_VERSION}"
+DEST="sdl3-${SDL3_VERSION}${OC_SYSROOT:+-$(basename "$OC_SYSROOT")}"
+
+# Against a sysroot: CMake told it is cross-compiling (for the machine's own
+# architecture too, so it looks for nothing outside the sysroot), and
+# pkg-config told to answer from inside it.
+CROSS=()
+if [ -n "${OC_SYSROOT:-}" ]; then
+  sysroot="$(cd .. && cd "${OC_SYSROOT}" && pwd)"   # named from the tree's root
+  arch="${OC_ARCH:-$(uname -m)}"
+  CROSS=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="${arch}" -DCMAKE_C_COMPILER="${CC:-cc}"
+         -DCMAKE_SYSROOT="${sysroot}" -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY)
+  export PKG_CONFIG_SYSROOT_DIR="${sysroot}"
+  export PKG_CONFIG_LIBDIR="${sysroot}/usr/lib/${arch}-linux-gnu/pkgconfig:${sysroot}/usr/lib/pkgconfig:${sysroot}/usr/share/pkgconfig"
+fi
 
 if [ ! -f "${DEST}/lib/libSDL3.a" ]; then
-  echo "build_sdl3_linux: building static SDL3 (X11 and Wayland)"
+  echo "build_sdl3_linux: building static SDL3 (X11 and Wayland)${OC_SYSROOT:+ against ${OC_SYSROOT}}"
   mkdir -p "${DEST}"
   cmake -S "${TREE}" -B "${DEST}/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
-    -DSDL_X11=ON -DSDL_WAYLAND=ON -DSDL_X11_XTEST=OFF \
+    -DSDL_X11=ON -DSDL_WAYLAND=ON -DSDL_X11_XTEST=OFF "${CROSS[@]}" \
     -DCMAKE_INSTALL_PREFIX="$(pwd)/${DEST}" > "${DEST}/cmake.log" 2>&1 \
     || { echo "build_sdl3_linux: configuring failed; see third_party/${DEST}/cmake.log" >&2; exit 1; }
   # SDL configures without a backend whose headers it cannot find; this build

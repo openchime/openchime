@@ -20,15 +20,50 @@ $(TUI_BIN): $(TUI_OBJS) $(MBEDTLS_A) | build-dir
 # test` does, because it needs system development packages a host running
 # only those may lack.
 #
+# --- Sysroots -----------------------------------------------------------------
+# The GUI builds against the machine's own development packages, or, with
+# LINUX_SYSROOT=<dir>, against a sysroot's: its compiler, its linker and
+# pkg-config read the sysroot alone, and SDL3, the objects and the binary have
+# a directory of their own, named for it. Two sysroots are made here, each by
+# a script that fetches it pinned into third_party/, and neither installs
+# anything on the machine (docs/details/VENDORS.md §2):
+#   UBUNTU_ARM64_SYSROOT  Ubuntu 24.04's arm64 packages
+#                         (scripts/build/sysroot_ubuntu_arm64.sh): what
+#                         `make ARCH=aarch64 linux-gui` builds against, the
+#                         client's arm64 .deb and .rpm
+#   FLATPAK_SYSROOT       the pinned Freedesktop SDK for ARCH
+#                         (scripts/build/freedesktop_sdk.sh): the Flatpak's,
+#                         for either architecture
+# Each script leaves <sysroot>/.pinned when the sysroot is whole.
+UBUNTU_ARM64_SYSROOT := third_party/sysroot-ubuntu-24.04-arm64
+include packaging/linux-client/freedesktop-runtime.conf
+FLATPAK_SYSROOT = third_party/freedesktop-sdk-$(FREEDESKTOP_BRANCH)-$(ARCH)
+ifeq ($(ARCH)-$(HOST_ARCH),aarch64-x86_64)
+LINUX_SYSROOT ?= $(UBUNTU_ARM64_SYSROOT)
+endif
+LINUX_SYSROOT ?=
+$(UBUNTU_ARM64_SYSROOT)/.pinned: scripts/build/sysroot_ubuntu_arm64.sh scripts/build/sysroot_ubuntu_arm64.list
+	scripts/build/sysroot_ubuntu_arm64.sh
+	@touch -c $@
+third_party/freedesktop-sdk-%/.pinned: scripts/build/freedesktop_sdk.sh packaging/linux-client/freedesktop-runtime.conf
+	scripts/build/freedesktop_sdk.sh $(lastword $(subst -, ,$*))
+LINUX_SYSROOT_ABS    := $(if $(LINUX_SYSROOT),$(abspath $(LINUX_SYSROOT)))
+LINUX_SYSROOT_SUFFIX := $(if $(LINUX_SYSROOT),-$(notdir $(LINUX_SYSROOT)))
+LINUX_SYSROOT_STAMP  := $(if $(LINUX_SYSROOT),$(LINUX_SYSROOT)/.pinned)
+LINUX_SYSROOT_FLAGS  := $(if $(LINUX_SYSROOT),--sysroot=$(LINUX_SYSROOT_ABS))
+LINUX_PKG_CONFIG     := $(if $(LINUX_SYSROOT),PKG_CONFIG_SYSROOT_DIR=$(LINUX_SYSROOT_ABS) \
+    PKG_CONFIG_LIBDIR=$(LINUX_SYSROOT_ABS)/usr/lib/$(ARCH)-linux-gnu/pkgconfig:$(LINUX_SYSROOT_ABS)/usr/lib/pkgconfig:$(LINUX_SYSROOT_ABS)/usr/share/pkgconfig )pkg-config
+
 # SDL3 is the committed third_party/SDL3 (docs/details/VENDORS.md §1), built
 # natively and statically by scripts/build/sdl3_linux.sh with the X11 and
 # Wayland video backends; it opens their libraries itself when it starts, so
-# the link names neither.
-SDL3_LINUX     := third_party/sdl3-$(SDL3_VERSION)
+# the link names neither. Against a sysroot, with the build's compiler, into
+# a directory named for the sysroot.
+SDL3_LINUX     := third_party/sdl3-$(SDL3_VERSION)$(LINUX_SYSROOT_SUFFIX)
 SDL3_LINUX_LIB := $(SDL3_LINUX)/lib/libSDL3.a
-$(SDL3_LINUX_LIB):
+$(SDL3_LINUX_LIB): | $(LINUX_SYSROOT_STAMP)
 	@echo "openchime: building SDL3 for Linux (a few minutes, once)"
-	scripts/build/sdl3_linux.sh
+	$(if $(LINUX_SYSROOT),CC='$(CC)' OC_SYSROOT=$(LINUX_SYSROOT) )scripts/build/sdl3_linux.sh
 # The system packages it compiles and links against (docs/details/VENDORS.md
 # §3): FreeType, HarfBuzz and fontconfig for text (FT_PKGS), GIO for D-Bus,
 # libsecret for the credential store, libpipewire for capture. Asked of
@@ -36,17 +71,22 @@ $(SDL3_LINUX_LIB):
 # expansion replaces each variable with its value), so `make` and `make test`
 # never ask.
 LINUX_GUI_PKGS    := $(FT_PKGS) gio-2.0 libsecret-1 libpipewire-0.3
-LINUX_GUI_PKG_CFLAGS = $(eval LINUX_GUI_PKG_CFLAGS := $(shell pkg-config --cflags $(LINUX_GUI_PKGS) 2>/dev/null))$(LINUX_GUI_PKG_CFLAGS)
-LINUX_GUI_PKG_LIBS   = $(eval LINUX_GUI_PKG_LIBS := $(shell pkg-config --libs $(LINUX_GUI_PKGS) 2>/dev/null))$(LINUX_GUI_PKG_LIBS)
-# What has to hold before the first object compiles: the packages are there.
-# A file never written, so its recipe runs on every `make linux-gui`; it is
-# order-only below, so it rebuilds nothing, and it fails naming what is missing
-# before a compiler is asked for a header it cannot find.
+LINUX_GUI_PKG_CFLAGS = $(eval LINUX_GUI_PKG_CFLAGS := $(shell $(LINUX_PKG_CONFIG) --cflags $(LINUX_GUI_PKGS) 2>/dev/null))$(LINUX_GUI_PKG_CFLAGS)
+LINUX_GUI_PKG_LIBS   = $(eval LINUX_GUI_PKG_LIBS := $(shell $(LINUX_PKG_CONFIG) --libs $(LINUX_GUI_PKGS) 2>/dev/null))$(LINUX_GUI_PKG_LIBS)
+# What has to hold before the first object compiles: the sysroot is laid out
+# and the packages are there. A file never written, so its recipe runs on
+# every `make linux-gui`; it is order-only below, so it rebuilds nothing, and
+# it fails naming what is missing before a compiler is asked for a header it
+# cannot find.
 LINUX_GUI_PKGS_OK := build/.linux_gui_pkgs
-$(LINUX_GUI_PKGS_OK): FORCE
-	$(call oc_need_pkgs,linux-gui,$(LINUX_GUI_PKGS))
+$(LINUX_GUI_PKGS_OK): FORCE $(LINUX_SYSROOT_STAMP)
+	$(call oc_need_pkgs,linux-gui,$(LINUX_GUI_PKGS),$(LINUX_PKG_CONFIG))
 
-LINUX_GUI_BIN := build/openchime-gui
+# The binary, and the objects' tree, by architecture and sysroot:
+# build/openchime-gui natively, build/aarch64/sysroot-ubuntu-24.04-arm64/
+# openchime-gui for the arm64 packages.
+LINUX_GUI_DIR := build$(BUILD_SUFFIX)$(if $(LINUX_SYSROOT),/$(notdir $(LINUX_SYSROOT)))
+LINUX_GUI_BIN := $(LINUX_GUI_DIR)/openchime-gui
 # Notifications go to the desktop's notification server over GIO
 # (osnotify_linux.c).
 LINUX_GUI_SRC := $(APP_GUI_SRC) $(wildcard client/gui/platform/linux/*.c) client/shared/icons.c \
@@ -70,15 +110,17 @@ LINUX_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC) \
 # cap_portal.c, which need GIO and libpipewire: in every other build that
 # compiles the media sources (the tests', Windows', the browser's) the file is
 # empty, as cap_mf.c and cap_wgc.c are off Windows.
-LINUX_GUI_CC   = $(CC) $(CFLAGS) $(VERSION_DEF) -std=c11 -g -Wno-unused-result -Wno-format-truncation -Wno-misleading-indentation \
+LINUX_GUI_CC   = $(CC) $(LINUX_SYSROOT_FLAGS) $(CFLAGS) $(VERSION_DEF) -std=c11 -g -Wno-unused-result -Wno-format-truncation -Wno-misleading-indentation \
                  -DUTF8PROC_STATIC -DOC_HAVE_LIBSECRET -DOC_HAVE_PORTAL_CAPTURE $(LINUX_GUI_INC) $(LINUX_GUI_PKG_CFLAGS)
 # The vendored libraries: the TLS, SDL3, the image decoders, and the media
 # codecs the native test binary links (mk/tests.mk), each built by its own rule.
 LINUX_GUI_A    := $(MBEDTLS_A) $(SDL3_LINUX_LIB) $(PREVIEW_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
-LINUX_GUI_OBJS := $(call oc_objs,$(OBJ_DIR)/linux-gui,$(LINUX_GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC))
-$(eval $(call oc_obj_rules,$(OBJ_DIR)/linux-gui,LINUX_GUI_CC,$(CC_STAMP) $(BUILD_ID_STAMP),$(LINUX_GUI_PKGS_OK) $(LINUX_GUI_A)))
+LINUX_GUI_OBJ_DIR := $(OBJ_DIR)/linux-gui$(LINUX_SYSROOT_SUFFIX)
+LINUX_GUI_OBJS := $(call oc_objs,$(LINUX_GUI_OBJ_DIR),$(LINUX_GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC))
+$(eval $(call oc_obj_rules,$(LINUX_GUI_OBJ_DIR),LINUX_GUI_CC,$(CC_STAMP) $(BUILD_ID_STAMP),$(LINUX_GUI_PKGS_OK) $(LINUX_GUI_A)))
 -include $(LINUX_GUI_OBJS:.o=.d)
 $(LINUX_GUI_BIN): $(LINUX_GUI_OBJS) $(LINUX_GUI_A) | $(LINUX_GUI_PKGS_OK) build-dir
-	$(CC) $(CFLAGS) -std=c11 -g $(LINUX_GUI_OBJS) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(MEDIA_LIBS) \
+	@mkdir -p $(dir $@)
+	$(CC) $(LINUX_SYSROOT_FLAGS) $(CFLAGS) -std=c11 -g $(LINUX_GUI_OBJS) $(MBEDTLS_LIBS) $(PREVIEW_LIBS) $(MEDIA_LIBS) \
 	    $(SDL3_LINUX_LIB) $(LINUX_GUI_PKG_LIBS) -lresolv -lpthread -ldl -lm -o $@
 linux-gui: $(LINUX_GUI_BIN)

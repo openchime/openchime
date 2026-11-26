@@ -630,7 +630,7 @@ static void test_autostart(void) {
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     exe[n > 0 ? n : 0] = 0;
     snprintf(want, sizeof want, "\"%s\"", exe);
-    tmp_path(p, sizeof p, "config/autostart/openchime.desktop");
+    tmp_path(p, sizeof p, "config/autostart/io.openchime.OpenChime.desktop");
     CHECK(oc_plat_autostart_get() == 0);
     oc_plat_autostart_set(1);
     char *d = slurp(p, NULL);

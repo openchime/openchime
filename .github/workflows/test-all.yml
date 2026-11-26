@@ -2,11 +2,14 @@ name: test-all
 
 # The release-candidate's gate and the full suite's code tests
 # (docs/details/TESTING.md), in one job on one machine: the gate first, then `make
-# build-all` and `make test-all` with PART=plain, then with PART=threads.
+# build-all` and `make test-all` with PART=plain, then with PART=threads, then
+# with PART=linux-client for each architecture: the Linux client's .deb, .rpm
+# and Flatpak, which build on Ubuntu 24.04 (ARCH-20) and so here, and reach
+# `stage` as an artifact, as the web client does.
 # Called by release-candidate.yml, once per release-candidate, on the staging
 # tip it is cutting, before it builds anything a release ships; nothing else
 # runs it. One job, because GitHub bills each job rounded up to a whole minute
-# plus its set-up, and the two parts share every tool and every cache: each is
+# plus its set-up, and the parts share every tool and every cache: each is
 # installed and restored once. The job runs the targets a person could read
 # and run the same way; every test is a script in scripts/test/. Every
 # vendored library and toolchain is fetched pinned, or built from the
@@ -17,8 +20,8 @@ name: test-all
 # The end-to-end test (scripts/test/full/e2e.sh) runs the daemon in
 # development mode, so this job lives here and not in a
 # release-path workflow, which scripts/test/fast/release_lint.sh keeps free of
-# it. The rest of the full suite -- the checks on the packages, the images and
-# the Windows installers -- runs in release-candidate.yml on the artifacts it
+# it. The rest of the full suite -- the checks on the daemon's packages, the
+# images and the Windows installers -- runs in release-candidate.yml on the artifacts it
 # builds.
 
 on:
@@ -52,8 +55,10 @@ jobs:
     runs-on: ubuntu-24.04
     # With both of the runner's CPUs compiling, a warm run took about 35
     # minutes and a cold cache, which builds the vendored libraries first,
-    # longer. One file at a time, on one CPU, is allowed twice that.
-    timeout-minutes: 160
+    # longer. One file at a time, on one CPU, is allowed twice that, and the
+    # Linux client's two architectures an hour more: each builds the client
+    # twice, and a cold cache fetches the Freedesktop SDK first.
+    timeout-minutes: 220
     outputs:
       build_id: ${{ steps.id.outputs.build_id }}
       run_number: ${{ steps.id.outputs.run_number }}
@@ -174,12 +179,28 @@ jobs:
           # (scripts/build/sdl3_linux.sh) is built with CMake and needs the
           # headers of both its video backends: X11 with the extensions it
           # uses, Wayland with xkbcommon, EGL and libdecor, and OpenGL.
-          # apt: nasm, gdb, libclang-rt-18-dev, ffmpeg, the -dev packages, the DejaVu fonts, pipewire and wireplumber are not on the runner image; dbus and cmake are named in case it lacks them
+          # The Linux client's packages (PART=linux-client, mk/full.mk) are
+          # compiled as the release compiles, with gcc 12, and for arm64 with
+          # Ubuntu's gcc 12 cross compiler (gcc-12-aarch64-linux-gnu,
+          # g++-12-aarch64-linux-gnu, libc6-dev-arm64-cross: amd64 packages
+          # that target arm64). No arm64 package comes from apt: the arm64
+          # libraries are the pinned sysroots' (restored below). flatpak and
+          # ostree fetch the Freedesktop SDK and assemble the Flatpak;
+          # desktop-file-utils and appstream validate the desktop entry and
+          # the metainfo; rpm builds and reads the .rpm. The source checks
+          # PART=plain runs publish a release into a local apt, rpm and
+          # Flatpak repository (scripts/test/fast/repo_update.sh,
+          # flatpak_repo.sh): apt-utils for apt-ftparchive, rpm for rpmsign,
+          # createrepo-c for the rpm index, and rclone, which comes pinned.
+          # apt: nasm, gdb, libclang-rt-18-dev, ffmpeg, the -dev packages, the DejaVu fonts, pipewire, wireplumber, the arm64 cross compiler, flatpak, ostree, desktop-file-utils, appstream, rpm and createrepo-c are not on the runner image; dbus, cmake, gcc-12, g++-12 and apt-utils are named in case it lacks them
           scripts/build/apt.sh bzip2 nasm gdb xz-utils libclang-rt-18-dev ffmpeg \
             libfreetype-dev libharfbuzz-dev libfontconfig-dev libglib2.0-dev libsecret-1-dev libpipewire-0.3-dev \
             fonts-dejavu-core dbus pipewire wireplumber cmake \
             libx11-dev libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxrandr-dev libxss-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libdecor-0-dev
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libdecor-0-dev \
+            gcc-12 g++-12 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu libc6-dev-arm64-cross \
+            flatpak ostree desktop-file-utils appstream rpm createrepo-c apt-utils
+          scripts/build/rclone.sh
       # Restored here and saved, each only when it missed, as soon as
       # `make build-all PART=plain` has built it: a cache saved at the end of
       # the job would be lost to any later failure, the sanitizer's included.
@@ -384,3 +405,237 @@ jobs:
       - name: make test-all PART=threads
         timeout-minutes: 60
         run: make test-all PART=threads
+
+      # --- PART=linux-client ----------------------------------------------------
+      # The Linux client's .deb, .rpm and Flatpak for each architecture
+      # (mk/full.mk, PART=linux-client), built here rather than in `stage`:
+      # they need Ubuntu 24.04's libraries, the client's floor (ARCH-20), and
+      # this is the job on Ubuntu 24.04. arm64 is cross-compiled on this x86
+      # runner with no emulation, against pinned sysroots, never against
+      # arm64 packages installed on the machine; its binaries are read, not
+      # run. Wrapped under the number a release of this build takes, as
+      # `stage` wraps the daemon's packages, and under the build id, so the
+      # client says the same build as the daemon; `stage` refuses them under
+      # any other number.
+      - id: number
+        name: The release number
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          n=$(scripts/release/version.sh next)
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "the Linux client is wrapped for release-${n}"
+      # The pinned build inputs the part fetches, one cache each, keyed by the
+      # file that pins them and the script that lays them out: the Freedesktop
+      # SDK and runtime in the tree's own Flatpak installation, with the
+      # sysroot over each architecture's SDK (scripts/build/freedesktop_sdk.sh;
+      # one cache, since each sysroot is hard links into that installation,
+      # which one archive keeps as links), and the Ubuntu 24.04 arm64 sysroot
+      # with the packages it is unpacked from
+      # (scripts/build/sysroot_ubuntu_arm64.sh). Restored here, where the part
+      # starts, and saved once the arm64 build, the last to need them, has
+      # run.
+      - id: c-freedesktop
+        name: Restore the Freedesktop SDK
+        uses: actions/cache/restore@v6
+        with:
+          path: &freedesktop-path |
+            third_party/flatpak-freedesktop-26.08
+            third_party/freedesktop-sdk-26.08-x86_64
+            third_party/freedesktop-sdk-26.08-aarch64
+          key: &freedesktop-key freedesktop-sdk-26.08-${{ runner.os }}-${{ hashFiles('packaging/linux-client/freedesktop-runtime.conf', 'scripts/build/freedesktop_sdk.sh') }}
+      - id: c-sysroot-arm64
+        name: Restore the Ubuntu arm64 sysroot
+        uses: actions/cache/restore@v6
+        with:
+          path: &sysroot-arm64-path |
+            third_party/sysroot-ubuntu-24.04-arm64
+            third_party/sysroot-ubuntu-24.04-arm64.debs
+          key: &sysroot-arm64-key sysroot-ubuntu-24.04-arm64-${{ hashFiles('scripts/build/sysroot_ubuntu_arm64.list', 'scripts/build/sysroot_ubuntu_arm64.sh') }}
+      # The vendored libraries the arm64 client links, cross-built with Ubuntu's
+      # gcc 12 into third_party/<name>-aarch64 (mk/toolchains.mk), one cache
+      # each, keyed as the native libraries are, by the version, the script
+      # and the compiler; the .deb's build and the Flatpak's share them. And
+      # SDL3 for each sysroot the part builds against
+      # (third_party/sdl3-<version>-<sysroot>, scripts/build/sdl3_linux.sh),
+      # keyed besides by the files that pin that sysroot, so a new sysroot
+      # rebuilds the SDL3 over it; only the library and its headers are kept,
+      # as for the native SDL3. Each is saved once the build that makes it has
+      # run: the Flatpak's x86_64 SDL3 after the amd64 build, the rest after
+      # the arm64 build.
+      - id: c-mbedtls-arm64
+        name: Restore mbedTLS for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &mbedtls-arm64-path third_party/mbedtls-3.6.7-aarch64
+          key: &mbedtls-arm64-key mbedtls-3.6.7-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/mbedtls.sh') }}
+      - id: c-libvpx-arm64
+        name: Restore libvpx for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &libvpx-arm64-path third_party/libvpx-1.17.0-aarch64
+          key: &libvpx-arm64-key libvpx-1.17.0-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/libvpx.sh') }}
+      - id: c-opus-arm64
+        name: Restore opus for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &opus-arm64-path third_party/opus-1.6.1-aarch64
+          key: &opus-arm64-key opus-1.6.1-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/opus.sh') }}
+      - id: c-speexdsp-arm64
+        name: Restore speexdsp for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &speexdsp-arm64-path third_party/speexdsp-1.2.1-aarch64
+          key: &speexdsp-arm64-key speexdsp-1.2.1-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/speexdsp.sh') }}
+      - id: c-libjpeg-arm64
+        name: Restore libjpeg-turbo for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &libjpeg-arm64-path third_party/libjpeg-turbo-3.2.1-aarch64
+          key: &libjpeg-arm64-key libjpeg-turbo-3.2.1-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/libjpeg-turbo.sh') }}
+      - id: c-libspng-arm64
+        name: Restore libspng for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &libspng-arm64-path third_party/libspng-0.7.4-aarch64
+          key: &libspng-arm64-key libspng-0.7.4-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/libspng.sh') }}
+      - id: c-libwebp-arm64
+        name: Restore libwebp for arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: &libwebp-arm64-path third_party/libwebp-1.6.0-aarch64
+          key: &libwebp-arm64-key libwebp-1.6.0-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/libwebp.sh') }}
+      - id: c-sdl3-ubuntu-arm64
+        name: Restore SDL3 for the Ubuntu arm64 sysroot
+        uses: actions/cache/restore@v6
+        with:
+          path: &sdl3-ubuntu-arm64-path |
+            third_party/sdl3-3.4.14-sysroot-ubuntu-24.04-arm64/lib
+            third_party/sdl3-3.4.14-sysroot-ubuntu-24.04-arm64/include
+          key: &sdl3-ubuntu-arm64-key linux-sdl3-3.4.14-sysroot-ubuntu-24.04-arm64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/sdl3_linux.sh', 'scripts/build/sysroot_ubuntu_arm64.list', 'scripts/build/sysroot_ubuntu_arm64.sh') }}
+      - id: c-sdl3-freedesktop-x86_64
+        name: Restore SDL3 for the Freedesktop SDK (x86_64)
+        uses: actions/cache/restore@v6
+        with:
+          path: &sdl3-freedesktop-x86_64-path |
+            third_party/sdl3-3.4.14-freedesktop-sdk-26.08-x86_64/lib
+            third_party/sdl3-3.4.14-freedesktop-sdk-26.08-x86_64/include
+          key: &sdl3-freedesktop-x86_64-key linux-sdl3-3.4.14-freedesktop-sdk-26.08-x86_64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/sdl3_linux.sh', 'packaging/linux-client/freedesktop-runtime.conf', 'scripts/build/freedesktop_sdk.sh') }}
+      - id: c-sdl3-freedesktop-aarch64
+        name: Restore SDL3 for the Freedesktop SDK (aarch64)
+        uses: actions/cache/restore@v6
+        with:
+          path: &sdl3-freedesktop-aarch64-path |
+            third_party/sdl3-3.4.14-freedesktop-sdk-26.08-aarch64/lib
+            third_party/sdl3-3.4.14-freedesktop-sdk-26.08-aarch64/include
+          key: &sdl3-freedesktop-aarch64-key linux-sdl3-3.4.14-freedesktop-sdk-26.08-aarch64-${{ runner.os }}-24.04-gcc12-${{ hashFiles('scripts/build/sdl3_linux.sh', 'packaging/linux-client/freedesktop-runtime.conf', 'scripts/build/freedesktop_sdk.sh') }}
+      - name: make build-all PART=linux-client (amd64)
+        timeout-minutes: 45
+        env:
+          OC_BUILD_ID: ${{ steps.id.outputs.build_id }}
+          VERSION: ${{ steps.number.outputs.n }}
+        run: make build-all PART=linux-client ARCH=x86_64 DIST=dist/linux-amd64 PKG_VERSION="$VERSION"
+      - name: Save SDL3 for the Freedesktop SDK (x86_64)
+        if: steps.c-sdl3-freedesktop-x86_64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *sdl3-freedesktop-x86_64-path
+          key: *sdl3-freedesktop-x86_64-key
+      - name: make test-all PART=linux-client (amd64)
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ steps.number.outputs.n }}
+        run: make test-all PART=linux-client ARCH=x86_64 DIST=dist/linux-amd64 PKG_VERSION="$VERSION"
+      - name: make build-all PART=linux-client (arm64)
+        timeout-minutes: 45
+        env:
+          OC_BUILD_ID: ${{ steps.id.outputs.build_id }}
+          VERSION: ${{ steps.number.outputs.n }}
+        run: make build-all PART=linux-client ARCH=aarch64 DIST=dist/linux-arm64 PKG_VERSION="$VERSION"
+      - name: Save the Freedesktop SDK
+        if: steps.c-freedesktop.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *freedesktop-path
+          key: *freedesktop-key
+      - name: Save the Ubuntu arm64 sysroot
+        if: steps.c-sysroot-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *sysroot-arm64-path
+          key: *sysroot-arm64-key
+      - name: Save mbedTLS for arm64
+        if: steps.c-mbedtls-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *mbedtls-arm64-path
+          key: *mbedtls-arm64-key
+      - name: Save libvpx for arm64
+        if: steps.c-libvpx-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *libvpx-arm64-path
+          key: *libvpx-arm64-key
+      - name: Save opus for arm64
+        if: steps.c-opus-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *opus-arm64-path
+          key: *opus-arm64-key
+      - name: Save speexdsp for arm64
+        if: steps.c-speexdsp-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *speexdsp-arm64-path
+          key: *speexdsp-arm64-key
+      - name: Save libjpeg-turbo for arm64
+        if: steps.c-libjpeg-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *libjpeg-arm64-path
+          key: *libjpeg-arm64-key
+      - name: Save libspng for arm64
+        if: steps.c-libspng-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *libspng-arm64-path
+          key: *libspng-arm64-key
+      - name: Save libwebp for arm64
+        if: steps.c-libwebp-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *libwebp-arm64-path
+          key: *libwebp-arm64-key
+      - name: Save SDL3 for the Ubuntu arm64 sysroot
+        if: steps.c-sdl3-ubuntu-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *sdl3-ubuntu-arm64-path
+          key: *sdl3-ubuntu-arm64-key
+      - name: Save SDL3 for the Freedesktop SDK (aarch64)
+        if: steps.c-sdl3-freedesktop-aarch64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: *sdl3-freedesktop-aarch64-path
+          key: *sdl3-freedesktop-aarch64-key
+      - name: make test-all PART=linux-client (arm64)
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ steps.number.outputs.n }}
+        run: make test-all PART=linux-client ARCH=aarch64 DIST=dist/linux-arm64 PKG_VERSION="$VERSION"
+      # The client's packages, built and checked, for `stage` to store with
+      # the build and sign into its manifest: the .deb, the .rpm and the
+      # Flatpak bundle of each architecture, under linux-amd64/ and
+      # linux-arm64/, and not the scratch repository the bundles were
+      # exported from.
+      - name: Keep the Linux client for stage
+        run: ls -l dist/linux-*/openchime_*.deb dist/linux-*/openchime-*.rpm dist/linux-*/*.flatpak
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-client
+          path: |
+            dist/linux-*/openchime_*.deb
+            dist/linux-*/openchime-*.rpm
+            dist/linux-*/*.flatpak
+          retention-days: 1
+          if-no-files-found: error

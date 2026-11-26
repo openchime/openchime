@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OpenChime
+GenericName=Chat
+Comment=Chat client for an OpenChime server
+Exec=openchime %u
+Icon=io.openchime.OpenChime
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.openchime.OpenChime
+Categories=Network;Chat;InstantMessaging;
+Keywords=chat;messages;calls;team;
+MimeType=x-scheme-handler/openchime;

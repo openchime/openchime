@@ -1,0 +1,136 @@
+# The Ubuntu 24.04 (noble) arm64 packages the Linux client's arm64 .deb and
+# .rpm are compiled and linked against: the development packages of what it
+# links (FreeType, HarfBuzz, fontconfig, GLib and GIO, libsecret, PipeWire),
+# the headers SDL3 builds its backends from (Wayland, X11, xkbcommon, ALSA,
+# D-Bus, libdecor, EGL and GL), glibc's, and every library those depend on,
+# which the linker reads to resolve them. Unpacked by sysroot_ubuntu_arm64.sh
+# into third_party/sysroot-ubuntu-24.04-arm64/.
+#
+# Each line: package, version, sha256 of the .deb, its path under
+# https://ports.ubuntu.com/ubuntu-ports/. The versions are noble's release
+# pocket, which the archive never removes, so a pin here never stops resolving;
+# glibc is 2.39, the client's floor (docs/ARCHITECTURE.md, ARCH-20). The list
+# was read from the release pocket's signed index (dists/noble/InRelease) for
+# main and universe, following each package's Depends and Pre-Depends and
+# leaving out programs, documentation and daemons, which a link never reads.
+libasound2-dev 1.2.11-1build2 302287cf2823d5bd2dd5bce1ca839809cd520b802715ab56e2c9fd13483c17cb pool/main/a/alsa-lib/libasound2-dev_1.2.11-1build2_arm64.deb
+libasound2t64 1.2.11-1build2 793a0961cad1540bdc6217f14b544eb1b27eda952675f4d7d150f547f0c196d7 pool/main/a/alsa-lib/libasound2t64_1.2.11-1build2_arm64.deb
+libblkid-dev 2.39.3-9ubuntu6 453ed327d64aed45c3895a1e1cc7700f12006055e56bc404d36d9742991e71dd pool/main/u/util-linux/libblkid-dev_2.39.3-9ubuntu6_arm64.deb
+libblkid1 2.39.3-9ubuntu6 274fa3f3fce678479ad85e834ef99247c0874fe56c6c4a76f086a1110614ffef pool/main/u/util-linux/libblkid1_2.39.3-9ubuntu6_arm64.deb
+libbrotli-dev 1.1.0-2build2 9049decef2672534a714ad92713844282dfdb15722f5c760e6a204048c28e4b7 pool/main/b/brotli/libbrotli-dev_1.1.0-2build2_arm64.deb
+libbrotli1 1.1.0-2build2 cabf3462d908e72f2e594f19ae87c581c4614f099947e38fbd865bf8eae27014 pool/main/b/brotli/libbrotli1_1.1.0-2build2_arm64.deb
+libbsd0 0.12.1-1build1 6200ae28cdd976f9bf98571e4f7d49f9c632cfbc7eba241a3fed0f21ec8fe3ca pool/main/libb/libbsd/libbsd0_0.12.1-1build1_arm64.deb
+libbz2-1.0 1.0.8-5.1 89eefec795475ab9fd9bd13d74412a4ec49b06bffb3a3fbd3af78aed60941aa9 pool/main/b/bzip2/libbz2-1.0_1.0.8-5.1_arm64.deb
+libbz2-dev 1.0.8-5.1 bae84cbf1bcbb34360786c30639728cfdedf6c32a93b6311c244576d3d868861 pool/main/b/bzip2/libbz2-dev_1.0.8-5.1_arm64.deb
+libc6 2.39-0ubuntu8 04d7cb73e608b41713b63ef915577f7f5d75e95b1b33174e82e05687fdb6cfaf pool/main/g/glibc/libc6_2.39-0ubuntu8_arm64.deb
+libc6-dev 2.39-0ubuntu8 cf8d2af040044ea5f9205a7a7a3eceabe9bc182fd780a1dac8e849f8eccee1f1 pool/main/g/glibc/libc6-dev_2.39-0ubuntu8_arm64.deb
+libcairo2 1.18.0-3build1 d7820deae45510a3ca1c1f6e32baa2e8b12a234a410d185e42e75e9dd5fcd6da pool/main/c/cairo/libcairo2_1.18.0-3build1_arm64.deb
+libcap2 1:2.66-5ubuntu2 88c75467ee09a14981661782bf62f4a0029458922245d7f22225c2ca4441eeee pool/main/libc/libcap2/libcap2_2.66-5ubuntu2_arm64.deb
+libcrypt-dev 1:4.4.36-4build1 cadcc00021aa1082a8cb5cd1c2686b25b7a4d396f2029eaa1b12159ca46f1766 pool/main/libx/libxcrypt/libcrypt-dev_4.4.36-4build1_arm64.deb
+libcrypt1 1:4.4.36-4build1 5cd73ba112507dabd8e43b528ca9f530719a370e014b8e3e797770e6e940cccf pool/main/libx/libxcrypt/libcrypt1_4.4.36-4build1_arm64.deb
+libdbus-1-3 1.14.10-4ubuntu4 c269be28a2ed45d08f85ca2e7eb8a333f7ef5b01a052f4ad561e6834fe4c8964 pool/main/d/dbus/libdbus-1-3_1.14.10-4ubuntu4_arm64.deb
+libdbus-1-dev 1.14.10-4ubuntu4 1fa300a05822252e95f3bb7690e184080dc24891b96c27484a42662a873aa3ab pool/main/d/dbus/libdbus-1-dev_1.14.10-4ubuntu4_arm64.deb
+libdecor-0-0 0.2.2-1build2 561403959907cbdb8b73a836373cca5ec2380b81723ad73698e9ba460ec08b69 pool/main/libd/libdecor-0/libdecor-0-0_0.2.2-1build2_arm64.deb
+libdecor-0-dev 0.2.2-1build2 170e2f3ac88459502ac0dd02cf6398470ee47197c027bf6a81c87a6502cbfc35 pool/main/libd/libdecor-0/libdecor-0-dev_0.2.2-1build2_arm64.deb
+libegl-dev 1.7.0-1build1 99e364f5b5d5847feeb57bf4bd866331da93f16ba767c25286dd7f65e4b828ec pool/main/libg/libglvnd/libegl-dev_1.7.0-1build1_arm64.deb
+libegl1 1.7.0-1build1 8813f4435c06abab54272e929cf8682b5b01a763abe29cb26b328922e4b081f9 pool/main/libg/libglvnd/libegl1_1.7.0-1build1_arm64.deb
+libexpat1 2.6.1-2build1 f6cea0cbe617519480ab3501166eab7092a9a75332cb186c30eee8107da381b9 pool/main/e/expat/libexpat1_2.6.1-2build1_arm64.deb
+libexpat1-dev 2.6.1-2build1 ad9f9b9116442096cf217286c14622b8c9ff4968bb8e71686121a6ebb167cf91 pool/main/e/expat/libexpat1-dev_2.6.1-2build1_arm64.deb
+libffi-dev 3.4.6-1build1 887755d6aa91c12ee0eb3404b61f6dc138c4c59234aa2add0264baf270337708 pool/main/libf/libffi/libffi-dev_3.4.6-1build1_arm64.deb
+libffi8 3.4.6-1build1 a4d4607144bc599328a913d7312761fd8f4a650d67c7d5058f1f3667d771d37c pool/main/libf/libffi/libffi8_3.4.6-1build1_arm64.deb
+libfontconfig-dev 2.15.0-1.1ubuntu2 782307ad68ea4937b86bb3b173dd97625efb45999be268ac06e3e3b810203abb pool/main/f/fontconfig/libfontconfig-dev_2.15.0-1.1ubuntu2_arm64.deb
+libfontconfig1 2.15.0-1.1ubuntu2 4df2aefa7395140499033b339a96164925f1fd3039df52669b87acb6bec20f19 pool/main/f/fontconfig/libfontconfig1_2.15.0-1.1ubuntu2_arm64.deb
+libfreetype-dev 2.13.2+dfsg-1build3 84f67a7f615a40241a021d2b5948262e4b1fe6eb261de92314e8b1c04113aaf3 pool/main/f/freetype/libfreetype-dev_2.13.2+dfsg-1build3_arm64.deb
+libfreetype6 2.13.2+dfsg-1build3 7f61d8fb0e17b94344454211ba910c6d63752a63d628f2e86344e54583948dae pool/main/f/freetype/libfreetype6_2.13.2+dfsg-1build3_arm64.deb
+libgcrypt20 1.10.3-2build1 ef72eafe2393bdc23d37750a2c8ee025b0d61f8158397bd8bca21b5319b5e2c6 pool/main/libg/libgcrypt20/libgcrypt20_1.10.3-2build1_arm64.deb
+libgcrypt20-dev 1.10.3-2build1 eb32cdaeccc952f030973d023a00a117929ca94e47545d79eebbec2864ccf598 pool/main/libg/libgcrypt20/libgcrypt20-dev_1.10.3-2build1_arm64.deb
+libgl-dev 1.7.0-1build1 9bc28c1265bb82ff2498c234893cbb891529e43fa6b100c007ba677c0a77bbc1 pool/main/libg/libglvnd/libgl-dev_1.7.0-1build1_arm64.deb
+libgl1 1.7.0-1build1 8b2478bdeaf7a13d3c3b993f0238ac74640ab5a623b9d2645ebf6f1336c9881b pool/main/libg/libglvnd/libgl1_1.7.0-1build1_arm64.deb
+libgles-dev 1.7.0-1build1 df742afc0b66f24d80920b419723e072ab59d70726519d5994f50cf09e1f3961 pool/main/libg/libglvnd/libgles-dev_1.7.0-1build1_arm64.deb
+libgles1 1.7.0-1build1 a7c9cd011c8e05fb573445560cab86d61583cda0f79c248fd73680e2d0618b54 pool/main/libg/libglvnd/libgles1_1.7.0-1build1_arm64.deb
+libgles2 1.7.0-1build1 b4be5859b727d181e6d4d8360f4864a4c4cadcfef3af794b837245800deff714 pool/main/libg/libglvnd/libgles2_1.7.0-1build1_arm64.deb
+libglib2.0-0t64 2.80.0-6ubuntu1 752ba1420f11452a2c3c9c8b8a68988defc4ea39d2d26a0372676722a27ebe0c pool/main/g/glib2.0/libglib2.0-0t64_2.80.0-6ubuntu1_arm64.deb
+libglib2.0-dev 2.80.0-6ubuntu1 232ce9efbecefbf80f464ae352f89f3b75f867ff6bfc38ea834b1ade9a50b580 pool/main/g/glib2.0/libglib2.0-dev_2.80.0-6ubuntu1_arm64.deb
+libglvnd0 1.7.0-1build1 3d0c30187bb5f0993b42cc9af94abfc42098451503fbde23d51fd152c4b7ff7e pool/main/libg/libglvnd/libglvnd0_1.7.0-1build1_arm64.deb
+libglx-dev 1.7.0-1build1 dc75223f01a41118e9ba8a7861ed9c0a01578c85cf303a9fecf48515b82fe352 pool/main/libg/libglvnd/libglx-dev_1.7.0-1build1_arm64.deb
+libglx0 1.7.0-1build1 830625e5a00b176afcc47742cd2b123c74555afd58da91f6bc7e68f0781b684a pool/main/libg/libglvnd/libglx0_1.7.0-1build1_arm64.deb
+libgpg-error-dev 1.47-3build2 dd47e2490577bccb31c0db9961bd4d58d97fe5997875e39ac4481b37262fee8d pool/main/libg/libgpg-error/libgpg-error-dev_1.47-3build2_arm64.deb
+libgpg-error0 1.47-3build2 0dd8e2b5abba5ebbdc33cbb403367cebc29db9ea0a68970689f433fcc2255c0a pool/main/libg/libgpg-error/libgpg-error0_1.47-3build2_arm64.deb
+libgraphite2-3 1.3.14-2build1 8f15a4393c26af67bf07751f85027f2bef5fcce239eab21194fb5fac4f5b9959 pool/main/g/graphite2/libgraphite2-3_1.3.14-2build1_arm64.deb
+libgraphite2-dev 1.3.14-2build1 9920a506c1a4c870e10c8e23e3552186f97cda291d6295eccf98fbe080dd8c7a pool/main/g/graphite2/libgraphite2-dev_1.3.14-2build1_arm64.deb
+libharfbuzz-cairo0 8.3.0-2build2 499475cb6df2c9113ab76303ce26de1dbfd82d4014b43c8a6d14426c76ca06b5 pool/main/h/harfbuzz/libharfbuzz-cairo0_8.3.0-2build2_arm64.deb
+libharfbuzz-dev 8.3.0-2build2 2897a334893c407502f3787fb1ca10ddfd2e35c05a19637396afcfd55873db8d pool/main/h/harfbuzz/libharfbuzz-dev_8.3.0-2build2_arm64.deb
+libharfbuzz-gobject0 8.3.0-2build2 76ff2a9e05eeaa3cf82f2c220d4cf12f2d91215c45f905560693c32126ef5f59 pool/main/h/harfbuzz/libharfbuzz-gobject0_8.3.0-2build2_arm64.deb
+libharfbuzz-icu0 8.3.0-2build2 92f1311987c69b90432408c19e28b4796ff7584927cb55c9cec74bd3bab9efb4 pool/main/h/harfbuzz/libharfbuzz-icu0_8.3.0-2build2_arm64.deb
+libharfbuzz-subset0 8.3.0-2build2 2e84bb4da1aaabd74eca66f04847a2b8c89acac349bb37aef2a1d6ba7d2770e1 pool/main/h/harfbuzz/libharfbuzz-subset0_8.3.0-2build2_arm64.deb
+libharfbuzz0b 8.3.0-2build2 f6917480f6e2df79563398f4fcfc25167fcaa512f35fe1f595a6e3fa7b78a46d pool/main/h/harfbuzz/libharfbuzz0b_8.3.0-2build2_arm64.deb
+libicu74 74.2-1ubuntu3 041df33ab32c57287a62ba141890a82512bf092854be455259c8034ab7ae9fbc pool/main/i/icu/libicu74_74.2-1ubuntu3_arm64.deb
+liblz4-1 1.9.4-1build1 ca49b1a29c5fc04533248d9bbe1b7fca75e38f6b9e808683a62b569541ef9d98 pool/main/l/lz4/liblz4-1_1.9.4-1build1_arm64.deb
+liblzma5 5.6.1+really5.4.5-1 649856baf5e43a011c46b0fd3a2a1bad574f4663e0b90c39a3ac609f297d60b7 pool/main/x/xz-utils/liblzma5_5.6.1+really5.4.5-1_arm64.deb
+libmd0 1.1.0-2build1 9d957330c83693dfd870a56794317395b9519b385a69933828ff8e8e14829aa0 pool/main/libm/libmd/libmd0_1.1.0-2build1_arm64.deb
+libmount-dev 2.39.3-9ubuntu6 b10cc6e19cdc06882497bb9da65133e8cfb55abe8434a679e6a7ad3de40e4907 pool/main/u/util-linux/libmount-dev_2.39.3-9ubuntu6_arm64.deb
+libmount1 2.39.3-9ubuntu6 c25e54d256ad15e8b183165bf47021bc97f4604372b3264c63904d56955c9098 pool/main/u/util-linux/libmount1_2.39.3-9ubuntu6_arm64.deb
+libpcre2-16-0 10.42-4ubuntu2 a9a31509605b31a3cec1b7798c8c71d8f4f67c92aa4b026aa97a417d7af8b5fc pool/main/p/pcre2/libpcre2-16-0_10.42-4ubuntu2_arm64.deb
+libpcre2-32-0 10.42-4ubuntu2 37b98f242823802d59b252d0adc7c7411de994b7a9a35d17ada6ad6c16c413b9 pool/main/p/pcre2/libpcre2-32-0_10.42-4ubuntu2_arm64.deb
+libpcre2-8-0 10.42-4ubuntu2 9ebb6ce8788d75beeb127ee13ebd28746511cf6f2d0499cab5f8f031858152ee pool/main/p/pcre2/libpcre2-8-0_10.42-4ubuntu2_arm64.deb
+libpcre2-dev 10.42-4ubuntu2 e79fd5827b83a713236a6c99b94496276cdce8e2dc01d66e67b2a43ed9862b01 pool/main/p/pcre2/libpcre2-dev_10.42-4ubuntu2_arm64.deb
+libpcre2-posix3 10.42-4ubuntu2 5044616c2a2fda233f1b68865130a348218785d53ef2b873bda9bef3381d0831 pool/main/p/pcre2/libpcre2-posix3_10.42-4ubuntu2_arm64.deb
+libpipewire-0.3-0t64 1.0.5-1 ae422df4717cb7f8497305e657d52cbc0f829163fff5a351d50bbcbb22b4944c pool/main/p/pipewire/libpipewire-0.3-0t64_1.0.5-1_arm64.deb
+libpipewire-0.3-dev 1.0.5-1 98d109f570847e78247b3b90b778c689fb821af5a3962b3f99db332dd05170e8 pool/main/p/pipewire/libpipewire-0.3-dev_1.0.5-1_arm64.deb
+libpixman-1-0 0.42.2-1build1 81065c180e30302950a1bd39428d335797126ef89dc2922f89216678720d4eca pool/main/p/pixman/libpixman-1-0_0.42.2-1build1_arm64.deb
+libpng-dev 1.6.43-5build1 7dc3a86050310ef00d7d631ee8072f92c6a9f8c1f523fbb0e71ea39dec7c5bac pool/main/libp/libpng1.6/libpng-dev_1.6.43-5build1_arm64.deb
+libpng16-16t64 1.6.43-5build1 5c13f372e60f1e183f3c9426dee24a0dbecaaee762d3a12d9cbe6296b40e5801 pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5build1_arm64.deb
+libpthread-stubs0-dev 0.4-1build3 c96f81b92c2ae0a40513b57df70926746165c600aaa65ae4754a0af246b52567 pool/main/libp/libpthread-stubs/libpthread-stubs0-dev_0.4-1build3_arm64.deb
+libsecret-1-0 0.21.4-1build3 b489847c20b4990e9e97dc701215c2af40ac071d9f1d465196a8a215b17ae2a4 pool/main/libs/libsecret/libsecret-1-0_0.21.4-1build3_arm64.deb
+libsecret-1-dev 0.21.4-1build3 8018a125ee7b98eef88749bc8e716bb3d4feee48de8cab7035a3c7c984d8480d pool/universe/libs/libsecret/libsecret-1-dev_0.21.4-1build3_arm64.deb
+libselinux1 3.5-2ubuntu2 07a4937bc8eb5a30373a6dcbd54f72761981d4dc342cd62b2e5fb5efe7f0b9b7 pool/main/libs/libselinux/libselinux1_3.5-2ubuntu2_arm64.deb
+libselinux1-dev 3.5-2ubuntu2 e66a92cf6bc5d93a1ddcecbe43976daafd9b26be15d8fe2d67b2dd4918486afe pool/main/libs/libselinux/libselinux1-dev_3.5-2ubuntu2_arm64.deb
+libsepol-dev 3.5-2build1 a683217cd059d5989b9e89b2f740ec546f92d6e11ac52457657d8598717fa60b pool/main/libs/libsepol/libsepol-dev_3.5-2build1_arm64.deb
+libsepol2 3.5-2build1 43339b502a91d0900b2e96ba9c30a3cc0175797a916d4d91dae26870f6d4655a pool/main/libs/libsepol/libsepol2_3.5-2build1_arm64.deb
+libspa-0.2-dev 1.0.5-1 e7b5391f786a4fe793f242640dddc8aa20d3e3e25c48aad2c614d5053bec99d1 pool/main/p/pipewire/libspa-0.2-dev_1.0.5-1_arm64.deb
+libsystemd0 255.4-1ubuntu8 f608afcee73fd60999388deaa2a88e399601f5e55f6ff301f737602e0e76977e pool/main/s/systemd/libsystemd0_255.4-1ubuntu8_arm64.deb
+libuuid1 2.39.3-9ubuntu6 f168c956126f5051136a5ce6fc43e0eab4fc762ae9488ce5d3692ce54b6f1235 pool/main/u/util-linux/libuuid1_2.39.3-9ubuntu6_arm64.deb
+libwayland-client0 1.22.0-2.1build1 f1d258e71fd42820cbc7ddd0cae3ae0b928e27b46e0b63877caa6affbe653752 pool/main/w/wayland/libwayland-client0_1.22.0-2.1build1_arm64.deb
+libwayland-cursor0 1.22.0-2.1build1 ee69ed1d5ff3c430cb09173809b73dfb044a9c3595e21ee1a31f67f9d5c07451 pool/main/w/wayland/libwayland-cursor0_1.22.0-2.1build1_arm64.deb
+libwayland-dev 1.22.0-2.1build1 6d94b723710aae35d0ff765978818601f4320c1dc4e0eec57e73b000943a1758 pool/main/w/wayland/libwayland-dev_1.22.0-2.1build1_arm64.deb
+libwayland-egl1 1.22.0-2.1build1 50e4ac8e2714b9eb84a47b8fe84d51a806104ec998530c61de349ec5b659ff43 pool/main/w/wayland/libwayland-egl1_1.22.0-2.1build1_arm64.deb
+libwayland-server0 1.22.0-2.1build1 2b6dec0d40070685f4ce346d20b064fc5e118a3149f30be88465251985b496ed pool/main/w/wayland/libwayland-server0_1.22.0-2.1build1_arm64.deb
+libx11-6 2:1.8.7-1build1 16d10ae5d27f1a0feb054001ff2b213b51acd29894f86ff088c31eebeba65fe3 pool/main/libx/libx11/libx11-6_1.8.7-1build1_arm64.deb
+libx11-data 2:1.8.7-1build1 9ae01f7747e7f479394c697c55acf11d3baf139e8e54b7c4adfb55ef9c50de08 pool/main/libx/libx11/libx11-data_1.8.7-1build1_all.deb
+libx11-dev 2:1.8.7-1build1 69b028d3917aae9fb44b2c56aa94739c7a1711afd3c86ccc7117dbf63a91c3c3 pool/main/libx/libx11/libx11-dev_1.8.7-1build1_arm64.deb
+libxau-dev 1:1.0.9-1build6 246ffb5b49c3d26b243fe4ce18777815484112c64f167ef37cf48b805a6a4ca2 pool/main/libx/libxau/libxau-dev_1.0.9-1build6_arm64.deb
+libxau6 1:1.0.9-1build6 348d0732ff9571f95d6ff18373a93e827bfe00474d792ef5e9071e6dd618605c pool/main/libx/libxau/libxau6_1.0.9-1build6_arm64.deb
+libxcb-render0 1.15-1ubuntu2 de6dafb552bab55a848b4017087eb0d9ce25fc0e1fd083a4fca5f71de9058934 pool/main/libx/libxcb/libxcb-render0_1.15-1ubuntu2_arm64.deb
+libxcb-shm0 1.15-1ubuntu2 1d3f59159910a43ec798a0bf467ca2f78d1f9e1351ac04fb8d3db8469d4a516c pool/main/libx/libxcb/libxcb-shm0_1.15-1ubuntu2_arm64.deb
+libxcb1 1.15-1ubuntu2 5483e5d19bbfa28e961d951645944e7763e943262ac17e216b2870d83597f319 pool/main/libx/libxcb/libxcb1_1.15-1ubuntu2_arm64.deb
+libxcb1-dev 1.15-1ubuntu2 10f2f12652c1825df1158c80ce3715c2cf48eddb0d3a102191b0c5974a15bc1d pool/main/libx/libxcb/libxcb1-dev_1.15-1ubuntu2_arm64.deb
+libxcursor-dev 1:1.2.1-1build1 1421a6ae484c903f859c5158346755b2c344871f39a10c848136e91d374bbb56 pool/main/libx/libxcursor/libxcursor-dev_1.2.1-1build1_arm64.deb
+libxcursor1 1:1.2.1-1build1 c059273cab51ca26f4776ce169dbfa8d4a442ea15fd1e478b0683156eb430e6b pool/main/libx/libxcursor/libxcursor1_1.2.1-1build1_arm64.deb
+libxdmcp-dev 1:1.1.3-0ubuntu6 dcbc325116fd8c91188a7dc7118dbfe8948ef349f337fbcc1a57e97d42139ac5 pool/main/libx/libxdmcp/libxdmcp-dev_1.1.3-0ubuntu6_arm64.deb
+libxdmcp6 1:1.1.3-0ubuntu6 6b96dbbae4e515ac8f32d6dacfcb6afd1266118400a85ae7cb3f887895017f53 pool/main/libx/libxdmcp/libxdmcp6_1.1.3-0ubuntu6_arm64.deb
+libxext-dev 2:1.3.4-1build2 570434025b9ec5d99f72acee82c35d46e4f576c5034a802270d06794574ea0ff pool/main/libx/libxext/libxext-dev_1.3.4-1build2_arm64.deb
+libxext6 2:1.3.4-1build2 1140abacd8d23cb83cc63fb9aebb15a201e2dddbf5ca79fd999c0cbd181d0088 pool/main/libx/libxext/libxext6_1.3.4-1build2_arm64.deb
+libxfixes-dev 1:6.0.0-2build1 48adc74f59a6fc6847168e74cc00450a8a5e60bc1992e412a3aa2d36b877ae6b pool/main/libx/libxfixes/libxfixes-dev_6.0.0-2build1_arm64.deb
+libxfixes3 1:6.0.0-2build1 884fc6560c5a8bc91fb6b7d067f557d8088ccee86ad1974b6a57085ac121e8de pool/main/libx/libxfixes/libxfixes3_6.0.0-2build1_arm64.deb
+libxi-dev 2:1.8.1-1build1 f7596e9d21f81ebef7149f07ca7014c0544fb732e234f5ce0ab19a6586a5b0c9 pool/main/libx/libxi/libxi-dev_1.8.1-1build1_arm64.deb
+libxi6 2:1.8.1-1build1 aeeb74a6ff6ea16312fd8eb1988b1ddf32afbb4503ab7121763530ee700058e3 pool/main/libx/libxi/libxi6_1.8.1-1build1_arm64.deb
+libxkbcommon-dev 1.6.0-1build1 de01e5d50d114ddc5419d61cde552d8a956a2dc9e6c004ce50b7f37a02a47c1d pool/main/libx/libxkbcommon/libxkbcommon-dev_1.6.0-1build1_arm64.deb
+libxkbcommon0 1.6.0-1build1 4ef68b9d56971a3119f40684f52a200be5c7c1bf8c5ef430a2d502e910bf8b61 pool/main/libx/libxkbcommon/libxkbcommon0_1.6.0-1build1_arm64.deb
+libxrandr-dev 2:1.5.2-2build1 7f965ded4be71fee097bddcbb051e42ef425f5018b59888533457cc83923e554 pool/main/libx/libxrandr/libxrandr-dev_1.5.2-2build1_arm64.deb
+libxrandr2 2:1.5.2-2build1 7470632764f1fde987e760850c2be58973e265f41b2bb8015c415d247898d2c4 pool/main/libx/libxrandr/libxrandr2_1.5.2-2build1_arm64.deb
+libxrender-dev 1:0.9.10-1.1build1 74a00e089f4d16c9de451dbf87a987cd0322ebef3ee89b2cf1f8c06bec5ebf2f pool/main/libx/libxrender/libxrender-dev_0.9.10-1.1build1_arm64.deb
+libxrender1 1:0.9.10-1.1build1 0a3aedab15d9b0d7a74b0b043676f0caacc104f188be16a008196dbc20e9e2e2 pool/main/libx/libxrender/libxrender1_0.9.10-1.1build1_arm64.deb
+libxss-dev 1:1.2.3-1build3 a6c8eb18ffb110de1c942588aab20b3c2419320e62f2eb51ad2db4f2c96cd9b3 pool/main/libx/libxss/libxss-dev_1.2.3-1build3_arm64.deb
+libxss1 1:1.2.3-1build3 8159cb3813e3706a3bac3bae1042da6caaa2b8e454e636738d00394160bd654d pool/main/libx/libxss/libxss1_1.2.3-1build3_arm64.deb
+libzstd1 1.5.5+dfsg2-2build1 98568129024af1a71702d5a13f2e01c53afd5e2c3f71b2ee97fdd9a19cd97eda pool/main/libz/libzstd/libzstd1_1.5.5+dfsg2-2build1_arm64.deb
+linux-libc-dev 6.8.0-31.31 7fd438efa44a794b438e7dde7ac280166fb8d4b1cf7846393ce019714d8bb3e3 pool/main/l/linux/linux-libc-dev_6.8.0-31.31_arm64.deb
+rpcsvc-proto 1.4.2-0ubuntu7 ae527152fc2bf9c1a645c2620d802b0849db32c8aa48328b4ae94c59cc57bcc9 pool/main/r/rpcsvc-proto/rpcsvc-proto_1.4.2-0ubuntu7_arm64.deb
+uuid-dev 2.39.3-9ubuntu6 f10a3c5317a4c4ce68b0f1997ec401d4f50b518964ddc87092decb4a696a17c4 pool/main/u/util-linux/uuid-dev_2.39.3-9ubuntu6_arm64.deb
+x11proto-core-dev 2023.2-1 d7c8cbeb485a45ca6e5486b46df7a5ead737440954ae4489866222101ac2f0d7 pool/main/x/xorgproto/x11proto-core-dev_2023.2-1_all.deb
+x11proto-dev 2023.2-1 3bf13a2ffb79ecd4014d438936014e5863f79eb59ebf76e8f43356271c90e7ce pool/main/x/xorgproto/x11proto-dev_2023.2-1_all.deb
+x11proto-render-dev 2:2023.2-1 605ebe525c88c0d6947f39d2bc3876f2ac39b72550f757237cfc4e1215526ae1 pool/main/x/xorgproto/x11proto-render-dev_2023.2-1_all.deb
+x11proto-scrnsaver-dev 2023.2-1 f1c5cb502be040995741faddcbc569fdd4ae2ef91cb794cfa8fd64fdb757c44c pool/main/x/xorgproto/x11proto-scrnsaver-dev_2023.2-1_all.deb
+xkb-data 2.41-2ubuntu1 5f0a5188398b606d723f1bed48ee38c11eaeb98357ab29a3bf33c451056815d1 pool/main/x/xkeyboard-config/xkb-data_2.41-2ubuntu1_all.deb
+xtrans-dev 1.4.0-1 45277c51d5d83db351b61859314b59595c9626ac372fbb2fc0d5542e169d9086 pool/main/x/xtrans/xtrans-dev_1.4.0-1_all.deb
+zlib1g 1:1.3.dfsg-3.1ubuntu2 66aaebb68401a88b4f70a5f48e1a516b611fdcaae15208d8aee677c556d2cf01 pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2_arm64.deb
+zlib1g-dev 1:1.3.dfsg-3.1ubuntu2 3ca97d064a8f3dbe3fed05b6132ba0890237d26fae16060c1fb8ea22c2a846e9 pool/main/z/zlib/zlib1g-dev_1.3.dfsg-3.1ubuntu2_arm64.deb

@@ -264,12 +264,45 @@ has moved.
 
 | Toolchain | Version | Script | Builds | License |
 |-----------|---------|--------|--------|---------|
-| **gcc 12** (Ubuntu 22.04's `gcc-12` and `g++-12`, with `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross` for arm64; not the default gcc 11, which leaves read-aloud's kernels unvectorised) | the distribution's 12.3 | none: installed from Ubuntu's packages on the runner (`release-candidate.yml`, `stage`) | the release's Linux daemon against glibc 2.35 (`make RELEASE=1`) and the arm64 daemon cross-built from x86 (`make ARCH=aarch64`) | GPL-3.0 with the GCC Runtime Library Exception |
+| **gcc 12** (Ubuntu 22.04's `gcc-12` and `g++-12`, with `gcc-12-aarch64-linux-gnu`, `g++-12-aarch64-linux-gnu` and `libc6-dev-arm64-cross` for arm64; not the default gcc 11, which leaves read-aloud's kernels unvectorised; the same packages of Ubuntu 24.04 for the Linux client) | the distribution's 12.3 (22.04), 12.4 (24.04) | none: installed from Ubuntu's packages on the runner (`release-candidate.yml`, `stage`; `test-all.yml` for the Linux client) | the release's Linux daemon against glibc 2.35 (`make RELEASE=1`) and the arm64 daemon cross-built from x86 (`make ARCH=aarch64`); the Linux client's packages (`make build-all PART=linux-client`), against the sysroots below | GPL-3.0 with the GCC Runtime Library Exception |
 | **Emscripten** (emsdk) | 6.0.13 | `scripts/build/emsdk.sh` | the web client (`make build/web/openchime.js`) and the loader compiled into a `WEB=1` daemon; brings its own Node for the web client's checks (`make test-all`) | MIT / NCSA |
 | **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261020 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make build`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 | **makemsix** (Microsoft msix-packaging, with CMake 3.31.6 to build it) | commit `25a65f5` | `scripts/build/makemsix.sh` | the Windows client's MSIX, on Linux (`packaging/build-windows.sh`); built from source because no release compiles with a current clang | MIT (makemsix); BSD-3-Clause (CMake) |
 | **WinShell** (NSIS plugin) | the NSIS wiki's `WinShell.zip`, SHA-256 pinned | `scripts/build/nsis_plugins.sh` | the installer's Start-menu shortcut AppUserModelID (`packaging/windows/openchime.nsi`); `makensis` itself is Ubuntu's `nsis` | zlib |
 | **jsign** | 7.6 | `scripts/build/jsign.sh` | Authenticode signing of the Windows binaries and installer against Azure Trusted Signing, on Linux (`scripts/release/sign_windows.sh`) | Apache-2.0 |
+
+**The Linux client's sysroots** are fetched this way too, pinned, into
+`third_party/` (gitignored), by a script each, and never installed on the
+machine: no foreign architecture is added to dpkg, nothing goes through apt,
+and no Flatpak runtime lands in the machine's or the user's installation. Each
+is a directory the compiler is pointed at (`make linux-gui
+LINUX_SYSROOT=<dir>`, `mk/linux.mk`, "Sysroots"), which its script marks
+whole with a `.pinned` file and lays out again when its pin moves. Both
+architectures are built on one x86 machine with no emulation: arm64 is
+cross-compiled with the gcc 12 above, and its binaries are read, not run
+(ARCHITECTURE.md, ARCH-20).
+
+| Input | Version | Script, and its pin | What builds against it | License |
+|-------|---------|---------------------|------------------------|---------|
+| **Freedesktop SDK and runtime** (`org.freedesktop.Sdk`, `org.freedesktop.Platform`) | branch 26.08, one commit per architecture for each | `scripts/build/freedesktop_sdk.sh <x86_64\|aarch64>`; the branch and the four commits in `packaging/linux-client/freedesktop-runtime.conf`, which make also reads | the Flatpak's client, against the SDK (`third_party/freedesktop-sdk-26.08-<arch>/`); `flatpak build-init` reads the SDK and the runtime, and the Flatpak runs on the runtime | each of the SDK's and the runtime's components under its own free licence |
+| **Ubuntu 24.04 arm64 packages** (glibc 2.39 and the development packages of what the client links, with their dependencies) | noble's release pocket, each package by version | `scripts/build/sysroot_ubuntu_arm64.sh`; each package's version, sha256 and pool path in `scripts/build/sysroot_ubuntu_arm64.list` beside it | the arm64 `.deb`'s and `.rpm`'s client (`third_party/sysroot-ubuntu-24.04-arm64/`), the default `LINUX_SYSROOT` of `make ARCH=aarch64 linux-gui` on x86 | each package's own (Ubuntu's archive) |
+
+The Freedesktop SDK and runtime come from Flathub through `flatpak` itself,
+which is the only client Flathub serves its objects to, into a Flatpak
+installation of the tree's own, `third_party/flatpak-freedesktop-26.08/`
+(`FLATPAK_USER_DIR`), at exactly the pinned commit: an OSTree commit is named
+by the checksum of everything in it, so a commit checked after the fetch is
+the files pinned. The sysroot is the SDK's files checked out again from that
+installation as hard links, about 950 MB per architecture. A bump is the
+branch and the four commits, which `flatpak remote-info flathub
+runtime/org.freedesktop.<Sdk|Platform>/<arch>/<branch>` prints. The Ubuntu
+packages are downloaded from Ubuntu's ports mirror
+(`https://ports.ubuntu.com/ubuntu-ports/`), each checked against its pinned
+sha256 and unpacked with `dpkg-deb -x` into a merged-`/usr` tree whose
+absolute links are made relative, about 37 MB; the versions are noble's
+release pocket, which the archive never removes. A bump is the list, read
+again from the release pocket's signed index. CI keeps both by their pins,
+one cache each (`test-all.yml`).
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
@@ -492,7 +525,12 @@ lazily: only `make linux-gui`, `build/sdltext_test` (FreeType, HarfBuzz and
 fontconfig alone) and `build/linux_gui_test` ask for them, each stopping
 before it compiles with the `pkg-config` names it cannot find, so `make build`
 and `make test` never need them. None of them is linked into the
-daemon or the test binary. SDL3's own X11 and Wayland client libraries are
+daemon or the test binary. The client's `.deb` and `.rpm` depend on the
+distribution's packages of all six, Ubuntu 24.04's for the build (arm64's
+from the pinned sysroot, §2); the Flatpak links the same libraries from the
+Freedesktop runtime (§2), libsecret included, so it adds no module of its
+own: in the sandbox libsecret reaches the desktop's Secret Service over the
+session bus, as the packages' does. SDL3's own X11 and Wayland client libraries are
 not linked at all: SDL opens them when it starts (§1, "SDL3"), so only their
 development headers are needed, to build it.
 

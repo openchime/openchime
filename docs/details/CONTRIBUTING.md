@@ -233,8 +233,8 @@ It runs three jobs, each its steps one after another on one runner:
 
 | Job | Environment | What it does |
 |---|---|---|
-| `test` (`test-all.yml`) | none | The gate, then the full suite's code tests (below). |
-| `stage` | `release` | On `ubuntu-22.04`, whose glibc 2.35 is the release binary's floor. Reports the release credentials; builds what a release ships — both daemons with their data and packages, the images and their manifest list, and the Windows clients with their installer and MSIX — each checked by `make test-all` (PART=packages, image, windows); stores the daemon trees, the Windows binaries and the images by commit. |
+| `test` (`test-all.yml`) | none | On `ubuntu-24.04`. The gate, then the full suite's code tests (below), then the Linux client's `.deb`, `.rpm` and Flatpak for amd64 and arm64, built and checked (PART=linux-client) on Ubuntu 24.04, the client's floor, and handed to `stage`. |
+| `stage` | `release` | On `ubuntu-22.04`, whose glibc 2.35 is the release binary's floor. Reports the release credentials; builds what a release ships — both daemons with their data and packages, the images and their manifest list, and the Windows clients with their installer and MSIX — each checked by `make test-all` (PART=packages, image, windows); takes the Linux client's packages from `test` as they are; stores the daemon trees and packages, the client's packages, the Windows binaries and the images by commit, in the signed manifest. |
 | `publish` | `release` | Reads the stored build back and verifies it, tags the commit `release-N-rcK`, tags the image, publishes the prerelease, and copies all of it to the public repository. |
 
 The gate refuses any ref but staging's tip, a commit already released or
@@ -250,8 +250,13 @@ policy warns). Then the full suite's code tests, in the same job:
   the fuzzing pass.
 - **then PART=threads** — the suites that start threads, under
   ThreadSanitizer, their one run (TESTING.md §2.4).
+- **then PART=linux-client**, for `ARCH=x86_64` and then `ARCH=aarch64` —
+  the Linux client's `.deb`, `.rpm` and Flatpak, under the number a release
+  of the build takes, and their checks; arm64 cross-compiled on the same
+  x86 runner against pinned sysroots, with no emulation and no arm64
+  package installed (TESTING.md).
 
-Only when both pass does `stage` build anything. It compiles the release
+Only when all of them pass does `stage` build anything. It compiles the release
 with Ubuntu 22.04's own gcc 12, and the arm64 daemon with Ubuntu's gcc 12 cross packages
 on the same x86 runner (`make ARCH=aarch64`); no compiler is fetched for
 either. Everything runs on Linux,
@@ -259,7 +264,13 @@ the Windows packaging included (NSIS, makemsix). Every vendored library and
 toolchain is cached by the script that builds it, one cache per library keyed
 by its version, its own script and the compiler that builds it, so a change to
 one script rebuilds that library alone; a cache is saved as soon as the step
-that builds it has run, and a cache unused for seven days is evicted.
+that builds it has run, and a cache unused for seven days is evicted. The
+Linux client's pinned build inputs are cached the same way, by the files that
+pin them: the Freedesktop SDK and runtime with the sysroot over each
+architecture's SDK, one cache keyed by
+`packaging/linux-client/freedesktop-runtime.conf` and its script, and the
+Ubuntu 24.04 arm64 sysroot with the packages it is unpacked from, keyed by
+`scripts/build/sysroot_ubuntu_arm64.list` and its script (VENDORS.md §2).
 `tools/toolchains.sh` says, when run by hand, whether a pinned toolchain is
 behind upstream.
 
@@ -289,8 +300,9 @@ The maintainers cut releases; a contributor does nothing for one. A
 release-candidate runs the full suite on the `staging` tip, builds and stores
 what a release ships, by commit, and tags it `release-N-rcK`, published as a
 prerelease; a release takes one release-candidate and publishes the same
-binaries, numbered N, to apt, dnf, the container registries and the GitHub
-release (the tarballs and the Windows installer), appends a `Release N`
+binaries, numbered N, to apt, dnf, the Linux client's Flatpak repository,
+the container registries and the GitHub release (the tarballs, the Linux
+client's Flatpak bundles and the Windows installer), appends a `Release N`
 snapshot to `main`, closes the issues it shipped, those of the
 documentation it carries included, removes the workflow label each one
 carries, `parked` included (from one closed already too; only its type stays), and sends the list of them, each as filed,
@@ -312,7 +324,7 @@ A release takes one release-candidate, by its tag:
 | Job | Environment | What it does |
 |---|---|---|
 | `prepare` | `release` | Refuses any ref but a release-candidate's tag; resolves it to its commit and number; checks every credential and the public tracker's token; fetches the stored build and verifies it; checks the number is the next one and that `main` can take the commit; then, last, reserves the number as the `release-N` tag. |
-| `deploy` | `release` | Publishes the packages the release-candidate wrapped under N (`.deb`, `.rpm`, tarballs; `prepare` refuses a build wrapped under another number), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories to both buckets, the GitHub release and the images, then verifies what it published (`scripts/release/smoke.sh`). |
+| `deploy` | `release` | Publishes the packages the release-candidate wrapped under N (the daemon's `.deb`, `.rpm` and tarballs, and the Linux client's `.deb`, `.rpm` and Flatpak bundles; `prepare` refuses a build wrapped under another number), builds the Windows installer and MSIX (signed when configured), moves `main`, publishes the apt and dnf repositories, with the daemon and the client side by side, and the client's Flatpak repository to both buckets, the GitHub release (the tarballs, the Flatpak bundles and the Windows installer) and the images, then verifies what it published (`scripts/release/smoke.sh`). |
 | `finish` | `release` | Closes the shipped issues and removes their workflow labels, sends the release notes, removes the release-candidates of N, and copies `main`, `staging`, the tag and the release to the public repository; a failure in any part is reported and the rest still run. |
 | `unreserve` | `release` | Only after a failure before anything was published: returns the number. |
 

@@ -246,9 +246,11 @@ SDLTEXT_INC    := -Isdltext
 FT_PKGS   := freetype2 harfbuzz fontconfig
 FT_CFLAGS  = $(shell pkg-config --cflags $(FT_PKGS) 2>/dev/null)
 FT_LIBS    = $(shell pkg-config --libs $(FT_PKGS) 2>/dev/null)
-#   $(call oc_need_pkgs,<target>,<pkg-config names>)  a recipe's first line:
-#   fails, naming each package pkg-config cannot find, before anything compiles.
-oc_need_pkgs = @missing=; for p in $(2); do pkg-config --exists $$p 2>/dev/null || missing="$$missing $$p"; done; \
+#   $(call oc_need_pkgs,<target>,<pkg-config names>[,<pkg-config command>])
+#   a recipe's first line: fails, naming each package pkg-config cannot find,
+#   before anything compiles. The command is pkg-config unless a sysroot's is
+#   given (mk/linux.mk, LINUX_PKG_CONFIG).
+oc_need_pkgs = @missing=; for p in $(2); do $(or $(3),pkg-config) --exists $$p 2>/dev/null || missing="$$missing $$p"; done; \
     if [ -n "$$missing" ]; then echo "openchime: $(1) needs the development packages of:$$missing (pkg-config names)" >&2; exit 1; fi
 # motion.c is GUI source compiled into the tests the same way: the arithmetic
 # of what moves on screen, and what "Reduce motion" stills, is asserted by

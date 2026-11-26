@@ -9,8 +9,8 @@
 #                                  variables; it builds nothing a release ships
 #
 # PART only splits the work into the steps CI runs, one part each, in turn:
-# plain then threads in test-all.yml's one job, packages, image and windows in
-# release-candidate.yml's `stage`. Unset, every part in turn:
+# plain, threads and linux-client in test-all.yml's one job, packages, image
+# and windows in release-candidate.yml's `stage`. Unset, every part in turn:
 #
 #   plain     the daemon with every feature, the Linux TUI, the Linux GUI, the
 #             web client, the test binary, the e2e and demo clients, the
@@ -35,11 +35,21 @@
 #   windows   the Windows GUI and TUI, and the installer and MSIX from them
 #             under PKG_VERSION, in WIN_DIST; then their version resources,
 #             the installer and the MSIX
+#   linux-client
+#             the Linux GUI for ARCH as the release builds it (gcc 12), twice:
+#             against Ubuntu 24.04's libraries (the machine's for x86_64, the
+#             pinned arm64 sysroot's for aarch64), packaged as the .deb and
+#             the .rpm, and against the pinned Freedesktop SDK, assembled as
+#             the Flatpak, all under PKG_VERSION, in DIST; then the desktop
+#             entry and the metainfo validate, the packages hold the client
+#             for ARCH with the dependencies they declare, the .deb's client
+#             says its version where it can run, and the Flatpak names its
+#             runtime and its sandbox (scripts/test/full/linux_client.sh)
 #
 # A check on a binary or an image this machine cannot run says so and skips
 # it (the arm64 package and image, on an x86 runner).
 FULL_SWITCHES := TTS=1 STT=1 SUM=1 WEB=1 EXPORT=1 CALLREC=1 REMEMBER=0
-FULL_PARTS    := plain threads packages image windows
+FULL_PARTS    := plain threads packages image windows linux-client
 PKG_ARCH    ?= $(if $(filter aarch64,$(ARCH)),arm64,amd64)
 PKG_VERSION ?= 0
 DIST        ?= dist/linux-$(PKG_ARCH)
@@ -123,3 +133,27 @@ build-all-windows:
 	packaging/build-windows.sh $(PKG_VERSION) $(WIN_BIN) $(WIN_DIST)
 test-all-windows:
 	scripts/test/full/windows.sh $(WIN_BIN) $(WIN_DIST) $(PKG_VERSION)
+
+# --- linux-client -------------------------------------------------------------
+# The Linux client's packages for ARCH, built on Ubuntu 24.04 (ARCH-20): the
+# .deb and the .rpm carry one binary, built against Ubuntu 24.04's libraries,
+# and the Flatpak another, built against the SDK of the runtime it runs on
+# (mk/linux.mk, "Sysroots"). aarch64 is cross-compiled, with no emulation:
+# the arm64 libraries are a sysroot's, never packages installed on the
+# machine. Only this part's own files in DIST are replaced, so it can share
+# DIST with the packages part, and with the other architecture's.
+LINUX_CLIENT_MAKE    = $(MAKE) --no-print-directory RELEASE=1 REMEMBER=0
+LINUX_CLIENT_DEB_BIN = $(LINUX_GUI_BIN)
+LINUX_CLIENT_FP_BIN  = build$(BUILD_SUFFIX)/$(notdir $(FLATPAK_SYSROOT))/openchime-gui
+LINUX_CLIENT_RPM_ARCH := $(if $(filter aarch64,$(ARCH)),aarch64,x86_64)
+build-all-linux-client:
+	+@$(LINUX_CLIENT_MAKE) linux-gui
+	+@$(LINUX_CLIENT_MAKE) LINUX_SYSROOT=$(FLATPAK_SYSROOT) linux-gui
+	mkdir -p $(DIST)
+	rm -rf $(DIST)/openchime_$(PKG_VERSION)_$(PKG_ARCH).deb $(DIST)/openchime-$(PKG_VERSION)-1.$(LINUX_CLIENT_RPM_ARCH).rpm \
+	    $(DIST)/io.openchime.OpenChime-$(PKG_VERSION)-$(ARCH).flatpak
+	packaging/build-client-rpm.sh     $(PKG_VERSION) $(PKG_ARCH) $(LINUX_CLIENT_DEB_BIN) $(DIST) >/dev/null
+	packaging/build-client-deb.sh     $(PKG_VERSION) $(PKG_ARCH) $(LINUX_CLIENT_DEB_BIN) $(DIST)
+	packaging/build-client-flatpak.sh $(PKG_VERSION) $(ARCH) $(LINUX_CLIENT_FP_BIN) $(DIST)
+test-all-linux-client:
+	scripts/test/full/linux_client.sh $(DIST) $(PKG_VERSION) $(ARCH)

@@ -40,7 +40,7 @@
 # mk/, one file per concern; scripts/test/fast/make_targets.sh keeps the typed
 # targets (the list above and PUBLIC/INTERNAL) in step, not this tool list.
 PUBLIC   := build test build-all test-all run linux-gui clean distclean
-INTERNAL := daemon fast-build fast-test build-dir linux windows web FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows test-all-plain test-all-threads test-all-packages test-all-image test-all-windows clean-run run-build
+INTERNAL := daemon fast-build fast-test build-dir linux windows web FORCE build-all-plain build-all-threads build-all-packages build-all-image build-all-windows build-all-linux-client test-all-plain test-all-threads test-all-packages test-all-image test-all-windows test-all-linux-client clean-run run-build
 
 # --- One build at a time (docs/details/TESTING.md, "One build at a time") --------------
 # One recipe at a time, in this make and every make it starts, whatever -j or

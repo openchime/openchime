@@ -42,9 +42,16 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
   registry is the one source of every `OPENCHIME_*` name; nothing that ships
   runs in development mode; the tests' own rules (§2.3a); every linked
   component has its licence notice; what a release lists, closes and
-  sends as shipped; and the speech data's archive tool checking, joining and
+  sends as shipped; the speech data's archive tool checking, joining and
   unpacking a stand-in archive offline, refusing a changed file by name
-  (`scripts/test/fast/speech_sources.sh`);
+  (`scripts/test/fast/speech_sources.sh`); the apt and rpm repositories
+  taking a release's packages, the daemon's and the Linux client's side by
+  side, one version more of each package name per architecture, and
+  refusing a second copy of a version (`scripts/test/fast/repo_update.sh`);
+  and the Flatpak repository taking a release's bundles for both
+  architectures, its summary signed, and refusing a changed summary
+  (`scripts/test/fast/flatpak_repo.sh`); both on a local-path rclone remote
+  with a throwaway signing key;
 - actionlint on the workflows (`scripts/test/fast/actionlint.sh`, fetched
   pinned on first use);
 - the suites `tests/main.c` marks `FAST`, one after another (§2.4), timing judged;
@@ -75,20 +82,36 @@ steps CI runs one after another (`mk/full.mk`):
 - `image` — the image laid from that tree; then it starts, and its database
   replicates and restores (§3.2);
 - `windows` — the Windows binaries, the installer and the MSIX; then their
-  version resources, the installer and the MSIX.
+  version resources, the installer and the MSIX;
+- `linux-client` — the Linux client for `ARCH` (x86_64, aarch64), built
+  twice with gcc 12: against Ubuntu 24.04's libraries (the machine's for
+  x86_64, the pinned arm64 sysroot's for aarch64) and packaged as the `.deb`
+  and the `.rpm`, and against the pinned Freedesktop SDK and assembled as the
+  Flatpak (VENDORS.md §2); then the desktop entry and the metainfo validate,
+  the packages hold the client for `ARCH` needing no glibc newer than 2.39,
+  with every library it links among their dependencies, the `.deb`'s client
+  prints its version where the machine can run it, and the Flatpak names
+  its runtime and its sandbox (`scripts/test/full/linux_client.sh`). arm64
+  is cross-compiled with no emulation, and no arm64 package is installed on
+  the machine.
 
 The code tests (`plain`, then `threads`, in one job) run in `test-all.yml`,
 which `release-candidate.yml` calls as its `test` job: they start the daemon
 in development mode, which no release-path workflow may
-(`scripts/test/fast/release_lint.sh`). The rest runs in
+(`scripts/test/fast/release_lint.sh`). `linux-client` runs there too, after
+them, for both architectures: the client's packages build on Ubuntu 24.04,
+the job's runner, and reach `stage` as an artifact. The rest runs in
 `release-candidate.yml`'s `stage` job, on the artifacts it then stores and
 publishes. A check on a binary or an image the runner cannot execute (the
 arm64 ones on an x86 runner) says so and skips.
 
 **After a release publishes**, `release.yml` verifies what it published
 (`scripts/release/smoke.sh`, every check in `scripts/release/smoke/`: the apt
-and dnf repositories install it, each index lists it once more, the released
-image pulls and runs). That is release verification, not a suite: it checks a
+and dnf repositories install the daemon, and the Linux client on
+`ubuntu:24.04` and Rocky Linux 10; each index lists the release once more,
+and the Flatpak repository's signed summary its client; the Flatpak
+repository adds from its `.flatpakrepo` and lists the client for both
+architectures; the released image pulls and runs). That is release verification, not a suite: it checks a
 publication, not a change.
 
 **Manual harnesses** live in `tools/` and are run by hand, never by either
@@ -142,10 +165,14 @@ harnesses in the full suite (§2.2b, "Fuzzing"). A concurrency load test
 llvm-mingw for the Windows clients) and `python3`. The vendored libraries and the toolchain build themselves on first
 use (`scripts/build/*.sh`, `mk/toolchains.mk`); no Emscripten is
 needed. actionlint is fetched once into
-`~/.cache/openchime/`. Four things are checked only where present, and a
+`~/.cache/openchime/`. The repository checks (`repo_update.sh`,
+`flatpak_repo.sh`) need `rclone`, `gpg`, `dpkg-deb`, `apt-ftparchive`
+(`apt-utils`), `rpmbuild` and `rpmsign` (`rpm`), `flatpak` and `ostree`.
+Five things are checked only where present, and a
 missing one is a `SKIP` (a failure where `CI` is set): `ffprobe` (package
-`ffmpeg`, the media suite's recording check, a full-suite suite), an IPv6
-loopback (`::1`), a non-loopback LAN address (`test_client_core`'s
+`ffmpeg`, the media suite's recording check, a full-suite suite),
+`createrepo_c` (package `createrepo-c`, the rpm half of `repo_update.sh`), an
+IPv6 loopback (`::1`), a non-loopback LAN address (`test_client_core`'s
 certificate-trust checks), and a kernel that leaves a connection attempt
 pending (`test_sock`'s connect bound, skipped when the kernel answers every
 SYN). `gdb` is optional and makes a crash print every thread's stack.
@@ -158,7 +185,12 @@ ThreadSanitizer part, a clang with libFuzzer for the fuzzing harnesses,
 packages of FreeType, HarfBuzz, fontconfig, GLib, libsecret and libpipewire,
 the X11, Wayland, xkbcommon, EGL, OpenGL and libdecor headers SDL3's Linux
 build needs, the DejaVu fonts, `dbus-run-session`, `pipewire` and
-`wireplumber` (DEVELOPMENT.md, "The Linux GUI", names the Ubuntu packages); and for the release's artifacts
+`wireplumber` (DEVELOPMENT.md, "The Linux GUI", names the Ubuntu packages); for
+the Linux client's packages gcc 12 and Ubuntu's gcc 12 cross compiler for
+arm64, `flatpak` and `ostree`, `desktop-file-validate`
+(`desktop-file-utils`), `appstreamcli` (`appstream`), `rpm` and `cpio`, with
+the Freedesktop SDK and the Ubuntu arm64 sysroot, which the build fetches
+pinned (VENDORS.md §2); and for the release's artifacts
 `podman`, `buildah`, `rpm`, `cpio`, `nsis`, `python3-pefile`, and clang and
 the pinned CMake `scripts/build/makemsix.sh` fetches.
 
