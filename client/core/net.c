@@ -4030,6 +4030,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 s.before_ms  = before_ms;
                 s.sort        = c->op;                  /* OC_SEARCH_* */
                 s.cursor_rank = c->rank;
+                s.channel_id  = sq.in[0] ? 0 : c->channel_id;   /* one conversation; a typed in: wins (53) */
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

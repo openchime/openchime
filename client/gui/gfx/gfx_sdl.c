@@ -35,6 +35,7 @@ typedef struct {
 struct gfx {
     SDL_Renderer *r;
     float         scale;
+    float         ox, oy;      /* the origin everything is drawn from, DIPs (gfx_set_origin) */
     SDL_Rect      clips[CLIP_MAX];
     int           nclip;
     icon_ent      icons[ICON_CACHE_N];
@@ -106,7 +107,23 @@ void gfx_end(gfx *g)
     SDL_RenderPresent(g->r);
 }
 
+/* The public calls add the origin once and call these; a call from one shape
+ * to another inside this file goes to these, so nothing is moved twice. */
+static void s_fill(gfx *g, gfx_rect r, uint32_t rgb, float a);
+static void s_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a);
+
+void gfx_set_origin(gfx *g, float x, float y)
+{
+    if (g) { g->ox = x; g->oy = y; }
+}
+
 void gfx_fill(gfx *g, gfx_rect r, uint32_t rgb, float a)
+{
+    r.x += g->ox; r.y += g->oy;
+    s_fill(g, r, rgb, a);
+}
+
+static void s_fill(gfx *g, gfx_rect r, uint32_t rgb, float a)
 {
     SDL_FColor c = fcol(rgb, a);
     SDL_FRect fr = { r.x * g->scale, r.y * g->scale, r.w * g->scale,
@@ -244,11 +261,17 @@ static void fan_round(gfx *g, gfx_rect shape, float radius, SDL_FColor c,
 
 void gfx_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
 {
+    r.x += g->ox; r.y += g->oy;
+    s_fill_round(g, r, radius, rgb, a);
+}
+
+static void s_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
+{
     float e = feather_u(g);
     /* Below the ramp's own width there is no room for it, and a square fill is
      * what the radius rounds to anyway. */
     if (radius <= 0.5f || r.w <= 2.0f * e || r.h <= 2.0f * e) {
-        gfx_fill(g, r, rgb, a);
+        s_fill(g, r, rgb, a);
         return;
     }
     fan_round(g, r, radius, fcol(rgb, a), NULL, 0.0f, 0.0f, 1.0f, 1.0f);
@@ -257,13 +280,14 @@ void gfx_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
 void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
                       float a)
 {
+    r.x += g->ox; r.y += g->oy;
     /* Centered on the path, like the Direct2D stroke it replaces. */
     float h = w / 2.0f;
     float e = feather_u(g);
     if (r.w - 2.0f * (h + e) < 0.0f || r.h - 2.0f * (h + e) < 0.0f) {
         /* Thicker than the shape: there is no hole left, so it is a fill. */
         gfx_rect outer = { r.x - h, r.y - h, r.w + w, r.h + w };
-        gfx_fill_round(g, outer, radius + h, rgb, a);
+        s_fill_round(g, outer, radius + h, rgb, a);
         return;
     }
     /* Four rings: the ramp's outer lip, the opaque band, the ramp's inner lip.
@@ -311,6 +335,7 @@ void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
 void gfx_line(gfx *g, float x0, float y0, float x1, float y1, float w,
               uint32_t rgb, float a)
 {
+    x0 += g->ox; x1 += g->ox; y0 += g->oy; y1 += g->oy;
     float dx = x1 - x0, dy = y1 - y0;
     float len = sqrtf(dx * dx + dy * dy);
     if (len < 1e-6f)
@@ -432,6 +457,7 @@ static void ellipse_ring(gfx *g, float cx, float cy, float rx, float ry,
 void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
                  float a)
 {
+    cx += g->ox; cy += g->oy;
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx, 0.0f, rgb, a))
         return;
@@ -469,6 +495,7 @@ void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
 void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
                         float w, uint32_t rgb, float a)
 {
+    cx += g->ox; cy += g->oy;
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx + w / 2.0f, w, rgb, a))
         return;
@@ -507,6 +534,7 @@ void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
 
 void gfx_clip_push(gfx *g, gfx_rect r)
 {
+    r.x += g->ox; r.y += g->oy;
     SDL_Rect px = { (int)floorf(r.x * g->scale), (int)floorf(r.y * g->scale),
                     (int)ceilf(r.w * g->scale), (int)ceilf(r.h * g->scale) };
     if (g->nclip > 0) {
@@ -586,6 +614,7 @@ void gfx_tex_size(const gfx_tex *t, int *w, int *h)
 
 void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
 {
+    dst.x += g->ox; dst.y += g->oy;
     SDL_SetTextureAlphaModFloat(t->t, a);
     if (radius <= 0.5f) {
         SDL_FRect fr = { dst.x * g->scale, dst.y * g->scale, dst.w * g->scale,
@@ -621,6 +650,7 @@ void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
 void gfx_tex_draw_shaped(gfx *g, gfx_tex *t, gfx_rect shape, float radius,
                          gfx_rect map, float a)
 {
+    shape.x += g->ox; shape.y += g->oy; map.x += g->ox; map.y += g->oy;
     SDL_SetTextureAlphaModFloat(t->t, a);
     float mx = map.x * g->scale, my = map.y * g->scale;
     float mw = map.w * g->scale, mh = map.h * g->scale;
@@ -704,6 +734,7 @@ static SDL_Texture *icon_raster(gfx *g, int icon_id, int pw, float stroke_w)
 void gfx_icon(gfx *g, int icon_id, gfx_rect box, float stroke_w, uint32_t rgb,
               float a)
 {
+    box.x += g->ox; box.y += g->oy;
     float side = box.w < box.h ? box.w : box.h;
     int pw = (int)(side * g->scale + 0.5f);
     if (pw < 2)

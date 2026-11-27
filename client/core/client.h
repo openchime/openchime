@@ -177,6 +177,9 @@ void oc_client_close_thread(oc_client *c);
 void oc_client_open_search(oc_client *c);
 /* `sort` is OC_SEARCH_NEWEST, _OLDEST or _RELEVANCE (protocol.h). */
 void oc_client_search(oc_client *c, const char *query, uint8_t sort);
+/* The same, limited to one conversation by id (REQ-080), 0 for none. A typed
+ * `in:` in the query wins: no id is sent, and `in:` works by name. */
+void oc_client_search_in(oc_client *c, const char *query, uint8_t sort, uint64_t channel_id);
 /* Next page of the current search, in its order, from the last hit shown. */
 void oc_client_search_more(oc_client *c);
 void oc_client_close_search(oc_client *c);

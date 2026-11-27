@@ -9618,6 +9618,12 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     if (j->sq_in && j->sq_in[0])
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND LOWER(COALESCE(c.name,''))=LOWER(?6) ");
+    /* One conversation by id (REQ-080): a DM's too, which has no name for in:
+     * to match. Inside the read rule above, so one the searcher cannot read
+     * gives nothing, as any other unreadable message does. A scope alone is
+     * not a search: it needs text or a filter, as before. */
+    if (j->sq_channel)
+        k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.channel_id = ?10 ");
     if (j->sq_has & 0x01u)   /* file: any attachment */
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id) ");
@@ -9659,6 +9665,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     if (j->sq_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)j->sq_before);
     if (j->message_id && sort == OC_SEARCH_RELEVANCE)
         sqlite3_bind_int64(st, 9, (sqlite3_int64)j->search_cursor_rank);
+    if (j->sq_channel) sqlite3_bind_int64(st, 10, (sqlite3_int64)j->sq_channel);
 
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
@@ -9694,7 +9701,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
      * the first page of a plain text search, newest first, after the message
      * hits and without repeating one; a filtered or later page is the
      * messages' alone, since those filters and cursors are the messages'. */
-    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+    if (arr && have_text && !have_filter && !j->sq_channel && !j->message_id && n < lim &&
         sqlite3_prepare_v2(db,
             "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, md.title "
             "  FROM snippets_fts s JOIN attachments a ON a.id = s.rowid "
@@ -9737,7 +9744,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
      * people, joining the first page of a plain text search as snippets do,
      * newest call first. A hit names the call and the line, which its page
      * opens at. */
-    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+    if (arr && have_text && !have_filter && !j->sq_channel && !j->message_id && n < lim &&
         sqlite3_prepare_v2(db,
             "SELECT l.id, t.call_id, COALESCE((SELECT ch.id FROM channels ch WHERE ch.call_id=t.call_id),0),"
             "       COALESCE(l.speaker,0), c.started_at_ms + l.start_ms,"

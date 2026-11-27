@@ -623,6 +623,10 @@ where one exists.
 - **REQ-080.** Full-text search has covered the complete message history
   visible to the searching user (i.e., channels they are a member of, per
   REQ-031), with no retention cutoff, implemented via SQLite FTS5 (ARCH-15).
+  A search has been able to be **limited to one conversation** -- a channel, a
+  DM or a group DM, by its id -- under the same read rule, and a graphical
+  client has offered one always-present search field that limits itself to the
+  open conversation and can widen to everywhere.
 - **REQ-081.** Search has accepted **structured operators** that scope a query —
   at minimum `from:<user>`, `in:<channel>`, `has:<file|link|image|video>`, and a date
   range (`before:`/`after:`/`on:`) — combined with free-text terms, all still

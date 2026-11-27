@@ -267,8 +267,12 @@
  * 52: a mute for a set time (REQ-137). SET_MUTE carries `minutes` (u32) after
  * `muted`, and each NOTIFY_PREFS entry `muted_until_ms` (u64) after
  * `follow_threads`: a field appended to a fixed layout and one to a repeated
- * entry. */
-#define OC_PROTOCOL_VERSION 52u
+ * entry.
+ *
+ * 53: SEARCH carries `channel_id` (u64) after `cursor_rank`, a search limited
+ * to one conversation by id, a DM's included (REQ-080). A field appended to a
+ * fixed layout. */
+#define OC_PROTOCOL_VERSION 53u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -2352,6 +2356,8 @@ typedef struct {
                                      * knows the user's timezone */
     uint8_t  sort;           /* OC_SEARCH_*; 0 = newest first */
     int64_t  cursor_rank;    /* relevance paging: the last row's rank */
+    uint64_t channel_id;     /* one conversation, by id; 0 = no conversation scope.
+                              * Since protocol 53 (REQ-080) */
 } oc_search;
 /* `action` 1: the message is an action and the snippet is cut from its action
  * text (REQ-058). */

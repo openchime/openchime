@@ -544,13 +544,18 @@ void oc_client_open_search(oc_client *c) {
 }
 
 void oc_client_search(oc_client *c, const char *query, uint8_t sort) {
+    oc_client_search_in(c, query, sort, 0);
+}
+
+void oc_client_search_in(oc_client *c, const char *query, uint8_t sort, uint64_t channel_id) {
     if (!c || !query || !query[0]) return;
-    oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */
+    oc_model_search_begin_scoped(&c->model, query, channel_id);   /* clears prior hits + records it */
     c->model.search_sort = sort;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
     if (!cmd) return;
     cmd->body = strdup(query);
     cmd->op = sort;
+    cmd->channel_id = c->model.search_scope;      /* 0 when a typed in: won */
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -570,6 +575,7 @@ void oc_client_search_more(oc_client *c) {
     cmd->op = c->model.search_sort;
     cmd->message_id = last->message_id;
     cmd->rank = last->rank;
+    cmd->channel_id = c->model.search_scope;      /* the same conversation, page after page */
     oc_queue_push(&c->cmds, cmd);
 }
 

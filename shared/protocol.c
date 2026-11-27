@@ -3465,6 +3465,7 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     oc_w_u64(w, m->before_ms);
     oc_w_u8(w, m->sort);                            /* 28 */
     oc_w_u64(w, (uint64_t)m->cursor_rank);
+    oc_w_u64(w, m->channel_id);                     /* 53 */
     return oc_frame_end(w, off);
 }
 
@@ -5041,6 +5042,7 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
     m->before_ms  = oc_r_u64(p);
     m->sort        = oc_r_u8(p);
     m->cursor_rank = (int64_t)oc_r_u64(p);
+    m->channel_id  = oc_r_u64(p);
     return r_done(p);
 }
 

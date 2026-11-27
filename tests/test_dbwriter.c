@@ -14222,6 +14222,89 @@ static void test_connections(void) {
     cleanup_db(path);
 }
 
+/* A search limited to one conversation by id (REQ-080): a DM, a group DM and a
+ * channel, which in: cannot name; a conversation the searcher cannot read gives
+ * nothing; 0 is every conversation; in: and the id apply together; a scope alone
+ * is not a search. */
+static oc_dbres *search_in_conv(oc_dbwriter *w, uint64_t uid, const char *text, const char *in, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 141);
+    j->user_id = uid;
+    j->search_limit = 50;
+    if (text && text[0]) oc_job_set_body(j, text, strlen(text));
+    if (in && in[0]) j->sq_in = strdup(in);
+    j->sq_channel = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_search_conversation_scope(void) {
+    const char *path = tdb("searchconv.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sc-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "sc-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "sc-carol", "pw", OC_ROLE_MEMBER);
+    uint64_t dave  = reg(w, "sc-dave",  "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol && dave);
+
+    oc_dbres *r = open_dm(w, alice, bob);
+    uint64_t dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 142);
+    j->user_id = alice; j->group_uids[0] = bob; j->group_uids[1] = carol; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    uint64_t gdm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, alice, "vault", 0);
+    uint64_t priv = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(dm && gdm && priv);
+
+    uint64_t m_dm  = send_id(w, alice, dm,  "marmalade in the dm");
+    uint64_t m_gdm = send_id(w, alice, gdm, "marmalade in the group");
+    uint64_t m_ch  = send_id(w, alice, OC_DEFAULT_CHANNEL, "marmalade in general");
+    uint64_t m_pv  = send_id(w, alice, priv, "marmalade in the vault");
+    CHECK(m_dm && m_gdm && m_ch && m_pv);
+
+    r = search_in_conv(w, alice, "marmalade", NULL, dm);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 1 && r->search[0].message_id == m_dm);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, gdm);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_gdm);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_ch);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, 0);                 /* unscoped: all four */
+    CHECK(r && r->n_search == 4);
+    oc_dbres_free(r);
+
+    /* Someone who cannot read it gets nothing, and no error. */
+    r = search_in_conv(w, dave, "marmalade", NULL, dm);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search_in_conv(w, dave, "marmalade", NULL, priv);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* in: and the id both apply. */
+    r = search_in_conv(w, alice, "marmalade", "general", OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_search == 1);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", "general", dm);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* A scope alone is not a search. */
+    r = search_in_conv(w, alice, NULL, NULL, dm);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* A mute for a set time (REQ-137): stored as now plus the minutes, cut to a
  * week; a mute with no end stores none; unmuting clears both; and a snapshot
  * reports a passed instant as unmuted. */
@@ -14327,6 +14410,7 @@ int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
     test_timed_mute();
+    test_search_conversation_scope();
     test_call_recordings();
     test_mcp_audit();
     test_retention_off();

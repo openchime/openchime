@@ -759,6 +759,7 @@ typedef struct oc_job {
      * predicates, never a grammar to interpret. */
     char          *sq_from;      /* heap; "" or NULL = any */
     char          *sq_in;
+    uint64_t       sq_channel;   /* one conversation by id, 0 for none (REQ-080) */
     uint8_t        sq_has;
     uint64_t       sq_after, sq_before;
 

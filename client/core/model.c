@@ -6,7 +6,8 @@
 #include "releasenotes.h"
 #include "richtext.h"
 #include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
-#include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
+#include "notify.h"
+#include "searchq.h"   /* a typed in: wins over a search's scope */    /* oc_notify_decide — the one notify rule (ARCH-103) */
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
 #include "oc_port.h"    /* oc_localtime_r */
@@ -969,12 +970,40 @@ void oc_model_close_search(oc_model *m) {
     m->search_open = 0;
     m->search_truncated = 0;
     m->search_query[0] = '\0';
+    m->search_scope = 0;
 }
 
 void oc_model_search_begin(oc_model *m, const char *query) {
+    oc_model_search_begin_scoped(m, query, 0);
+}
+
+void oc_model_search_begin_scoped(oc_model *m, const char *query, uint64_t scope) {
     oc_model_close_search(m);      /* drop any prior hits */
     m->search_open = 1;
     snprintf(m->search_query, sizeof m->search_query, "%s", query ? query : "");
+    oc_searchq sq;
+    oc_searchq_parse(m->search_query, &sq);
+    m->search_scope = sq.in[0] ? 0 : scope;      /* a typed in: wins */
+}
+
+void oc_model_search_target(const oc_model *m, int view, uint64_t conv, oc_search_target *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->kind = OC_ST_MESSAGES;
+    snprintf(out->placeholder, sizeof out->placeholder, "Search messages");
+    if (view == OC_SV_FILES)  { out->kind = OC_ST_FILES;  snprintf(out->placeholder, sizeof out->placeholder, "Search files");  return; }
+    if (view == OC_SV_PEOPLE) { out->kind = OC_ST_PEOPLE; snprintf(out->placeholder, sizeof out->placeholder, "Search people"); return; }
+    if (view != OC_SV_CONVERSATION || !m || !conv) return;
+    const oc_channel *c = oc_model_channel((oc_model *)m, conv);
+    if (!c || c->e2e) return;                    /* the server cannot search it */
+    out->scope = conv;
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        char t[128] = "";
+        oc_model_dm_title(m, c, t, sizeof t);
+        snprintf(out->placeholder, sizeof out->placeholder, "Search %s", t[0] ? t : "this conversation");
+    } else {
+        snprintf(out->placeholder, sizeof out->placeholder, "Search #%s", c->name && c->name[0] ? c->name : "channel");
+    }
 }
 
 void oc_model_close_reactlist(oc_model *m) {

@@ -7130,6 +7130,58 @@ static int chat_search(client *c, const char *q, uint64_t chat, uint64_t mid) {
     return 0;
 }
 
+/* A search limited to one conversation by id, over the wire (REQ-080): alice
+ * and bob share a DM and the general channel, the same word in each; bob's
+ * search scoped to the DM finds only the DM's message, and carol, who is not
+ * in it, finds nothing with the same scope. */
+static int scoped_search(client *c, const char *q, uint64_t ch, oc_search_result_entry *ents, uint16_t *n) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq; memset(&sq, 0, sizeof sq);
+    sq.query = oc_slice_str(q);
+    sq.limit = 50;
+    sq.channel_id = ch;
+    if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p; uint8_t tr = 0;
+    if (read_type(c, OC_MSG_SEARCH_RESULTS, &hdr, &p) != 0) return -1;
+    return oc_decode_search_results(&p, ents, 64, n, &tr) == OC_OK ? 0 : -1;
+}
+
+static void test_search_conversation_scope_vertical(int port, const uint8_t *pin) {
+    client a, b, cc;
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&cc, port, pin) == 0 && do_handshake(&cc) == 0 && do_auth(&cc, "carol", "pw", &uc) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    const char *bodies[2] = { "quillwort in the dm", "quillwort in general" };
+    uint64_t chans[2] = { dm, OC_DEFAULT_CHANNEL }, mids[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s = {0}; s.channel_id = chans[i]; memset(s.idem, 0xE5 + i, OC_IDEM_SIZE); s.body = oc_slice_str(bodies[i]);
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+        oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+        mids[i] = bc.message_id;
+    }
+    static oc_search_result_entry ents[64]; uint16_t n = 0;
+    CHECK(scoped_search(&b, "quillwort", dm, ents, &n) == 0);
+    CHECK(n == 1 && ents[0].channel_id == dm && ents[0].message_id == mids[0]);
+    CHECK(scoped_search(&b, "quillwort", 0, ents, &n) == 0);
+    CHECK(n == 2);
+    CHECK(scoped_search(&cc, "quillwort", dm, ents, &n) == 0);
+    CHECK(n == 0);
+    (void)uc;
+    client_close(&cc);
+    client_close(&b);
+    client_close(&a);
+}
+
 static void test_call_chat(int port, const uint8_t *pin) {
     client a, b, c;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -10808,6 +10860,7 @@ int run_netloop_tests(void) {
         test_call_vertical(arg.port, pin);
         test_call_message(arg.port, pin);
         test_call_chat(arg.port, pin);
+        test_search_conversation_scope_vertical(arg.port, pin);
         test_call_history(arg.port, pin, dbw);
         test_call_recording(arg.port, pin);
         test_calls_closed_at_start();

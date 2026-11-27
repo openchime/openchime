@@ -4088,6 +4088,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->message_id = sq.before_id;
             j->sq_from   = sq.from_name.len  ? strndup((const char *)sq.from_name.ptr, sq.from_name.len)   : NULL;
             j->sq_in     = sq.in_channel.len ? strndup((const char *)sq.in_channel.ptr, sq.in_channel.len) : NULL;
+            j->sq_channel = sq.channel_id;                  /* 53 */
             j->sq_has    = sq.has_mask;
             j->sq_after  = sq.after_ms;
             j->sq_before = sq.before_ms;

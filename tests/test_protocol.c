@@ -1684,6 +1684,32 @@ static void test_search_frames(void) {
         CHECK(oc_decode_search(&p, &out) == OC_OK);
         CHECK(out.sort == OC_SEARCH_RELEVANCE && out.cursor_rank == -4321987 && out.before_id == 990);
     }
+    /* One conversation by id (53, REQ-080): nonzero and 0 cross intact, and a
+     * frame cut off before the id is refused rather than read as unscoped. */
+    CHECK(OC_PROTOCOL_VERSION == 53);
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25, .channel_id = 0x1122334455667788ull };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK && out.channel_id == 0x1122334455667788ull);
+        CHECK(slice_eq_str(out.query, "deploy"));
+    }
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out = { .channel_id = 9 };
+        CHECK(oc_decode_search(&p, &out) == OC_OK && out.channel_id == 0);
+    }
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25, .channel_id = 7 };
+        uint8_t fr[256];
+        oc_wbuf w2; oc_wbuf_init(&w2, fr, sizeof fr);
+        CHECK(oc_encode_search(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2; oc_search out;
+        CHECK(oc_parse_frame(fr, w2.len, &h2, &p2) == OC_OK);
+        p2.len -= 8;                                     /* the id missing */
+        CHECK(oc_decode_search(&p2, &out) == OC_E_MALFORMED);
+    }
     {
         oc_search_result_entry ents[2] = {
             { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0, -2500000, 0, 0 },
@@ -1900,7 +1926,7 @@ static void test_notify_frames(void) {
         CHECK(got[1].muted == 1 && got[1].muted_until_ms == 1700000123456ull);
     }
     /* A mute for a set time (REQ-137): the minutes travel, and 0 is no end. */
-    CHECK(OC_PROTOCOL_VERSION == 52);
+    CHECK(OC_PROTOCOL_VERSION >= 52);   /* timed mutes since 52 */
     {
         oc_set_mute in = { 7, 1, 120 };
         ROUNDTRIP(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_MUTE, h, p);

@@ -221,8 +221,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 52** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 53** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 53 appended `channel_id` (u64) to `SEARCH`, after `cursor_rank`: a search
+> limited to one conversation by id, a DM's included (REQ-080, §5.11). Version
 > 52 appended `minutes` (u32) to `SET_MUTE`, after `muted`, and
 > `muted_until_ms` (u64) to each `NOTIFY_PREFS` entry, after `follow_threads`:
 > a mute for a set time (REQ-137, §5.16, §5.16d). Version
@@ -1600,6 +1602,7 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 | `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
 | `sort`        | u8   | `0` newest first (by id, descending), `1` oldest first (by id, ascending), `2` by relevance (best match first, ties by id ascending). Relevance with no `query` text falls back to newest first: nothing ranks a filters-only search. Since protocol 28. |
 | `cursor_rank` | i64  | Relevance paging: the last row's `rank`, with its id in `before_id`. A message posted since moves every bm25 score, so the daemon measures that row's rank afresh and uses `cursor_rank` only when the row no longer matches (edited or deleted). Ignored by the other orders. Since protocol 28. |
+| `channel_id`  | u64  | One conversation, by id — a channel, a DM or a group DM, a renamed channel included; `0` for no conversation scope. The daemon limits results to it under the same read rule as every other search: a conversation the searcher cannot read gives no results and no error. With `in_channel` too, both apply. An end-to-end DM is never searched, scoped or not (PRIVATE-DM.md). Required: a frame without it is malformed. Since protocol 53. |
 
 The operator grammar is parsed by `shared/searchq.c`, which the daemon and both
 frontends link, so the filter line a client shows and the `WHERE` clause the

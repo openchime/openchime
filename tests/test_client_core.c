@@ -2977,6 +2977,53 @@ static void test_timed_mute_model(void) {
     CHECK(oc_minutes_until_local(9, 30, 9, 0, 0) == 1410);
 }
 
+/* One search field (REQ-080): what it searches in each view and kind of
+ * conversation, and a search's scope as it begins, pages and widens, a typed
+ * in: winning over it. */
+static void test_search_target(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 20; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.body = strdup(""); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 30; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.e2e = 1; e.body = strdup(""); oc_model_apply(&m, &e);
+
+    oc_search_target t;
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 10, &t);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 10 && !strcmp(t.placeholder, "Search #general"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 20, &t);
+    char dmt[128] = ""; oc_model_dm_title(&m, oc_model_channel(&m, 20), dmt, sizeof dmt);
+    char want[160]; snprintf(want, sizeof want, "Search %s", dmt);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 20 && dmt[0] && !strcmp(t.placeholder, want));
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 30, &t);           /* end to end: unscoped */
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 0 && !strcmp(t.placeholder, "Search messages"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_FILES, 10, &t);
+    CHECK(t.kind == OC_ST_FILES && t.scope == 0 && !strcmp(t.placeholder, "Search files"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_PEOPLE, 0, &t);
+    CHECK(t.kind == OC_ST_PEOPLE && !strcmp(t.placeholder, "Search people"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_OTHER, 10, &t);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 0 && !strcmp(t.placeholder, "Search messages"));   /* contract: the field's words for each view are the plan's */
+
+    oc_model_search_begin_scoped(&m, "deploy", 20);
+    CHECK(m.search_open && m.search_scope == 20);
+    oc_model_search_begin_scoped(&m, "deploy in:general", 20);       /* typed in: wins */
+    CHECK(m.search_scope == 0);
+    oc_model_search_begin_scoped(&m, "deploy", 0);                   /* widened */
+    CHECK(m.search_scope == 0);
+    oc_model_search_begin_scoped(&m, "deploy", 10);
+    oc_model_close_search(&m);
+    CHECK(m.search_scope == 0);
+    oc_model_free(&m);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -7411,6 +7458,7 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_chanmem_overlap();
     test_sidebar();
+    test_search_target();
     test_timed_mute_model();
     test_rail_opts();
     test_chan_colors();
@@ -8114,6 +8162,23 @@ int run_client_core_tests(void) {
         }
         oc_client_close_search(a);
         CHECK(!oc_client_model(a)->search_open && oc_client_model(a)->n_search == 0);
+        /* ... limited to channel 1 by id (REQ-080): every hit is there, the
+         * model keeps the scope, and the next page asks for the same one. */
+        oc_client_search_in(a, "core", OC_SEARCH_NEWEST, 1);
+        CHECK(oc_client_model(a)->search_scope == 1);
+        CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int elsewhere = 0, found = 0;
+            for (size_t j = 0; j < am->n_search; j++) {
+                if (am->search_results[j].channel_id != 1) elsewhere = 1;
+                if (am->search_results[j].message_id == mid) found = 1;
+            }
+            CHECK(found && !elsewhere);
+        }
+        oc_client_search_more(a);
+        CHECK(oc_client_model(a)->search_scope == 1);
+        oc_client_close_search(a);
 
         /* dana creates a public channel — it shows up joined in her list — and
          * erik joins it by id, seeing it joined too. */

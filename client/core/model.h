@@ -575,6 +575,7 @@ typedef struct {
     uint8_t   search_open;
     char      search_query[128];
     uint8_t   search_sort;       /* OC_SEARCH_*: the order the hits are in */
+    uint64_t  search_scope;      /* one conversation by id, 0 for none (REQ-080) */
     oc_search_result *search_results;
     size_t    n_search, cap_search;
     /* The server said it had more hits than it sent. The wire gained a keyset
@@ -1284,6 +1285,21 @@ void oc_model_close_thread(oc_model *m);
 
 /* Begin a search (clears prior hits, records the query) / close the search view. */
 void oc_model_search_begin(oc_model *m, const char *query);
+/* The same, limited to one conversation (`scope`, 0 for none). A typed `in:`
+ * in the query wins: the scope is then 0, so `in:` keeps its meaning by name. */
+void oc_model_search_begin_scoped(oc_model *m, const char *query, uint64_t scope);
+
+/* What a graphical client's one search field searches, and what it says, in a
+ * view (REQ-080): in a channel, "Search #name", messages scoped to it by id; in
+ * a DM or group DM, "Search <its names>", scoped the same way; in an
+ * end-to-end DM, which the server cannot search, "Search messages" with no
+ * scope; in Files, "Search files"; in People, "Search people"; anywhere else,
+ * "Search messages", unscoped. `view` is OC_SV_*; `conv` the open conversation
+ * in OC_SV_CONVERSATION. */
+enum { OC_SV_CONVERSATION = 0, OC_SV_FILES, OC_SV_PEOPLE, OC_SV_OTHER };
+enum { OC_ST_MESSAGES = 0, OC_ST_FILES, OC_ST_PEOPLE };
+typedef struct { uint8_t kind; uint64_t scope; char placeholder[160]; } oc_search_target;
+void oc_model_search_target(const oc_model *m, int view, uint64_t conv, oc_search_target *out);
 void oc_model_close_search(oc_model *m);
 
 /* Begin a "who reacted" inspection (clears prior reactors, records the message)

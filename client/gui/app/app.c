@@ -257,12 +257,23 @@ static int g_quit;               /* the loop ends */
 /* Modifier state, as the handlers read it; see mod_down. */
 static int mod_down(int key);
 
+/* THE SCENE STARTS BELOW THE TOP BAR. While the bar is shown, the scene --
+ * rail, sidebar, every view, pane, menu, modal and popover -- is drawn this
+ * many DIPs down (gfx_set_origin), the pointer is moved up by as much before
+ * any handler sees it, and the accessibility tree, the input-method area and
+ * the window size the scene is told are moved to match. So the scene keeps its
+ * own coordinates, and the bar lives above its zero, at negative y. */
+static float g_scene_dy;
+static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs need it */
+
 /* The window's client area in device pixels (what the scene is laid out in,
- * before DIPF). */
+ * before DIPF): the window less the top bar, which is not the scene's. */
 static void client_rect(oc_win *w, irect *rc) {
     int pw = 0, ph = 0;
     if (w && w->sdl) SDL_GetWindowSizeInPixels(w->sdl, &pw, &ph);
     rc->left = rc->top = 0; rc->right = pw; rc->bottom = ph;
+    int bar = (int)(g_scene_dy * (float)g_dpi / 96.0f + 0.5f);
+    if (bar > 0 && bar < ph) rc->bottom = ph - bar;
 }
 
 /* UTF-16 units a UTF-8 byte range needs (surrogate pairs count two). */
@@ -306,7 +317,6 @@ enum { APP_EV_TRUST_RESUME = 1 };
  * Without any of this the process is DPI-unaware and Windows bitmap-stretches
  * the whole window on a scaled display — the app shipped blurry on any modern
  * laptop. */
-static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs need it */
 #define PX(v)   ((int)((float)(v) * (float)g_dpi / 96.0f + 0.5f))   /* DIP -> device */
 #define DIPF(v) ((float)(v) * 96.0f / (float)g_dpi)                 /* device -> DIP */
 
@@ -368,6 +378,11 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
 #define RAIL_W      UISW(70.0f)     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   UISW(250.0f)
 #define HEADER_H    UIS(56.0f)
+/* The window-wide bar above the rail, the sidebar and the view (g_scene_dy):
+ * back and forward at its left, the one search field in its middle. */
+#define TOPBAR_H    UIS(44.0f)
+/* A scene y to device pixels in the window: the bar above it counted. */
+#define PXY(v)      PX((float)(v) + g_scene_dy)
 /* The channel tab strip under the header. Slack's shape: the channel
  * name and its controls on one row, and the channel's own sub-views on the next.
  * It also fixes something structural — Pins and Files used to replace the
@@ -2308,8 +2323,6 @@ static rectf g_notify_kw_btn, g_notify_vip_btn, g_notify_mute_btn, g_notify_bloc
 /* The Threads pane (REQ-062): its unread-only toggle and the per-card
  * "turn off replies" targets. */
 static char        g_dir_filter[80];     /* the People pane's search text (REQ-289) */
-static rectf g_dir_search_box;
-static field      *g_dir_edit;
 static int         g_threads_unread;
 static rectf g_threads_unread_btn;
 static rectf g_thread_follow_hit[32];
@@ -2443,10 +2456,16 @@ static uint64_t g_hover_pinrow;
 static rectf g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static rectf g_hdr_compose;               /* channel-column header compose button */
 static field   *g_find;                 /* "Find a conversation" filter box */
-static field   *g_ffind;                /* "Search files" box, Files view only */
 static field   *g_efind;                /* Admin > Custom emoji's search box */
 static rectf    g_emoji_search_box;
-static field   *g_srch;                 /* search-overlay query box */
+static field   *g_srch;                 /* the top bar's one search field */
+/* What it searches now (oc_model_search_target): its kind, the conversation a
+ * message search is limited to, and the words it shows while empty. */
+static rectf    g_top_box;
+static uint8_t  g_top_kind = OC_ST_MESSAGES;
+static uint64_t g_top_scope;
+static char     g_top_ph[160] = "Search messages";
+static rectf    g_srch_widen;           /* "Search everywhere", in a scoped search's results */
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
  * to the caret on every change; the popover renders above the composer and the
@@ -2488,7 +2507,6 @@ static rectf g_ac_rows[AC_MAX];   /* hit-boxes, captured at paint */
 static rectf g_ac_panel;
 static float    g_srch_scroll;          /* search-results scroll offset, px */
 static float    g_srch_max;             /* its maximum, computed at paint */
-static rectf g_srch_box;          /* the query field's chrome, for layout_search */
 static char     g_find_filter[64];      /* current filter text (lowercased) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
 /* The pointer, in DIPs, updated from on_mouse_move. The file tracked a dozen
@@ -9126,13 +9144,22 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
     rectf body = pane_header(rt, reg, "Search");
     g_n_searchrows = 0;
 
-    /* The query box lives IN the overlay, so refining a search never
-     * closes and reopens it. The field is drawn inside this chrome here, and
-     * layout_search() decides whether it is shown. */
-    g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 10 + SEARCH_BOX_H);
-    search_box_draw(rt, g_srch_box, OC_COL_INPUT);
-    if (g_srch) field_draw(rt, g_srch, search_text_box(g_srch_box), OC_COL_TEXT);
-    body.top = g_srch_box.bottom + 10;
+    /* The query is typed in the top bar's field; this is its results.
+     * A search limited to one conversation offers to look everywhere. */
+    body.top += 10;
+    g_srch_widen = rf(0, 0, 0, 0);
+    if (m->search_scope && m->search_query[0]) {
+        const char *wl = "Search everywhere";
+        float ww = text_width(wl, g_meta) + 16;
+        g_srch_widen = rf(body.left + 20, body.top, body.left + 20 + ww, body.top + 20);
+        int hot = in_rect(g_srch_widen, g_mouse_x, g_mouse_y);
+        fill_round(rt, g_srch_widen, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, g_srch_widen, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, wl, g_meta, g_srch_widen, OC_COL_ACCENT);
+        g_meta->align = ST_ALIGN_LEFT;
+        body.top += 26;
+    }
 
     /* A count line, so "5 results" and "no matches" are told apart at a glance. */
     char count[96];
@@ -11259,7 +11286,7 @@ enum { FSORT_RECENT = 0, FSORT_NAME, FSORT_LARGEST, FSORT_SORTS };
 static int  g_file_sort;
 static char g_file_q[64];
 static rectf g_file_type_btn, g_file_sort_btn, g_file_scope_btn;
-static rectf g_file_up_btn, g_file_search_box;
+static rectf g_file_up_btn;
 static rectf g_file_more_btn;     /* "Load more", while the daemon says there are */
 /* The channel census, built only while showing everything — see files_index. */
 static oc_gui_chan_count g_fchan[64];
@@ -11429,16 +11456,8 @@ static const char *FSORT_LABEL[FSORT_SORTS] = { "Recently shared", "Name", "Larg
 static float draw_file_filters(gfx *rt, rectf body, int full) {
     float y = body.top + 8;
 
-    if (full) {
-        /* Name search: a rounded container with the glyph, the field drawn
-         * inside it; layout_files_find() decides whether it is shown. */
-        g_file_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
-        search_box_draw(rt, g_file_search_box, OC_COL_INPUT);
-        if (g_ffind) field_draw(rt, g_ffind, search_text_box(g_file_search_box), OC_COL_TEXT);
-        y = g_file_search_box.bottom + 12;
-    } else {
-        g_file_search_box = rf(0, 0, 0, 0);
-    }
+    /* Name search is the top bar's field, its text in g_file_q. */
+    (void)full;
 
     for (int i = 0; i < FS_SCOPES; i++) g_file_scopes[i] = rf(0, 0, 0, 0);
     for (int i = 0; i < FF_KINDS;  i++) g_file_filters[i] = rf(0, 0, 0, 0);
@@ -12906,19 +12925,28 @@ static rectf g_dms_new_btn;       /* the DMs list's header: New message */
 
 /* Back and forward, ahead of a header's title, as a browser's: dimmed while
  * there is nowhere to go. Returns where the title starts. */
-static float hdr_hist_buttons(gfx *rt, float x0) {
-    float bs = UIS(26), by = (HEADER_H - bs) / 2, bx = x0 + UIS(10);
-    g_hist_back_btn = rf(bx, by, bx + bs, by + bs);
-    g_hist_fwd_btn  = rf(bx + bs + UIS(2), by, bx + 2 * bs + UIS(2), by + bs);
+/* Back and forward, at the left of the top bar (above the scene's zero): drawn
+ * in every view, dimmed while there is nowhere to go. */
+static void topbar_hist_buttons(gfx *rt, float x) {
+    float bs = UIS(28), by = -TOPBAR_H + (TOPBAR_H - bs) / 2;
+    g_hist_back_btn = rf(x, by, x + bs, by + bs);
+    g_hist_fwd_btn  = rf(x + bs + UIS(2), by, x + 2 * bs + UIS(2), by + bs);
     for (int k = 0; k < 2; k++) {
         rectf b = k ? g_hist_fwd_btn : g_hist_back_btn;
         int can = hist_can(k ? 1 : -1);
-        if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+        if (can && in_rect(b, g_mouse_x, g_mouse_y)) fill_round_a(rt, b, OC_R_CONTROL, 0xFFFFFF, 0.12f);
         const char *ar = k ? "\u2192" : "\u2190";
         float aw = text_width(ar, g_ui), ax = (b.left + b.right - aw) / 2;
-        draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom), can ? OC_COL_TEXT : OC_COL_FAINT);
+        draw_text(rt, ar, g_ui, rf(ax, b.top, b.right, b.bottom),
+                  can ? OC_COL_RAIL_ICON : OC_COL_FAINT);
     }
-    return g_hist_fwd_btn.right + UIS(10);
+}
+
+/* Where a header's title starts: the history buttons moved to the top bar,
+ * and the title takes the room they left. */
+static float hdr_hist_buttons(gfx *rt, float x0) {
+    (void)rt;
+    return x0 + 20;
 }
 
 /* The DMs view's person list has a header of its own -- with none, a banner
@@ -13011,11 +13039,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     /* Back and forward, ahead of the title, as a browser's: dimmed while there
      * is nowhere to go. The title starts after them. */
     float tx = x0 + 20;
-    if (c) {
-        tx = hdr_hist_buttons(rt, x0);
-    } else {
-        g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
-    }
+    if (c) tx = hdr_hist_buttons(rt, x0);
     /* The channel's colour, the person's own, before its name. */
     {
         uint8_t dc = (c && c->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, c->channel_id) : 0;
@@ -20206,9 +20230,7 @@ static int modal_key(oc_win *hwnd, int vk) {
  * and all but the last two also yield to `window_is_covered()`. A new view or a
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's fields. */
-static void layout_files_find(oc_win *hwnd);   /* fwd */
 static void layout_emoji_find(oc_win *hwnd);   /* fwd */
-static void layout_dir_find(oc_win *hwnd);     /* fwd */
 
 static void layout_natives(oc_win *hwnd) {
     {   /* The fields are placed against the same columns the scene draws, so
@@ -20219,9 +20241,7 @@ static void layout_natives(oc_win *hwnd) {
     }
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
-    layout_files_find(hwnd);
     layout_emoji_find(hwnd);
-    layout_dir_find(hwnd);
 
     int covered = window_is_covered();
     /* The palette is itself the cover, so it does not consult `covered`. */
@@ -22753,7 +22773,7 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
     if (focused && l) {
         st_rect cr = fld_caret_rect(f, l, f->caret);
         float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
-        SDL_Rect area = { PX(cx), PX(oy + cr.y), 1, PX(cr.h) };
+        SDL_Rect area = { PX(cx), PXY(oy + cr.y), 1, PX(cr.h) };
         caret_place(area);
     }
     gfx_clip_pop(rt);
@@ -22775,14 +22795,14 @@ static int fields_mouse(int kind, float x, float y) {
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
     for (int i = 0; i < FORM_MAX_FIELDS && nm < 24 + FORM_MAX_FIELDS; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
-    field *shell[9] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user, g_efind };
+    field *shell[7] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_si_e_ws, g_si_e_user, g_efind };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
         if (g_focus && g_focus->dragging) return field_mouse(g_focus, kind, x, y);
         return 0;
     }
     for (int i = 0; i < nm; i++) if (modal[i]->visible && field_mouse(modal[i], kind, x, y)) return 1;
-    for (int i = 0; i < 9; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
+    for (int i = 0; i < 7; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
     if (g_si_e_pass && g_si_e_pass->visible && field_mouse(g_si_e_pass, kind, x, y)) return 1;
     if (kind == 0 && g_focus) focus_set(NULL);
     return 0;
@@ -23850,14 +23870,8 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
     rectf body = view_header(rt, reg, "People",
                                    "Everyone in this workspace.");
     g_n_listrows = 0;
-    /* The search field's CHROME — the rounded container and the glyph — with the
-     * field drawn inside it, exactly as the Files search is built. Reserving the
-     * space without painting the box once left an unframed field on a white
-     * pane, invisible to a person. */
-    g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
-    search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
-    if (g_dir_edit) field_draw(rt, g_dir_edit, search_text_box(g_dir_search_box), OC_COL_TEXT);
-    body.top = g_dir_search_box.bottom + 12;
+    /* The search is the top bar's field, its text in g_dir_filter. */
+    body.top += 8;
 
     char filter[80];
     snprintf(filter, sizeof filter, "%s", g_dir_filter);
@@ -26023,6 +26037,50 @@ static void draw_stub_view(gfx *rt, rectf reg,
 static void draw_lightbox(gfx *rt, float W, float H);   /* fwd */
 
 static void draw_pastechoice(gfx *rt, float W, float H);   /* fwd */
+/* The top bar, window-wide above the rail, the sidebar and the view, drawn at
+ * negative y (g_scene_dy): back and forward at the left, the search field in
+ * the middle (topbar_field_draw), room on the right for what comes later. */
+static void topbar_field_draw(gfx *rt, const oc_model *m, float W);   /* fwd */
+static void draw_topbar(gfx *rt, const oc_model *m, float W) {
+    rectf bar = rf(0, -TOPBAR_H, W, 0);
+    fill(rt, bar, OC_COL_RAIL);
+    fill(rt, rf(0, -1, W, 0), OC_COL_BORDER);
+    topbar_hist_buttons(rt, RAIL_W + UIS(8));
+    topbar_field_draw(rt, m, W);
+}
+
+/* The view's search: messages in a conversation (limited to it) or anywhere
+ * else, files in Files, people in People -- one decision, the core's. While a
+ * message search's results are up, it stays what it was. */
+static void top_target_update(const oc_model *m) {
+    if (!m || m->search_open) return;
+    int sv = g_view == VIEW_FILES ? OC_SV_FILES
+           : g_view == VIEW_DIRECTORY ? OC_SV_PEOPLE
+           : (main_is_conversation() && g_sel) ? OC_SV_CONVERSATION : OC_SV_OTHER;
+    oc_search_target t;
+    oc_model_search_target(m, sv, g_sel, &t);
+    if (t.kind != g_top_kind && g_srch) {     /* another kind of search: start empty */
+        field_set(g_srch, "");
+        g_file_q[0] = '\0';
+        g_dir_filter[0] = '\0';
+    }
+    g_top_kind = t.kind;
+    g_top_scope = t.scope;
+    snprintf(g_top_ph, sizeof g_top_ph, "%s", t.placeholder);
+    if (g_srch) g_srch->placeholder = g_top_ph;
+}
+
+static void topbar_field_draw(gfx *rt, const oc_model *m, float W) {
+    top_target_update(m);
+    float bw = UIS(560.0f), room = W - 2 * (RAIL_W + UIS(80.0f));
+    if (bw > room) bw = room;
+    if (bw < UIS(160.0f)) { g_top_box = rf(0, 0, 0, 0); return; }
+    float by = -TOPBAR_H + (TOPBAR_H - SEARCH_BOX_H) / 2;
+    g_top_box = rf((W - bw) / 2, by, (W + bw) / 2, by + SEARCH_BOX_H);
+    search_box_draw(rt, g_top_box, OC_COL_INPUT);
+    if (g_srch) field_draw(rt, g_srch, search_text_box(g_top_box), OC_COL_TEXT);
+}
+
 static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     shell_scale_update(W, H);   /* the shell's furniture is capped by the window */
     call_rects_reset();         /* the call's hit-boxes, for the same reason as below */
@@ -26087,6 +26145,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     if (!m) return;
     ensure_selection(m);
+    if (g_scene_dy > 0) draw_topbar(rt, m, W);   /* above the scene's zero */
     draw_rail(rt, m, H);
 
     if (shell_visible()) {
@@ -26258,6 +26317,11 @@ static void layout_find(oc_win *hwnd);    /* fwd */
 static void paint(oc_win *hwnd) {
     if (!g_gfx || !g_st) return;
     gfx *rt = g_gfx;
+    /* The top bar is the shell's: shown with a workspace, not on the sign-in
+     * card (which, over a live shell, dims it anyway). Decided before the size
+     * is read, since the scene is told the window less the bar. */
+    g_scene_dy = (g_client && g_view != VIEW_SIGNIN) ? TOPBAR_H : 0.0f;
+    gfx_set_origin(rt, 0, g_scene_dy);
     irect rc; client_rect(hwnd, &rc);
     /* DIPs, not pixels — the scene is authored device-independent and the
      * gfx/sdltext scale (DPI x zoom) maps it at the seam. */
@@ -26295,6 +26359,7 @@ static void paint(oc_win *hwnd) {
     layout_natives(hwnd);
     a11y_publish_scene(m);   /* describe what was just drawn (ARCH-99) */
     gfx_end(rt);
+    gfx_set_origin(rt, 0, 0);   /* the scene's origin is this paint's alone */
     oc_plat_frame_shown();
 }
 
@@ -27834,7 +27899,7 @@ static void caret_place(SDL_Rect area) {
  * caret nobody placed is removed at the end of the paint (g_caret_placed). */
 static void ed_caret_sync(rectf cr) {
     if (!ed_focused()) return;
-    SDL_Rect area = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
+    SDL_Rect area = { PX(cr.left), PXY(cr.top), 1, PX(cr.bottom - cr.top) };
     caret_place(area);
 }
 
@@ -29705,7 +29770,8 @@ enum {
     AT_JUMPCAL,       /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
     AT_PREFCHOICE,    /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
     AT_ALSO,          /* the thread composer's "Also send to #channel" -- toggle it */
-    AT_NAVPREF        /* payload: a Navigation row's index in g_rail * 4 + 0 show/hide, 1 up, 2 down */
+    AT_NAVPREF,       /* payload: a Navigation row's index in g_rail * 4 + 0 show/hide, 1 up, 2 down */
+    AT_TOPSEARCH      /* the top bar's search field -- the keyboard to it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -29745,7 +29811,7 @@ static void acc_push(oc_acc_item *items, int *n, oc_acc_kind kind, const char *a
     memset(it, 0, sizeof *it);
     it->kind = kind;
     it->l = PX(r.left); it->r = PX(r.right);
-    it->t = PX(r.top);  it->b = PX(r.bottom);
+    it->t = PXY(r.top);  it->b = PXY(r.bottom);
     snprintf(it->aid, sizeof it->aid, "%s", aid ? aid : "");
     snprintf(it->name, sizeof it->name, "%s", name ? name : "");
     it->invoke = invoke;
@@ -29838,7 +29904,7 @@ static void a11y_publish_scene(const oc_model *m) {
         snprintf(it->aid, sizeof it->aid, "conv.%llu", (unsigned long long)g_rows[i].cid);
         it->invoke = ATOK(AT_CONV, g_rows[i].cid);
         it->l = PX(RAIL_W); it->r = PX(RAIL_W + SIDEBAR_W);
-        it->t = PX(g_rows[i].top); it->b = PX(g_rows[i].bot);
+        it->t = PXY(g_rows[i].top); it->b = PXY(g_rows[i].bot);
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_rows[i].cid) : NULL;
         /* Unread belongs in the NAME, not only in a property: it is the reason a
          * person is scanning this list, and a count nobody reads aloud is a
@@ -29875,7 +29941,7 @@ static void a11y_publish_scene(const oc_model *m) {
         it->id   = g_msgrows[i].mid;
         snprintf(it->aid, sizeof it->aid, "message.%llu", (unsigned long long)g_msgrows[i].mid);
         it->l = PX(rr.left);  it->r = PX(rr.right);
-        it->t = PX(rr.top);   it->b = PX(rr.bottom);
+        it->t = PXY(rr.top);   it->b = PXY(rr.bottom);
         const char *who = msg->author_name[0] ? msg->author_name
                                               : oc_model_user_name(m, msg->author_id);
         char when[24]; rel_time(msg->server_time, when, sizeof when);
@@ -29940,7 +30006,7 @@ static void a11y_publish_scene(const oc_model *m) {
         it->id   = g_sel;
         snprintf(it->aid, sizeof it->aid, "composer");
         it->l = PX(g_ed_box.left);  it->r = PX(g_ed_box.right);
-        it->t = PX(g_ed_box.top);   it->b = PX(g_ed_box.bottom);
+        it->t = PXY(g_ed_box.top);   it->b = PXY(g_ed_box.bottom);
         char cue[128]; composer_cue(m, cue, sizeof cue);
         snprintf(it->name, sizeof it->name, "%s", cue[0] ? cue : "Message");
         ctext  = g_ed;
@@ -30083,6 +30149,9 @@ static void a11y_publish_scene(const oc_model *m) {
         acc_push(items, &n, OC_ACC_BUTTON, "header.back", "Back", g_hist_back_btn, ATOK(AT_HIST, 0));
     if (g_hist_fwd_btn.right > g_hist_fwd_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.forward", "Forward", g_hist_fwd_btn, ATOK(AT_HIST, 1));
+    /* The top bar's one search field, named for what it searches now. */
+    if (g_srch && g_srch->visible && g_top_box.right > g_top_box.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_COMPOSER, "topbar.search", g_top_ph, g_top_box, ATOK(AT_TOPSEARCH, 0));
     if (g_mem_addppl.right > g_mem_addppl.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "members.addperson", "Add person", g_mem_addppl, ATOK(AT_MEMADDPPL, 0));
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
@@ -31317,18 +31386,6 @@ static void find_changed(field *f) {
     snprintf(g_find_filter, sizeof g_find_filter, "%s", b);
 }
 
-/* The Files view's "Search files" box. It is gated on its OWN view rather than
- * on any predicate that happens to be true there today.
- *
- * g_file_search_box is measured during paint, so this runs from the paint path
- * (layout_natives) as well as on resize. */
-static void layout_files_find(oc_win *hwnd) {
-    (void)hwnd;
-    if (!g_ffind) return;
-    int want = (g_view == VIEW_FILES) && !window_is_covered() &&
-               g_file_search_box.right > g_file_search_box.left;
-    field_show(g_ffind, want);
-}
 
 /* Admin > Custom emoji's search box, on the same rules: its own view and tab. */
 static void layout_emoji_find(oc_win *hwnd) {
@@ -31356,22 +31413,6 @@ static int efind_key(field *f, int key, int ctrl, int shift) {
     return 0;
 }
 
-/* The People pane's search box, written to the same rules as the Files one:
- * gated on its own view, never on a predicate that happens to be true there. */
-static void dir_changed(field *f) {
-    snprintf(g_dir_filter, sizeof g_dir_filter, "%s", f->buf);
-    g_ovl_scroll = 0;          /* a new query starts at the top */
-}
-
-static void layout_dir_find(oc_win *hwnd) {
-    (void)hwnd;
-    if (!g_dir_edit) return;
-    int want = (g_view == VIEW_DIRECTORY) && !window_is_covered() &&
-               g_dir_search_box.right > g_dir_search_box.left;
-    field_show(g_dir_edit, want);
-}
-
-static void ffind_changed(field *f) { snprintf(g_file_q, sizeof g_file_q, "%s", f->buf); }
 
 /* Show or hide the search-overlay query field draw_search() draws.
  * g_srch_box is only valid after a paint, so this runs from the paint path as
@@ -31393,12 +31434,10 @@ static void layout_search(oc_win *hwnd) {
      * pane's open flag" is exactly the assumption that was wrong: `g_pick_open`
      * is a static the paint pass clears on leaving the shell, `search_open` is
      * not. Reported from a screenshot of the running client. */
-    if (!m || !m->search_open || !transcript_shell() || dm_index_view() ||
-        window_is_covered()) {
-        field_show(g_srch, 0); return;
-    }
+    /* It lives in the top bar now, so it is shown whenever the bar is,
+     * unless something covers the window. */
     (void)hwnd;
-    field_show(g_srch, 1);
+    field_show(g_srch, m && g_scene_dy > 0 && !window_is_covered() && g_top_box.right > g_top_box.left);
 }
 
 
@@ -33026,18 +33065,17 @@ static void search_submit(void) {
     snprintf(q, sizeof q, "%s", g_srch->buf);
     if (!q[0]) return;
     g_srch_scroll = 0;
-    oc_client_search(g_client, q, g_search_sort);
+    g_view = VIEW_HOME;                 /* the results are a middle-column overlay */
+    oc_client_search_in(g_client, q, g_search_sort, g_top_scope);
 }
 
-/* Open the overlay with the box focused and empty — no modal prompt. */
+/* Ctrl+F: the top bar's field takes the keyboard, its text selected, so what
+ * is typed replaces it. Nothing opens until Enter. */
 static void search_open(oc_win *hwnd) {
-    if (!g_client) return;
-    g_view = VIEW_HOME;
-    g_srch_scroll = 0;
-    oc_client_open_search(g_client);
-    field_set(g_srch, "");
+    if (!g_client || !g_srch) return;
     layout_search(hwnd);
     focus_set(g_srch);
+    field_select_all(g_srch);
     invalidate();
 }
 
@@ -33063,17 +33101,28 @@ static int pick_key(field *f, int key, int ctrl, int shift) {
 }
 static void pick_changed(field *f) { (void)f; g_pick_scroll = 0; }
 
-/* Enter submits the query; Escape closes the overlay. */
+/* Enter runs a message search (Files and People filter as typed); Escape
+ * clears the field and closes the results. */
 static int srch_key(field *f, int key, int ctrl, int shift) {
     (void)ctrl; (void)shift;
-    if (key == OCK_RETURN) { search_submit(); return 1; }
+    if (key == OCK_RETURN) { if (g_top_kind == OC_ST_MESSAGES) search_submit(); return 1; }
     if (key == OCK_ESCAPE) {
+        field_set(f, "");
+        g_file_q[0] = '\0';
+        g_dir_filter[0] = '\0';
         if (g_client) oc_client_close_search(g_client);
-        field_show(f, 0);
         ed_focus(g_main);
         return 1;
     }
     return 0;
+}
+/* Files and People filter as the field changes, as their own boxes did. */
+static void srch_changed(field *f) {
+    if (g_top_kind == OC_ST_FILES) snprintf(g_file_q, sizeof g_file_q, "%s", f->buf);
+    else if (g_top_kind == OC_ST_PEOPLE) {
+        snprintf(g_dir_filter, sizeof g_dir_filter, "%s", f->buf);
+        g_ovl_scroll = 0;          /* a new query starts at the top */
+    }
 }
 
 /* Show or hide the sign-in fields drawn over the chrome draw_signin() paints
@@ -34521,8 +34570,21 @@ static void view_go(oc_win *hwnd, int act) {
     if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
 }
 
+/* A press in the top bar, above the scene's zero. A modal or the palette owns
+ * the window meanwhile; an open menu closes, as a press anywhere outside it
+ * does. */
+static int topbar_click(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
+    if (modal_open() || g_pal_open) return 1;
+    if (g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; submenu_close(); invalidate(); return 1; }
+    if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); invalidate(); return 1; }
+    if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); invalidate(); return 1; }
+    return 1;
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
+    if (y < 0) return topbar_click(hwnd, x, y);
     /* Admin > Agents: each button, as it was drawn -- first, since the
      * transcript's hit-boxes from before Admin opened are still held. */
     if (g_view == VIEW_ADMIN && (g_adm_tab == ADM_AGENTS || g_adm_tab == ADM_CONNECTIONS) && !modal_open())
@@ -36018,11 +36080,20 @@ static int on_click(oc_win *hwnd, int x, int y) {
                         char q[128];
                         snprintf(q, sizeof q, "%s", mm->search_query);
                         g_srch_scroll = 0;
-                        if (q[0]) oc_client_search(g_client, q, g_search_sort);
+                        if (q[0]) oc_client_search_in(g_client, q, g_search_sort, mm->search_scope);
                         invalidate();
                     }
                     return 1;
                 }
+            /* "Search everywhere": the same query, no longer limited. */
+            if (mm->search_open && in_rect(g_srch_widen, x, y)) {
+                char q[128];
+                snprintf(q, sizeof q, "%s", mm->search_query);
+                g_srch_scroll = 0;
+                if (q[0]) oc_client_search_in(g_client, q, g_search_sort, 0);
+                invalidate();
+                return 1;
+            }
             if (mm->search_open)
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
@@ -36686,6 +36757,7 @@ static int audit_key(oc_win *hwnd, int vk) {
 static void on_rclick(oc_win *hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
+    if (y < 0) return;                   /* the top bar has no menu of its own */
     /* A rail view: hide it (never Home), or arrange the rail in Preferences. */
     if ((float)x < RAIL_W) {
         for (int i = 0; i < g_n_navrows; i++)
@@ -41571,7 +41643,7 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
 /* Every drawn field, made once with the window: its placeholder, its keys and
  * its change hook. */
 static void fields_create(void) {
-    static field find, ffind, efind, dir, srch, pal, pick, si[3], csubj;
+    static field find, efind, srch, pal, pick, si[3], csubj;
     field_init(&csubj, "What is the call about? (optional)", 0, 0);
     csubj.maxlen = OC_CALL_SUBJECT_MAX; g_cpick_subject = &csubj;
     static field cq;
@@ -41579,17 +41651,13 @@ static void fields_create(void) {
     cq.maxlen = 79; g_cpick_q = &cq;
     field_init(&find, "Find a conversation", 0, 0);
     find.key = find_key; find.changed = find_changed; find.maxlen = 63; g_find = &find;
-    field_init(&ffind, "Search files", 0, 0);
-    ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
     field_init(&efind, "Search custom emoji", 0, 0);
     efind.key = efind_key; efind.changed = efind_changed; efind.maxlen = 47; g_efind = &efind;
     static field wsmq;
     field_init(&wsmq, "Filter by name or address", 0, 0);
     wsmq.key = wsm_q_key; wsmq.changed = wsm_q_changed; wsmq.maxlen = 79; g_wsm_q = &wsmq;
-    field_init(&dir, "Search people", 0, 0);
-    dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
     field_init(&srch, "Search messages", 0, 0);
-    srch.key = srch_key; srch.maxlen = 255; g_srch = &srch;
+    srch.key = srch_key; srch.changed = srch_changed; srch.maxlen = 255; g_srch = &srch;
     field_init(&pal, "Run an action or jump to a conversation", 0, 0);
     pal.key = pal_key; pal.changed = pal_changed; pal.maxlen = 511; g_pal_edit = &pal;
     field_init(&pick, "Search emoji", 0, 0);
@@ -42676,6 +42744,7 @@ static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) 
 }
 
 static int on_dblclk(oc_win *hwnd, int mx, int my) {
+    if (my < 0) return on_click(hwnd, mx, my);   /* the top bar: a second press */
     if (pastechoice_click(hwnd, (float)mx, (float)my)) { invalidate(); return 0; }
     if (fields_mouse(3, (float)mx, (float)my)) { invalidate(); return 0; }
         g_dbl_ms = now_ms(); g_dbl_x = mx; g_dbl_y = my;
@@ -43461,6 +43530,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                     sched_custom_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
             break;
+        case AT_TOPSEARCH: search_open(hwnd); break;
         case AT_NAVPREF:
             if (g_prefs_open) nav_pref_act((int)(arg / 4), (int)(arg % 4));
             break;
@@ -43758,16 +43828,20 @@ static void handle_event(const SDL_Event *e) {
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
         if (win == &g_nt_win) { g_nt_hover = g_nt_close_hover = -1; nt_paint(); }
         return;
-    case SDL_EVENT_MOUSE_WHEEL:
-        if (win == hwnd && !tab_wheel(wc_px(win, e->wheel.mouse_x), wc_px(win, e->wheel.mouse_y),
+    case SDL_EVENT_MOUSE_WHEEL: {
+        /* In the scene's coordinates: the top bar above its zero (g_scene_dy). */
+        int wy = wc_px(win, e->wheel.mouse_y) - PX(g_scene_dy);
+        if (win == hwnd && wy >= 0 && !tab_wheel(wc_px(win, e->wheel.mouse_x), wy,
                                       e->wheel.x, e->wheel.y))
-            on_wheel(hwnd, wc_px(win, e->wheel.mouse_x), wc_px(win, e->wheel.mouse_y),
+            on_wheel(hwnd, wc_px(win, e->wheel.mouse_x), wy,
                      e->wheel.y, e->wheel.integer_y);
         return;
+    }
     case SDL_EVENT_MOUSE_BUTTON_DOWN: {
         int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
         if (win == &g_recbar || win == &g_sharebar) { bar_click(win, mx, my); return; }
         if (win != hwnd) return;
+        my -= (int)g_scene_dy;          /* the scene's coordinates: the bar is above 0 */
         /* A mouse's side buttons: back and forward, as everywhere else. */
         if (e->button.button == SDL_BUTTON_X1 || e->button.button == SDL_BUTTON_X2) {
             hist_go(e->button.button == SDL_BUTTON_X1 ? -1 : 1);
@@ -43789,7 +43863,7 @@ static void handle_event(const SDL_Event *e) {
         int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
         if (win == &g_nt_win) { nt_click(mx, my); return; }
         if (win != hwnd || e->button.button != SDL_BUTTON_LEFT) return;
-        on_lbutton_up(hwnd, mx, my);
+        on_lbutton_up(hwnd, mx, my - (int)g_scene_dy);
         return;
     }
     case SDL_EVENT_MOUSE_MOTION: {
@@ -43797,7 +43871,7 @@ static void handle_event(const SDL_Event *e) {
         if (win == &g_nt_win) { nt_hover(mx, my); return; }
         if (win == &g_recbar || win == &g_sharebar) { bar_hover(win, mx, my); return; }
         if (win != hwnd) return;
-        on_mouse_move(hwnd, mx, my);
+        on_mouse_move(hwnd, mx, my - (int)g_scene_dy);
         return;
     }
     case SDL_EVENT_KEY_DOWN:

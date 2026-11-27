@@ -1084,9 +1084,9 @@ and the web client draws it the same way.
   conversation shell.
 - `main_is_conversation()` -- whether the middle column is something you can type
   into. The DMs view has a sidebar but shows an index until you pick someone;
-  the index has a header of its own ("Direct messages", Back and Forward, New
-  message, which opens the New message pane as the sidebar's compose button
-  does), so a banner -- the demo notice, a lost connection -- sits under a
+  the index has a header of its own ("Direct messages" and New message, which
+  opens the New message pane as the sidebar's compose button does; Back and
+  Forward are in the top bar), so a banner -- the demo notice, a lost connection -- sits under a
   header there as it does over a conversation, never under an empty strip.
 - `window_is_covered()` -- whether a modal, the palette, the lightbox, a menu or
   the sign-in card owns the whole window.
@@ -1109,18 +1109,48 @@ variable. A press outside every field returns the keyboard to the window, as
 clicking a native window did; the shortcuts (`accel_dispatch`) run before any
 field sees a key, as they always have.
 
-**The six search boxes are one control.** Find a conversation, search messages,
-search files, search people, Jump to (Ctrl+K) and search emoji are each a
-field over chrome the client draws, and all six are built the same way:
+**The four search boxes are one control.** Find a conversation, the top bar's
+search (messages, files or people, by view), Jump to (Ctrl+K) and search emoji
+are each a field over chrome the client draws, and all four are built the same
+way:
 `search_box_draw()` draws the chrome -- `SEARCH_BOX_H` tall, following the text
 scale, with the glyph centred -- and `search_text_box()` is where the field's
 text goes, after the glyph, up to the right inset. The field wears the UI
 token (`g_ui`), so it follows the text size and the DPI as everything else
 does.
 
-A new gated field (the Files view's "Search files" box, `g_ffind`, is the
-model) is gated on the view it belongs to -- never on a predicate that merely
-happens to be true there.
+A new gated field (Admin's "Search custom emoji" box, `g_efind`, is the model)
+is gated on the view it belongs to -- never on a predicate that merely happens
+to be true there.
+
+### The top bar and its one search field (REQ-080)
+
+A **top bar** spans the window above the rail, the sidebar and the view,
+`TOPBAR_H` tall (it follows the text scale), with Back and Forward at its left
+(`header.back`, `header.forward`; Alt+Left and Alt+Right as before) and one
+search field in its middle (`topbar.search`), room on the right left for later.
+The scene below it is drawn as it always was: the drawing layer is given an
+origin (`gfx_set_origin`) that far down, the pointer is moved up by as much
+before any handler sees it, and the accessibility rectangles and the
+input-method area are moved down to match, so every view, pane, menu, modal
+and popover keeps its own coordinates and the bar sits above their zero, at
+negative y (`g_scene_dy`). `client_rect` gives the scene the window less the
+bar. The sign-in card has no bar.
+
+The field replaces the Files and People views' own boxes and the search
+overlay's query box. What it searches, and what it says while empty, is one
+function in the client core (`oc_model_search_target`): in a channel, "Search
+#name", its messages only; in a DM or group DM, "Search" and its names, its
+messages only, by the conversation's id (`SEARCH`'s `channel_id`, PROTOCOL.md
+§5.11); in an end-to-end DM, which the server cannot search, "Search messages",
+everywhere; in Files, "Search files", filtering as you type; in People,
+"Search people", the same; anywhere else, "Search messages", everywhere.
+Enter runs a message search and shows its results in the search pane, the
+query kept in the field and the "Filters:" line saying what was understood; a
+search limited to one conversation offers **Search everywhere**, which runs it
+again with no limit. A typed `in:` wins over the conversation: no id is sent,
+and `in:` works by name. Escape clears the field and closes the results.
+Ctrl+F gives the field the keyboard with its text selected.
 
 ### Shortcuts belong in the message loop, not a window proc
 
