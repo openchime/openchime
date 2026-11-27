@@ -49,9 +49,12 @@ and `pr-policy` still checks it. Once merged, `promote.yml` can put it on
   side, one version more of each package name per architecture, and
   refusing a second copy of a version (`scripts/test/fast/repo_update.sh`);
   and the Flatpak repository taking a release's bundles for both
-  architectures, its summary signed, and refusing a changed summary
-  (`scripts/test/fast/flatpak_repo.sh`); both on a local-path rclone remote
-  with a throwaway signing key;
+  architectures, its summary and each commit signed, each commit verifying
+  against the key as a client verifies it, refusing a changed summary, a
+  commit whose signature is missing or another key's, and a key that cannot
+  sign, and repairing, with `resign`, a repository published with unsigned
+  commits, at the same commits (`scripts/test/fast/flatpak_repo.sh`); both
+  on a local-path rclone remote with a throwaway signing key;
 - actionlint on the workflows (`scripts/test/fast/actionlint.sh`, fetched
   pinned on first use);
 - the suites `tests/main.c` marks `FAST`, one after another (§2.4), timing judged;
@@ -109,9 +112,10 @@ arm64 ones on an x86 runner) says so and skips.
 (`scripts/release/smoke.sh`, every check in `scripts/release/smoke/`: the apt
 and dnf repositories install the daemon, and the Linux client on
 `ubuntu:24.04` and Rocky Linux 10; each index lists the release once more,
-and the Flatpak repository's signed summary its client; the Flatpak
-repository adds from its `.flatpakrepo` and lists the client for both
-architectures; the released image pulls and runs). That is release verification, not a suite: it checks a
+and the Flatpak repository's signed summary its client, each commit
+signed with the key; the Flatpak repository adds from its `.flatpakrepo`,
+lists the client for both architectures, and pulls each architecture's
+commit metadata with signature checking on, as an install does; the released image pulls and runs). That is release verification, not a suite: it checks a
 publication, not a change.
 
 **Manual harnesses** live in `tools/` and are run by hand, never by either

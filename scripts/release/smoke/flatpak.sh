@@ -6,16 +6,20 @@
 # client, io.openchime.OpenChime, for x86_64 and aarch64. The .flatpakrepo
 # carries the signing key, so the remote it adds verifies the summary's
 # signature, and `flatpak remote-ls` reads nothing from a summary that does
-# not verify. Nothing is installed: the remote is added to a Flatpak
+# not verify. Each architecture's commit is then pulled, its metadata alone,
+# into that installation's repository with the remote's signature checking
+# on, which is what an install verifies first: a commit with no valid
+# signature from the key fails here as `flatpak install` would. Nothing is
+# installed, and no runtime is needed: the remote is added to a Flatpak
 # installation of this check's own (FLATPAK_USER_DIR, in a scratch directory
 # removed after), never the machine's or the user's. Read from
 # DIST_VERIFY_URL, which serves the same repository as DIST_BASE_URL, which
 # the .flatpakrepo names.
 #
-# Needs: flatpak, curl; DIST_VERIFY_URL; network.
+# Needs: flatpak, ostree, curl; DIST_VERIFY_URL; network.
 # Run by: scripts/release/smoke.sh.
 . "$(dirname "$0")/../../test/lib/common.sh"
-need flatpak "flatpak"; need curl "curl"
+need flatpak "flatpak"; need ostree "ostree"; need curl "curl"
 : "${DIST_VERIFY_URL:?DIST_VERIFY_URL is the address the published repository is verified at}"
 app=io.openchime.OpenChime
 tmp=$(mktemp -d)
@@ -31,5 +35,7 @@ for a in x86_64 aarch64; do
         || fail "flatpak cannot read the repository's signed summary for $a"
     grep -qxF "app/$app/$a/stable" <<<"$refs" \
         || fail "the repository does not list $app for $a (it lists: $(tr '\n' ' ' <<<"$refs"))"
+    ostree --repo="$FLATPAK_USER_DIR/repo" pull --commit-metadata-only openchime "app/$app/$a/stable" > "$tmp/pull.log" 2>&1 \
+        || { cat "$tmp/pull.log" >&2; fail "the repository's $a commit has no valid signature from its key"; }
 done
-ok "the Flatpak repository adds from its .flatpakrepo and lists $app for x86_64 and aarch64, signed"
+ok "the Flatpak repository adds from its .flatpakrepo and lists $app for x86_64 and aarch64, its summary and each commit signed"
