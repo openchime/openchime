@@ -599,7 +599,20 @@ model; translate input to intents }, stop.
   **Shell layout.** A **global left-nav rail** (Lucide icons stroke-tessellated
   by oc_gfx) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
-  overflow flyout), and a bottom cluster of New (+) / profile avatar.
+  overflow flyout), and a bottom cluster of New (+) / profile avatar. A person
+  arranges the views (REQ-394): Preferences → Appearance → **Navigation** lists
+  them in order, each with a show/hide box and Move up / Move down
+  (`prefs.nav.<view>.show|up|down`), and right-clicking a rail view offers
+  "Hide from navigation" and "Customize navigation…". Home is always first and
+  shown; Admin is listed only for an admin, and while it is hidden its alert
+  badge is drawn nowhere on the rail. The arrangement is kept under its own key,
+  `rail`, in the GUI's synced bucket (`oc_rail_opts`, by the views' stable
+  names, so a build that adds or drops a view reads another's value without
+  losing one), and written only once the account's settings have arrived. A
+  hidden view stays reachable: the command palette has "Go to DMs", "Go to
+  Activity", "Go to Files", "Go to Later" and, for an admin, "Go to Admin",
+  each doing exactly what the rail button does (`view_go`). The terminal client
+  has no rail and is unaffected.
   Three self-drawn dropdowns hang off the rail and the channel header —
   **workspace** (invites, notifications, mark all read, shortcuts, storage/audit,
   reconnect, sign out everywhere), **profile** (status, away, pause

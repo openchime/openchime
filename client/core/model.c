@@ -4012,6 +4012,74 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
     }
 }
 
+/* ---- the graphical client's rail -------------------------------------------- */
+
+static int rail_known(const char *const *known, size_t n_known, const char *name, size_t len) {
+    for (size_t i = 0; i < n_known; i++)
+        if (known[i] && strlen(known[i]) == len && !strncmp(known[i], name, len)) return (int)i;
+    return -1;
+}
+static int rail_has(const oc_rail_opts *o, const char *name) {
+    for (uint8_t i = 0; i < o->n; i++) if (!strcmp(o->v[i].name, name)) return i;
+    return -1;
+}
+
+void oc_rail_opts_default(oc_rail_opts *o, const char *const *known, size_t n_known) {
+    if (!o) return;
+    memset(o, 0, sizeof *o);
+    for (size_t i = 0; known && i < n_known && o->n < OC_RAIL_MAX; i++) {
+        if (!known[i] || !known[i][0] || strlen(known[i]) >= OC_RAIL_NAME) continue;
+        snprintf(o->v[o->n].name, OC_RAIL_NAME, "%s", known[i]);
+        o->v[o->n].shown = 1;
+        o->n++;
+    }
+}
+
+void oc_rail_opts_encode(const oc_rail_opts *o, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    size_t len = 0;
+    for (uint8_t i = 0; o && i < o->n; i++) {
+        int w = snprintf(out + len, cap - len, "%s%s%s", len ? "," : "", o->v[i].shown ? "" : "-", o->v[i].name);
+        if (w < 0 || (size_t)w >= cap - len) { out[len] = '\0'; return; }
+        len += (size_t)w;
+    }
+}
+
+void oc_rail_opts_parse(oc_rail_opts *o, const char *s, const char *const *known, size_t n_known) {
+    if (!o) return;
+    oc_rail_opts r; memset(&r, 0, sizeof r);
+    while (s && *s && r.n < OC_RAIL_MAX) {
+        const char *e = strchr(s, ',');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        const char *nm = s; size_t nl = n; int shown = 1;
+        if (nl && *nm == '-') { shown = 0; nm++; nl--; }
+        int k = nl ? rail_known(known, n_known, nm, nl) : -1;
+        if (k >= 0 && rail_has(&r, known[k]) < 0) {
+            snprintf(r.v[r.n].name, OC_RAIL_NAME, "%s", known[k]);
+            r.v[r.n].shown = (uint8_t)shown;
+            r.n++;
+        }
+        if (!e) break;
+        s = e + 1;
+    }
+    if (r.n == 0) { oc_rail_opts_default(o, known, n_known); return; }
+    for (size_t i = 0; known && i < n_known && r.n < OC_RAIL_MAX; i++)   /* what it does not name */
+        if (known[i] && known[i][0] && strlen(known[i]) < OC_RAIL_NAME && rail_has(&r, known[i]) < 0) {
+            snprintf(r.v[r.n].name, OC_RAIL_NAME, "%s", known[i]);
+            r.v[r.n].shown = 1;
+            r.n++;
+        }
+    int h = rail_has(&r, "home");                                         /* first, and shown */
+    if (h > 0) {
+        oc_rail_view hv = r.v[h];
+        memmove(&r.v[1], &r.v[0], (size_t)h * sizeof r.v[0]);
+        r.v[0] = hv;
+    }
+    if (h >= 0) r.v[0].shown = 1;
+    *o = r;
+}
+
 /* ---- a person's channel colours --------------------------------------------- */
 
 uint8_t oc_chan_color_of(const oc_chan_colors *c, uint64_t channel_id) {

@@ -1213,6 +1213,26 @@ void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
 void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
 
+/* The graphical client's rail, as a person arranges it: its views in their
+ * order, each shown or hidden. Views are named by stable short names the
+ * frontend gives (`home`, `dms`, `activity`, ...), never by position, so a
+ * later build that reorders its table reorders nobody's rail. `home` is always
+ * first and shown: it is where the client opens. */
+#define OC_RAIL_MAX   16
+#define OC_RAIL_NAME  16
+typedef struct { char name[OC_RAIL_NAME]; uint8_t shown; } oc_rail_view;
+typedef struct { oc_rail_view v[OC_RAIL_MAX]; uint8_t n; } oc_rail_opts;
+/* The frontend's views in its own order, all shown. */
+void oc_rail_opts_default(oc_rail_opts *o, const char *const *known, size_t n_known);
+/* As one setting value: the names in order, comma-separated, a hidden one
+ * after a '-' ("home,dms,-files,later"). */
+void oc_rail_opts_encode(const oc_rail_opts *o, char *out, size_t cap);
+/* Back from that value, forgiving across builds: a name this build does not
+ * know is dropped, a known view the value does not name is added at the end,
+ * shown, `home` is put first and shown whatever the value says, and an empty,
+ * NULL or malformed value gives the default. */
+void oc_rail_opts_parse(oc_rail_opts *o, const char *s, const char *const *known, size_t n_known);
+
 /* A person's own channel colours: a dot before a channel's name, to tell
  * channels apart. Personal and synced, each client type in its own settings
  * bucket under the key `colors`; nobody else sees them. A colour is an index,

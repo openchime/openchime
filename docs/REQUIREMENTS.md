@@ -2747,6 +2747,11 @@ choose — which makes each one a per-frontend *obligation*.*
   there, because every rect, menu and model pointer it touches belongs to the UI
   thread. Each token ends in the same call the mouse path makes, so an invoke and
   a click cannot do different things.
+- **REQ-394.** A person has been able to **arrange the graphical client's
+  navigation rail**: hide the views they do not use and put the rest in the
+  order they work in, with Home always first and shown. The arrangement has
+  followed their account to their other graphical clients, and a hidden view
+  has stayed reachable from the command palette. (ARCH-92: per-frontend.)
 
 ---
 

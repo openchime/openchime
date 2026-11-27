@@ -2153,6 +2153,11 @@ enum { WSM_CMD_REMOVE_ALL = 2703 };   /* the Workspaces footer's Remove all */
 /* ...its Remove unused (the day dialog), and that dialog's Continue; its
  * Remove unreachable. */
 enum { WSM_CMD_UNUSED = 2720, WSM_CMD_UNUSED_GO = 2721, WSM_CMD_UNREACH = 2722 };
+/* The palette's "Go to" entries, one per rail view but Home (view_go). */
+enum { GOTO_CMD_DMS = 2730, GOTO_CMD_ACTIVITY, GOTO_CMD_FILES, GOTO_CMD_LATER, GOTO_CMD_ADMIN };
+/* A rail view's right-click menu: hide it (g_menu_target is its act), or open
+ * Preferences at the Navigation group. */
+enum { RAIL_CMD_HIDE = 2736, RAIL_CMD_CUSTOMIZE = 2737 };
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
 static char     g_confirm_body[2048];
@@ -2523,7 +2528,7 @@ static int g_n_moreflyrows;
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
        MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT,
-       MENU_SUMMARIZE, MENU_AUDIT };
+       MENU_SUMMARIZE, MENU_AUDIT, MENU_RAIL };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box (it predates the flyout below and stays a row — six separate rows
  * would bury the rest of the message actions).
@@ -4253,19 +4258,50 @@ static void draw_alert_badge(gfx *rt, const oc_model *m, float y) {
 }
 
 /* The main nav items (the user's list). "More" is synthesized only on overflow. */
-static const struct { int act; int icon; const char *label; int admin; } RAIL_ITEMS[] = {
-    { VIEW_HOME,     OC_ICON_HOME,     "Home",     0 },
-    { VIEW_DMS,      OC_ICON_DMS,      "DMs",      0 },
-    { VIEW_ACTIVITY, OC_ICON_BELL,     "Activity", 0 },
-    { VIEW_FILES,    OC_ICON_FILE,     "Files",    0 },
-    { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0 },
+/* `name` is the view's stable name (view_aid's), which the person's `rail`
+ * setting keeps the order and the hidden ones by: never the index. */
+static const struct { int act; int icon; const char *label; int admin; const char *name; } RAIL_ITEMS[] = {
+    { VIEW_HOME,     OC_ICON_HOME,     "Home",     0, "home"     },
+    { VIEW_DMS,      OC_ICON_DMS,      "DMs",      0, "dms"      },
+    { VIEW_ACTIVITY, OC_ICON_BELL,     "Activity", 0, "activity" },
+    { VIEW_FILES,    OC_ICON_FILE,     "Files",    0, "files"    },
+    { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0, "later"    },
     /* Drafts is NOT here. It briefly was, and that was wrong: Slack reaches
      * "Drafts & sent" from a row at the top of the HOME SIDEBAR, beside Threads
      * and Directories, not from a sixth rail destination. REQ-223 said so before
      * it was built. See the destinations shelf in draw_sidebar. */
-    { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1 },
+    { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1, "admin"    },
 };
 #define RAIL_N_ITEMS ((int)(sizeof RAIL_ITEMS / sizeof RAIL_ITEMS[0]))
+
+/* The rail as this person arranges it (oc_rail_opts): its own key in the GUI's
+ * synced bucket, beside `sidebar` and `prefs`, so it follows the account to
+ * another desktop or web client. Read whenever the stored value changes
+ * (rail_opts_load), written only once the account's settings have arrived. */
+#define RAIL_SETTING_KEY "rail"
+static oc_rail_opts g_rail;
+static char         g_rail_seen[OC_SETTING_VALUE_MAX] = "\x01";   /* nothing read yet */
+
+static void rail_names(const char *names[RAIL_N_ITEMS]) {
+    for (int i = 0; i < RAIL_N_ITEMS; i++) names[i] = RAIL_ITEMS[i].name;
+}
+static void rail_opts_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting((oc_model *)m, RAIL_SETTING_KEY) : NULL;
+    if (!v) v = "";
+    if (!strcmp(v, g_rail_seen)) return;
+    snprintf(g_rail_seen, sizeof g_rail_seen, "%s", v);
+    const char *names[RAIL_N_ITEMS];
+    rail_names(names);
+    oc_rail_opts_parse(&g_rail, v, names, RAIL_N_ITEMS);
+}
+/* 1 when it was written; 0 before the account's settings have arrived. */
+static int rail_opts_save(const oc_model *m) {
+    if (!g_client || !m || !m->settings_synced) return 0;
+    char enc[OC_SETTING_VALUE_MAX];
+    oc_rail_opts_encode(&g_rail, enc, sizeof enc);
+    oc_client_set_setting(g_client, RAIL_SETTING_KEY, enc);
+    return 1;
+}
 
 /* The Home sidebar's destinations shelf (REQ-228): where each row landed, so a
  * click can find it, and which one the pointer is over. */
@@ -4415,8 +4451,17 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
 
     /* Gate admin-only items, then overflow the tail into "More" when there isn't
      * enough vertical space (fold Admin first, up toward Home; Home never folds). */
+    /* In the person's order, the views they keep shown (g_rail); the table's
+     * order until their setting is read. A hidden Admin takes its alert sign
+     * with it: it is drawn on neither the rail nor More. */
     int vis[RAIL_N_ITEMS], nv = 0;
-    for (int i = 0; i < RAIL_N_ITEMS; i++) {
+    for (int j = 0; j < (g_rail.n ? (int)g_rail.n : RAIL_N_ITEMS); j++) {
+        int i = j;
+        if (g_rail.n) {
+            if (!g_rail.v[j].shown) continue;
+            for (i = 0; i < RAIL_N_ITEMS && strcmp(RAIL_ITEMS[i].name, g_rail.v[j].name); i++) {}
+            if (i == RAIL_N_ITEMS) continue;
+        }
         if (RAIL_ITEMS[i].admin && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
         vis[nv++] = i;
     }
@@ -11835,6 +11880,98 @@ static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notification
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
+/* Preferences -> Appearance -> Navigation: the rail's views in their order,
+ * each with a show/hide box and Move up / Move down. Home is first, always shown
+ * and not movable; Admin is listed only for an admin. Changes apply to the rail
+ * at once and, like every row here, persist on Save and revert on Cancel. */
+static rectf g_nav_show[OC_RAIL_MAX], g_nav_up[OC_RAIL_MAX], g_nav_dn[OC_RAIL_MAX];
+static int   g_nav_jump;   /* "Customize navigation…": scroll to the group once */
+
+static int nav_listed(const oc_model *m, int j) {
+    if (j < 0 || j >= g_rail.n) return 0;
+    if (!strcmp(g_rail.v[j].name, "admin")) return m && self_role(m) >= OC_ROLE_ADMIN;
+    return 1;
+}
+static const char *nav_label(const char *name) {
+    for (int i = 0; i < RAIL_N_ITEMS; i++) if (!strcmp(RAIL_ITEMS[i].name, name)) return RAIL_ITEMS[i].label;
+    return name;
+}
+/* The neighbour a Move swaps with: the next listed row up or down, never Home. */
+static int nav_neighbour(const oc_model *m, int j, int dir) {
+    for (int k = j + dir; k > 0 && k < g_rail.n; k += dir) if (nav_listed(m, k)) return k;
+    return -1;
+}
+/* A Navigation row's control: 0 show/hide, 1 up, 2 down. */
+static void nav_pref_act(int j, int kind) {
+    const oc_model *m = model();
+    if (!nav_listed(m, j) || j == 0) return;           /* Home: not hidden, not moved */
+    if (kind == 0) { g_rail.v[j].shown = !g_rail.v[j].shown; invalidate(); return; }
+    int k = nav_neighbour(m, j, kind == 1 ? -1 : 1);
+    if (k < 0) return;
+    oc_rail_view t = g_rail.v[j]; g_rail.v[j] = g_rail.v[k]; g_rail.v[k] = t;
+    invalidate();
+}
+
+static float pref_nav_group(gfx *rt, rectf body, float y) {
+    const oc_model *m = model();
+    for (int j = 0; j < OC_RAIL_MAX; j++) g_nav_show[j] = g_nav_up[j] = g_nav_dn[j] = rf(0, 0, 0, 0);
+    if (!g_rail.n) {                                   /* not read yet: the table's order */
+        const char *names[RAIL_N_ITEMS];
+        rail_names(names);
+        oc_rail_opts_default(&g_rail, names, RAIL_N_ITEMS);
+    }
+    if (g_nav_jump) {                  /* its top at the top of the rows */
+        g_nav_jump = 0;
+        g_ovl_scroll += y - (body.top + 14);
+        invalidate();
+    }
+    const char *hint = "The views on the left rail, in your order. A hidden view is still in the "
+                       "command palette (Ctrl+K).";
+    draw_text(rt, "Navigation", g_ui_b, rf(body.left + 24, y, body.right - 24, y + 22), OC_COL_TEXT);
+    float hw = (body.right - 24) - (body.left + 24);
+    float hint_h = text_height(hint, g_meta_w, hw);
+    draw_text(rt, hint, g_meta_w, rf(body.left + 24, y + 30, body.right - 24, y + 30 + hint_h), OC_COL_FAINT);
+    y += 30 + hint_h + 8;
+    float rowh = UIS(34.0f), box = UIS(16.0f), bw = UIS(84.0f);
+    for (int j = 0; j < g_rail.n; j++) {
+        if (!nav_listed(m, j)) continue;
+        int home = (j == 0);
+        float cy = y + rowh / 2;
+        rectf chk = rf(body.left + 24, cy - box / 2, body.left + 24 + box, cy + box / 2);
+        if (g_rail.v[j].shown) {
+            fill_round(rt, chk, OC_R_CONTROL, home ? OC_COL_FAINT : OC_COL_ACCENT);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
+            g_meta->align = ST_ALIGN_LEFT;
+        } else {
+            stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        }
+        char lbl[64];
+        snprintf(lbl, sizeof lbl, "%s%s", nav_label(g_rail.v[j].name), home ? "  (always shown)" : "");
+        draw_text(rt, lbl, g_ui, rf(chk.right + UIS(10.0f), y, body.right - 24 - 2 * bw - 16, y + rowh),
+                  home ? OC_COL_MUTED : OC_COL_TEXT);
+        if (!home) {
+            g_nav_show[j] = rf(chk.left - 4, y, chk.right + UIS(10.0f) + text_width(lbl, g_ui), y + rowh);
+            int can_up = nav_neighbour(m, j, -1) > 0, can_dn = nav_neighbour(m, j, 1) > 0;
+            rectf up = rf(body.right - 24 - 2 * bw - 8, y + 4, body.right - 24 - bw - 8, y + rowh - 4);
+            rectf dn = rf(body.right - 24 - bw, y + 4, body.right - 24, y + rowh - 4);
+            const struct { rectf r; int on; const char *t; } B[2] = { { up, can_up, "Move up" }, { dn, can_dn, "Move down" } };
+            for (int b = 0; b < 2; b++) {
+                int hot = B[b].on && in_rect(B[b].r, g_mouse_x, g_mouse_y);
+                if (hot) fill_round(rt, B[b].r, OC_R_CONTROL, OC_COL_HOVER);
+                stroke_round(rt, B[b].r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                g_meta->align = ST_ALIGN_CENTER;
+                draw_text(rt, B[b].t, g_meta, B[b].r, B[b].on ? OC_COL_TEXT : OC_COL_FAINT);
+                g_meta->align = ST_ALIGN_LEFT;
+            }
+            if (can_up) g_nav_up[j] = up;
+            if (can_dn) g_nav_dn[j] = dn;
+        }
+        y += rowh;
+    }
+    return y + 12;
+}
+
 /* The colour-scheme row: each choice is a PAIR — the rail colour and the accent —
  * drawn as one swatch showing both, because that is what you are choosing. Discs
  * rather than named chips: the name of a colour is not the thing being chosen. */
@@ -12009,6 +12146,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
         static const char *TPOS[3] = { "Bottom centre", "Bottom right", "Top right" };
         y = pref_row(rt, body, y, PREF_ROW_TOASTPOS, "Notices",
                      "Where confirmations, Undo and failures appear in the window.", TPOS, 3, g_pref_toastpos);
+        y = pref_nav_group(rt, body, y);
     } else if (g_pref_cat == PC_MESSAGES) {
         y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
@@ -12168,6 +12306,11 @@ static void draw_prefs(gfx *rt, rectf reg) {
     for (int i = 0; i < QUICK_SLOTS; i++) {
         g_quick_tile[i]  = hit_visible(g_quick_tile[i], rows);
         g_quick_clear[i] = hit_visible(g_quick_clear[i], rows);
+    }
+    for (int j = 0; j < OC_RAIL_MAX; j++) {
+        g_nav_show[j] = hit_visible(g_nav_show[j], rows);
+        g_nav_up[j]   = hit_visible(g_nav_up[j], rows);
+        g_nav_dn[j]   = hit_visible(g_nav_dn[j], rows);
     }
 }
 
@@ -13180,6 +13323,12 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Change email address",    33 },
     { "Threads",                 74 },
     { "People",                  75 },
+    /* Every rail view, so one hidden from the rail is still a step away. */
+    { "Go to DMs",               GOTO_CMD_DMS },
+    { "Go to Activity",          GOTO_CMD_ACTIVITY },
+    { "Go to Files",             GOTO_CMD_FILES },
+    { "Go to Later",             GOTO_CMD_LATER },
+    { "Go to Admin",             GOTO_CMD_ADMIN },
     { "Notification schedule",   50 },
     { "Pause notifications for 30 minutes", 58 },
     { "Pause notifications for 1 hour",     59 },
@@ -13246,6 +13395,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     for (size_t i = 0; !picking && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
         if (PALETTE[i].cmd == 88 && !(m && g_sel && oc_model_summarize_available(m))) continue;   /* REQ-313 */
         else if (PALETTE[i].cmd == 90 && !poll_offered(m)) continue;   /* REQ-225 */
+        else if (PALETTE[i].cmd == GOTO_CMD_ADMIN && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
         else if (pal_match(PALETTE[i].label, q)) {
             hit[nh].label = PALETTE[i].label; hit[nh].kind = "Action";
             hit[nh].cmd = PALETTE[i].cmd; hit[nh].cid = 0; nh++;
@@ -17915,6 +18065,7 @@ static struct {
     int  announce_new;
     int  motion;
     int  contrast;
+    oc_rail_opts rail;       /* the Navigation group (rail_opts_*) */
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -17938,6 +18089,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.contrast = g_pref_contrast;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
+    g_prefs_snap.rail = g_rail;
 }
 
 static void theme_set(int mode);      /* fwd — a cancel restores the palette */
@@ -17971,6 +18123,7 @@ static void prefs_restore(void) {
     ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
+    g_rail = g_prefs_snap.rail;
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
      * through the one path that knows that — and only when they actually moved. */
     if (g_dpi != g_prefs_snap.dpi) dpi_set(g_main, g_prefs_snap.dpi);
@@ -29551,7 +29704,8 @@ enum {
     AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
     AT_JUMPCAL,       /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
     AT_PREFCHOICE,    /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
-    AT_ALSO           /* the thread composer's "Also send to #channel" -- toggle it */
+    AT_ALSO,          /* the thread composer's "Also send to #channel" -- toggle it */
+    AT_NAVPREF        /* payload: a Navigation row's index in g_rail * 4 + 0 show/hide, 1 up, 2 down */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -30608,6 +30762,19 @@ modal_items:
                 for (int i = 0; i < g_n_agtbtns && n < OC_ACC_MAX; i++)
                     acc_push(items, &n, OC_ACC_BUTTON, g_agtbtns[i].aid, g_agtbtns[i].name, g_agtbtns[i].r,
                              ATOK(AT_AGENTBTN, (uint64_t)i));
+            for (int j = 0; g_pref_cat == PC_APPEARANCE && j < g_rail.n && j < OC_RAIL_MAX; j++) {
+                const rectf *R[3] = { &g_nav_show[j], &g_nav_up[j], &g_nav_dn[j] };
+                static const char *const K[3] = { "show", "up", "down" };
+                for (int k = 0; k < 3 && n < OC_ACC_MAX; k++) {
+                    if (R[k]->right <= R[k]->left) continue;
+                    char aid[OC_ACC_AID_MAX], label[96];
+                    snprintf(aid, sizeof aid, "prefs.nav.%s.%s", g_rail.v[j].name, K[k]);
+                    const char *vl = nav_label(g_rail.v[j].name);
+                    if (k == 0) snprintf(label, sizeof label, "Show %s on the rail, %s", vl, g_rail.v[j].shown ? "on" : "off");
+                    else        snprintf(label, sizeof label, "Move %s %s", vl, k == 1 ? "up" : "down");
+                    acc_push(items, &n, OC_ACC_BUTTON, aid, label, *R[k], ATOK(AT_NAVPREF, (uint64_t)(j * 4 + k)));
+                }
+            }
             for (int i = 0; i < QUICK_SLOTS && n < OC_ACC_MAX; i++) {
                 char aid[OC_ACC_AID_MAX], nm[40], label[64];
                 quick_slot_get(i, nm, sizeof nm);
@@ -34332,6 +34499,28 @@ static void pref_choose(oc_win *hwnd, int row, int v) {
     }
 }
 
+/* Go to a rail view: what a rail button does, and the More flyout's rows and
+ * the palette's "Go to" entries with it, so a view hidden from the rail is
+ * reached exactly as it would have been. Entering a report view fetches it. */
+static void view_go(oc_win *hwnd, int act) {
+    /* Leaving Admin closes its report panes: the admin Storage and Audit tabs
+     * share the model's pane flags with the channel-tools versions, and a flag
+     * left set replaced the Home transcript with a storage report -- no tab
+     * selected it, and neither Esc nor a tab click could dismiss it. */
+    if (g_view == VIEW_ADMIN && act != VIEW_ADMIN) {
+        const oc_model *am = model();
+        if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
+        if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
+    }
+    g_view = act; layout_composer(hwnd);
+    if (act == VIEW_ADMIN) admin_select(admin_entry_tab(model()));
+    if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
+                             oc_client_list_files(g_client, 0);
+                             oc_client_list_file_channels(g_client); }
+    if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
+    if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
+}
+
 static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Admin > Agents: each button, as it was drawn -- first, since the
@@ -35104,6 +35293,11 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 return 1;
             }
         }
+        for (int j = 0; g_pref_cat == PC_APPEARANCE && j < OC_RAIL_MAX; j++) {
+            if (in_rect(g_nav_show[j], x, y)) { nav_pref_act(j, 0); return 1; }
+            if (in_rect(g_nav_up[j], x, y))   { nav_pref_act(j, 1); return 1; }
+            if (in_rect(g_nav_dn[j], x, y))   { nav_pref_act(j, 2); return 1; }
+        }
         for (int i = 0; i < PC_COUNT; i++)
             if (in_rect(g_pref_cats[i], x, y)) { pref_cat_select(i); invalidate(); return 1; }
         if (g_pref_cat == PC_AICLIENTS)
@@ -35253,16 +35447,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
         for (int i = 0; i < g_n_moreflyrows; i++)
             if ((float)y >= g_moreflyrows[i].top && (float)y < g_moreflyrows[i].bot &&
                 (float)x >= RAIL_W && (float)x < RAIL_W + 6 + 196) {
-                if (g_view == VIEW_ADMIN && g_moreflyrows[i].act != VIEW_ADMIN) {
-                    const oc_model *am = model();   /* see the rail-item comment */
-                    if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
-                    if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
-                }
-                g_view = g_moreflyrows[i].act; g_more_open = 0; layout_composer(hwnd);
-                if (g_view == VIEW_FILES) {
-                    g_file_chan = 0; g_filelist_from_view = 1;
-                    oc_client_list_files(g_client, 0);
-                }
+                g_more_open = 0;
+                view_go(hwnd, g_moreflyrows[i].act);
                 return 1;
             }
         g_more_open = 0;
@@ -35274,27 +35460,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
         for (int i = 0; i < g_n_navrows; i++)
             if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
                 int act = g_navrows[i].act;
-                if (act >= 0)                  {
-                    /* Leaving Admin closes its report panes: the admin Storage
-                     * and Audit tabs share the model's pane flags with the
-                     * channel-tools versions, and a flag left set replaced the
-                     * Home transcript with a storage report — no tab selected
-                     * it, and neither Esc nor a tab click could dismiss it. */
-                    if (g_view == VIEW_ADMIN && act != VIEW_ADMIN) {
-                        const oc_model *am = model();
-                        if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
-                        if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
-                    }
-                    g_view = act; layout_composer(hwnd);
-                    /* Entering a report view fetches it: both are point-in-time
-                     * and a stale one is worse than a moment's wait. */
-                    if (act == VIEW_ADMIN) admin_select(admin_entry_tab(model()));
-                    if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
-                                             oc_client_list_files(g_client, 0);
-                                             oc_client_list_file_channels(g_client); }
-                    if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
-                    if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
-                }
+                if (act >= 0)                  view_go(hwnd, act);
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
                 else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
                 else if (act == NAV_NEW)       { open_new_menu(hwnd); }
@@ -36520,6 +36686,28 @@ static int audit_key(oc_win *hwnd, int vk) {
 static void on_rclick(oc_win *hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
+    /* A rail view: hide it (never Home), or arrange the rail in Preferences. */
+    if ((float)x < RAIL_W) {
+        for (int i = 0; i < g_n_navrows; i++)
+            if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
+                int act = g_navrows[i].act, is_view = 0;
+                for (int k = 0; k < RAIL_N_ITEMS; k++) if (RAIL_ITEMS[k].act == act) is_view = 1;
+                if (!is_view) return;
+                g_n_mi = 0;
+                if (act != VIEW_HOME) mi_item(RAIL_CMD_HIDE, "Hide from navigation");
+                mi_item(RAIL_CMD_CUSTOMIZE, "Customize navigation\xE2\x80\xA6");
+                g_menu = MENU_RAIL; g_menu_headerblock = 0; g_menu_hover = -1;
+                g_menu_target = (uint64_t)act; g_menu_target2 = 0;
+                g_menu_w = UIS(240);
+                g_menu_x = (float)x; g_menu_y = (float)y;
+                float mh = 12; for (int k = 0; k < g_n_mi; k++) mh += menu_item_h(g_mi[k].kind);
+                irect rc; client_rect(hwnd, &rc);
+                if (g_menu_y + mh > DIPF(rc.bottom) - 8) g_menu_y = DIPF(rc.bottom) - 8 - mh;
+                invalidate();
+                return;
+            }
+        return;
+    }
     /* Sidebar channel rows -> channel menu. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_rows; i++)
@@ -38472,6 +38660,7 @@ static void open_new_menu(oc_win *hwnd) {
  * so a terminal and a window can keep different sidebar shapes. */
 static void prefs_save(void) {
     if (!g_client) return;
+    rail_opts_save(model());              /* the Navigation group, its own key */
     if (!g_prefs_read) { g_prefs_save_held = 1; return; }
     char enc[448];   /* within OC_SETTING_VALUE_MAX; the quick reactions alone may take 160 */
     /* Zoom is deliberately absent: it is per window and transient (ARCH-97), so
@@ -40624,6 +40813,31 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         oc_client_list_threads(g_client,
             g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
         break;
+    case RAIL_CMD_HIDE: {
+        const oc_model *hm = model();
+        const char *nm = NULL;
+        for (int k = 0; k < RAIL_N_ITEMS; k++) if ((uint64_t)RAIL_ITEMS[k].act == g_menu_target) nm = RAIL_ITEMS[k].name;
+        if (!nm || !strcmp(nm, "home")) break;
+        if (!hm || !hm->settings_synced) { fb_failed("Your settings are still loading. Try again in a moment."); break; }
+        for (int j = 0; j < g_rail.n; j++)
+            if (!strcmp(g_rail.v[j].name, nm)) g_rail.v[j].shown = 0;
+        rail_opts_save(hm);
+        fb_confirm("Hidden from the rail. It is still in the command palette (Ctrl+K).");
+        invalidate();
+        break; }
+    case RAIL_CMD_CUSTOMIZE:
+        g_pref_cat = PC_APPEARANCE;
+        modal_enter(hwnd, &g_prefs_open);
+        g_nav_jump = 1;
+        break;
+    case GOTO_CMD_DMS:      close_overlays(); view_go(hwnd, VIEW_DMS);      break;
+    case GOTO_CMD_ACTIVITY: close_overlays(); view_go(hwnd, VIEW_ACTIVITY); break;
+    case GOTO_CMD_FILES:    close_overlays(); view_go(hwnd, VIEW_FILES);    break;
+    case GOTO_CMD_LATER:    close_overlays(); view_go(hwnd, VIEW_LATER);    break;
+    case GOTO_CMD_ADMIN: {
+        const oc_model *gm = model();
+        if (gm && self_role(gm) >= OC_ROLE_ADMIN) { close_overlays(); view_go(hwnd, VIEW_ADMIN); }
+        break; }
     case 75:  /* The people directory (REQ-289). */
         close_overlays();
         g_view = VIEW_DIRECTORY;
@@ -42058,6 +42272,7 @@ static int on_tick(oc_win *hwnd) {
                 }
             }
             hist_track();
+            rail_opts_load(m);                 /* the rail's order, as it changes */
             /* Channel colours: whenever the stored value changes, from this
              * device's own save coming back or another device's. */
             {
@@ -43213,6 +43428,9 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
                 if (r.right > r.left)
                     sched_custom_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
+            break;
+        case AT_NAVPREF:
+            if (g_prefs_open) nav_pref_act((int)(arg / 4), (int)(arg % 4));
             break;
         case AT_QUICKSLOT:
             if (g_prefs_open) {

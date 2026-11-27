@@ -2897,6 +2897,56 @@ static void test_chan_colors(void) {
     CHECK(oc_chan_color_of(&back, 4) == 0 && oc_chan_color_of(&back, 5) == 0);
 }
 
+/* The graphical client's rail as a person arranges it: the order and what is
+ * shown survive the setting, and an older or newer build's value is read
+ * without losing a view. */
+static void test_rail_opts(void) {
+    static const char *const K[] = { "home", "dms", "activity", "files", "later", "admin" };
+    const size_t NK = sizeof K / sizeof K[0];
+    oc_rail_opts o, b;
+    char enc[OC_SETTING_VALUE_MAX];
+    oc_rail_opts_default(&o, K, NK);
+    CHECK(o.n == NK);
+    for (size_t i = 0; i < NK; i++) CHECK(!strcmp(o.v[i].name, K[i]) && o.v[i].shown);
+
+    /* Reordered and partly hidden: encode then parse is the identity. */
+    oc_rail_opts_parse(&o, "home,later,-dms,activity,-admin,files", K, NK);
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(!strcmp(enc, "home,later,-dms,activity,-admin,files"));
+    oc_rail_opts_parse(&b, enc, K, NK);
+    CHECK(b.n == o.n && !memcmp(&b, &o, sizeof b));
+
+    /* A view this build does not know is dropped; one it has that the value
+     * does not name is added at the end, shown. */
+    oc_rail_opts_parse(&o, "home,calls,files,-later", K, NK);
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(!strcmp(enc, "home,files,-later,dms,activity,admin"));
+
+    /* Home is first and shown whatever the value says. */
+    oc_rail_opts_parse(&o, "dms,-home,files", K, NK);
+    CHECK(o.n == NK && !strcmp(o.v[0].name, "home") && o.v[0].shown);
+    CHECK(!strcmp(o.v[1].name, "dms") && !strcmp(o.v[2].name, "files"));
+
+    /* Empty, NULL and malformed: the default order, all shown. */
+    const char *bad[] = { NULL, "", ",,,", "nonsense", "-", "home;dms" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        oc_rail_opts_parse(&o, bad[i], K, NK);
+        CHECK(o.n == NK);
+        for (size_t k = 0; k < NK && k < o.n; k++) CHECK(!strcmp(o.v[k].name, K[k]) && o.v[k].shown);
+    }
+    /* Duplicates count once. */
+    oc_rail_opts_parse(&o, "home,dms,dms,-dms", K, NK);
+    CHECK(o.n == NK && o.v[1].shown && !strcmp(o.v[1].name, "dms"));
+
+    /* Every view, hidden, fits one setting. */
+    oc_rail_opts_default(&o, K, NK);
+    for (uint8_t i = 0; i < o.n; i++) o.v[i].shown = 0;
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(strlen(enc) > 0 && strlen(enc) < OC_SETTING_VALUE_MAX);
+    oc_rail_opts_parse(&b, enc, K, NK);
+    CHECK(b.n == NK && b.v[0].shown && !b.v[1].shown);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -7331,6 +7381,7 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_chanmem_overlap();
     test_sidebar();
+    test_rail_opts();
     test_chan_colors();
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
