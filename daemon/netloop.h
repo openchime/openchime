@@ -149,6 +149,12 @@ void oc_netloop_set_push(struct oc_push *push);
 struct oc_invite_mail;
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
 
+/* Wire the invitations central queues (central_invites.h). When set, what came of
+ * each invitation central asked for -- made, or refused and why -- is handed to
+ * it to report. NULL turns it off. */
+struct oc_central_invites;
+void oc_netloop_set_central_invites(struct oc_central_invites *ci);
+
 /* Wire the outgoing webhooks' delivery worker (webhooks_out.h), before the loop
  * runs; NULL (the default) delivers nothing and refuses creations. */
 struct oc_webhooks_out;

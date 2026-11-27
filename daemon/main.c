@@ -23,6 +23,7 @@
 #include "dbwriter.h"
 #include "enroll.h"
 #include "invite_mail.h"
+#include "central_invites.h"
 #include "webhooks_out.h"
 #include "address_report.h"
 #include "listen.h"
@@ -150,6 +151,7 @@ typedef struct {
     oc_address_report *addr;              /* the address report (AUTH.md §3.6) */
     oc_push        *push;
     oc_invite_mail *invite_mail;
+    oc_central_invites *central_invites;  /* the invitations central queues (ARCH-85) */
     oc_release_notes_worker *release_notes;   /* the clients' release notes (PROTOCOL.md §5.16r) */
     /* The CA-issued certificate (TLS.md, "Certificates"): its worker, the TLS
      * state it presents into, what the database kept, and whether the binding
@@ -299,6 +301,20 @@ static void start_certs(services *f) {
     if (!f->certs) fprintf(stderr, "openchimed: the certificate worker failed to start\n");
 }
 
+/* An invitation central queued (central_invites.h): made through the writer as a
+ * member's invitation bound to its address is; the loop hands back what came of it. */
+static void make_central_invite(void *ctx, const char *id, const char *address) {
+    services *f = ctx;
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 0);
+    if (!j) return;
+    j->role = OC_ROLE_MEMBER;
+    j->uses = 1;
+    j->email = strdup(address);
+    snprintf(j->central_id, sizeof j->central_id, "%s", id);
+    if (!j->email) { oc_job_free(j); return; }
+    oc_dbwriter_submit(f->db, j);
+}
+
 static void start_services(services *f) {
     const oc_config *cfg = f->cfg;
     /* The address proof (AUTH.md §3.6): central's check of the address this
@@ -332,6 +348,12 @@ static void start_services(services *f) {
             fprintf(stderr, "openchimed: invitation mail failed to start\n");
         }
     }
+    /* The invitations central queues for this workspace (ARCH-85): taken, made,
+     * and reported, at the pace central sets. */
+    f->central_invites = oc_central_invites_start(cfg->enroll.url, f->audience, f->privkey,
+                                                  make_central_invite, f);
+    if (f->central_invites) oc_netloop_set_central_invites(f->central_invites);
+    else fprintf(stderr, "openchimed: the central invitations worker failed to start\n");
 }
 
 /* Sleep up to `secs`, returning early (non-zero) once shutdown is asked for. */
@@ -1074,6 +1096,8 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&svc.adopt_mu);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
+    oc_netloop_set_central_invites(NULL);
+    oc_central_invites_stop(svc.central_invites);
     oc_netloop_set_release_notes(NULL);
     oc_release_notes_stop(svc.release_notes);
     oc_netloop_set_webhooks_out(NULL);

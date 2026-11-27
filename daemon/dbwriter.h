@@ -603,6 +603,9 @@ typedef struct oc_job {
     uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
     uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
     char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
+    /* INVITE_USER queued by central (central_invites.h): central's id for it, 32
+     * lower-case hex digits, or empty for one a user asked for. Echoed on the result. */
+    char           central_id[33];
     /* A passkey (AUTH.md §8.6): the trusted name it is for -- its relying party
      * and origin -- the ceremony's challenge, and what the browser answered,
      * each base64url: a credential id, client data, authenticator data, a
@@ -1718,6 +1721,10 @@ typedef struct oc_dbres {
      * invitation mail report carries (ARCH-85). Empty/NULL for a bearer invite. */
     char            invite_id[33];
     char           *invite_email;   /* heap */
+    /* INVITE_OK/ERR for an invitation central queued: central's id for it, and on
+     * ERR why it was refused, as reported to central (a static string). */
+    char            central_id[33];
+    const char     *central_why;
     uint16_t        invite_uses;    /* INVITE_OK: how many may redeem it; 0 = no limit */
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */

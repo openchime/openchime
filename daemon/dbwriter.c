@@ -3215,17 +3215,33 @@ static void invite_report_id(const uint8_t hash[OC_SHA256_LEN], char out[33]) {
     out[32] = '\0';
 }
 
+/* Whether a user already holds `email`, compared case-blind. */
+static int user_with_email(sqlite3 *db, const char *email) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE lower(email)=lower(?) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_STATIC);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
 static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    /* An invitation central queued for this workspace (central_invites.h): no
+     * inviting user, a member, one use, bound to its address. Its outcome goes
+     * back to central under central's id; a refusal says why. */
+    int central = j->central_id[0] != '\0';
+    if (central) memcpy(r->central_id, j->central_id, sizeof r->central_id);
 
     uint8_t actor_role = OC_ROLE_MEMBER;
-    if (!user_role(db, j->user_id, &actor_role) || !oc_role_can_manage_members(actor_role)) {
+    if (!central && (!user_role(db, j->user_id, &actor_role) || !oc_role_can_manage_members(actor_role))) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    uint8_t want = j->role > OC_ROLE_OWNER ? OC_ROLE_MEMBER : j->role;
+    uint8_t want = central || j->role > OC_ROLE_OWNER ? OC_ROLE_MEMBER : j->role;
     if (want != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
@@ -3233,8 +3249,9 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
      * address it is spent by that address's verified sign-in (AUTH.md §8.4), and
      * the token that comes back is zeros — there is nothing to hand anybody. */
     const char *email = (j->email && j->email[0]) ? j->email : NULL;
-    if (email && !oc_email_plausible(email)) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    if ((central && !email) || (email && !oc_email_plausible(email))) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        r->central_why = "not an email address"; return r;
     }
     /* How many may redeem it (REQ-026): 1 is an invitation to one person; N, or
      * 0 for no limit, is a link to pass around. One address spends its invite
@@ -3250,11 +3267,18 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
      * it, and minting it anyway would hand the inviter a row that sits there
      * until it expires. */
     if (email && !(w->auth_methods & OC_AUTH_OIDC) && w->n_direct_iss == 0) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE;
+        r->central_why = "this workspace signs nobody in by email address"; return r;
+    }
+    /* Central's invitation to somebody already here has nothing to do. */
+    if (central && user_with_email(db, email)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        r->central_why = "already a member"; return r;
     }
     uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;
     if (mint_invite_for(db, j->user_id, want, email, uses, token, &expiry, hash) != 0) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL;
+        r->central_why = "could not be made"; return r;
     }
     if (email) {
         memset(token, 0, sizeof token);
@@ -3280,7 +3304,9 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
 static void spend_setup_tokens(sqlite3 *db) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "UPDATE invites SET consumed_at_ms=? WHERE created_by IS NULL AND consumed_at_ms IS NULL;",
+        /* A setup token has no inviter and no address; an invitation central
+         * queued has no inviter either, but is bound to one, and stands. */
+        "UPDATE invites SET consumed_at_ms=? WHERE created_by IS NULL AND email IS NULL AND consumed_at_ms IS NULL;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
     sqlite3_step(st);

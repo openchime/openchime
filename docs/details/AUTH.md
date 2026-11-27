@@ -873,8 +873,9 @@ Central checks the ticket — single use, short-lived — and the signature, sto
 the public key and activates. The ticket is the authorization the operator's
 paste is in the self-hosted flow; the private key still never leaves the box.
 
-Requests the daemon makes afterwards — push batches, invitation reports and
-certificates through central — are each signed on their own with the same key.
+Requests the daemon makes afterwards — push batches, invitation reports,
+certificates through central, and taking and reporting the invitations central
+queued for the workspace (ARCH-85) — are each signed on their own with the same key.
 The canonical string is
 `openchime-machine-v2|<METHOD>|<path>|<aud>|<unix_ts>|<sha256hex(body)>`: the
 method, the path and query as sent, and the lowercase hex SHA-256 of the exact

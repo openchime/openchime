@@ -12,6 +12,7 @@
 #include "config.h"
 #include "push.h"
 #include "invite_mail.h"
+#include "central_invites.h"
 #include "webhooks_out.h"
 #include "release_notes.h"
 #include "enroll.h"    /* the address proof (AUTH.md §3.6) */
@@ -1409,6 +1410,13 @@ void oc_netloop_set_push(struct oc_push *push) {
 
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m) {
     __atomic_store_n(&g_invite_mail, m, __ATOMIC_RELEASE);
+}
+
+/* The invitations central queues (central_invites.h), NULL = off; published like push. */
+static oc_central_invites *g_central_invites;
+
+void oc_netloop_set_central_invites(struct oc_central_invites *ci) {
+    __atomic_store_n(&g_central_invites, ci, __ATOMIC_RELEASE);
 }
 
 /* Outgoing webhooks' delivery worker (webhooks_out.h), NULL = none: without a
@@ -8990,6 +8998,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (r->invite_email && r->invite_id[0] && demo_ok(OC_DL_MAIL, 0))
             oc_invite_mail_report(__atomic_load_n(&g_invite_mail, __ATOMIC_ACQUIRE),
                                   r->invite_id, r->invite_email, r->session_expiry / 1000u);
+        /* One central asked for: made, so central stops offering it. */
+        if (r->central_id[0]) {
+            oc_central_invites_outcome(__atomic_load_n(&g_central_invites, __ATOMIC_ACQUIRE),
+                                       r->central_id, 1, NULL);
+            return;
+        }
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
@@ -9013,6 +9027,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_INVITE_ERR:
     case OC_RES_SETROLE_ERR:
     case OC_RES_USER_ERR: {
+        /* One central asked for and refused: central hears why, and stops offering it. */
+        if (r->type == OC_RES_INVITE_ERR && r->central_id[0]) {
+            oc_central_invites_outcome(__atomic_load_n(&g_central_invites, __ATOMIC_ACQUIRE),
+                                       r->central_id, 0, r->central_why ? r->central_why : "refused");
+            return;
+        }
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);

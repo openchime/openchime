@@ -1274,6 +1274,71 @@ static void test_direct_identities(void) {
 
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
+/* An invitation central queued (central_invites.h): made with no inviting user,
+ * as a member, for one use, bound to its address, its result carrying central's
+ * id and what the invitation mail report needs; a setup token's sweep leaves it
+ * standing, and the address's verified sign-in spends it. Central asking again for
+ * somebody already here, or for something not an address, is refused, saying why. */
+static oc_dbres *central_invite(oc_dbwriter *w, const char *id, const char *address) {
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 0);
+    j->role = OC_ROLE_MEMBER; j->uses = 1;
+    oc_job_set_email(j, address, strlen(address));
+    snprintf(j->central_id, sizeof j->central_id, "%s", id);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_central_invite(void) {
+    const char *path = tdb("central-invite.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-central") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    static const char ID[] = "0123456789abcdef0123456789abcdef";
+    const char *LEE = "\"email\":\"lee@partner.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    oc_dbres *r = central_invite(w, ID, "Lee@Partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    if (r) {
+        CHECK(strcmp(r->central_id, ID) == 0);
+        CHECK(r->role == OC_ROLE_MEMBER && r->invite_uses == 1);
+        CHECK(r->invite_id[0] != '\0');
+        CHECK(r->invite_email && strcmp(r->invite_email, "lee@partner.example") == 0);
+    }
+    oc_dbres_free(r);
+
+    /* No owner yet: a setup token is minted, and the sweep of older ones leaves
+     * central's invitation, which has no inviter either, standing. */
+    oc_dbwriter_submit(w, oc_job_new(OC_JOB_SETUP_INVITE, 0));
+    oc_dbres_free(wait_result(w));
+
+    uint8_t role; int err;
+    uint64_t lee = oidc_signin(w, &is, 90, "g|lee", "c1", LEE, &role, &err);
+    CHECK(lee != 0 && role == OC_ROLE_MEMBER);
+
+    /* Somebody already here: nothing to do, and central is told why. */
+    r = central_invite(w, ID, "lee@partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_ERR);
+    if (r) {
+        CHECK(strcmp(r->central_id, ID) == 0);
+        /* contract: the reason reported to central, which records it */
+        CHECK(r->central_why && strcmp(r->central_why, "already a member") == 0);
+    }
+    oc_dbres_free(r);
+
+    r = central_invite(w, ID, "not an address");
+    CHECK(r && r->type == OC_RES_INVITE_ERR);
+    /* contract: the reason reported to central, which records it */
+    if (r) CHECK(r->central_why && strcmp(r->central_why, "not an email address") == 0);
+    oc_dbres_free(r);
+
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_oidc_join_rules(void) {
     const char *path = tdb("join.db");
     cleanup_db(path);
@@ -14443,6 +14508,7 @@ int run_dbwriter_tests(void) {
     test_demo_mode();
     test_e2e_dms();
     test_oidc_join_rules();
+    test_central_invite();
     test_direct_identities();
     test_relay_published_keys();
     test_oidc_no_downgrade();
