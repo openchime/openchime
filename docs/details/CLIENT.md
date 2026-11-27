@@ -480,7 +480,12 @@ model; translate input to intents }, stop.
     on the status line.
   - **threads** — the message menu's "Reply in thread" (or `t`) opens a message's
     thread in place of the channel (Enter then posts a reply), with a `↳ N
-    replies` marker on the parent; Esc exits.
+    replies` marker on the parent; Esc exits. In a thread, Ctrl+T toggles "also
+    send to the channel" (REQ-062), shown as `[also #channel]` before the
+    composer and in the hint line; it is off by default and off again after
+    each send. Such a reply shows in the channel too, under a `↳ replied to a
+    thread: <excerpt>` line (the line alone when the parent is not loaded), and
+    the message menu's thread entry (or `t`) on it opens its thread.
   - **search** — Ctrl+F (or the launcher's "Search messages") overlays matching
     messages (channel, author, snippet).
   - **channel management** — `n` in the Channels pane creates a channel; the
@@ -1782,6 +1787,21 @@ set. Consequences worth knowing before touching it:
   in the window (a reaction, say) still goes, being theirs. The terminal client has no preview: it shows a body as
   written ([MARKDOWN.md](./MARKDOWN.md) §5), so its message box is already
   what the conversation will show.
+
+### Replies also sent to the channel (REQ-062)
+
+While the composer replies in a thread, an **Also send to #channel** check box
+("Also send to this conversation" in a DM) sits just before Send, published as
+`composer.also_channel`. It is off by default and goes off again after each
+send and in another thread; with it on, the reply, its files or a video
+message go to the thread and to the channel's main scroll (`also_channel` on
+`SEND_REPLY`). In the main scroll such a reply is drawn under a "replied to a
+thread" line, with the parent's first words when the parent is loaded and the
+line alone when it is not; nothing is fetched to fill it in. Clicking the line,
+or the message menu's "Open thread", opens that thread. The client core puts
+the reply in the scroll once, whether it arrives live or with the history,
+counts it toward unread once, and notifies it once: as a thread notice when
+the thread is one of yours, otherwise as a channel message.
 
 ### Long messages
 

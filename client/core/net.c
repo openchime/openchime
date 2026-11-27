@@ -1107,6 +1107,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
                 e->call_id = b.call_id;          /* a call's message: which call (CALLS.md §1) */
+                e->parent_id = b.parent_id;      /* a thread reply also in the main scroll (REQ-062) */
                 e->broadcast_stored = b.broadcast_stored;
                 slice_into(e->via, sizeof e->via, b.via);   /* an AI client's post (AUTH.md §8.13) */
                 if (b.author_name.len) {
@@ -1743,6 +1744,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
+                    e->also_channel = tr.also_channel;
                     e->broadcast_stored = tr.broadcast_stored;
                     slice_into(e->via, sizeof e->via, tr.via);
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
@@ -2370,6 +2372,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (job->message_id) {
                         oc_send_reply sr; memset(&sr, 0, sizeof sr);
                         sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                        sr.also_channel = job->also_channel;
                         gen_idem(sr.idem);
                         sr.body = oc_slice_str(job->body ? job->body : "");
                         sr.n_attach = job->n_paths;
@@ -2444,6 +2447,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (job->message_id) {
                     oc_send_reply sr; memset(&sr, 0, sizeof sr);
                     sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                    sr.also_channel = job->also_channel;
                     gen_idem(sr.idem);
                     sr.body = oc_slice_str(job->body ? job->body : "");
                     sr.n_attach = 1; sr.attach_ids[0] = mo.attachment_id;
@@ -3995,6 +3999,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 sr.channel_id = c->channel_id;
                 gen_idem(sr.idem);
                 sr.parent_id = c->message_id;
+                sr.also_channel = c->also_channel;
                 sr.body = oc_slice_str(c->body);
                 if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);

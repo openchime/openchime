@@ -471,11 +471,11 @@ int run_slow_blob_tests(void) {
         }
         g_s3.held = 0;
         g_s3.gate = 1;
-        uint64_t ta = oc_client_post_files(alice, ch, 0, &pa, 1, "running, then cancelled");
+        uint64_t ta = oc_client_post_files(alice, ch, 0, &pa, 1, "running, then cancelled", 0);
         CHECK(ta != 0);
         CHECK(SB_WAIT(alice, g_s3.held == 1, 10000));
-        uint64_t tb = oc_client_post_files(alice, ch, 0, &pb, 1, "queued, then cancelled");
-        uint64_t tc = oc_client_post_files(alice, ch, 0, &pc, 1, "queued after both");
+        uint64_t tb = oc_client_post_files(alice, ch, 0, &pb, 1, "queued, then cancelled", 0);
+        uint64_t tc = oc_client_post_files(alice, ch, 0, &pc, 1, "queued after both", 0);
         CHECK(tb != 0 && tc != 0);
         oc_client_cancel_transfer(alice, tb);
         oc_client_cancel_transfer(alice, ta);

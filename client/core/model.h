@@ -153,6 +153,12 @@ typedef struct {
     /* A call's message in the conversation it was started from (CALLS.md §1):
      * the call. 0 for any other, and for a missed call stored before. */
     uint64_t        call_id;
+    /* A thread reply also posted to the main scroll (REQ-062): its thread's
+     * parent. 0 for a top-level message. */
+    uint64_t        parent_id;
+    /* Such a reply already queued as a thread notice (notice_push): the
+     * channel's notification scan leaves it alone, so it notifies once. */
+    uint8_t         thread_noticed;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The

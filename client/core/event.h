@@ -513,6 +513,9 @@ typedef struct {
     char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
                               Its own field because a topic is up to 250 bytes and
                               every fixed buffer here is smaller. */
+    uint8_t  also_channel; /* THREAD_REPLY: the reply is in the channel's main
+                              scroll too (REQ-062); MESSAGE carries such a reply's
+                              thread in `parent_id` */
     uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
@@ -952,6 +955,9 @@ typedef struct {
      * relevance, this rank beside it. */
     int64_t  rank;
     uint64_t parent_id;    /* MOVE_MESSAGE: the destination thread, 0 its top level */
+    /* REPLY, and POST_FILES / POST_VIDEO into a thread: the reply is posted to
+     * the channel's main scroll too (SEND_REPLY's `also_channel`, REQ-062). */
+    uint8_t  also_channel;
     /* USAGE: over how many UTC days (1..OC_USAGE_MAX_DAYS). */
     uint16_t usage_days;
     /* SET_USER_MUTE: the person; `op` 1 mutes, 0 unmutes. */

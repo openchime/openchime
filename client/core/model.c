@@ -2035,9 +2035,13 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
-        /* thread_reply is 0: this watches a channel's main scroll, and a thread
-         * reply is deliberately not in it (REQ-060), so it never sees one.
-         * Replies are answered by oc_model_thread_notify_take instead. */
+        /* A reply also posted here (REQ-062) that was queued as a thread
+         * notice has had its notification: oc_model_thread_notify_take answers
+         * it. One that was not is a channel message like any other. */
+        if (msg->thread_noticed) continue;
+        /* thread_reply is 0: this watches a channel's main scroll, where only a
+         * reply also posted to it appears, and is judged as a message there.
+         * Other replies are answered by oc_model_thread_notify_take. */
         if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted,
                               oc_model_is_muted_user(m, msg->author_id), is_vip,
                               c->notify_level, men, kw, 0, quiet, paused)) continue;
@@ -2079,6 +2083,85 @@ static void notice_push(oc_model *m, const oc_ev *e) {
                   e->action_start <= blen && e->action_len <= blen - e->action_start;
         n->action = (uint8_t)act;
         preview_set(m, n->body, sizeof n->body, act ? e->body + e->action_start : e->body);
+    }
+}
+
+/* A message arrives in a channel's main scroll: a BROADCAST, or a thread reply
+ * also posted there (REQ-062). Takes `*body`. Keeps the preview, appends it,
+ * and counts it toward unread and the listening queue, the same rule for both.
+ * `parent_id` is the reply's thread (0 for a top-level message), and
+ * `thread_noticed` says it was already queued as a thread notice, so the
+ * channel's notification scan does not raise it a second time. */
+static void message_arrived(oc_model *m, oc_ev *e, char **body, uint64_t parent_id, int thread_noticed) {
+    oc_channel *c = channel_ensure(m, e->channel_id);
+    /* Keep the list preview live. Taken BEFORE channel_append, which takes
+     * ownership of the body — after it, *body is gone. Only for messages
+     * newer than what we last previewed, so a backfill replaying older
+     * history cannot rewind the sidebar to an old line. */
+    if (c && *body && e->message_id >= c->high_water) {
+        /* An action previews as its action text, flagged, read beside its
+         * author (REQ-058); the net thread paired the two before this. */
+        size_t blen = strlen(*body);
+        int act = e->action_known && e->action && e->action_len &&
+                  e->action_start <= blen && e->action_len <= blen - e->action_start;
+        preview_set(m, c->preview, sizeof c->preview, act ? *body + e->action_start : *body);
+        c->preview_author = e->author_id;
+        c->preview_action = (uint8_t)act;
+    }
+    if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
+                            e->msg_kind, e->broadcast_stored, body)) {
+        msg_set_action(&c->msgs[c->n_msgs - 1], e);
+        c->msgs[c->n_msgs - 1].call_id = e->call_id;
+        /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
+         * in the scroll an older page put it. */
+        for (size_t k = c->n_msgs; k-- > 0;)
+            if (c->msgs[k].message_id == e->message_id) {
+                snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
+                c->msgs[k].parent_id = parent_id;          /* REQ-062 */
+                c->msgs[k].thread_noticed = (uint8_t)(thread_noticed ? 1 : 0);
+                break;
+            }
+        /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
+         * the pause left out — they say when to interrupt you, not whether
+         * a message mattered, and a badge that emptied itself overnight
+         * would hide the morning's backlog. The daemon counts the same
+         * thing the same way, which is what makes the seeded count and this
+         * one the same number rather than two plausible ones.
+         *
+         * Asked of the evaluator rather than restated: the message is in
+         * hand, so there is no reason to guess at what it would have said.
+         * Own messages are excluded by `own`, not by a second test. */
+        const oc_msg *msg = &c->msgs[c->n_msgs - 1];
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        int vip = oc_model_is_priority(m, e->author_id);
+        if (e->message_id > c->read_marker &&
+            oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
+                             c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
+                             men, kw, 0, 0, 0)) {
+            c->unread++;
+            if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
+        }
+        /* Talking mode speaks what arrives from now on (ARCH-111), except
+         * one's own messages: you know what you just typed, and hearing it
+         * read back -- over the next person's reply, since the queue plays
+         * end to end -- is only in the way. A listener too far behind loses
+         * the oldest rather than the newest: what is being said now matters
+         * more than what was said while the queue was backing up. */
+        if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
+            e->msg_kind == OC_MSG_KIND_MESSAGE) {
+            if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
+                memmove(m->listen_queue, m->listen_queue + 1,
+                        (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
+                m->n_listen_queue--;
+                m->listen_skipped++;
+            }
+            m->listen_queue[m->n_listen_queue++] = e->message_id;
+        }
     }
 }
 
@@ -2435,77 +2518,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
-    case OC_EV_MESSAGE: {
-        oc_channel *c = channel_ensure(m, e->channel_id);
-        /* Keep the list preview live. Taken BEFORE channel_append, which takes
-         * ownership of the body — after it, e->body is gone. Only for messages
-         * newer than what we last previewed, so a backfill replaying older
-         * history cannot rewind the sidebar to an old line. */
-        if (c && e->body && e->message_id >= c->high_water) {
-            /* An action previews as its action text, flagged, read beside its
-             * author (REQ-058); the net thread paired the two before this. */
-            size_t blen = strlen(e->body);
-            int act = e->action_known && e->action && e->action_len &&
-                      e->action_start <= blen && e->action_len <= blen - e->action_start;
-            preview_set(m, c->preview, sizeof c->preview, act ? e->body + e->action_start : e->body);
-            c->preview_author = e->author_id;
-            c->preview_action = (uint8_t)act;
-        }
-        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
-                                e->msg_kind, e->broadcast_stored, &e->body)) {
-            msg_set_action(&c->msgs[c->n_msgs - 1], e);
-            c->msgs[c->n_msgs - 1].call_id = e->call_id;
-            /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
-             * in the scroll an older page put it. */
-            for (size_t k = c->n_msgs; k-- > 0;)
-                if (c->msgs[k].message_id == e->message_id) {
-                    snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
-                    break;
-                }
-            /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
-             * the pause left out — they say when to interrupt you, not whether
-             * a message mattered, and a badge that emptied itself overnight
-             * would hide the morning's backlog. The daemon counts the same
-             * thing the same way, which is what makes the seeded count and this
-             * one the same number rather than two plausible ones.
-             *
-             * Asked of the evaluator rather than restated: the message is in
-             * hand, so there is no reason to guess at what it would have said.
-             * Own messages are excluded by `own`, not by a second test. */
-            const oc_msg *msg = &c->msgs[c->n_msgs - 1];
-            int men = 0, kw = 0;
-            if (msg->body) {
-                size_t blen = strlen(msg->body);
-                men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
-                kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
-            }
-            int vip = oc_model_is_priority(m, e->author_id);
-            if (e->message_id > c->read_marker &&
-                oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
-                                 c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
-                                 men, kw, 0, 0, 0)) {
-                c->unread++;
-                if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
-            }
-            /* Talking mode speaks what arrives from now on (ARCH-111), except
-             * one's own messages: you know what you just typed, and hearing it
-             * read back -- over the next person's reply, since the queue plays
-             * end to end -- is only in the way. A listener too far behind loses
-             * the oldest rather than the newest: what is being said now matters
-             * more than what was said while the queue was backing up. */
-            if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
-                e->msg_kind == OC_MSG_KIND_MESSAGE) {
-                if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
-                    memmove(m->listen_queue, m->listen_queue + 1,
-                            (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
-                    m->n_listen_queue--;
-                    m->listen_skipped++;
-                }
-                m->listen_queue[m->n_listen_queue++] = e->message_id;
-            }
-        }
+    case OC_EV_MESSAGE:
+        message_arrived(m, e, &e->body, e->parent_id, 0);
         break;
-    }
     case OC_EV_CAPABILITIES:
         snprintf(m->capabilities, sizeof m->capabilities, "%s", e->body ? e->body : "");
         break;
@@ -3304,14 +3319,22 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         break;
     }
-    case OC_EV_THREAD_REPLY:
+    case OC_EV_THREAD_REPLY: {
         bump_reply_count(m, e->parent_id, e->count);   /* mark the parent in scroll */
+        /* Also posted to the main scroll (REQ-062): a copy of the body for the
+         * channel's, taken now, before the open thread takes this one. Live
+         * replies only: a thread's replay is history, and the main scroll's own
+         * replay brings its copy as a BROADCAST with the thread in `parent_id`. */
+        int to_scroll = e->also_channel && !(m->thread_replay && e->parent_id == m->thread_parent);
+        char *scroll_body = (to_scroll && e->body) ? strdup(e->body) : NULL;
+        int noticed = 0;
         /* Worth interrupting for? Only if the daemon says this thread is one of
          * mine (REQ-061), only if I did not write it, and only if this is news
          * rather than the history I just asked for — a replay's frames are
          * these same frames, and its participation byte is just as true. */
         if (e->participant && e->author_id != m->user_id && !m->thread_replay) {
             notice_push(m, e);
+            noticed = 1;
             /* The Threads view's unread is server-supplied and refreshed only by
              * a list (REQ-062), so move it here too: the badge should follow the
              * toast, not wait for the next LIST_THREADS. A muted person's reply
@@ -3329,7 +3352,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->thread_msgs[m->n_thread_msgs - 1].via, sizeof m->thread_msgs[0].via, "%s", e->via);
             }
         }
+        if (to_scroll) {
+            message_arrived(m, e, &scroll_body, e->parent_id, noticed);
+            free(scroll_body);                       /* not taken: a redelivery */
+        }
         break;
+    }
     case OC_EV_THREAD_END:
         /* The replay is done; anything arriving from here is live. */
         if (e->parent_id == m->thread_parent) m->thread_replay = 0;

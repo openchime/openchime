@@ -722,9 +722,34 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
 /* Build the wrapped rows for a channel's messages (oldest→newest), then a
  * "seen by …" footer (REQ-090) naming the other members whose read cursor has
  * reached the last message. */
+/* "Also send to #channel" (REQ-062): toggled with Ctrl+T while the composer
+ * replies in a thread, off by default, and off again after each send and in
+ * another thread. */
+static int      g_also_chan;
+static uint64_t g_also_for;
+
 static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
-    for (size_t i = 0; i < ch->n_msgs; i++)
+    for (size_t i = 0; i < ch->n_msgs; i++) {
+        /* A thread reply also posted here: which thread, above it, with the
+         * parent's first words when the parent is loaded. Part of the message,
+         * so selecting it selects this. */
+        if (ch->msgs[i].parent_id) {
+            const oc_msg *par = NULL;
+            for (size_t k = 0; k < ch->n_msgs && !par; k++)
+                if (ch->msgs[k].message_id == ch->msgs[i].parent_id) par = &ch->msgs[k];
+            char ex[96] = "", line[160];
+            if (par && !par->deleted && par->body) {
+                size_t k = 0;
+                for (const char *q = par->body; *q && *q != '\n' && k + 1 < sizeof ex; q++) ex[k++] = *q;
+                ex[k] = '\0';
+            }
+            snprintf(line, sizeof line, "    \xe2\x86\xb3 replied to a thread%s%s", ex[0] ? ": " : "", ex);   /* ↳ */
+            size_t first = r->n;
+            wrap_push(r, line, TB_BLACK | TB_BOLD, width, 6);
+            for (size_t k = first; k < r->n; k++) r->v[k].mi = (int)i;
+        }
         append_msg_rows(r, m, &ch->msgs[i], me, width, ch, 1, (int)i);
+    }
     if (ch->n_msgs == 0 || !oc_model_receipts_on(m)) return;   /* the workspace has none (REQ-090) */
     uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
     char names[192]; size_t p = 0; int shown = 0;
@@ -1251,6 +1276,7 @@ static void draw_help(int W, int H) {
     static const hrow R[] = {
         { NULL, "Basics" },
         { "Enter",      "send the typed message" },
+        { "Ctrl+T",     "in a thread: also send the reply to the channel" },
         { "Tab · Esc",  "move between the panes and the composer" },
         { "Ctrl+K · :", "action menu: reach everything" },
         { "Ctrl+F",     "search messages" },
@@ -2517,6 +2543,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     tk_fill(H - 2, 0, W, TB_DEFAULT);
     int cx = editing ? tk_text(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
                      : tk_text(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
+    if (m->thread_open && g_also_chan && !editing) {
+        const oc_channel *ac = oc_model_channel((oc_model *)m, m->thread_channel);
+        char also[96];
+        if (ac && ac->kind != OC_CHANNEL_KIND_DM && ac->name && ac->name[0]) snprintf(also, sizeof also, "[also #%s] ", ac->name);
+        else snprintf(also, sizeof also, "[also to the conversation] ");
+        cx = tk_text(cx, H - 2, W, also, th->accent | TB_BOLD, TB_DEFAULT);
+    }
     cx = tk_text(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
     if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
 
@@ -2526,6 +2559,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     static const tk_binding KB_COMPOSER[] = {
         { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_ESC, 0, "Esc", "navigate", 1 },
         { TB_KEY_CTRL_F, 0, "Ctrl+F", "search", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
+        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
+    };
+    static const tk_binding KB_COMPOSER_THREAD[] = {
+        { TB_KEY_ENTER, 0, "Enter", "reply", 1 }, { TB_KEY_CTRL_T, 0, "Ctrl+T", "also send to the channel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "navigate", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
         { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
     };
     static const tk_binding KB_CHANNELS[] = {
@@ -2552,6 +2590,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         if      (panel == 1) { label = " Channels"; kb = KB_CHANNELS; kn = (int)(sizeof KB_CHANNELS / sizeof *KB_CHANNELS); }
         else if (panel == 2) { label = " Messages"; kb = KB_MESSAGES; kn = (int)(sizeof KB_MESSAGES / sizeof *KB_MESSAGES); }
         else if (panel == 3) { label = " Members";  kb = KB_MEMBERS;  kn = (int)(sizeof KB_MEMBERS  / sizeof *KB_MEMBERS);  }
+        else if (m->thread_open) { label = "";      kb = KB_COMPOSER_THREAD; kn = (int)(sizeof KB_COMPOSER_THREAD / sizeof *KB_COMPOSER_THREAD); }
         else                 { label = "";          kb = KB_COMPOSER; kn = (int)(sizeof KB_COMPOSER / sizeof *KB_COMPOSER); }
         int hx = label[0] ? tk_text(0, H - 1, W, label, th->accent | TB_BOLD, th->footer_bg) : 0;
         tk_help_footer(H - 1, hx, W, kb, kn, th->muted, th->footer_bg);
@@ -5057,7 +5096,15 @@ int main(int argc, char **argv) {
                 action_open = 0;
                 if (ai >= 0) {
                     int id = g_menu[ai].id;
-                    if      (id == ACT_THREAD)      oc_client_open_thread(cl, act_cid, act_mid);
+                    if      (id == ACT_THREAD) {
+                        /* A reply also posted to the main scroll opens its own
+                         * thread (REQ-062), not one of its own. */
+                        const oc_channel *tc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        uint64_t root = act_mid;
+                        for (size_t k = 0; tc && k < tc->n_msgs; k++)
+                            if (tc->msgs[k].message_id == act_mid && tc->msgs[k].parent_id) root = tc->msgs[k].parent_id;
+                        oc_client_open_thread(cl, act_cid, root);
+                    }
                     else if (id == ACT_REACTORS)    oc_client_list_reactions(cl, act_cid, act_mid);
                     else if (id == ACT_VOTERS)      oc_client_list_poll_voters(cl, act_cid, act_mid);
                     else if (id == ACT_POLL_CLOSE) {
@@ -5517,7 +5564,8 @@ int main(int argc, char **argv) {
                         act_cid = cid; act_mid = mid; act_uid = sel->author_id; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
-                    else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 't' && !locked)   /* a reply also here opens its own thread */
+                        oc_client_open_thread(cl, cid, sel->parent_id ? sel->parent_id : mid);
                     else if (ev.ch == 'D' && sel->todo && !sel->deleted && !locked && !ch->archived) {
                         act_cid = cid; act_mid = mid;   /* mark a task of this list */
                         prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)";
@@ -5629,8 +5677,10 @@ int main(int argc, char **argv) {
                     char conv[COMPOSER_CAP * 2];
                     const char *body = composer;
                     if (oc_emoticon_send(emoticons_on(mm), composer, clen, conv, sizeof conv) > 0) body = conv;
-                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body);
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body,
+                                                         g_also_for == mm->thread_parent && g_also_chan);
                     else                 oc_client_send(cl, cid, body);
+                    g_also_chan = 0;                                    /* per send (REQ-062) */
                 }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
@@ -5660,6 +5710,11 @@ int main(int argc, char **argv) {
         } else if (ev.key == TB_KEY_PGDN) {
             scroll -= (tb_height() - 3) / 2;
             if (scroll < 0) scroll = 0;
+        } else if (ev.key == TB_KEY_CTRL_T && oc_client_model(cl)->thread_open) {
+            /* Also send this reply to the channel (REQ-062), this thread's. */
+            const oc_model *tm = oc_client_model(cl);
+            if (g_also_for != tm->thread_parent) { g_also_chan = 0; g_also_for = tm->thread_parent; }
+            g_also_chan = !g_also_chan;
         } else if (ev.ch == '?' && clen == 0) {
             help_open = 1;                     /* ? on an empty composer opens help */
         } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */

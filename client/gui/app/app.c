@@ -2631,6 +2631,11 @@ static void   draw_wsunused(gfx *rt, rectf body);   /* fwd */
 
 static rectf g_attach_btn;        /* composer attach (+) hit-box */
 static rectf g_send_btn;          /* composer send-button hit-box */
+/* "Also send to #channel" (REQ-062): shown while the composer replies in a
+ * thread, off by default, and off again after each send and in another thread. */
+static int      g_also_chan;
+static uint64_t g_also_for;       /* the thread it was ticked in */
+static rectf    g_also_btn;
 static rectf g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
 static rectf g_emoji_btn;         /* composer emoji-picker hit-box */
 static rectf g_at_btn;            /* composer mention button */
@@ -7243,7 +7248,9 @@ static float g_density = 1.0f;         /* 0.6 compact, 1.0 cozy */
  * Slack does — a pin you can only see by opening a list is a pin you forget.
  * It sits ABOVE the block, so it costs height on grouped continuations too. */
 #define MSG_PIN_H UIS(17.0f)
-#define MSG_PIN(msg) ((msg)->pinned ? MSG_PIN_H : 0.0f)
+/* The marker lines above a message: its pin, and the thread a reply also posted
+ * to the main scroll belongs to (REQ-062). One height each. */
+#define MSG_PIN(msg) (((msg)->pinned ? MSG_PIN_H : 0.0f) + ((msg)->parent_id ? MSG_PIN_H : 0.0f))
 
 /* A link-preview card (REQ-222): accent bar, the fetched title, and — when the
  * page offered one — a description line. One height function shared by the
@@ -7825,6 +7832,32 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         draw_text(rt, lbl, g_meta, rf(tx + 17, py - 2, x0 + content_w + AVA + 12, py + 14),
                   OC_COL_MUTED);
         y += MSG_PIN_H;          /* everything below shifts down by the marker */
+    }
+
+    /* A thread reply also posted here (REQ-062): "replied to a thread", with
+     * the parent's first words when the parent is in this scroll, and nothing
+     * fetched to fill them in when it is not. A click opens that thread, as
+     * the replies row under a parent does (g_rephits). */
+    if (msg->parent_id) {
+        float py = y + 3, right = x0 + content_w + AVA + 12;
+        const oc_msg *par = find_msg(oc_model_channel((oc_model *)m, g_sel), msg->parent_id);
+        char lbl[160] = "replied to a thread";
+        if (par && !par->deleted && par->body && par->body[0]) {
+            char ex[96]; size_t k = 0;
+            for (const char *q = par->body; *q && *q != '\n' && k + 1 < sizeof ex; q++) ex[k++] = *q;
+            ex[k] = '\0';
+            snprintf(lbl, sizeof lbl, "replied to a thread: %s", ex);
+        }
+        rectf row = rf(tx, py - 2, right, py + 14);
+        int hot = in_rect(row, g_mouse_x, g_mouse_y) && !pointer_blocked();
+        draw_lucide(rt, OC_ICON_MESSAGE, rf(tx, py, tx + 12, py + 12), hot ? OC_COL_ACCENT : OC_COL_MUTED);
+        draw_text(rt, lbl, g_meta, rf(tx + 17, py - 2, right, py + 14), hot ? OC_COL_ACCENT : OC_COL_MUTED);
+        if (g_n_rephits < (int)(sizeof g_rephits / sizeof g_rephits[0])) {
+            g_rephits[g_n_rephits].r = row;
+            g_rephits[g_n_rephits].mid = msg->parent_id;
+            g_n_rephits++;
+        }
+        y += MSG_PIN_H;
     }
 
     if (!grouped) {
@@ -16075,7 +16108,7 @@ static int ftray_post(const char *text) {
     if (!n) return 0;
     uint64_t cid = m->thread_open ? m->thread_channel : g_sel;
     uint64_t root = m->thread_open ? m->thread_parent : 0;
-    uint64_t tag = oc_client_post_items(g_client, cid, root, items, (size_t)n, text);
+    uint64_t tag = oc_client_post_items(g_client, cid, root, items, (size_t)n, text, root ? g_also_chan : 0);
     if (!tag) { fb_failed("Those files could not be sent."); return 0; }
     for (int k = 0; k < n; k++) {
         ftray_chip *c = &g_ftray[ix[k]];
@@ -16396,6 +16429,13 @@ static void preview_btn_draw(gfx *rt, const char *label) {
     g_meta->align = ST_ALIGN_LEFT;
 }
 
+/* The option's words: the channel by name, or "this conversation" for a DM. */
+static void also_label(const oc_model *m, char *out, size_t cap) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, m->thread_channel);
+    if (c && c->kind != OC_CHANNEL_KIND_DM && c->name && c->name[0]) snprintf(out, cap, "Also send to #%s", c->name);
+    else snprintf(out, cap, "Also send to this conversation");
+}
+
 static void draw_composer(gfx *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -16466,6 +16506,37 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
             g_preview_btn = rf(left_limit - pw, cy, left_limit, cy + sq);
             preview_btn_draw(rt, pl);
             left_limit -= pw + UIS(4);
+        }
+    }
+    /* "Also send to #channel" while the box replies in a thread (REQ-062),
+     * just before Send, as Preview is; the left icons yield to it. */
+    g_also_btn = rf(0, 0, 0, 0);
+    {
+        const oc_model *am = model();
+        if (am && am->thread_open) {
+            if (g_also_for != am->thread_parent) { g_also_chan = 0; g_also_for = am->thread_parent; }
+            char al[160];
+            also_label(am, al, sizeof al);
+            float box = UIS(14.0f), aw = box + UIS(6.0f) + text_width(al, g_meta) + UIS(8.0f);
+            if (left_limit - aw - UIS(4) > composer_row_x(bx0) + COMPOSER_PITCH) {
+                g_also_btn = rf(left_limit - aw, cy, left_limit, cy + sq);
+                int hot = in_rect(g_also_btn, g_mouse_x, g_mouse_y) && !pointer_blocked();
+                if (hot) fill_round(rt, g_also_btn, OC_R_CONTROL, OC_COL_HOVER);
+                float bx = g_also_btn.left + UIS(4.0f), byy = cy + (sq - box) / 2;
+                rectf chk = rf(bx, byy, bx + box, byy + box);
+                if (g_also_chan) {
+                    fill_round(rt, chk, OC_R_CONTROL, OC_COL_ACCENT);
+                    g_meta->align = ST_ALIGN_CENTER;
+                    draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
+                    g_meta->align = ST_ALIGN_LEFT;
+                } else {
+                    stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                }
+                draw_text(rt, al, g_meta, rf(chk.right + UIS(6.0f), cy, g_also_btn.right, cy + sq), OC_COL_MUTED);
+                left_limit -= aw + UIS(4);
+            }
+        } else {
+            g_also_chan = 0; g_also_for = 0;
         }
     }
     g_at_btn = ACT_AT(2 + vk);
@@ -29342,7 +29413,8 @@ enum {
     AT_THRDATE,       /* the thread pane's Jump to date */
     AT_RXSHOW,        /* payload: index into g_rx_show_hits -- show that muted person's reaction */
     AT_JUMPCAL,       /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the jump-to-date calendar */
-    AT_PREFCHOICE     /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
+    AT_PREFCHOICE,    /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
+    AT_ALSO           /* the thread composer's "Also send to #channel" -- toggle it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -29843,6 +29915,14 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_BUTTON, "composer.freetalk",
                      dm == OC_STT_MODE_FREE ? "Free talk, on" : "Free talk, off", g_freetalk_btn,
                      ATOK(AT_VOICE, 1));
+        }
+        if (g_also_btn.right > g_also_btn.left) {
+            const oc_model *am = model();
+            char al[180];
+            if (am) also_label(am, al, sizeof al); else snprintf(al, sizeof al, "Also send");
+            size_t k = strlen(al);
+            snprintf(al + k, sizeof al - k, g_also_chan ? ", on" : ", off");
+            acc_push(items, &n, OC_ACC_BUTTON, "composer.also_channel", al, g_also_btn, ATOK(AT_ALSO, 0));
         }
         acc_push(items, &n, OC_ACC_BUTTON, "composer.send",
                  ed_len() ? "Send" : "Send, nothing to send", g_send_btn, ATOK(AT_SEND, 0));
@@ -30628,7 +30708,7 @@ static void composer_send(void) {
             if (g_edit_msg)
                 oc_client_edit(g_client, g_sel, g_edit_msg, b);
             else if (mm && mm->thread_open)
-                oc_client_reply(g_client, mm->thread_channel, mm->thread_parent, b);
+                oc_client_reply(g_client, mm->thread_channel, mm->thread_parent, b, g_also_chan);
             else
                 oc_client_send(g_client, g_sel, b);
             g_scroll = 0;
@@ -30636,6 +30716,7 @@ static void composer_send(void) {
         free(b);
     }
     g_edit_msg = 0;
+    g_also_chan = 0;                     /* per send (REQ-062) */
     ac_close();
     /* Your own message ends the unread run; leaving the divider above it would
      * claim there is still something new to read. */
@@ -31842,7 +31923,8 @@ static void vm_send(oc_win *hwnd) {
                                          g_rec_res.video, g_rec_res.video_len,
                                          g_rec_res.poster, g_rec_res.poster_len,
                                          g_rec_res.duration_ms, (uint16_t)g_rec_res.width,
-                                         (uint16_t)g_rec_res.height, cap);
+                                         (uint16_t)g_rec_res.height, cap, proot ? g_also_chan : 0);
+    g_also_chan = 0;                                  /* per send (REQ-062) */
     g_rec_res.video = g_rec_res.poster = NULL;        /* the core owns them now */
     if (cap[0]) ed_clear();
     g_vm_fb = fb_progress("Sending video message\xE2\x80\xA6");
@@ -33128,7 +33210,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
     if (msg->n_attach) mi_sep();
     /* No nested threads (REQ-060), so a reply offers no thread item. */
     if (!msg->deleted && !is_reply && !(locked && !msg->reply_count))
-        mi_item(100, msg->reply_count ? "Open thread" : "Reply in thread");
+        mi_item(100, (msg->reply_count || msg->parent_id) ? "Open thread" : "Reply in thread");
     if (msg->n_reactions) mi_item(102, "Who reacted");
     /* A pin belongs to the channel, so this reads the same for everyone — anyone
      * may unpin, including someone else's pin (ARCH-90). */
@@ -33398,7 +33480,8 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         g_undo_delete.cid = chan; g_undo_delete.mid = mid;
         fb_undo("Message deleted.", FBA_UNDO_DELETE);
     } else if (cmd == 100) {
-        g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
+        /* A reply also posted to the main scroll opens its own thread (REQ-062). */
+        g_scroll = 0; oc_client_open_thread(g_client, g_sel, msg->parent_id ? msg->parent_id : mid);
         g_kb_mid = 0;                    /* ...and the keyboard to the reply, as for Edit */
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
@@ -35586,6 +35669,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
     if (in_rect(g_preview_btn, x, y)) { preview_set(hwnd, !g_preview); return 1; }
+    if (in_rect(g_also_btn, x, y)) { g_also_chan = !g_also_chan; invalidate(); return 1; }
     /* The formatting toolbar. Focus first: the button acts on the
      * field's selection, and clicking chrome must not be what takes the caret
      * away from the text it is about to wrap. */
@@ -42672,6 +42756,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             }
             break;
         case AT_SEND:      composer_send(); break;
+        case AT_ALSO:      g_also_chan = !g_also_chan; break;
         case AT_NMTO:      g_nm_to_focus = 1; tgt_rebuild(); break;
         case AT_NMBODY:    g_nm_to_focus = 0; ed_focus(hwnd); break;
         case AT_NMCHIP:
