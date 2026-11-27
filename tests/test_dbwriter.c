@@ -14222,10 +14222,111 @@ static void test_connections(void) {
     cleanup_db(path);
 }
 
+/* A mute for a set time (REQ-137): stored as now plus the minutes, cut to a
+ * week; a mute with no end stores none; unmuting clears both; and a snapshot
+ * reports a passed instant as unmuted. */
+static const oc_notify_pref_row *pref_of(const oc_dbres *r, uint64_t ch) {
+    for (size_t i = 0; r && i < r->n_nprefs; i++) if (r->nprefs[i].channel_id == ch) return &r->nprefs[i];
+    return NULL;
+}
+static oc_dbres *set_mute_for(oc_dbwriter *w, uint64_t uid, uint64_t ch, int muted, uint32_t minutes) {
+    oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 931);
+    j->user_id = uid; j->channel_id = ch;
+    j->hook_disabled = (uint8_t)muted;     /* the field SET_MUTE reuses for it */
+    j->snooze_minutes = minutes;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static uint64_t wall_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+static void test_timed_mute(void) {
+    const char *path = tdb("timedmute.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "tm-alice", "pw", OC_ROLE_OWNER);
+    CHECK(alice != 0);
+
+    uint64_t before = wall_ms();
+    oc_dbres *r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 60);
+    uint64_t after = wall_ms();
+    const oc_notify_pref_row *pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && pr && pr->muted == 1);
+    CHECK(pr && pr->muted_until_ms >= before + 60u * 60000u && pr->muted_until_ms <= after + 60u * 60000u);
+    oc_dbres_free(r);
+
+    before = wall_ms();                    /* past a week: cut to a week */
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 20000);
+    after = wall_ms();
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 1 && pr->muted_until_ms >= before + 10080ull * 60000u &&
+          pr->muted_until_ms <= after + 10080ull * 60000u);
+    oc_dbres_free(r);
+
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 0);   /* no end */
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 1 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 0, 30);  /* unmute clears both */
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    /* A passed instant reads as unmuted in the snapshot, before any sweep. */
+    oc_dbres_free(set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 1));
+    oc_dbwriter_advance_clock_ms(2u * 60000u);
+    oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 932);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(0);
+
+    /* The sweep: nothing before the instant; after it, the row is cleared and
+     * that person answered once; then nothing again. */
+    oc_dbres_free(set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 60));
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == 0 && !r->next);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(61u * 60000u);
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == alice);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(0);
+    /* Cleared in the row, not only reported: the clock back, still unmuted. */
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 933);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_timed_mute();
     test_call_recordings();
     test_mcp_audit();
     test_retention_off();

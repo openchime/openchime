@@ -2947,6 +2947,36 @@ static void test_rail_opts(void) {
     CHECK(b.n == NK && b.v[0].shown && !b.v[1].shown);
 }
 
+/* A mute for a set time (REQ-137): the model keeps the end NOTIFY_PREFS
+ * says, and clears it when a later one says none; and "until tomorrow" is one
+ * pure function both clients' menus call. */
+static void test_timed_mute_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DND; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 10; e.status = 1; e.muted_until_ms = 1700000000000ull;
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->muted == 1 && c->muted_until_ms == 1700000000000ull);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DND; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 10; e.status = 0; e.muted_until_ms = 0;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 10);
+    CHECK(c && c->muted == 0 && c->muted_until_ms == 0);
+    oc_model_free(&m);
+
+    CHECK(oc_minutes_until_local(8, 0, 9, 0, 1) == 1500);
+    CHECK(oc_minutes_until_local(9, 0, 9, 0, 1) == 1440);
+    CHECK(oc_minutes_until_local(23, 30, 9, 0, 1) == 570);
+    CHECK(oc_minutes_until_local(8, 0, 9, 0, 0) == 60);
+    CHECK(oc_minutes_until_local(9, 30, 9, 0, 0) == 1410);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -7381,6 +7411,7 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_chanmem_overlap();
     test_sidebar();
+    test_timed_mute_model();
     test_rail_opts();
     test_chan_colors();
     test_new_channel_takes_the_default_level();

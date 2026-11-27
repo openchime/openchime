@@ -4479,6 +4479,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id; j->channel_id = sm.channel_id;
             j->hook_disabled = sm.muted;      /* the flag field, reused */
+            j->snooze_minutes = sm.minutes;   /* how long, from now (REQ-137) */
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -10634,6 +10635,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
     case OC_RES_NOTIFY_PREFS: {
+        if (!r->user_id) break;          /* the mute sweep found nothing (REQ-137) */
         /* Sync the settings snapshot to *all* of the user's connections, so a
          * change on one device updates the others (REQ-130/131). */
         static __thread oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
@@ -10643,6 +10645,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[n].level = r->nprefs[i].level;
             ents[n].muted = r->nprefs[i].muted;      /* */
             ents[n].follow_threads = r->nprefs[i].follow_threads;   /* REQ-282 */
+            ents[n].muted_until_ms = r->nprefs[i].muted_until_ms;   /* REQ-137 */
             n++;
         }
         /* Designated, not positional: adding `notify_default` before `count` silently
@@ -11397,6 +11400,9 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     /* Reminders on the same tick (REQ-283): within it of their time. */
     oc_job *rj = oc_job_new(OC_JOB_FIRE_REMINDERS, 0);
     if (rj) oc_dbwriter_submit(dbw, rj);
+    /* And timed mutes that have run out (REQ-137), on the same tick. */
+    oc_job *mj = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    if (mj) oc_dbwriter_submit(dbw, mj);
 }
 
 /* Do-not-disturb changing with no frame to hang it on.

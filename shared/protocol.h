@@ -262,8 +262,13 @@
  *
  * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
  * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
- * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
-#define OC_PROTOCOL_VERSION 51u
+ * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`.
+ *
+ * 52: a mute for a set time (REQ-137). SET_MUTE carries `minutes` (u32) after
+ * `muted`, and each NOTIFY_PREFS entry `muted_until_ms` (u64) after
+ * `follow_threads`: a field appended to a fixed layout and one to a repeated
+ * entry. */
+#define OC_PROTOCOL_VERSION 52u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1696,7 +1701,9 @@ typedef struct { uint64_t session_id; uint64_t created_at; uint64_t last_seen;
 typedef struct { uint16_t count; const oc_session_entry *entries; } oc_session_list;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_file_channel_entry;
 typedef struct { uint16_t count; const oc_file_channel_entry *entries; } oc_file_channels;
-typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
+/* `minutes` (REQ-137): with `muted` 1, how long from now, cut to a week as
+ * SET_SNOOZE's are; 0 mutes until unmuted. Since protocol 52. */
+typedef struct { uint64_t channel_id; uint8_t muted; uint32_t minutes; } oc_set_mute;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
 typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
@@ -1816,7 +1823,10 @@ typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
 /* `follow_threads` (REQ-282): every thread in the conversation is followed, as
  * if each were, unless muted or one is unfollowed by itself. Appended per entry:
  * a layout change, so protocol 37. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_entry;
+/* `muted_until_ms` (REQ-137): when a timed mute ends, 0 for a mute with no end
+ * or none. Appended per entry: protocol 52. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads;
+                 uint64_t muted_until_ms; } oc_notify_pref_entry;
 /* SET_CHANNEL_THREAD_FOLLOW: follow every thread in a conversation, or stop. */
 typedef struct { uint64_t channel_id; uint8_t on; } oc_set_channel_thread_follow;
 typedef struct { uint8_t level; } oc_set_notify_default;

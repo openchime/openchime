@@ -1852,6 +1852,19 @@ terminal client's are separate: the terminal client has its own **Colour**
 action in its channel menu and draws the mark as the 256-colour cell nearest
 each colour. Nothing is written before the account's settings have arrived.
 
+### Muting a conversation for a set time (REQ-137)
+
+A conversation's menu offers **Mute…** in both clients, which opens a menu of
+its own with the "Pause notifications" durations: For 30 minutes, For 1 hour,
+For 2 hours, Until tomorrow (09:00 the next day, from the local clock, through
+`oc_minutes_until_local` in the client core, which the pause uses too), and
+Until I turn it back on. A muted conversation's menu offers **Unmute**; in the
+graphical client a timed mute's says when it ends ("Unmute (muted until Tue
+09:00)"). The client sends minutes from now (`SET_MUTE`); the daemon resolves
+the end, ends the mute on its own clock and tells every device with
+`NOTIFY_PREFS`, so the client keeps no timer and shows what the daemon last
+said (`oc_channel.muted_until_ms`). The sidebar row is dimmed as for any mute.
+
 ### Long messages
 
 A message a reader **collapses** (its menu's Collapse, or `c` in the terminal

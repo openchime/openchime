@@ -921,6 +921,13 @@ where one exists.
   push excludes a muted conversation unconditionally, so mute outranks both the
   level and a priority person.
 
+  **A mute may be set to end at a chosen time** — for 30 minutes, 1 hour, 2
+  hours, until 09:00 tomorrow, or until turned off — the durations the pause
+  offers. The client sends minutes from now; the daemon resolves the end once
+  (`notification_prefs.muted_until_ms`, migration 0093), ends the mute on its
+  own clock for every device, and tells each of the person's connections; push
+  treats a mute whose end has passed as over at once.
+
   **What a muted conversation contributes to a badge is nothing**, and every
   badge asks one function for it. A muted conversation's unread is excluded;
   thread replies are included, because they bump no channel's unread and a day

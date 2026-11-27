@@ -453,6 +453,8 @@ Server-authoritative notification settings, synced across a user's devices.
   and drops the conversation from the unread badge (REQ-137). Push excludes a
   muted channel unconditionally, so mute outranks both the level and a priority
   person.
+- `muted_until_ms` (INTEGER, migration 0093) — when a timed mute ends; `0` is a
+  mute with no end. See §3cf.
 
 ### `users` (added columns)
 - `dnd_mode` (INTEGER 0-3, migration 0034) — the notification schedule (REQ-136):
@@ -2598,3 +2600,21 @@ enabled webhook that receives it in the same transaction. *Read* by the list,
 which never returns the secret, and by the delivery worker. *Deleted*: a
 delivery when it succeeds or its eighth attempt fails; a webhook's rows, its
 channels and its deliveries together when it is deleted.
+
+## 3cf. Migration 0093 — a mute for a set time (REQ-137)
+
+```sql
+ALTER TABLE notification_prefs ADD COLUMN muted_until_ms INTEGER NOT NULL DEFAULT 0;
+```
+
+When a timed mute ends: `muted = 1` with `muted_until_ms` the instant, or `0`
+for a mute with no end. *Written* by `SET_MUTE` (PROTOCOL.md §5.16): muting
+for `minutes` stores now plus those minutes, the instant resolved once by the
+daemon and the minutes cut to a week; muting with `0` stores no end; unmuting
+clears both columns. *Cleared* on the tick that fires reminders
+(`OC_JOB_EXPIRE_MUTES`), which sets `muted = 0, muted_until_ms = 0` on every
+row whose instant has passed and sends each affected person their
+`NOTIFY_PREFS`, so every query that reads `muted` stays as it is. *Read* by
+`NOTIFY_PREFS`, which reports a passed instant as unmuted, and by the push
+collector, which treats a muted row whose instant has passed as unmuted even
+before the sweep has run. Every row before this reads `0`.

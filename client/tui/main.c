@@ -1474,6 +1474,9 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_SOURCE,
        /* a person's own colour for a channel: the menu, then a colour (0 none) */
        ACT_COLOR, ACT_COLOR0, ACT_COLOR_LAST = ACT_COLOR0 + OC_CHAN_COLOR_COUNT,
+       /* a conversation muted for a set time (REQ-137): the menu, its choices,
+        * and Unmute */
+       ACT_MUTE, ACT_MUTE_30, ACT_MUTE_60, ACT_MUTE_120, ACT_MUTE_TOMORROW, ACT_MUTE_FOREVER, ACT_UNMUTE,
        /* a reminder on a message, which saves it (REQ-283): the choices, as
         * the desktop client's reminder menu has them, and a time typed */
        ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
@@ -2048,6 +2051,23 @@ static void colors_sync(const oc_model *m) {
 static uint8_t chan_color(const oc_channel *c) {
     return (c && c->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, c->channel_id) : 0;
 }
+/* "Mute...": the "Pause notifications" durations, and a mute with no end
+ * (REQ-137), labelled and timed as the desktop client's. */
+static void menu_build_mute(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "For 30 minutes",          ACT_MUTE_30 };
+    g_menu[g_nmenu++] = (menuitem){ "For 1 hour",              ACT_MUTE_60 };
+    g_menu[g_nmenu++] = (menuitem){ "For 2 hours",             ACT_MUTE_120 };
+    g_menu[g_nmenu++] = (menuitem){ "Until tomorrow",          ACT_MUTE_TOMORROW };
+    g_menu[g_nmenu++] = (menuitem){ "Until I turn it back on", ACT_MUTE_FOREVER };
+}
+/* 09:00 tomorrow, from the local clock, through the core's one function. */
+static uint32_t tui_mute_until_tomorrow(void) {
+    time_t now = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 24u * 60u;
+    return oc_minutes_until_local(tv.tm_hour, tv.tm_min, 9, 0, 1);
+}
+
 /* The Colour menu: the eight, then None, the one in force marked. */
 static void menu_build_colors(uint8_t now) {
     g_nmenu = 0;
@@ -5212,6 +5232,17 @@ int main(int argc, char **argv) {
                     else if (id == ACT_TODO_ADD) { prompt_kind = PROMPT_TODO_ADD; prompt_title = "Add a task (name, or name: description)"; tk_input_init(&prompt_input, 0, "task"); }
                     else if (id == ACT_TODO_RENAME) { prompt_kind = PROMPT_TODO_RENAME; prompt_title = "Rename the list"; tk_input_init(&prompt_input, 0, "title"); }
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
+                    else if (id == ACT_MUTE) {
+                        menu_build_mute();
+                        act_title = "Mute";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_MUTE_30)       oc_client_set_mute(cl, act_cid, 1, 30);
+                    else if (id == ACT_MUTE_60)       oc_client_set_mute(cl, act_cid, 1, 60);
+                    else if (id == ACT_MUTE_120)      oc_client_set_mute(cl, act_cid, 1, 120);
+                    else if (id == ACT_MUTE_TOMORROW) oc_client_set_mute(cl, act_cid, 1, tui_mute_until_tomorrow());
+                    else if (id == ACT_MUTE_FOREVER)  oc_client_set_mute(cl, act_cid, 1, 0);
+                    else if (id == ACT_UNMUTE)        oc_client_set_mute(cl, act_cid, 0, 0);
                     else if (id == ACT_COLOR) {
                         menu_build_colors(oc_chan_color_of(&g_colors, act_cid));
                         act_title = "Colour";
@@ -5535,6 +5566,9 @@ int main(int argc, char **argv) {
                                            mm->thread_open && mm->thread_channel == mc->channel_id);
                         if (mc->kind != OC_CHANNEL_KIND_DM && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
                             g_menu[g_nmenu++] = (menuitem){ "Colour", ACT_COLOR };
+                        if (mc->joined && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = mc->muted ? (menuitem){ "Unmute", ACT_UNMUTE }
+                                                          : (menuitem){ "Mute...", ACT_MUTE };
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }

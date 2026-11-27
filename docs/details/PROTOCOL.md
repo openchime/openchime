@@ -221,8 +221,11 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 51** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 52** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 52 appended `minutes` (u32) to `SET_MUTE`, after `muted`, and
+> `muted_until_ms` (u64) to each `NOTIFY_PREFS` entry, after `follow_threads`:
+> a mute for a set time (REQ-137, §5.16, §5.16d). Version
 > 51 put `via` in `BROADCAST` (after `call_id`) and `THREAD_REPLY` (after
 > `also_channel`), each ahead of the body: the AI client a person posted
 > through (AUTH.md §8.13, §5.16q). Version
@@ -2203,10 +2206,13 @@ differently.
 settings.
 
 **`NOTIFY_PREFS` (S → C), `0x0093`** `{ notify_default: u8, count: u16,
-count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8, muted_until_ms: u64 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
 device updates the others. `follow_threads` (since version 37) is `1` when the
-person follows every thread in the conversation (REQ-282).
+person follows every thread in the conversation (REQ-282). `muted_until_ms`
+(since version 52) is when a timed mute ends, `0` for a mute with no end or
+none; an entry whose instant has already passed reports `muted` `0` and
+`muted_until_ms` `0`, as a passed pause reports none (REQ-137).
 
 **`SET_CHANNEL_THREAD_FOLLOW` (C → S), `0x011B`** `{ channel_id: u64, on: u8 }` —
 follow every thread in a conversation the caller can read, or stop (REQ-282);
@@ -2513,7 +2519,18 @@ A level above `2` (none) is refused with a non-fatal `ERROR MALFORMED_FRAME` (10
 
 **`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137)
 
-    channel_id (u64), muted (u8)
+    channel_id (u64), muted (u8), minutes (u32)
+
+`minutes` (since version 52) times a mute: with `muted` `1`, the mute ends that
+many minutes from now, cut to a week (10,080) as `SET_SNOOZE`'s are; `0` mutes
+until unmuted. As with the pause, the wire carries minutes from now because
+only the client knows the timezone that turns "until tomorrow" into an
+instant; the daemon resolves the instant once and stores it
+(`notification_prefs.muted_until_ms`). Unmuting clears both. **A timed mute
+ends on the daemon's clock, for every device:** on the tick that fires
+reminders the daemon clears each mute whose instant has passed and sends that
+person's `NOTIFY_PREFS`, with its trailer, to all of their connections. Push
+treats a mute whose instant has passed as over even before that tick.
 
 **`SET_READ_CURSOR` (C → S), `0x006E`** — Set my read cursor for a channel deliberately, including BACKWARDS (mark unread). (REQ-235)
 

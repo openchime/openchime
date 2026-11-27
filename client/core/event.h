@@ -513,6 +513,7 @@ typedef struct {
     char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
                               Its own field because a topic is up to 250 bytes and
                               every fixed buffer here is smaller. */
+    uint64_t muted_until_ms; /* NOTIFY_PREF: when a timed mute ends, 0 for none (REQ-137) */
     uint8_t  also_channel; /* THREAD_REPLY: the reply is in the channel's main
                               scroll too (REQ-062); MESSAGE carries such a reply's
                               thread in `parent_id` */

@@ -478,7 +478,9 @@ void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
 void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled);
 void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
 /* Mute a conversation (REQ-137) and mark it unread from a message (REQ-235). */
-void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
+/* Mute a conversation (REQ-137) for `minutes` from now, or until unmuted with
+ * 0; `muted` 0 unmutes. The daemon resolves the end and ends it. */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted, uint32_t minutes);
 
 /* The global notification default (REQ-134): the level for every channel without a
  * per-channel override. The daemon answers with a full NOTIFY_PREFS sync. */

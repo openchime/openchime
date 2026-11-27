@@ -1885,7 +1885,7 @@ static void test_notify_frames(void) {
     {
         oc_notify_pref_entry ents[2] = {
             { .channel_id = 7, .level = OC_NOTIFY_MENTIONS, .follow_threads = 1 },
-            { .channel_id = 9, .level = OC_NOTIFY_NONE },
+            { .channel_id = 9, .level = OC_NOTIFY_NONE, .muted = 1, .muted_until_ms = 1700000123456ull },
         };
         oc_notify_prefs in;
         in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
@@ -1896,6 +1896,22 @@ static void test_notify_frames(void) {
         CHECK(dflt == OC_NOTIFY_MENTIONS);
         CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS && got[0].follow_threads == 1);
         CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE && got[1].follow_threads == 0);
+        CHECK(got[0].muted == 0 && got[0].muted_until_ms == 0);              /* REQ-137 */
+        CHECK(got[1].muted == 1 && got[1].muted_until_ms == 1700000123456ull);
+    }
+    /* A mute for a set time (REQ-137): the minutes travel, and 0 is no end. */
+    CHECK(OC_PROTOCOL_VERSION == 52);
+    {
+        oc_set_mute in = { 7, 1, 120 };
+        ROUNDTRIP(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_MUTE, h, p);
+        oc_set_mute out = { 0, 0, 0 };
+        CHECK(oc_decode_set_mute(&p, &out) == OC_OK && out.channel_id == 7 && out.muted == 1 && out.minutes == 120);
+    }
+    {
+        oc_set_mute in = { 9, 0, 0 };
+        ROUNDTRIP(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_MUTE, h, p);
+        oc_set_mute out = { 1, 1, 1 };
+        CHECK(oc_decode_set_mute(&p, &out) == OC_OK && out.channel_id == 9 && out.muted == 0 && out.minutes == 0);
     }
     /* Follow every thread in a conversation (REQ-282). */
     {
@@ -3097,7 +3113,7 @@ static void test_agent_frames(void) {
  * `via` on BROADCAST and THREAD_REPLY at version 51. */
 static void test_connection_frames(void) {
     static uint8_t frame[4096];
-    CHECK(OC_PROTOCOL_VERSION == 51);
+    CHECK(OC_PROTOCOL_VERSION >= 51);   /* `via` since 51 */
     {
         oc_connection_code in = { oc_slice_str("bcdf-ghjk") };
         ROUNDTRIP(oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_CODE, h, p);

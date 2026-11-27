@@ -3385,15 +3385,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * the default level; the following OC_EV_NOTIFY_PREF events set the
          * non-default ones. Works for both solicited and pushed syncs. */
         m->notify_default = e->op;                 /* REQ-134 */
-        for (size_t i = 0; i < m->n_channels; i++)
+        for (size_t i = 0; i < m->n_channels; i++) {
             m->channels[i].notify_level = m->notify_default;
+            m->channels[i].muted_until_ms = 0;      /* each entry states its own (REQ-137) */
+        }
         /* The DND window left this frame with REQ-136: the schedule arrives in
          * its own OC_EV_SCHEDULE, right behind this one. */
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
         /* `participant` carries follow_threads here (REQ-282): in every thread. */
-        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant; }
+        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant;
+                 c->muted_until_ms = e->status ? e->muted_until_ms : 0; }   /* REQ-137 */
         break;
     }
     case OC_EV_GROUP:
@@ -4587,4 +4590,10 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
         free(tmp);
     }
     return n;
+}
+
+uint32_t oc_minutes_until_local(int now_hour, int now_min, int hh, int mm, int force_tomorrow) {
+    int delta = (hh * 60 + mm) - (now_hour * 60 + now_min);
+    if (force_tomorrow || delta <= 0) delta += 24 * 60;
+    return (uint32_t)delta;
 }

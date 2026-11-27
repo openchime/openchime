@@ -38493,11 +38493,7 @@ static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
     time_t now = time(NULL);
     struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
-    int now_min = tv.tm_hour * 60 + tv.tm_min;
-    int want = hh * 60 + mm;
-    int delta = want - now_min;
-    if (force_tomorrow || delta <= 0) delta += 24 * 60;
-    return (uint32_t)delta;
+    return oc_minutes_until_local(tv.tm_hour, tv.tm_min, hh, mm, force_tomorrow);   /* the core's, shared */
 }
 
 /* "2026-12-03" as local midnight, in ms; 0 when it is not a date. */
@@ -41163,7 +41159,15 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
     } else {
         mi_item(30, oc_sidebar_is_starred(&g_sb, cid) ? "Remove from Starred"
                                                       : "Add to Starred");
-        mi_item(31, c->muted ? "Unmute" : "Mute");
+        if (c->muted && c->muted_until_ms) {   /* a timed mute says when it ends (REQ-137) */
+            char ul[64], when[40] = "";
+            time_t tt = (time_t)(c->muted_until_ms / 1000); struct tm tv;
+            if (oc_localtime_r(&tt, &tv)) strftime(when, sizeof when, g_pref_time24 ? "%a %H:%M" : "%a %I:%M %p", &tv);
+            snprintf(ul, sizeof ul, "Unmute (muted until %s)", when[0] ? when : "later");
+            mi_item(31, ul);
+        } else {
+            mi_item(31, c->muted ? "Unmute" : "Mute\xE2\x80\xA6");
+        }
         if (c->kind != OC_CHANNEL_KIND_DM) mi_item(50, "Colour\xE2\x80\xA6");
         mi_item(2, "Mark as read");
         mi_item(40, "Jump to date");
@@ -41372,6 +41376,28 @@ static void color_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
     invalidate();
 }
 
+/* "Mute…": a menu of its own, as "Remind me…" is, with the "Pause
+ * notifications" durations and a mute with no end (REQ-137). Commands 71-75. */
+static void mute_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
+    g_n_mi = 0;
+    mi_section("MUTE");
+    mi_item(71, "For 30 minutes");
+    mi_item(72, "For 1 hour");
+    mi_item(73, "For 2 hours");
+    mi_item(74, "Until tomorrow");
+    mi_item(75, "Until I turn it back on");
+    g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 240;
+    g_menu_target = cid; g_menu_target2 = 0;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+}
+
 static void colors_save(void) {
     if (!g_client) return;
     char enc[OC_SETTING_VALUE_MAX];
@@ -41393,10 +41419,16 @@ static void channel_menu_run(oc_win *hwnd, int cmd) {
         if (r == OC_CHAN_COLOR_OK) { colors_save(); invalidate(); }
         else fb_failed("You have coloured as many channels as you can. Take the colour off one first.");
         break; }
-    case 31: {                                 /* */
+    case 31: {   /* Unmute, or the mute menu: for how long (REQ-137) */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
-        oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
+        if (mc && mc->muted) oc_client_set_mute(g_client, cid, 0, 0);
+        else mute_menu_open(hwnd, cid, g_menu_x, g_menu_y);
         break; }
+    case 71: oc_client_set_mute(g_client, cid, 1, 30);  break;   /* the pause's durations */
+    case 72: oc_client_set_mute(g_client, cid, 1, 60);  break;
+    case 73: oc_client_set_mute(g_client, cid, 1, 120); break;
+    case 74: oc_client_set_mute(g_client, cid, 1, minutes_until_local(9, 0, 1)); break;   /* 09:00 tomorrow */
+    case 75: oc_client_set_mute(g_client, cid, 1, 0);   break;   /* until unmuted */
     case 24: {   /* every thread in it followed, or not (REQ-282) */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
         int on = !(mc && mc->follow_threads);

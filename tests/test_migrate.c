@@ -102,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 92);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections/outgoing-webhooks */
+    CHECK(oc_schema_version(db) == 93);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions/summaries/summary-queue/summary-notices/mentions-indexed/invite-uses/argon2id/encrypted-dms/polls/system-user/own-quiet-hours/read-receipts/invite-created/collapsed/user-kind/unspoiled-search/reply-also-channel/follow-threads/reminders/active-days/muted-people/snippets/blocks/profile-fields/out-of-office/channel-managers/emoji-aliases/audit-channel/todo-lists/exported-video/calls/image-previews/rendered-audio-uses/principal-tokens/mcp-connections/outgoing-webhooks/timed-mute */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -415,13 +415,33 @@ static void test_also_channel(void) {
 /* Outgoing webhooks (0092), from 0090: the three tables are made; a webhook
  * keeps its sealed secret as written, its channels are one row each, and a
  * delivery is due by its index. */
+/* A mute for a set time (0093), from 0092: the column is added, an existing
+ * mute reads as one with no end, and a timed one keeps its instant. */
+static void test_timed_mute_0093(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 92, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'iss|a',0);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(7,'channel','general',1,1);"
+        "INSERT INTO notification_prefs(user_id,channel_id,level,muted) VALUES(1,7,0,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 93, &err) == SQLITE_OK);
+    CHECK(oc_schema_version(db) == 93);
+    CHECK(scalar(db, "SELECT muted_until_ms FROM notification_prefs WHERE user_id=1 AND channel_id=7;") == 0);
+    CHECK(sqlite3_exec(db, "UPDATE notification_prefs SET muted_until_ms=1234 WHERE channel_id=7;",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT muted_until_ms FROM notification_prefs WHERE channel_id=7;") == 1234);
+    sqlite3_close(db);
+}
+
 static void test_outgoing_webhooks_0092(void) {
     sqlite3 *db = open_mem();
     char *err = NULL;
     CHECK(oc_migrate(db, OC_MIGRATIONS, 90, &err) == SQLITE_OK);
     CHECK(oc_schema_version(db) == 90);
     CHECK(!table_exists(db, "outgoing_webhooks"));
-    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 92, &err) == SQLITE_OK);
     CHECK(oc_schema_version(db) == 92);
     CHECK(table_exists(db, "outgoing_webhooks"));
     CHECK(table_exists(db, "outgoing_webhook_channels"));
@@ -662,6 +682,7 @@ int run_migrate_tests(void) {
     test_rendered_audio_uses_0089();
     test_connections_0091();
     test_outgoing_webhooks_0092();
+    test_timed_mute_0093();
     test_sql_functions();
     test_newer_database_refused();
     return failures;

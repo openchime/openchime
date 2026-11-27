@@ -1473,12 +1473,13 @@ void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
 
 /* Mute (REQ-137). Independent of the notification level: the daemon keeps
  * them in separate columns for the same reason. */
-void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted, uint32_t minutes) {
     if (!c || !channel_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_MUTE);
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->op = muted ? 1 : 0;
+    cmd->message_id = muted ? minutes : 0;   /* the minutes, as SET_SNOOZE carries them */
     oc_queue_push(&c->cmds, cmd);
 }
 

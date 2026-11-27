@@ -6493,6 +6493,31 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         read_notify_tail(devs[d]);
     }
 
+    /* A mute for a set time (REQ-137): set on one device, its end reaches both,
+     * the same instant; unmuted again, both hear that it has none. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_mute tm = { OC_DEFAULT_CHANNEL, 1, 30 };
+    CHECK(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    uint64_t mute_until = 0;
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK && n == 1);
+        CHECK(ents[0].muted == 1 && ents[0].muted_until_ms > 0);
+        if (d == 0) mute_until = ents[0].muted_until_ms; else CHECK(ents[0].muted_until_ms == mute_until);
+        read_notify_tail(devs[d]);
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_mute um = { OC_DEFAULT_CHANNEL, 0, 0 };
+    CHECK(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &um) == OC_OK);
+    CHECK(send_frame(&a2, buf, w.len) == 0);
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK && n == 1);
+        CHECK(ents[0].muted == 0 && ents[0].muted_until_ms == 0);
+        read_notify_tail(devs[d]);
+    }
+
     /* --- pausing (REQ-278) ----------------------------------------
      * The pause is the OTHER mechanism, and the vertical is what proves they
      * are separate: setting one must not disturb the other, both of the user's

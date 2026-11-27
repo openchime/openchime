@@ -467,7 +467,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * OC_RES_OUTWH_DUE. OUTWH_DONE: delivery owh_delivery succeeded (owh_ok)
         * or failed with owh_reason, answered OC_RES_OUTWH_DONE. */
        OC_JOB_OUTWH_CREATE = 280, OC_JOB_OUTWH_LIST = 281, OC_JOB_OUTWH_SET = 282,
-       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285 };
+       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285,
+       /* Timed mutes come to their end (REQ-137), on the reminder tick: each
+        * lapsed one is cleared, and each person it was theirs answered with an
+        * OC_RES_NOTIFY_PREFS for all their connections; none due, one with
+        * user_id 0, which sends nothing. Write. */
+       OC_JOB_EXPIRE_MUTES = 286 };
 
 /* Outgoing webhooks (docs/details/WEBHOOKS.md). A signing secret is 20 random
  * bytes, shown and used as its 40 hex digits; it is kept sealed under the
@@ -808,7 +813,9 @@ typedef struct oc_job {
     /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
      * SET_DND uses the dnd_* fields. */
     uint8_t        notify_level;
-    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
+    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause.
+                                      * SET_MUTE: the mute's minutes from now, 0
+                                      * for no end (REQ-137) */
     int16_t        tz_offset_min;    /* SET_TZ_OFFSET: minutes east of UTC */
     /* SET_SCHEDULE (REQ-136). `sched_days` is heap when n_sched_days > 0. */
     uint8_t          sched_mode;
@@ -1360,7 +1367,10 @@ typedef struct {
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_row;
+/* `muted_until_ms`: when a timed mute ends, 0 for a mute with no end or none
+ * (REQ-137); a passed one is reported as no mute at all. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads;
+                 uint64_t muted_until_ms; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;

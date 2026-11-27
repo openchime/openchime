@@ -13245,7 +13245,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, level, muted, follow_threads FROM notification_prefs WHERE user_id=? "
+        "SELECT channel_id, level, muted, follow_threads, muted_until_ms FROM notification_prefs WHERE user_id=? "
         "ORDER BY channel_id LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
@@ -13258,6 +13258,11 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
         r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
         r->nprefs[r->n_nprefs].muted = (uint8_t)sqlite3_column_int(st, 2);
         r->nprefs[r->n_nprefs].follow_threads = (uint8_t)sqlite3_column_int(st, 3);
+        /* A timed mute whose instant has passed is no mute, even before the
+         * sweep has cleared it (REQ-137), as a passed pause is none. */
+        uint64_t until = (uint64_t)sqlite3_column_int64(st, 4);
+        if (until && until <= dbw_now_ms()) { r->nprefs[r->n_nprefs].muted = 0; until = 0; }
+        r->nprefs[r->n_nprefs].muted_until_ms = r->nprefs[r->n_nprefs].muted ? until : 0;
         r->n_nprefs++;
     }
     sqlite3_finalize(st);
@@ -13323,15 +13328,23 @@ static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
     if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
     }
+    /* For a set time (REQ-137): the minutes from now, cut to a week as the
+     * pause's are, resolved to an instant once, here; 0 is a mute with no end.
+     * Unmuting clears both. */
+    int muted = j->hook_disabled ? 1 : 0;                 /* reused: the mute flag */
+    uint32_t mins = j->snooze_minutes > 7u * 24u * 60u ? 7u * 24u * 60u : j->snooze_minutes;
+    uint64_t until = (muted && mins) ? dbw_now_ms() + (uint64_t)mins * 60000ull : 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO notification_prefs(user_id, channel_id, level, muted) "
-        "VALUES(?1, ?2, 0, ?3) "
-        "ON CONFLICT(user_id, channel_id) DO UPDATE SET muted=excluded.muted;",
+        "INSERT INTO notification_prefs(user_id, channel_id, level, muted, muted_until_ms) "
+        "VALUES(?1, ?2, 0, ?3, ?4) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET muted=excluded.muted, "
+        "muted_until_ms=excluded.muted_until_ms;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int  (st, 3, j->hook_disabled ? 1 : 0);   /* reused: the mute flag */
+    sqlite3_bind_int  (st, 3, muted);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)until);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
@@ -14867,6 +14880,49 @@ static oc_dbres *process_fire_reminders(sqlite3 *db, const oc_job *j) {
     return head;
 }
 
+/* Timed mutes come to their end (REQ-137): on the reminder tick, every mute
+ * whose instant has passed is cleared (muted = 0, muted_until_ms = 0), so every
+ * reader of `muted` stays as it was, and each person whose mute it was gets
+ * their NOTIFY_PREFS, to all their connections. A batch of people at a time;
+ * the rest on the next tick. Nothing due: one result for nobody. */
+static oc_dbres *process_expire_mutes(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    uint64_t now = dbw_now_ms();
+    uint64_t users[64]; size_t nu = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT DISTINCT user_id FROM notification_prefs "
+            " WHERE muted = 1 AND muted_until_ms > 0 AND muted_until_ms <= ?1 LIMIT 64;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        while (nu < 64 && sqlite3_step(st) == SQLITE_ROW) users[nu++] = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    for (size_t i = 0; i < nu; i++) {
+        if (sqlite3_prepare_v2(db,
+                "UPDATE notification_prefs SET muted = 0, muted_until_ms = 0 "
+                " WHERE user_id = ?1 AND muted_until_ms > 0 AND muted_until_ms <= ?2;",
+                -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)users[i]);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    oc_dbres *head = NULL, **tail = &head;
+    for (size_t i = 0; i < nu; i++) {
+        oc_dbres *r = calloc(1, sizeof *r);
+        if (!r) break;
+        build_notify_prefs(db, users[i], r);
+        *tail = r; tail = &r->next;
+    }
+    if (!head) {                                /* nothing due: a benign no-op */
+        head = calloc(1, sizeof *head);
+        if (head) head->type = OC_RES_NOTIFY_PREFS;   /* user_id 0: sent to nobody */
+    }
+    return head;
+}
+
 static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
     (void)j;
     uint64_t id = 0, uid = 0, cid = 0, root = 0;
@@ -16172,6 +16228,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
     if (j->type == OC_JOB_FIRE_REMINDERS)    return process_fire_reminders(w->db, j);
+    if (j->type == OC_JOB_EXPIRE_MUTES)      return process_expire_mutes(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
     if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
     if (j->type == OC_JOB_CANCEL_SCHEDULED)  return process_cancel_scheduled(w->db, j);

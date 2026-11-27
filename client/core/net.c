@@ -1904,6 +1904,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* distinct from the level */
                 e->participant = ne[i].follow_threads;   /* every thread followed (REQ-282) */
+                e->muted_until_ms = ne[i].muted_until_ms; /* a timed mute's end (REQ-137) */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
@@ -4691,7 +4692,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_SET_MUTE) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_set_mute sm = { c->channel_id, c->op };
+                oc_set_mute sm = { c->channel_id, c->op, (uint32_t)c->message_id };   /* minutes (REQ-137) */
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

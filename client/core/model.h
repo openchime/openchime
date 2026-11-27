@@ -272,6 +272,9 @@ typedef struct {
      * unread badge, so a conversation can be quiet but still countable, or
      * countable but silent. */
     uint8_t  muted;
+    /* When a timed mute ends (REQ-137), as the last NOTIFY_PREFS said; 0 for a
+     * mute with no end, or none. The daemon ends it; the client keeps no clock. */
+    uint64_t muted_until_ms;
     /* Every thread in it followed (REQ-282): a reply anywhere in it counts as a
      * reply in a thread this reader is in, unless that thread is unfollowed. */
     uint8_t  follow_threads;
@@ -1266,6 +1269,11 @@ void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot
 
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
+/* Minutes from a local time (`now_hour`:`now_min`) to `hh`:`mm`: later today, or
+ * tomorrow when that has passed or `force_tomorrow` is set. "Until tomorrow"
+ * in the pause and mute menus is (9, 0, force_tomorrow 1): 09:00 the next day.
+ * Pure, so both clients' menus answer the same. */
+uint32_t oc_minutes_until_local(int now_hour, int now_min, int hh, int mm, int force_tomorrow);
 /* Put this user's read position in a channel at `message_id`, backwards included
  * (mark unread, REQ-235), and recount its unread badge from the loaded messages. */
 void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id);
