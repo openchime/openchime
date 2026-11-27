@@ -118,6 +118,19 @@ static int g_mode = -1;
 static int g_scheme = OC_SCHEME_MIDNIGHT;
 static int g_high_contrast = 0;
 
+/* The channel colours, one set per palette (oc_theme_chan_color): blue,
+ * indigo, violet, pink, teal, cyan, slate, brown. Lighter on the dark
+ * palettes, deeper on the light ones, so each clears 3:1 on the sidebar. */
+static const uint32_t CHAN_DARK[8]     = { 0x60A5FA, 0x818CF8, 0xA78BFA, 0xF472B6,
+                                           0x2DD4BF, 0x22D3EE, 0x94A3B8, 0xC8946A };
+static const uint32_t CHAN_LIGHT[8]    = { 0x1D4ED8, 0x4338CA, 0x6D28D9, 0xBE185D,
+                                           0x0F766E, 0x0E7490, 0x475569, 0x8A4B22 };
+static const uint32_t CHAN_HC_DARK[8]  = { 0x7AB8FF, 0x9FA8FF, 0xC0A8FF, 0xFF8CCB,
+                                           0x4EEAD6, 0x5BE3F5, 0xB8C4D4, 0xE0AE84 };
+static const uint32_t CHAN_HC_LIGHT[8] = { 0x1E40AF, 0x3730A3, 0x5B21B6, 0x9D174D,
+                                           0x115E59, 0x155E75, 0x334155, 0x6F3B19 };
+static const uint32_t *g_chan = CHAN_DARK;
+
 /* A scheme is the RAIL and the ACCENT together, per mode:
  *   name, dark rail, light rail, dark accent, dark dim, light accent, light dim.
  *
@@ -246,11 +259,13 @@ void oc_theme_apply(int mode) {
          * resolved, so OC_INK_ON answers as it always does. */
         const uint32_t *hc = light ? HC_LIGHT : HC_DARK;
         for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = hc[i];
+        g_chan = light ? CHAN_HC_LIGHT : CHAN_HC_DARK;
         resolve_ink_table();
         return;
     }
     const uint32_t *src = light ? LIGHT : DARK;
     for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = src[i];
+    g_chan = light ? CHAN_LIGHT : CHAN_DARK;
     /* The scheme is applied AFTER the palette copy, not folded into the tables:
      * otherwise every scheme would need its own full palette and the two would drift
      * the first time a neutral changed. */
@@ -324,4 +339,9 @@ int oc_presence_mark(uint8_t presence, int dnd) {
     if (presence == OC_PRESENCE_ONLINE) return OC_PMARK_ONLINE;
     if (presence == OC_PRESENCE_AWAY)   return OC_PMARK_AWAY;
     return OC_PMARK_OFFLINE;
+}
+
+uint32_t oc_theme_chan_color(int idx) {
+    if (idx < 1 || idx > 8) return 0;
+    return g_chan[idx - 1];
 }

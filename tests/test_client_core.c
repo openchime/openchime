@@ -2843,6 +2843,60 @@ static void test_notify_scan(void) {
     oc_model_free(&m);
 }
 
+/* A person's own channel colours: set, change, clear, the cap, the value's
+ * size, and the setting's round trip. */
+static void test_chan_colors(void) {
+    oc_chan_colors c; memset(&c, 0, sizeof c);
+    CHECK(oc_chan_color_of(&c, 12) == 0);
+    CHECK(oc_chan_color_set(&c, 12, 3) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 3);
+    CHECK(oc_chan_color_set(&c, 12, 5) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 5 && c.n == 1);
+    CHECK(oc_chan_color_set(&c, 12, 0) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 0 && c.n == 0);
+    CHECK(oc_chan_color_set(&c, 12, 0) == OC_CHAN_COLOR_OK);                   /* clearing none */
+    CHECK(oc_chan_color_set(&c, 12, OC_CHAN_COLOR_COUNT + 1) == OC_CHAN_COLOR_BAD && c.n == 0);
+    CHECK(oc_chan_color_set(&c, 0, 1) == OC_CHAN_COLOR_BAD);
+
+    /* 64 channels across all 8 colours fit, and the 65th is refused, the map
+     * as it was. */
+    for (uint64_t id = 1; id <= OC_CHAN_COLORS_MAX; id++)
+        CHECK(oc_chan_color_set(&c, id, (uint8_t)(1 + id % OC_CHAN_COLOR_COUNT)) == OC_CHAN_COLOR_OK);
+    CHECK(c.n == OC_CHAN_COLORS_MAX);
+    oc_chan_colors before = c;
+    CHECK(oc_chan_color_set(&c, 999, 2) == OC_CHAN_COLOR_FULL);
+    CHECK(memcmp(&before, &c, sizeof c) == 0);
+    char enc[OC_SETTING_VALUE_MAX];
+    size_t need = oc_chan_colors_encode(&c, enc, sizeof enc);
+    CHECK(need < OC_SETTING_VALUE_MAX && need == strlen(enc));
+    CHECK(strncmp(enc, "1:8,16,", 7) == 0);                 /* grouped: the colour once */
+    oc_chan_colors back; oc_chan_colors_parse(&back, enc);
+    CHECK(back.n == c.n);
+    for (uint64_t id = 1; id <= OC_CHAN_COLORS_MAX; id++)
+        CHECK(oc_chan_color_of(&back, id) == oc_chan_color_of(&c, id));
+    char enc2[OC_SETTING_VALUE_MAX];
+    oc_chan_colors_encode(&back, enc2, sizeof enc2);
+    CHECK(strcmp(enc, enc2) == 0);
+
+    /* Long ids: the colour whose value would not fit a setting is refused. */
+    memset(&c, 0, sizeof c);
+    int refused = 0, set = 0;
+    for (uint64_t k = 0; k < OC_CHAN_COLORS_MAX; k++) {
+        int r = oc_chan_color_set(&c, 18000000000000000000ull + k, (uint8_t)(1 + k % 2));
+        if (r == OC_CHAN_COLOR_TOO_LONG) { refused = 1; break; }
+        if (r == OC_CHAN_COLOR_OK) set++;
+    }
+    CHECK(refused && set > 0 && c.n == set);
+    CHECK(oc_chan_colors_encode(&c, enc, sizeof enc) < OC_SETTING_VALUE_MAX);
+
+    /* Malformed groups and ids are skipped, the rest kept; nothing crashes. */
+    oc_chan_colors_parse(&back, NULL);
+    CHECK(back.n == 0);
+    oc_chan_colors_parse(&back, "");
+    CHECK(back.n == 0);
+    oc_chan_colors_parse(&back, "9:4;x:5;2:7,,0,abc,88;:3;1:12,12;3");
+    CHECK(back.n == 3);
+    CHECK(oc_chan_color_of(&back, 7) == 2 && oc_chan_color_of(&back, 88) == 2 && oc_chan_color_of(&back, 12) == 1);
+    CHECK(oc_chan_color_of(&back, 4) == 0 && oc_chan_color_of(&back, 5) == 0);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -7277,6 +7331,7 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_chanmem_overlap();
     test_sidebar();
+    test_chan_colors();
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
     test_srvalerts_model();

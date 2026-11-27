@@ -359,12 +359,43 @@ static void test_high_contrast_follows_the_preference(void) {
     }
 }
 
+/* A person's channel colours: in every scheme, mode and high-contrast
+ * palette, each of the 8 clears 3:1 on the sidebar and the header, where its
+ * dot is drawn, and none is the presence or danger colour. */
+static void test_channel_colours_clear_the_floor(void) {
+    int checked = 0;
+    for (int hc = 0; hc < 2; hc++)
+        for (int scheme = 0; scheme < OC_SCHEME_COUNT; scheme++)
+            for (int light = 0; light < 2; light++) {
+                oc_theme_set_high_contrast(hc);
+                oc_theme_set_scheme(scheme);
+                oc_theme_apply(light ? OC_THEME_LIGHT : OC_THEME_DARK);
+                for (int k = 1; k <= 8; k++) {
+                    uint32_t col = oc_theme_chan_color(k);
+                    const int surf[2] = { TH_SIDEBAR, TH_HEADER };
+                    for (int s = 0; s < 2; s++) {
+                        float c = oc_theme_contrast(col, oc_theme[surf[s]]);
+                        checked++;
+                        if (c < FLOOR)
+                            printf("  contrast: channel colour %d on %s, %s %s%s: %06X on %06X is %.2f:1\n",
+                                   k, s ? "HEADER" : "SIDEBAR", oc_theme_scheme_name(scheme),
+                                   light ? "light" : "dark", hc ? " high contrast" : "",
+                                   col, oc_theme[surf[s]], (double)c);
+                        CHECK(c >= FLOOR);
+                    }
+                    CHECK(col != oc_theme[TH_ONLINE] && col != oc_theme[TH_AWAY] && col != oc_theme[TH_DANGER]);
+                }
+            }
+    CHECK(oc_theme_chan_color(0) == 0 && oc_theme_chan_color(9) == 0);
+    CHECK(checked == 2 * OC_SCHEME_COUNT * 2 * 8 * 2);
+}
+
 int run_theme_tests(void) {
     printf("test_theme: the contrast floor over every ink x surface x scheme x mode, "
            "one-way escalation, the faint tier survives, the reported pairs, "
            "the ratio arithmetic, distinct presence marks, the away ring, "
            "high contrast at 7:1 and 4.5:1, blind to the scheme, off unchanged, "
-           "white on the accent without it, and its preference\n");
+           "white on the accent without it, its preference, and the channel colours\n");
     test_contrast_arithmetic();
     test_every_pair_clears_the_floor();
     test_escalation_is_one_way();
@@ -378,6 +409,7 @@ int run_theme_tests(void) {
     test_high_contrast_off_is_unchanged();
     test_on_accent_is_white_without_high_contrast();
     test_high_contrast_follows_the_preference();
+    test_channel_colours_clear_the_floor();
     /* Leave the palette as the rest of the suite expects to find it. */
     oc_theme_set_high_contrast(0);
     oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);

@@ -4012,6 +4012,103 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
     }
 }
 
+/* ---- a person's channel colours --------------------------------------------- */
+
+uint8_t oc_chan_color_of(const oc_chan_colors *c, uint64_t channel_id) {
+    for (uint8_t i = 0; c && i < c->n; i++)
+        if (c->v[i].channel_id == channel_id) return c->v[i].color;
+    return 0;
+}
+
+/* The length of the whole encoding, its NUL left out; written into `out`
+ * when `out` is not NULL (the caller has made sure it fits). */
+static size_t chan_colors_write(const oc_chan_colors *c, char *out) {
+    size_t len = 0;
+    int groups = 0;
+    for (uint8_t col = 1; col <= OC_CHAN_COLOR_COUNT; col++) {
+        int any = 0;
+        for (uint8_t i = 0; i < c->n; i++) {
+            if (c->v[i].color != col) continue;
+            char part[32];
+            int w = any ? snprintf(part, sizeof part, ",%llu", (unsigned long long)c->v[i].channel_id)
+                        : snprintf(part, sizeof part, "%s%u:%llu", groups ? ";" : "", (unsigned)col,
+                                   (unsigned long long)c->v[i].channel_id);
+            if (w < 0) continue;
+            if (out) memcpy(out + len, part, (size_t)w);
+            len += (size_t)w;
+            if (!any) groups++;
+            any = 1;
+        }
+    }
+    if (out) out[len] = '\0';
+    return len;
+}
+
+size_t oc_chan_colors_encode(const oc_chan_colors *c, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!c) return 0;
+    size_t need = chan_colors_write(c, NULL);
+    if (out && need < cap) chan_colors_write(c, out);
+    return need;
+}
+
+int oc_chan_color_set(oc_chan_colors *c, uint64_t channel_id, uint8_t color) {
+    if (!c || !channel_id || color > OC_CHAN_COLOR_COUNT) return OC_CHAN_COLOR_BAD;
+    oc_chan_colors t = *c;
+    int at = -1;
+    for (uint8_t i = 0; i < t.n; i++) if (t.v[i].channel_id == channel_id) { at = i; break; }
+    if (color == 0) {
+        if (at >= 0) {
+            memmove(&t.v[at], &t.v[at + 1], (size_t)(t.n - 1 - at) * sizeof t.v[0]);
+            t.n--;
+        }
+    } else if (at >= 0) {
+        t.v[at].color = color;
+    } else {
+        if (t.n == OC_CHAN_COLORS_MAX) return OC_CHAN_COLOR_FULL;
+        t.v[t.n].channel_id = channel_id;
+        t.v[t.n].color = color;
+        t.n++;
+    }
+    if (chan_colors_write(&t, NULL) + 1 > OC_SETTING_VALUE_MAX) return OC_CHAN_COLOR_TOO_LONG;
+    *c = t;
+    return OC_CHAN_COLOR_OK;
+}
+
+void oc_chan_colors_parse(oc_chan_colors *c, const char *s) {
+    if (!c) return;
+    memset(c, 0, sizeof *c);
+    if (!s) return;
+    while (*s) {
+        const char *end = strchr(s, ';');
+        size_t n = end ? (size_t)(end - s) : strlen(s);
+        const char *colon = memchr(s, ':', n);
+        unsigned col = 0; int cd = 0;
+        const char *p = s;
+        while (p < s + n && *p >= '0' && *p <= '9' && cd < 2) { col = col * 10u + (unsigned)(*p - '0'); p++; cd++; }
+        if (colon && p == colon && cd && col >= 1 && col <= OC_CHAN_COLOR_COUNT) {
+            const char *q = colon + 1, *ge = s + n;
+            while (q < ge) {
+                const char *ie = memchr(q, ',', (size_t)(ge - q));
+                if (!ie) ie = ge;
+                uint64_t id = 0; int ok = ie > q && ie - q <= 20;
+                for (const char *d = q; ok && d < ie; d++) {
+                    if (*d < '0' || *d > '9') ok = 0;
+                    else id = id * 10u + (uint64_t)(*d - '0');
+                }
+                if (ok && id && !oc_chan_color_of(c, id) && c->n < OC_CHAN_COLORS_MAX) {
+                    c->v[c->n].channel_id = id;
+                    c->v[c->n].color = (uint8_t)col;
+                    c->n++;
+                }
+                q = ie + 1;
+            }
+        }
+        if (!end) break;
+        s = end + 1;
+    }
+}
+
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
     unsigned cs, cf, cc, ds, df, dc;
     if (!s || !*s) return;

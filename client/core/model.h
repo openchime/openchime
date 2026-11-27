@@ -1212,6 +1212,32 @@ void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
  * Format is a compact "c:s,f,x;d:s,f,x" so one setting key carries all of it. */
 void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
+
+/* A person's own channel colours: a dot before a channel's name, to tell
+ * channels apart. Personal and synced, each client type in its own settings
+ * bucket under the key `colors`; nobody else sees them. A colour is an index,
+ * 1 to OC_CHAN_COLOR_COUNT, into the frontend's palette; 0 is none. */
+#define OC_CHAN_COLORS_MAX   64
+#define OC_CHAN_COLOR_COUNT  8
+typedef struct { uint64_t channel_id; uint8_t color; } oc_chan_color;
+typedef struct { oc_chan_color v[OC_CHAN_COLORS_MAX]; uint8_t n; } oc_chan_colors;
+enum {
+    OC_CHAN_COLOR_OK = 0,
+    OC_CHAN_COLOR_FULL,       /* a 65th channel */
+    OC_CHAN_COLOR_TOO_LONG,   /* the value would not fit OC_SETTING_VALUE_MAX */
+    OC_CHAN_COLOR_BAD         /* no such colour, or no channel */
+};
+uint8_t oc_chan_color_of(const oc_chan_colors *c, uint64_t channel_id);
+/* Set a channel's colour (0 clears it). Refused with OC_CHAN_COLOR_FULL,
+ * _TOO_LONG or _BAD, and then the map is unchanged. */
+int     oc_chan_color_set(oc_chan_colors *c, uint64_t channel_id, uint8_t color);
+/* The map as one setting value, grouped by colour: the colour once, then its
+ * channels ("1:12,45,301;2:7,88"). Returns the length the whole value needs;
+ * it is written only when that fits `cap`, and `out` is "" otherwise. */
+size_t  oc_chan_colors_encode(const oc_chan_colors *c, char *out, size_t cap);
+/* Back from that value: a malformed group or id is skipped and the rest kept;
+ * NULL or empty is an empty map. */
+void    oc_chan_colors_parse(oc_chan_colors *c, const char *s);
 /* A conversation's badge, two tiers as every chat client draws it: a COUNT of
  * what is about you -- mentions, keywords, priority people, and in a direct
  * message every message, since all of it is to you -- and a DOT for any other

@@ -1472,6 +1472,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_MOVE,
        /* the message's body as stored, unrendered */
        ACT_SOURCE,
+       /* a person's own colour for a channel: the menu, then a colour (0 none) */
+       ACT_COLOR, ACT_COLOR0, ACT_COLOR_LAST = ACT_COLOR0 + OC_CHAN_COLOR_COUNT,
        /* a reminder on a message, which saves it (REQ-283): the choices, as
         * the desktop client's reminder menu has them, and a time typed */
        ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
@@ -2024,6 +2026,39 @@ static void sidebar_opts_load(const oc_model *m) {
     if (v && v[0]) oc_sidebar_opts_parse(&g_sb, v);
 }
 
+/* A person's channel colours (oc_chan_colors): this client's own, under
+ * `colors` in its own bucket, so the GUI's are not these. Read whenever the
+ * stored value changes (colors_sync). Drawn as the 256-colour cell nearest each
+ * of the GUI's eight: blue, indigo, violet, pink, teal, cyan, slate, brown. */
+#define COLORS_SETTING_KEY "colors"
+static oc_chan_colors g_colors;
+static char           g_colors_seen[OC_SETTING_VALUE_MAX];
+static const uintattr_t TUI_CHAN_COLOR[OC_CHAN_COLOR_COUNT] = { 75, 105, 141, 211, 43, 45, 103, 173 };
+static const char *const TUI_CHAN_COLOR_NAME[OC_CHAN_COLOR_COUNT] = {
+    "Blue", "Indigo", "Violet", "Pink", "Teal", "Cyan", "Slate", "Brown" };
+static char g_color_labels[OC_CHAN_COLOR_COUNT + 1][32];
+
+static void colors_sync(const oc_model *m) {
+    const char *v = m ? oc_model_setting((oc_model *)m, COLORS_SETTING_KEY) : NULL;
+    if (!v) v = "";
+    if (!strcmp(v, g_colors_seen)) return;
+    snprintf(g_colors_seen, sizeof g_colors_seen, "%s", v);
+    oc_chan_colors_parse(&g_colors, v);
+}
+static uint8_t chan_color(const oc_channel *c) {
+    return (c && c->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, c->channel_id) : 0;
+}
+/* The Colour menu: the eight, then None, the one in force marked. */
+static void menu_build_colors(uint8_t now) {
+    g_nmenu = 0;
+    for (int k = 1; k <= OC_CHAN_COLOR_COUNT; k++) {
+        snprintf(g_color_labels[k], sizeof g_color_labels[k], "%s%s", TUI_CHAN_COLOR_NAME[k - 1], now == k ? "  \xe2\x9c\x93" : "");
+        g_menu[g_nmenu++] = (menuitem){ g_color_labels[k], ACT_COLOR0 + k };
+    }
+    snprintf(g_color_labels[0], sizeof g_color_labels[0], "None%s", now ? "" : "  \xe2\x9c\x93");
+    g_menu[g_nmenu++] = (menuitem){ g_color_labels[0], ACT_COLOR0 };
+}
+
 static int chan_group(const oc_channel *c) {
     return c->kind == OC_CHANNEL_KIND_DM ? OC_SB_DMS : OC_SB_CHANNELS;
 }
@@ -2315,6 +2350,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                 else        snprintf(label, sizeof label, "  %s", title);
                 if ((bn > 0 || bdot) && !sel) fg |= TB_BOLD;
                 tk_text(1, iy, ch_w - 1, label, fg, bg);
+                uint8_t cc = chan_color(c);                 /* its colour, before the name */
+                if (cc && ch_w > 4) tb_set_cell(2, iy, 0x25CF, TUI_CHAN_COLOR[cc - 1], bg);
             }
         }
     }
@@ -2337,10 +2374,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         if (om) { char ol[96]; oc_model_ooo_label(om, ol, sizeof ol); snprintf(oo, sizeof oo, " \xc2\xb7 %s", ol); }
         snprintf(mt, sizeof mt, "%s@%s%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm", oo);
     } else if (fc && !fc->is_public)
-        snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
-    else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
+        snprintf(mt, sizeof mt, "%s\xf0\x9f\x94\x92 %s", chan_color(fc) ? "  " : "",
+                 fc->name ? fc->name : "…");  /* 🔒 private */
+    else if (fc)                 snprintf(mt, sizeof mt, "%s#%s", chan_color(fc) ? "  " : "", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
     tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
+    {   /* The channel's colour before its name, in the two cells left for it. */
+        int plain = !(m->roster_open || m->search_open || m->reactlist_open || m->voterlist_open ||
+                      m->prefs_open || m->weblist_open || m->thread_open);
+        uint8_t cc = plain ? chan_color(fc) : 0;
+        if (cc && msg_w > 8) tb_set_cell(msg_x + 3, panels_top, 0x25CF, TUI_CHAN_COLOR[cc - 1], th->bg);
+    }
     /* Summarize, at the right of the conversation's title (REQ-310): a click
      * offers the spans, as the launcher's "Summarize" does. */
     g_sumbtn_x0 = g_sumbtn_x1 = 0;
@@ -4291,6 +4335,7 @@ int main(int argc, char **argv) {
             sidebar_opts_load(m);
             g_sb_loaded = 1;
         }
+        colors_sync(m);                   /* this client's channel colours */
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
         /* Encrypted DMs: say what changed, and select the DM just asked for. */
         e2e_watch((oc_model *)m, &focus);
@@ -5167,6 +5212,23 @@ int main(int argc, char **argv) {
                     else if (id == ACT_TODO_ADD) { prompt_kind = PROMPT_TODO_ADD; prompt_title = "Add a task (name, or name: description)"; tk_input_init(&prompt_input, 0, "task"); }
                     else if (id == ACT_TODO_RENAME) { prompt_kind = PROMPT_TODO_RENAME; prompt_title = "Rename the list"; tk_input_init(&prompt_input, 0, "title"); }
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
+                    else if (id == ACT_COLOR) {
+                        menu_build_colors(oc_chan_color_of(&g_colors, act_cid));
+                        act_title = "Colour";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id >= ACT_COLOR0 && id <= ACT_COLOR_LAST) {
+                        const oc_model *cm = oc_client_model(cl);
+                        if (!cm->settings_synced) {
+                            snprintf(g_closed_note, sizeof g_closed_note, "Your settings are still loading. Try again in a moment.");
+                        } else if (oc_chan_color_set(&g_colors, act_cid, (uint8_t)(id - ACT_COLOR0)) == OC_CHAN_COLOR_OK) {
+                            char enc[OC_SETTING_VALUE_MAX];
+                            oc_chan_colors_encode(&g_colors, enc, sizeof enc);
+                            oc_client_set_setting(cl, COLORS_SETTING_KEY, enc);
+                        } else {
+                            snprintf(g_closed_note, sizeof g_closed_note, "You have coloured as many channels as you can. Take the colour off one first.");
+                        }
+                    }
                     else if (id == ACT_REMIND) {
                         /* The choices, then: Clear among them when one is set. */
                         int reminded = 0;
@@ -5471,6 +5533,8 @@ int main(int argc, char **argv) {
                         menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc),
                                            mc->follow_threads,
                                            mm->thread_open && mm->thread_channel == mc->channel_id);
+                        if (mc->kind != OC_CHANNEL_KIND_DM && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "Colour", ACT_COLOR };
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }

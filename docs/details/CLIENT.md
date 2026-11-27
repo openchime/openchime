@@ -399,8 +399,9 @@ model; translate input to intents }, stop.
   frontends never step on each other. The TUI pulls the daemon bucket on connect
   and layers it over the machine-local `~/.config/openchime/config` file. Most
   display prefs are read-only there — editing the file is how they change — but
-  the TUI **does** write one thing back: its sidebar sort, filter and collapse state, persisted
-  through `oc_client_set_setting`. Which server you connect to
+  the TUI **does** write two things back, through `oc_client_set_setting`: its
+  sidebar sort, filter and collapse state, and its channel colours (`colors`,
+  below). Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
   **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
   space, live attachment usage, the active retention/eviction policy, and how
@@ -569,8 +570,8 @@ model; translate input to intents }, stop.
     Text-only, so files are never rendered inline (REQ-140/141).
 
   `oc_client_set_setting` **is called by both frontends** — the TUI persists
-  its sidebar sort/filter/collapse through it and the Win32 client its
-  preferences.
+  its sidebar sort/filter/collapse and its channel colours through it and the
+  Win32 client its preferences.
 
   `INVITE_TO_CHANNEL` and
   `REMOVE_FROM_CHANNEL` are core entry points (`oc_client_channel_invite` /
@@ -1817,6 +1818,26 @@ or the message menu's "Open thread", opens that thread. The client core puts
 the reply in the scroll once, whether it arrives live or with the history,
 counts it toward unread once, and notifies it once: as a thread notice when
 the thread is one of yours, otherwise as a channel message.
+
+### Channel colours
+
+A person can colour a channel to tell it apart: its menu's **Colour…** opens a
+menu of its own with eight colours (blue, indigo, violet, pink, teal, cyan,
+slate, brown, each with its swatch) and None, the one in force ticked. The
+colour is a filled dot before the channel's name in the sidebar and in the
+conversation header. None of the eight is green, amber or red, which mean
+presence and danger, and each clears 3:1 on the sidebar and header in the
+dark, light and both high-contrast palettes (`oc_theme_chan_color`,
+`tests/test_theme.c`). DMs are not coloured.
+
+Colours are the person's own and nobody else sees them. They are kept under the
+settings key `colors`, beside `sidebar`, grouped by colour (`1:12,45;2:7`,
+`oc_chan_colors` in the client core), at most 64 channels and never more than
+fits one setting; a channel past either is refused with a short message. Each
+client type keeps its own bucket, so the graphical client's colours and the
+terminal client's are separate: the terminal client has its own **Colour**
+action in its channel menu and draws the mark as the 256-colour cell nearest
+each colour. Nothing is written before the account's settings have arrived.
 
 ### Long messages
 

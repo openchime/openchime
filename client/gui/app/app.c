@@ -1173,6 +1173,13 @@ static void open_section_menu(oc_win *hwnd, int sec);
 static void sidebar_opts_save(void);
 static void sidebar_opts_load(const oc_model *m);
 #define SB_SETTING_KEY "sidebar"
+/* A person's channel colours (oc_chan_colors): their own key in this client's
+ * bucket, read whenever the model's value changes (colors_sync). */
+#define COLORS_SETTING_KEY "colors"
+static oc_chan_colors g_colors;
+static char           g_colors_seen[OC_SETTING_VALUE_MAX];
+/* The dot drawn before a coloured channel's name, in the sidebar and header. */
+#define CHAN_DOT  UIS(8.0f)
 #define PREFS_SETTING_KEY "prefs"
 
 /* Preferences (REQ-261). Client-side display choices, synced through the
@@ -4584,6 +4591,12 @@ static void mi_add(int kind, int cmd, const char *label, int danger) {
 #define mi_userheader()        mi_add(MK_USERHEADER, 0, NULL, 0)
 #define mi_statusrow(cmd)      mi_add(MK_STATUSROW, (cmd), NULL, 0)
 #define mi_subitem(cmd, label) mi_add(MK_SUB, (cmd), (label), 0)
+/* An item with a channel colour's swatch before its label (icon 1000 + colour). */
+#define MI_SWATCH 1000
+static void mi_swatch(int cmd, const char *label, int color) {
+    mi_add(MK_ITEM, cmd, label, 0);
+    if (g_n_mi) g_mi[g_n_mi - 1].icon = MI_SWATCH + color;
+}
 
 /* Workspace display name, or the host's leading label as a fallback. */
 static void ws_display_name(const oc_model *m, char *out, size_t cap) {
@@ -4757,7 +4770,15 @@ static void draw_menu(gfx *rt) {
             if (lit)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), OC_R_CONTROL, OC_COL_HOVER);
             uint32_t col = g_mi[i].danger ? OC_COL_DANGER : OC_COL_TEXT;
-            draw_text(rt, g_mi[i].label, g_ui, rf(x + MI_TEXT_L, cy, panel.right - MI_TEXT_R, cy + ih), col);
+            float lx = x + MI_TEXT_L;
+            if (g_mi[i].icon >= MI_SWATCH) {          /* a channel colour's swatch */
+                int sc = g_mi[i].icon - MI_SWATCH;
+                float d = UIS(12.0f), my = cy + ih / 2;
+                if (sc) fill_round(rt, rf(lx, my - d / 2, lx + d, my + d / 2), OC_R_PILL, oc_theme_chan_color(sc));
+                else    stroke_round(rt, rf(lx, my - d / 2, lx + d, my + d / 2), OC_R_PILL, OC_COL_BORDER, 1.0f);
+                lx += d + UIS(10.0f);
+            }
+            draw_text(rt, g_mi[i].label, g_ui, rf(lx, cy, panel.right - MI_TEXT_R, cy + ih), col);
             if (g_mi[i].kind == MK_SUB) {
                 g_meta->align = ST_ALIGN_RIGHT;
                 draw_text(rt, "\xE2\x80\xBA", g_meta,
@@ -5496,6 +5517,12 @@ static void draw_call_strip(gfx *rt, const oc_model *m, float h) {
         draw_rec_mark(rt, m, x0 + UIS(8), g_cstrip.top + UIS(44), m->call.rec_by, 1, 1, "strip");
 }
 
+/* A person's channel colour, as a dot before the name (sidebar and header). */
+static void chan_dot(gfx *rt, float x, float cy, uint8_t color) {
+    float d = CHAN_DOT;
+    fill_round(rt, rf(x, cy - d / 2, x + d, cy + d / 2), OC_R_PILL, oc_theme_chan_color(color));
+}
+
 static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     sidebar_surface(rt, h);
 
@@ -5797,8 +5824,12 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 char locked[112];
                 const char *lab = r->label;
                 if (rc && rc->e2e) { snprintf(locked, sizeof locked, "\xF0\x9F\x94\x92 %s", r->label); lab = locked; }
+                float lx = sx0 + 34;
+                /* Its colour, the person's own, before the name. Never a DM's. */
+                uint8_t dc = (rc && rc->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, r->channel_id) : 0;
+                if (dc) { chan_dot(rt, lx, ry + ROW_H / 2, dc); lx += CHAN_DOT + UIS(6.0f); }
                 draw_text(rt, lab, unread ? g_ui_b : g_ui,
-                          rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H), fg);
+                          rf(lx, ry, sx1 - UIS(44), ry + ROW_H), fg);
             }
             if (r->is_self) {
                 /* "you" sits right after the name, dimmed — so the self-DM is
@@ -12841,6 +12872,14 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         tx = hdr_hist_buttons(rt, x0);
     } else {
         g_hist_back_btn = g_hist_fwd_btn = rf(0, 0, 0, 0);
+    }
+    /* The channel's colour, the person's own, before its name. */
+    {
+        uint8_t dc = (c && c->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, c->channel_id) : 0;
+        if (dc) {
+            chan_dot(rt, tx, (typing[0] || topic) ? 20.0f : HEADER_H / 2, dc);
+            tx += CHAN_DOT + UIS(8.0f);
+        }
     }
     float title_r = x0 + w - right_used - UIS(12);
     if (title_r < tx + UIS(60)) title_r = tx + UIS(60);   /* never nothing at all */
@@ -40911,6 +40950,7 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
         mi_item(30, oc_sidebar_is_starred(&g_sb, cid) ? "Remove from Starred"
                                                       : "Add to Starred");
         mi_item(31, c->muted ? "Unmute" : "Mute");
+        if (c->kind != OC_CHANNEL_KIND_DM) mi_item(50, "Colour\xE2\x80\xA6");
         mi_item(2, "Mark as read");
         mi_item(40, "Jump to date");
         if (oc_model_summarize_available(m)) mi_item(23, "Summarize");   /* REQ-310 */
@@ -41088,11 +41128,57 @@ static void kb_msg_key(oc_win *hwnd, int key) {
     if (g_menu) menu_move(1);            /* Remind me's choices, ready for Enter */
 }
 
+/* The channel colours, in the order of oc_theme_chan_color. */
+static const char *const CHAN_COLOR_NAMES[OC_CHAN_COLOR_COUNT] = {
+    "Blue", "Indigo", "Violet", "Pink", "Teal", "Cyan", "Slate", "Brown" };
+
+/* "Colour…": a menu of its own, as "Remind me…" is -- the eight colours with
+ * their swatches, and None, the one in force ticked. Commands 51..58 a colour,
+ * 59 none. */
+static void color_menu_open(oc_win *hwnd, uint64_t cid, float x, float y) {
+    g_n_mi = 0;
+    mi_section("COLOUR");
+    uint8_t now = oc_chan_color_of(&g_colors, cid);
+    char lbl[48];
+    for (int k = 1; k <= OC_CHAN_COLOR_COUNT; k++) {
+        snprintf(lbl, sizeof lbl, "%s%s", CHAN_COLOR_NAMES[k - 1], now == k ? "  \xE2\x9C\x93" : "");
+        mi_swatch(50 + k, lbl, k);
+    }
+    snprintf(lbl, sizeof lbl, "None%s", now ? "" : "  \xE2\x9C\x93");
+    mi_swatch(59, lbl, 0);
+    g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 220;
+    g_menu_target = cid; g_menu_target2 = 0;
+    g_menu_x = x; g_menu_y = y;
+    irect rc; client_rect(hwnd, &rc);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+    if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    invalidate();
+}
+
+static void colors_save(void) {
+    if (!g_client) return;
+    char enc[OC_SETTING_VALUE_MAX];
+    oc_chan_colors_encode(&g_colors, enc, sizeof enc);
+    oc_client_set_setting(g_client, COLORS_SETTING_KEY, enc);
+}
+
 static void channel_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     uint64_t cid = g_menu_target;
     if (!m || !cid) return;
     switch (cmd) {
+    case 50: color_menu_open(hwnd, cid, g_menu_x, g_menu_y); break;
+    case 51: case 52: case 53: case 54: case 55: case 56: case 57: case 58: case 59: {
+        /* Not before the account's settings have arrived: the snapshot would
+         * write over a colour set now. */
+        if (!m->settings_synced) { fb_failed("Your settings are still loading. Try again in a moment."); break; }
+        int r = oc_chan_color_set(&g_colors, cid, (uint8_t)(cmd == 59 ? 0 : cmd - 50));
+        if (r == OC_CHAN_COLOR_OK) { colors_save(); invalidate(); }
+        else fb_failed("You have coloured as many channels as you can. Take the colour off one first.");
+        break; }
     case 31: {                                 /* */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
         oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
@@ -41972,6 +42058,17 @@ static int on_tick(oc_win *hwnd) {
                 }
             }
             hist_track();
+            /* Channel colours: whenever the stored value changes, from this
+             * device's own save coming back or another device's. */
+            {
+                const char *cv = oc_model_setting((oc_model *)m, COLORS_SETTING_KEY);
+                if (!cv) cv = "";
+                if (strcmp(cv, g_colors_seen) != 0) {
+                    snprintf(g_colors_seen, sizeof g_colors_seen, "%s", cv);
+                    oc_chan_colors_parse(&g_colors, cv);
+                    invalidate();
+                }
+            }
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);
