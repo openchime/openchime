@@ -1003,6 +1003,11 @@ static const char *quick_name_for(const char *glyph) {
     return NULL;
 }
 
+/* The emoji this person picks (REQ-265): see emoji_usage_load. */
+#define EMOJI_USAGE_SETTING_KEY "emoji.frequent"
+static oc_emoji_usage g_emoji_usage;
+static char           g_emoji_usage_seen[OC_SETTING_VALUE_MAX];
+
 /* ---- app state ----------------------------------------------------------- */
 
 static oc_client *g_client;
@@ -15129,6 +15134,65 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     float y = body.top - g_pick_scroll, x = body.left;
     int col = 0, last_cat = -1;
 
+    /* Frequently used (REQ-265), before everything, while nothing is searched:
+     * the emoji used last, then by how often (oc_emoji_usage_rank). Ordinary
+     * cells, so a pick here does what any pick does; a catalogue one drawn in
+     * the reader's skin tone; a workspace one only while the workspace still
+     * has it, and never in a quick-reaction slot's picker, which is catalogue
+     * shortcodes alone. The strings a cell points at live in a pool that
+     * outlives the frame and a pick's own note. */
+    if (!q[0]) {
+        static char fpool[OC_EMOJI_FREQUENT_SHOW][OC_EMOJI_USE_KEY];
+        const char *ranked[OC_EMOJI_FREQUENT_SHOW];
+        size_t nr = oc_emoji_usage_rank(&g_emoji_usage, ranked, OC_EMOJI_FREQUENT_SHOW);
+        const oc_model *fm = model();
+        int nf = 0;
+        for (size_t i = 0; i < nr; i++) {
+            const char *key = ranked[i];
+            if (key[0] == ':') {
+                if (g_pick_target == PICK_QUICK || !fm) continue;
+                size_t kl = strlen(key);
+                int have = 0;
+                for (size_t c = 0; c < fm->n_cemoji && !have; c++) {
+                    const oc_custom_emoji *ce = &fm->cemoji[c];
+                    if (strlen(ce->name) == kl - 2 && !strncmp(ce->name, key + 1, kl - 2)) have = 1;
+                    for (uint8_t a = 0; a < ce->n_aliases && !have; a++)
+                        if (strlen(ce->aliases[a]) == kl - 2 && !strncmp(ce->aliases[a], key + 1, kl - 2)) have = 1;
+                }
+                if (!have) continue;
+                snprintf(fpool[nf++], sizeof fpool[0], "%s", key);
+            } else {
+                size_t an = 0;
+                const oc_emoji *all = oc_emoji_all(&an), *e = NULL;
+                for (size_t c = 0; c < an && !e; c++) if (!strcmp(all[c].name, key)) e = &all[c];
+                if (!e) continue;
+                char tb[OC_EMOJI_USE_KEY];
+                snprintf(fpool[nf++], sizeof fpool[0], "%s", toned(e, tb, sizeof tb));
+            }
+        }
+        if (nf) {
+            draw_text(rt, "Frequently used", g_meta,
+                      rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
+            y += 20;
+            for (int i = 0; i < nf; i++) {
+                if (y + cell >= body.top && y <= body.bottom) {
+                    rectf r = rf(x, y, x + cell, y + cell);
+                    if (g_n_pick_cells < 256) {
+                        if (g_pick_hover == g_n_pick_cells)
+                            fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
+                        g_pick_cells[g_n_pick_cells].r = r;
+                        g_pick_cells[g_n_pick_cells].emoji = fpool[i];
+                        g_n_pick_cells++;
+                    }
+                    draw_emoji_glyph(rt, fpool[i], r);
+                }
+                x += cell;
+                if (++col >= (int)cols) { col = 0; x = body.left; y += cell; }
+            }
+            if (col != 0) { y += cell; col = 0; x = body.left; }
+        }
+    }
+
     /* The workspace's own emoji FIRST (REQ-072): they are the ones this workspace
      * invented and the ones a stock catalogue cannot offer, so burying them under
      * 1800 standard glyphs would make them unfindable. The cell stores a pointer, so
@@ -15224,9 +15288,40 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
 static void ac_close(void);                                   /* fwd */
 static int  reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
 
+/* The emoji this person picks (REQ-265), for the picker's "Frequently used":
+ * per account and workspace, in the GUI's synced bucket under its own key, as
+ * status.recents is. Its value is read from the model when the picker opens,
+ * and only when it differs from the one last read, so a pick saved since --
+ * which the model may not have heard back yet -- is not undone by it. */
+
+static void emoji_usage_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting((oc_model *)m, EMOJI_USAGE_SETTING_KEY) : NULL;
+    if (!v) v = "";
+    if (!strcmp(v, g_emoji_usage_seen)) return;
+    snprintf(g_emoji_usage_seen, sizeof g_emoji_usage_seen, "%s", v);
+    oc_emoji_usage_parse(&g_emoji_usage, v);
+}
+
+/* A pick noted: a catalogue emoji by its base shortcode (a toned pick as its
+ * base, quick_name_for), a workspace one as ":name:". Saved only once the
+ * account's settings have arrived (settings_synced): noted before then, it
+ * would be written over the stored usage the snapshot is about to bring. */
+static void emoji_usage_note(const char *emoji) {
+    const oc_model *m = model();
+    if (!emoji || !emoji[0] || !g_client || !m || !m->settings_synced) return;
+    emoji_usage_load(m);
+    const char *key = emoji[0] == ':' ? emoji : quick_name_for(emoji);
+    if (!key) return;
+    oc_emoji_usage_note(&g_emoji_usage, key);
+    char enc[OC_SETTING_VALUE_MAX];
+    oc_emoji_usage_encode(&g_emoji_usage, enc, sizeof enc);
+    oc_client_set_setting(g_client, EMOJI_USAGE_SETTING_KEY, enc);
+}
+
 /* Open the picker for the composer (mid == 0) or for reacting to a message. */
 static void picker_open(oc_win *hwnd, uint64_t mid) {
     (void)hwnd;
+    emoji_usage_load(model());
     g_pick_open = 1; g_pick_mid = mid; g_pick_scroll = 0;
     g_pick_target = mid ? PICK_REACT : PICK_COMPOSER;
     ac_close();
@@ -15242,6 +15337,7 @@ static void picker_open(oc_win *hwnd, uint64_t mid) {
  * allowed to float over the card that opened it (the time-picker pattern). */
 static void picker_open_status(oc_win *hwnd, rectf anchor) {
     (void)hwnd;
+    emoji_usage_load(model());
     g_pick_open = 1; g_pick_mid = 0; g_pick_scroll = 0;
     g_pick_target = PICK_STATUS;
     g_pick_anchor = anchor;
@@ -15304,12 +15400,14 @@ static void picker_choose(oc_win *hwnd, const char *emoji) {
                 if (m->thread_msgs[i].message_id == g_pick_mid) {
                     msg = &m->thread_msgs[i]; chan = m->thread_channel; break;
                 }
-        oc_client_react(g_client, chan, g_pick_mid, emoji,
-                        (msg && reaction_is_mine(msg, emoji)) ? 0 : 1);
+        int add = !(msg && reaction_is_mine(msg, emoji));
+        oc_client_react(g_client, chan, g_pick_mid, emoji, add ? 1 : 0);
+        if (add) emoji_usage_note(emoji);            /* taking one back is no use */
     } else {
         oc_wch w[16];
         if (to_w(emoji, w, 16) > 0) {
             ed_insert(w);
+            emoji_usage_note(emoji);
         }
     }
     picker_close(hwnd);

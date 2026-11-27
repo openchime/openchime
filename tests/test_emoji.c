@@ -236,12 +236,127 @@ static void test_search(void) {
     CHECK(oc_emoji_search("zzzzznope", hits, OC_EMOJI_MAX) == 0);
 }
 
+/* The emoji a person uses (REQ-265): what "Frequently used" is drawn from. */
+static void test_emoji_usage(void) {
+    oc_emoji_usage u; memset(&u, 0, sizeof u);
+    const char *r[OC_EMOJI_FREQUENT_SHOW];
+
+    /* Noting moves to the front and counts; noting again does not duplicate. */
+    oc_emoji_usage_note(&u, "fire");
+    oc_emoji_usage_note(&u, "tada");
+    oc_emoji_usage_note(&u, "fire");
+    CHECK(u.n == 2);
+    CHECK(strcmp(u.v[0].key, "fire") == 0 && u.v[0].count == 2);
+    CHECK(strcmp(u.v[1].key, "tada") == 0 && u.v[1].count == 1);
+    oc_emoji_usage_note(&u, ":partyparrot:");             /* a workspace emoji */
+    CHECK(u.n == 3 && strcmp(u.v[0].key, ":partyparrot:") == 0);
+    oc_emoji_usage_note(&u, "");                          /* not keys */
+    oc_emoji_usage_note(&u, "has space");
+    oc_emoji_usage_note(&u, ":half");
+    CHECK(u.n == 3);
+
+    /* Ranking: the last used first, then by count, a tie to the more recent;
+     * at most OC_EMOJI_FREQUENT_SHOW, and never more than the list holds. */
+    memset(&u, 0, sizeof u);
+    for (int i = 0; i < 3; i++) oc_emoji_usage_note(&u, "a");
+    for (int i = 0; i < 2; i++) oc_emoji_usage_note(&u, "b");
+    oc_emoji_usage_note(&u, "c");
+    oc_emoji_usage_note(&u, "d");                         /* d c b a: counts 1 1 2 3 */
+    size_t k = oc_emoji_usage_rank(&u, r, OC_EMOJI_FREQUENT_SHOW);
+    CHECK(k == 4);
+    CHECK(k == 4 && strcmp(r[0], "d") == 0 && strcmp(r[1], "a") == 0 &&
+          strcmp(r[2], "b") == 0 && strcmp(r[3], "c") == 0);
+    CHECK(oc_emoji_usage_rank(&u, r, 2) == 2);
+    memset(&u, 0, sizeof u);
+    char key[16];
+    for (int i = 0; i < 20; i++) { snprintf(key, sizeof key, "e%d", i); oc_emoji_usage_note(&u, key); }
+    CHECK(oc_emoji_usage_rank(&u, r, OC_EMOJI_FREQUENT_SHOW) == OC_EMOJI_FREQUENT_SHOW);
+    CHECK(oc_emoji_usage_rank(&u, r, 0) == 0);
+
+    /* Full: the 25th evicts the lowest count, the oldest of a tie, and is kept. */
+    memset(&u, 0, sizeof u);
+    for (int i = 0; i < OC_EMOJI_USES_MAX; i++) {
+        snprintf(key, sizeof key, "k%d", i);
+        oc_emoji_usage_note(&u, key);
+        if (i != 3 && i != 7) oc_emoji_usage_note(&u, key);   /* k3 and k7 used once */
+    }
+    CHECK(u.n == OC_EMOJI_USES_MAX);
+    oc_emoji_usage_note(&u, "newest");
+    CHECK(u.n == OC_EMOJI_USES_MAX && strcmp(u.v[0].key, "newest") == 0);
+    int has3 = 0, has7 = 0;
+    for (int i = 0; i < u.n; i++) {
+        if (strcmp(u.v[i].key, "k3") == 0) has3 = 1;
+        if (strcmp(u.v[i].key, "k7") == 0) has7 = 1;
+    }
+    CHECK(!has3 && has7);                                  /* k3 the older of the two */
+    oc_emoji_usage_note(&u, "newer");                      /* now the lowest are k7 and "newest" */
+    int hasnewest = 0; has7 = 0;
+    for (int i = 0; i < u.n; i++) {
+        if (strcmp(u.v[i].key, "k7") == 0) has7 = 1;
+        if (strcmp(u.v[i].key, "newest") == 0) hasnewest = 1;
+    }
+    CHECK(!has7 && hasnewest && strcmp(u.v[0].key, "newer") == 0);
+
+    /* Past 99 every count halves, rounding up, and the order stays. */
+    memset(&u, 0, sizeof u);
+    for (int i = 0; i < 5; i++) oc_emoji_usage_note(&u, "low");
+    for (int i = 0; i < 99; i++) oc_emoji_usage_note(&u, "hot");
+    CHECK(u.v[0].count == 99 && u.v[1].count == 5);
+    oc_emoji_usage_note(&u, "hot");
+    CHECK(strcmp(u.v[0].key, "hot") == 0 && u.v[0].count == 51);   /* 99 -> 50, then +1 */
+    CHECK(strcmp(u.v[1].key, "low") == 0 && u.v[1].count == 3);    /* 5 -> 3 */
+
+    /* Encode then parse is the identity. */
+    memset(&u, 0, sizeof u);
+    oc_emoji_usage_note(&u, "+1");
+    oc_emoji_usage_note(&u, "fire"); oc_emoji_usage_note(&u, "fire");
+    oc_emoji_usage_note(&u, ":parrot:");
+    char enc[OC_SETTING_VALUE_MAX];
+    size_t el = oc_emoji_usage_encode(&u, enc, sizeof enc);
+    CHECK(el == strlen(enc) && strcmp(enc, ":parrot:=1,fire=2,+1=1") == 0);
+    oc_emoji_usage back; oc_emoji_usage_parse(&back, enc);
+    CHECK(back.n == u.n);
+    for (int i = 0; i < u.n && i < back.n; i++)
+        CHECK(strcmp(back.v[i].key, u.v[i].key) == 0 && back.v[i].count == u.v[i].count);
+
+    /* 24 longest keys stay within a setting, and parse back to the most recent. */
+    memset(&u, 0, sizeof u);
+    for (int i = OC_EMOJI_USES_MAX - 1; i >= 0; i--) {
+        char lk[OC_EMOJI_USE_KEY];
+        memset(lk, 'a' + (i % 26), OC_EMOJI_USE_KEY - 1);
+        lk[OC_EMOJI_USE_KEY - 1] = '\0';
+        snprintf(lk + OC_EMOJI_USE_KEY - 4, 4, "%03d", i);
+        for (int c = 0; c < 99 && i == 0; c++) oc_emoji_usage_note(&u, lk);
+        if (i) oc_emoji_usage_note(&u, lk);
+    }
+    CHECK(u.n == OC_EMOJI_USES_MAX);
+    el = oc_emoji_usage_encode(&u, enc, sizeof enc);
+    CHECK(el < OC_SETTING_VALUE_MAX && el == strlen(enc));
+    oc_emoji_usage_parse(&back, enc);
+    CHECK(back.n > 0 && back.n < u.n);
+    for (int i = 0; i < back.n; i++) CHECK(strcmp(back.v[i].key, u.v[i].key) == 0);
+    CHECK(back.v[0].count == u.v[0].count);
+
+    /* Empty, NULL and malformed values: nothing crashes, the good ones are kept. */
+    oc_emoji_usage_parse(&back, NULL);
+    CHECK(back.n == 0);
+    oc_emoji_usage_parse(&back, "");
+    CHECK(back.n == 0);
+    oc_emoji_usage_parse(&back, ",,=,fire,=3,tada=0,cat=100,dog=x,bad key=2,ok=7,ok=8,:x=2,heart=12,");
+    CHECK(back.n == 2);
+    CHECK(back.n == 2 && strcmp(back.v[0].key, "ok") == 0 && back.v[0].count == 7 &&
+          strcmp(back.v[1].key, "heart") == 0 && back.v[1].count == 12);
+    oc_emoji_usage_parse(&back, "garbage");
+    CHECK(back.n == 0);
+}
+
 int run_emoji_tests(void) {
     printf("test_emoji: catalogue integrity (names, UTF-8, categories, duplicates),\n");
-    printf("            shipped shortcodes still resolve, skin tones, search\n");
+    printf("            shipped shortcodes still resolve, skin tones, search, usage\n");
     test_catalogue_integrity();
     test_shipped_shortcodes_still_resolve();
     test_skin_tones();
     test_search();
+    test_emoji_usage();
     return failures;
 }

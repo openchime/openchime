@@ -1265,6 +1265,20 @@ picker the status dialog uses, floating over the card that owns it
 never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
+
+**The picker leads with the emoji you use** (REQ-265). With nothing searched,
+it opens on a "Frequently used" row before "This workspace" and the
+catalogue: the emoji used last, then the rest by how often, at most ten
+(`oc_emoji_usage_rank`, `client/core/complete.c`). A pick that goes into the
+composer or adds a reaction counts; taking a reaction back, a status emoji, a
+quick-reaction slot, the quick-reaction strip and a typed `:shortcode:` do
+not. The usage is kept under its own settings key, `emoji.frequent`, in the
+GUI's synced bucket, per account and workspace, as `key=count` pairs, most
+recent first: a catalogue emoji by its base shortcode (it is drawn in the
+reader's skin tone) and a workspace emoji as `:name:`, shown only while the
+workspace still has it and never in a quick-reaction slot's picker. Up to 24
+are kept, counts halve past 99, and nothing is written until the account's
+settings have arrived, so a pick at start cannot overwrite them.
 `Ctrl+Shift+\` opens the emoji picker to react to the conversation's newest
 message (`oc_model_last_reactable`: not a deleted one, not a call event), as
 the reference client binds it.
@@ -1337,7 +1351,8 @@ emoji picker floating *over* the card — the time-dropdown rule: drawn after
 `draw_modal`, clicks claimed ahead of the frame's scrim-cancel, Esc closes it
 before it closes the card, and `modal_finish` closes it with the card. The text
 field offers suggested statuses (five defaults plus recent ones, kept under the
-`status.recents` settings key); choosing one fills emoji, text and its default
+`status.recents` settings key, as the emoji picker's usage is under
+`emoji.frequent`); choosing one fills emoji, text and its default
 clear time in one click. The "Clear after" chips are prefilled by bucketing the
 member's live `status_expires`, so the dialog reopens showing what is actually
 set. The card publishes its buttons, suggestion rows and chips to the a11y

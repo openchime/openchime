@@ -2659,8 +2659,9 @@ choose — which makes each one a per-frontend *obligation*.*
   discoverable list of its shortcuts (the TUI's `?` help overlay, ARCH-83). (ARCH-92: per-frontend.)
 - **REQ-265.** A client's composer has offered **input aids** — inline
   autocomplete for `@user`, `#channel`, and `:emoji:` (REQ-221/072) and a full,
-  searchable **emoji picker** (beyond a hardcoded set) — so mentioning, linking a
-  channel, or reacting has not required typing exact names. (ARCH-92:
+  searchable **emoji picker** (beyond a hardcoded set) that leads with the emoji
+  the user uses most — so mentioning, linking a channel, or reacting has not
+  required typing exact names. (ARCH-92:
   per-frontend, over the shared `client/core/complete.c` catalogue.)
 - **REQ-266.** A client has let a user **view another user's profile** — opening a
   profile pane from a name or avatar anywhere the user appears — showing the fields
