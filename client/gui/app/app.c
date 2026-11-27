@@ -1085,6 +1085,7 @@ static fmtw *g_fmt_ital;
 static fmtw *g_fmt_quote;
 static fmtw *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
 static fmtw *g_code;    /* the code family at meta size: snippets (REQ-226) */
+static fmtw *g_code_w;  /* the same, wrapping: a message's source */
 static fmtw *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide icons draw through gfx_icon — tessellated in the gfx layer, no cached
  * geometry objects to own here. */
@@ -1804,6 +1805,13 @@ static int        g_sv_lang;
 static oc_lex_tok *g_sv_toks;
 static size_t     g_sv_ntoks;
 enum { SV_CMD_COPY = 2711, SV_CMD_SAVE = 2712 };
+/* View source: a message's body exactly as stored, unrendered, in a card of its
+ * own. A copy of the body, not a pointer into the model, which can be rebuilt
+ * while the card is open. */
+static int   g_src_open;
+static char *g_src_text;
+static rectf g_src_rect;    /* where its text was drawn, for assistive technology */
+enum { SRC_CMD_COPY = 2713 };
 /* The text a long paste brought, held while the person is asked whether to
  * make it a snippet; declined, it is pasted as it would have been. */
 static char *g_snip_paste;
@@ -3566,7 +3574,7 @@ static void fonts_build(void) {
     const float k = g_text_scale;
     fmtw **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
                      &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro,
-                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w, &g_code };
+                     &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote, &g_ui_w, &g_code, &g_code_w };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
     txt_drop_all();
 
@@ -3619,6 +3627,7 @@ static void fonts_build(void) {
         float clh, cbl;
         oc_typeface_pin(FONT_META * k, 0.0f, 0.0f, &clh, &cbl);
         g_code = mk_fmt_s("Consolas", FONT_META * k, REG, L, MID, 0, 0, clh, cbl);
+        g_code_w = mk_fmt_s("Consolas", FONT_META * k, REG, L, TOP, 1, 0, clh, cbl);
     }
 }
 
@@ -8892,7 +8901,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI, OVL_SNIPPET };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS, OVL_EMOJI, OVL_SNIPPET, OVL_SOURCE };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -16636,7 +16645,7 @@ static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
            g_status_open || g_sch_open || g_sr_open || g_jc_open || g_pc_open || g_te_open || g_sv_open ||
-           g_wsu_open || g_cpick_open || g_pj_open;
+           g_src_open || g_wsu_open || g_cpick_open || g_pj_open;
 }
 
 static rectf g_modal_card;
@@ -17580,6 +17589,35 @@ static void draw_snippet_view(gfx *rt, rectf body) {
     ovl_end(rt, body);
 }
 
+/* View source: the message's body exactly as stored, before any formatting,
+ * spoilers included as written. The decrypted body for an end-to-end message,
+ * since that is the one the client holds and renders. */
+static void source_view_open(oc_win *hwnd, const char *body) {
+    free(g_src_text);
+    g_src_text = strdup(body ? body : "");
+    if (!g_src_text) return;
+    modal_enter(hwnd, &g_src_open);
+    ovl_use(OVL_SOURCE);
+}
+
+/* Its body: the text wrapped in the code face, scrolled with the wheel and the
+ * keys (modal_key). Drawn as text, not in a field: a field holds FIELD_BUF and a
+ * body may be OC_MAX_BODY_SIZE. */
+static void draw_source_view(gfx *rt, rectf body) {
+    const char *t = g_src_text ? g_src_text : "";
+    float l = body.left + 16, r = body.right - 16;
+    ovl_use(OVL_SOURCE);
+    g_src_rect = body;
+    if (!t[0]) {
+        draw_text(rt, "This message has no text.", g_ui, rf(l, body.top + 8, r, body.top + 32), OC_COL_MUTED);
+        return;
+    }
+    float h = text_height(t, g_code_w, r - l);
+    float y = ovl_begin(rt, body, h + 12);
+    draw_text(rt, t, g_code_w, rf(l, y, r, y + h + 4), OC_COL_TEXT);
+    ovl_end(rt, body);
+}
+
 static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
         g_modal_card = rf(0, 0, 0, 0);
@@ -17624,6 +17662,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_pc_open)     draw_poll_compose(rt, body);
     else if (g_te_open)     draw_table_editor(rt, body);
     else if (g_sv_open)     draw_snippet_view(rt, body);
+    else if (g_src_open)    draw_source_view(rt, body);
     else if (g_form_open && g_form_side.on) {
         /* Two columns: the fields get everything left of the photo column. The
          * column is drawn first, though an open select list is bounded by the
@@ -19432,6 +19471,13 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Download", MB_NORMAL,  SV_CMD_SAVE };
         sp.buttons[2] = (oc_mbtn){ "Close",    MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 3;
+    } else if (g_src_open) {
+        sp.title = "Message source";
+        sp.subtitle = "Exactly as it was written, before formatting.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Copy",  MB_NORMAL,  SRC_CMD_COPY };
+        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
     } else if (g_about_open) {
         sp.title = "About OpenChime";
         sp.size = MODAL_SM;
@@ -19572,6 +19618,7 @@ static void modal_finish(int save) {
     g_wsu_open = 0;
     g_te_open = 0;
     g_sv_open = 0;
+    if (g_src_open) { g_src_open = 0; free(g_src_text); g_src_text = NULL; }
     if (te_was) te_closed();
     if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
     /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
@@ -19746,6 +19793,22 @@ static int modal_key(oc_win *hwnd, int vk) {
         return 1;
     }
     if (vk == OCK_ESCAPE) { modal_finish(0); return 1; }
+    /* View source scrolls from the keyboard as well as with the wheel. */
+    if (g_src_open && (vk == OCK_UP || vk == OCK_DOWN || vk == OCK_PRIOR || vk == OCK_NEXT ||
+                       vk == OCK_HOME || vk == OCK_END)) {
+        float page = g_modal_card.bottom - g_modal_card.top - MODAL_TITLE_H - MODAL_FOOT_H;
+        if (page < LINE_H) page = LINE_H;
+        if (vk == OCK_UP)    g_ovl_scroll -= LINE_H;
+        if (vk == OCK_DOWN)  g_ovl_scroll += LINE_H;
+        if (vk == OCK_PRIOR) g_ovl_scroll -= page;
+        if (vk == OCK_NEXT)  g_ovl_scroll += page;
+        if (vk == OCK_HOME)  g_ovl_scroll = 0;
+        if (vk == OCK_END)   g_ovl_scroll = g_ovl_max;
+        if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+        if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
+        invalidate();
+        return 1;
+    }
     if (vk == OCK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
         else if (g_modal_primary_cmd == MODAL_CANCEL) { modal_finish(0); }
@@ -30136,6 +30199,11 @@ modal_items:
             acc_push(items, &n, OC_ACC_BUTTON, aid, g_modal_btns[i].label,
                      g_modal_btns[i].r, ATOK(AT_MODALBTN, i));
         }
+        /* View source's text, read as one message would be (its start, up to
+         * the name's limit; Copy has the whole). */
+        if (g_src_open && g_src_text)
+            acc_push(items, &n, OC_ACC_MESSAGE, "source.body",
+                     g_src_text[0] ? g_src_text : "This message has no text.", g_src_rect, 0);
         /* New Call's own controls: its people, chips, results and devices. */
         for (int i = g_nc_btn_from; (g_cpick_open || g_pj_open) && i < g_nc_btn_to && i < g_n_call_btns && n < OC_ACC_MAX; i++)
             acc_push(items, &n, OC_ACC_BUTTON, g_call_btns[i].aid, g_call_btns[i].name, g_call_btns[i].r,
@@ -33080,6 +33148,8 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         if (!msg->deleted) mi_item(114, (msg->saved && msg->remind_at) ? "Reminder\xE2\x80\xA6" : "Remind me\xE2\x80\xA6");
     }
     mi_item(20,  "Copy text");
+    /* The body as stored, unrendered: anyone's message, not a deleted one. */
+    if (!msg->deleted) mi_item(123, "View source");
     /* Spoilers (MARKDOWN.md §1d), from the keyboard: Ctrl+Up to the message,
      * Shift+F10, and Enter on this reveals them all, or covers them again. */
     if (!msg->deleted && msg->body) {
@@ -33289,6 +33359,8 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
         const char *t = msg->body ? msg->body : "";
         char *cv = copy_covered(mid, t, 0, 0, strlen(t));
         if (cv) { copy_to_clipboard(hwnd, cv); free(cv); }
+    } else if (cmd == 123) {
+        if (!msg->deleted) source_view_open(hwnd, msg->body);
     } else if (cmd == 109) {
         copy_table(hwnd, msg, g_menu_tab);
     } else if (cmd == 110) {
@@ -40409,6 +40481,9 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         if (t) { copy_to_clipboard(hwnd, t); fb_confirm("Snippet copied."); }
         else fb_failed("The snippet has not loaded yet.");
         break; }
+    case SRC_CMD_COPY:                 /* a message's source, every byte as stored */
+        if (g_src_text) { copy_to_clipboard(hwnd, g_src_text); fb_confirm("Source copied."); }
+        break;
     case SV_CMD_SAVE: {                /* ...or its file, as any download */
         oc_attachment a; memset(&a, 0, sizeof a);
         a.id = g_sv_aid;

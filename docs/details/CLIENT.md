@@ -362,7 +362,8 @@ model; translate input to intents }, stop.
   channel. On the Messages
   panel, Enter opens an action menu (Reply in thread / Add reaction / on a poll,
   Vote: each option, Who voted and, for its author, Close poll now / Download /
-  Edit / Delete / Who reacted / Mark unread from here -- which holds off the
+  Edit / Delete / Who reacted / View source (§8, "View source") / Mark unread from here --
+  which holds off the
   keep-the-open-conversation-read step until focus moves, or the next frame
   would read it again); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
@@ -1802,6 +1803,26 @@ prefix, so formatting still applies to what shows.
 Both are reachable without a pointer: the message's menu (Ctrl+Up to the
 message, Shift+F10) offers Collapse or Expand, and each "Show …" is a button
 for assistive technology (`message.<id>.expand`).
+
+### View source
+
+Every message that is not deleted, anyone's, offers **View source** in its
+menu: the body exactly as stored, before any formatting, with spoiler markup
+and what it covers shown as written ("Copy text" still keeps covered spoilers
+covered). For an end-to-end message it is the decrypted body, the one the
+client renders. Nothing is fetched: the body the client holds is the stored
+one.
+
+- **Graphical client** — a "Message source" dialog: the text wrapped in the
+  code face, scrolled with the wheel, the arrow keys, Page Up / Page Down and
+  Home / End, and published to assistive technology as `source.body`. Copy
+  (`modal.button.copy`) puts every byte of the body on the
+  clipboard; Close (`modal.button.close`) or Esc dismisses it. It is drawn
+  text, not a field, so there is no partial selection.
+- **Terminal client** — "View source" in the message menu opens the body over
+  the screen, wrapped to its width: `j`/`k` scroll, space and Page Down page,
+  `g`/`G` go to the start and end, `q` or Esc closes it. Copying is the
+  terminal's own selection.
 
 ### Typography (graphical clients) — ARCH-97
 

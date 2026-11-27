@@ -277,6 +277,38 @@ static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int
     } while (off < len);
 }
 
+/* View source: a message's body exactly as stored, unrendered, wrapped to the
+ * screen from row `top`, over the screen; the title and keys on the first row.
+ * Copying is the terminal's own selection. Returns the row count. */
+static int tui_src_view_draw(const char *body, int top) {
+    int W = tb_width(), H = tb_height();
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, TB_DEFAULT);
+    tk_text(0, 0, W, " Message source    j/k scroll, space page, q close", TB_BOLD, TB_DEFAULT);
+    rows_t rows = {0};
+    const char *s = body ? body : "";
+    for (;;) {
+        const char *e = strchr(s, '\n');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        char *line = malloc(n * 4 + 1);
+        if (!line) break;
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {        /* a tab as four columns; a CR is not drawn */
+            if (s[i] == '\t') { memcpy(line + k, "    ", 4); k += 4; }
+            else if (s[i] != '\r') line[k++] = s[i];
+        }
+        line[k] = '\0';
+        wrap_push(&rows, line, TB_DEFAULT, W - 2, 0);
+        free(line);
+        if (!e) break;
+        s = e + 1;
+    }
+    for (int r = 0; top + r < (int)rows.n && 2 + r < H; r++)
+        tk_text(1, 2 + r, W - 1, rows.v[top + r].s, TB_DEFAULT, TB_DEFAULT);
+    int count = (int)rows.n;
+    rows_free(&rows);
+    return count;
+}
+
 /* wrap_push, breaking between words: for prose a person reads and copies out,
  * where a word cut in two is a word mistyped. A word longer than a row is cut. */
 static void wrap_words_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
@@ -1412,6 +1444,8 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_JUMP_DATE, ACT_JUMP_DATE_THREAD,
        /* move a message to another channel (REQ-053) */
        ACT_MOVE,
+       /* the message's body as stored, unrendered */
+       ACT_SOURCE,
        /* a reminder on a message, which saves it (REQ-283): the choices, as
         * the desktop client's reminder menu has them, and a time typed */
        ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
@@ -4085,6 +4119,9 @@ int main(int argc, char **argv) {
     /* The snippet open over the screen (REQ-226): which, its title and
      * language, and the first line shown. */
     uint64_t sv_id = 0; int sv_top = 0, sv_lang = 0, sv_lines = 0;
+    /* A message's source open over the screen: its body, copied when it
+     * opened, and the first row shown. */
+    char *src_text = NULL; int src_top = 0, src_lines = 0;
     /* A snippet's title, or its file name when it has none: room for either. */
     char sv_title[sizeof ((oc_attachment *)0)->filename > sizeof ((oc_attachment *)0)->title
                   ? sizeof ((oc_attachment *)0)->filename : sizeof ((oc_attachment *)0)->title] = "";
@@ -4328,6 +4365,7 @@ int main(int argc, char **argv) {
             if (!tui_snip_text(sv_id, &(size_t){0})) tui_snip_want(sv_id);
             sv_lines = tui_snip_view_draw(sv_id, sv_title, sv_lang, sv_top);
         }
+        if (src_text) src_lines = tui_src_view_draw(src_text, src_top);
         if (deactivate_ask)
             tk_modal_confirm(tb_width(), tb_height(),
                              "Deactivate your account? You will be signed out everywhere and "
@@ -4627,6 +4665,19 @@ int main(int argc, char **argv) {
             else if (ev.ch == 'G') sv_top = sv_lines - page;
             if (sv_top > sv_lines - page) sv_top = sv_lines - page;
             if (sv_top < 0) sv_top = 0;
+            continue;
+        }
+        if (src_text) {                        /* a message's source */
+            int page = tb_height() - 3; if (page < 1) page = 1;
+            if (ev.ch == 'q' || ev.key == TB_KEY_ESC) { free(src_text); src_text = NULL; continue; }
+            else if (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN) src_top++;
+            else if (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP) src_top--;
+            else if (ev.ch == ' ' || ev.key == TB_KEY_PGDN) src_top += page;
+            else if (ev.key == TB_KEY_PGUP) src_top -= page;
+            else if (ev.ch == 'g') src_top = 0;
+            else if (ev.ch == 'G') src_top = src_lines - page;
+            if (src_top > src_lines - page) src_top = src_lines - page;
+            if (src_top < 0) src_top = 0;
             continue;
         }
         if (cpage_id) {                        /* a call's page: c its chat, m more lines, any other key back */
@@ -5034,6 +5085,22 @@ int main(int argc, char **argv) {
                         }
                     }
                     else if (id == ACT_SPOILERS) spoilers_toggle(act_mid);
+                    else if (id == ACT_SOURCE) {
+                        /* In the conversation, or the open thread's replies. */
+                        const oc_model *sm = oc_client_model(cl);
+                        const oc_channel *sc = oc_model_channel((oc_model *)sm, act_cid);
+                        const oc_msg *smsg = NULL;
+                        if (sc) for (size_t k = 0; k < sc->n_msgs && !smsg; k++)
+                            if (sc->msgs[k].message_id == act_mid) smsg = &sc->msgs[k];
+                        if (!smsg && sm->thread_open)
+                            for (size_t k = 0; k < sm->n_thread_msgs && !smsg; k++)
+                                if (sm->thread_msgs[k].message_id == act_mid) smsg = &sm->thread_msgs[k];
+                        if (smsg && !smsg->deleted) {
+                            free(src_text);
+                            src_text = strdup(smsg->body ? smsg->body : "");
+                            src_top = 0;
+                        }
+                    }
                     else if (id == ACT_COLLAPSE) { tui_expand(act_mid, 0); oc_client_set_collapsed(cl, act_mid, 1); }
                     else if (id == ACT_EXPAND)   { tui_expand(act_mid, 1); oc_client_set_collapsed(cl, act_mid, 0); }
                     else if (id == ACT_UNREAD) {
@@ -5423,6 +5490,10 @@ int main(int argc, char **argv) {
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
                                        has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
                                        sel->saved && sel->remind_at);
+                        /* The body as stored, unrendered: anyone's message, not
+                         * a deleted one. */
+                        if (!sel->deleted && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "View source", ACT_SOURCE };
                         /* Move (REQ-053): one's own, or anything for an admin or
                          * owner, out of a channel that is not archived. */
                         uint8_t role = OC_ROLE_MEMBER;
