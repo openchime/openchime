@@ -146,6 +146,73 @@ void oc_searchq_describe(const oc_searchq *sq, char *out, size_t cap) {
     #undef SQ_ADD
 }
 
+/* One operator and its value, quoted when it holds a space, as sq_take reads
+ * it back. 0, or -1 when the value cannot be written. */
+static int sq_put(char *out, size_t cap, size_t *n, const char *op, const char *v) {
+    if (!v || !v[0]) return 0;
+    if (strchr(v, '"')) return -1;
+    int q = strchr(v, ' ') || strchr(v, '\t');
+    int w = snprintf(out + *n, cap > *n ? cap - *n : 0, "%s%s:%s%s%s", *n ? " " : "", op,
+                     q ? "\"" : "", v, q ? "\"" : "");
+    if (w < 0 || (size_t)w >= (cap > *n ? cap - *n : 0)) return -1;
+    *n += (size_t)w;
+    return 0;
+}
+
+int oc_searchq_set(const char *q, const char *op, const char *value, char *out, size_t cap) {
+    if (!op || !out || !cap) return -1;
+    oc_searchq sq;
+    oc_searchq_parse(q ? q : "", &sq);
+    const char *v = value ? value : "";
+    if (!strcmp(op, "from"))        snprintf(sq.from, sizeof sq.from, "%s", v);
+    else if (!strcmp(op, "in"))     snprintf(sq.in, sizeof sq.in, "%s", v[0] == '#' ? v + 1 : v);
+    else if (!strcmp(op, "has")) {
+        unsigned mask = 0;
+        for (const char *t = v; *t; ) {          /* "file,image": each kind once */
+            while (*t == ',' || *t == ' ') t++;
+            if (!*t) break;
+            size_t k = strcspn(t, ", ");
+            if      (k == 4 && !strncmp(t, "file", 4))  mask |= OC_SQ_HAS_FILE;
+            else if (k == 4 && !strncmp(t, "link", 4))  mask |= OC_SQ_HAS_LINK;
+            else if (k == 5 && !strncmp(t, "image", 5)) mask |= OC_SQ_HAS_IMAGE;
+            else if (k == 5 && !strncmp(t, "video", 5)) mask |= OC_SQ_HAS_VIDEO;
+            else return -1;
+            t += k;
+        }
+        sq.has = mask;
+    } else if (!strcmp(op, "on")) {
+        snprintf(sq.before, sizeof sq.before, "%s", v);
+        snprintf(sq.after, sizeof sq.after, "%s", v);
+    } else if (!strcmp(op, "before") || !strcmp(op, "after")) {
+        if (sq.before[0] && !strcmp(sq.before, sq.after)) sq.before[0] = sq.after[0] = '\0';   /* on: goes */
+        if (!strcmp(op, "before")) snprintf(sq.before, sizeof sq.before, "%s", v);
+        else                       snprintf(sq.after, sizeof sq.after, "%s", v);
+    } else {
+        return -1;
+    }
+    char tmp[OC_SQ_TEXT_MAX + 4 * OC_SQ_NAME_MAX + 128];
+    size_t n = 0;
+    tmp[0] = '\0';
+    if (sq_put(tmp, sizeof tmp, &n, "from", sq.from) || sq_put(tmp, sizeof tmp, &n, "in", sq.in)) return -1;
+    static const struct { unsigned bit; const char *name; } H[4] = {
+        { OC_SQ_HAS_FILE, "file" }, { OC_SQ_HAS_LINK, "link" }, { OC_SQ_HAS_IMAGE, "image" }, { OC_SQ_HAS_VIDEO, "video" } };
+    for (int i = 0; i < 4; i++)
+        if ((sq.has & H[i].bit) && sq_put(tmp, sizeof tmp, &n, "has", H[i].name)) return -1;
+    if (sq.after[0] && sq.before[0] && !strcmp(sq.after, sq.before)) {
+        if (sq_put(tmp, sizeof tmp, &n, "on", sq.after)) return -1;
+    } else if (sq_put(tmp, sizeof tmp, &n, "after", sq.after) || sq_put(tmp, sizeof tmp, &n, "before", sq.before)) {
+        return -1;
+    }
+    if (sq.text[0]) {
+        int w = snprintf(tmp + n, sizeof tmp - n, "%s%s", n ? " " : "", sq.text);
+        if (w < 0 || (size_t)w >= sizeof tmp - n) return -1;
+        n += (size_t)w;
+    }
+    if (n + 1 > cap) return -1;
+    memcpy(out, tmp, n + 1);
+    return 0;
+}
+
 /* Local midnight for a YYYY-MM-DD, as epoch ms. mktime interprets the struct tm in
  * LOCAL time, which is exactly the intent. */
 static uint64_t sq_day_ms(const char *ymd, int end) {

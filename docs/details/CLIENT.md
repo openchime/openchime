@@ -1152,6 +1152,24 @@ again with no limit. A typed `in:` wins over the conversation: no id is sent,
 and `in:` works by name. Escape clears the field and closes the results.
 Ctrl+F gives the field the keyboard with its text selected.
 
+**The results' filters panel** (REQ-081) sits at the top of the search results,
+under the field: **From** (a picker of everyone by display name, Anyone first),
+**In** (a picker of your channels, Anywhere first), a box each for Files,
+Links, Images and Videos, and **After**, **Before** and **On** date fields
+(YYYY-MM-DD, resolved in your own timezone as typed dates are). The query text
+is the only model: the panel is drawn each frame from `oc_searchq_parse` of the
+field's text, and each control writes its one operator back through
+`oc_searchq_set` (shared/searchq.c) and runs the search again in its order and
+its conversation, so a choice in the panel and the same operator typed give the
+same `SEARCH`. A name with a space is written quoted; On replaces After and
+Before, and either of those replaces On. From the field, Tab moves into the
+panel and on through its controls in the order drawn (Shift+Tab back); Space
+turns a box over, Enter opens a picker, turns a box over or applies a date,
+and Escape closes the results. Each control is published as
+`search.filter.from`, `search.filter.in`, `search.filter.has.file`,
+`.has.link`, `.has.image`, `.has.video`, `search.filter.after`, `.before` and
+`.on`. The "Filters:" line still says what was understood.
+
 ### Shortcuts belong in the message loop, not a window proc
 
 `SHORTCUTS[]` in app.c drives **both** the sheet (Ctrl+/) and the keys, and

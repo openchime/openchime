@@ -2466,6 +2466,15 @@ static uint8_t  g_top_kind = OC_ST_MESSAGES;
 static uint64_t g_top_scope;
 static char     g_top_ph[160] = "Search messages";
 static rectf    g_srch_widen;           /* "Search everywhere", in a scoped search's results */
+/* The search results' filters panel (REQ-081): a view of the query text, never
+ * a second filter state. Its controls in the order drawn and tabbed through;
+ * g_sf_focus is the one with the keyboard, -1 none. */
+enum { SF_FROM = 0, SF_IN, SF_FILE, SF_LINK, SF_IMAGE, SF_VIDEO, SF_AFTER, SF_BEFORE, SF_ON, SF_N };
+static rectf  g_sf_r[SF_N];
+static int    g_sf_focus = -1;
+static field *g_sf_date[3];             /* After, Before, On: YYYY-MM-DD */
+static const char *const SF_AID[SF_N] = { "from", "in", "has.file", "has.link", "has.image", "has.video",
+                                          "after", "before", "on" };
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
  * to the caret on every change; the popover renders above the composer and the
@@ -9140,6 +9149,74 @@ static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
     else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, MSGLIST_THREAD);
 }
 
+/* The filters panel, drawn from the field's text each frame (oc_searchq_parse)
+ * under the top bar's field: the author, the channel, what the message has,
+ * and its dates. Each control writes its operator into the text
+ * (oc_searchq_set) and runs the search again. Returns where the results start. */
+static float sf_panel_draw(gfx *rt, rectf body) {
+    oc_searchq pq;
+    oc_searchq_parse(g_srch ? g_srch->buf : "", &pq);
+    for (int k = 0; k < SF_N; k++) g_sf_r[k] = rf(0, 0, 0, 0);
+    float x = body.left + 20, y = body.top, h = UIS(26.0f);
+    char lbl[96];
+    for (int k = SF_FROM; k <= SF_IN; k++) {           /* the two pickers */
+        if (k == SF_FROM) snprintf(lbl, sizeof lbl, "From: %s \xE2\x96\xBE", pq.from[0] ? pq.from : "Anyone");
+        else              snprintf(lbl, sizeof lbl, "In: %s%s \xE2\x96\xBE", pq.in[0] ? "#" : "", pq.in[0] ? pq.in : "Anywhere");
+        float w = text_width(lbl, g_meta) + UIS(20.0f);
+        rectf b = rf(x, y, x + w, y + h);
+        int on = (k == SF_FROM) ? pq.from[0] != 0 : pq.in[0] != 0;
+        fill_round(rt, b, OC_R_CONTROL, in_rect(b, g_mouse_x, g_mouse_y) ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, b, OC_R_CONTROL, on ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, lbl, g_meta, b, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+        g_sf_r[k] = b;
+        x = b.right + UIS(8.0f);
+    }
+    static const char *const HL[4] = { "Files", "Links", "Images", "Videos" };
+    static const unsigned HB[4] = { OC_SQ_HAS_FILE, OC_SQ_HAS_LINK, OC_SQ_HAS_IMAGE, OC_SQ_HAS_VIDEO };
+    x += UIS(8.0f);
+    for (int i = 0; i < 4; i++) {                       /* what it has */
+        float bx = UIS(14.0f), w = bx + UIS(6.0f) + text_width(HL[i], g_meta) + UIS(10.0f);
+        if (x + w > body.right - 16) { x = body.left + 20; y += h + UIS(6.0f); }
+        rectf b = rf(x, y, x + w, y + h);
+        rectf chk = rf(x + UIS(4.0f), y + (h - bx) / 2, x + UIS(4.0f) + bx, y + (h + bx) / 2);
+        if (pq.has & HB[i]) {
+            fill_round(rt, chk, OC_R_CONTROL, OC_COL_ACCENT);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "\u2713", g_meta, chk, OC_COL_ON_ACCENT);
+            g_meta->align = ST_ALIGN_LEFT;
+        } else {
+            stroke_round(rt, chk, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        }
+        draw_text(rt, HL[i], g_meta, rf(chk.right + UIS(6.0f), y, b.right, y + h), OC_COL_TEXT);
+        g_sf_r[SF_FILE + i] = b;
+        x = b.right + UIS(4.0f);
+    }
+    y += h + UIS(8.0f);
+    x = body.left + 20;
+    static const char *const DL[3] = { "After", "Before", "On" };
+    int on_day = pq.after[0] && !strcmp(pq.after, pq.before);
+    const char *dv[3] = { on_day ? "" : pq.after, on_day ? "" : pq.before, on_day ? pq.after : "" };
+    for (int i = 0; i < 3; i++) {                       /* the dates, as typed */
+        float lw = text_width(DL[i], g_meta) + UIS(6.0f), fw = UIS(104.0f);
+        draw_text(rt, DL[i], g_meta, rf(x, y, x + lw, y + h), OC_COL_MUTED);
+        rectf b = rf(x + lw, y, x + lw + fw, y + h);
+        fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, b, OC_R_CONTROL, g_focus == g_sf_date[i] ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        if (g_sf_date[i]) {
+            if (g_focus != g_sf_date[i] && strcmp(g_sf_date[i]->buf, dv[i])) field_set(g_sf_date[i], dv[i]);
+            field_draw(rt, g_sf_date[i], rf(b.left + 6, b.top, b.right - 6, b.bottom), OC_COL_TEXT);
+        }
+        g_sf_r[SF_AFTER + i] = b;
+        x = b.right + UIS(12.0f);
+    }
+    /* The control with the keyboard, ringed. */
+    if (g_sf_focus >= 0 && g_sf_focus < SF_AFTER && g_sf_r[g_sf_focus].right > g_sf_r[g_sf_focus].left)
+        stroke_round(rt, g_sf_r[g_sf_focus], OC_R_CONTROL, OC_COL_ACCENT, 2.0f);
+    return y + h + UIS(10.0f);
+}
+
 static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
     rectf body = pane_header(rt, reg, "Search");
     g_n_searchrows = 0;
@@ -9147,6 +9224,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
     /* The query is typed in the top bar's field; this is its results.
      * A search limited to one conversation offers to look everywhere. */
     body.top += 10;
+    body.top = sf_panel_draw(rt, body);
     g_srch_widen = rf(0, 0, 0, 0);
     if (m->search_scope && m->search_query[0]) {
         const char *wl = "Search everywhere";
@@ -22795,14 +22873,15 @@ static int fields_mouse(int kind, float x, float y) {
     if (g_te_open) modal[nm++] = &g_te_field;
     for (int i = 0; i < OC_POLL_MAX_OPTIONS; i++) if (g_pc_opt[i]) modal[nm++] = g_pc_opt[i];
     for (int i = 0; i < FORM_MAX_FIELDS && nm < 24 + FORM_MAX_FIELDS; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
-    field *shell[7] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_si_e_ws, g_si_e_user, g_efind };
+    field *shell[10] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_si_e_ws, g_si_e_user, g_efind,
+                         g_sf_date[0], g_sf_date[1], g_sf_date[2] };
     if (kind == 1 || kind == 2) {
         /* A drag or a release belongs to the field that took the press. */
         if (g_focus && g_focus->dragging) return field_mouse(g_focus, kind, x, y);
         return 0;
     }
     for (int i = 0; i < nm; i++) if (modal[i]->visible && field_mouse(modal[i], kind, x, y)) return 1;
-    for (int i = 0; i < 7; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
+    for (int i = 0; i < 10; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
     if (g_si_e_pass && g_si_e_pass->visible && field_mouse(g_si_e_pass, kind, x, y)) return 1;
     if (kind == 0 && g_focus) focus_set(NULL);
     return 0;
@@ -29771,7 +29850,8 @@ enum {
     AT_PREFCHOICE,    /* payload: a Preferences row (PREF_ROW_*) * 256 + the choice's value — choose it */
     AT_ALSO,          /* the thread composer's "Also send to #channel" -- toggle it */
     AT_NAVPREF,       /* payload: a Navigation row's index in g_rail * 4 + 0 show/hide, 1 up, 2 down */
-    AT_TOPSEARCH      /* the top bar's search field -- the keyboard to it */
+    AT_TOPSEARCH,     /* the top bar's search field -- the keyboard to it */
+    AT_SFILTER        /* payload: a filters-panel control (SF_*) -- do what it does */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -30149,6 +30229,19 @@ static void a11y_publish_scene(const oc_model *m) {
         acc_push(items, &n, OC_ACC_BUTTON, "header.back", "Back", g_hist_back_btn, ATOK(AT_HIST, 0));
     if (g_hist_fwd_btn.right > g_hist_fwd_btn.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "header.forward", "Forward", g_hist_fwd_btn, ATOK(AT_HIST, 1));
+    /* The search results' filters panel, each control by its operator. */
+    {
+        const oc_model *am = model();
+        static const char *const SFL[SF_N] = { "From", "In", "Has files", "Has links", "Has images",
+                                               "Has videos", "After", "Before", "On" };
+        for (int k = 0; am && am->search_open && k < SF_N && n < OC_ACC_MAX; k++) {
+            if (g_sf_r[k].right <= g_sf_r[k].left) continue;
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "search.filter.%s", SF_AID[k]);
+            acc_push(items, &n, k >= SF_AFTER ? OC_ACC_COMPOSER : OC_ACC_BUTTON, aid, SFL[k], g_sf_r[k],
+                     ATOK(AT_SFILTER, (uint64_t)k));
+        }
+    }
     /* The top bar's one search field, named for what it searches now. */
     if (g_srch && g_srch->visible && g_top_box.right > g_top_box.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_COMPOSER, "topbar.search", g_top_ph, g_top_box, ATOK(AT_TOPSEARCH, 0));
@@ -31438,6 +31531,10 @@ static void layout_search(oc_win *hwnd) {
      * unless something covers the window. */
     (void)hwnd;
     field_show(g_srch, m && g_scene_dy > 0 && !window_is_covered() && g_top_box.right > g_top_box.left);
+    /* The filters panel's date fields: with the results, as the panel is. */
+    int panel = m && m->search_open && transcript_shell() && !dm_index_view() && !window_is_covered();
+    for (int i = 0; i < 3; i++)
+        if (g_sf_date[i]) field_show(g_sf_date[i], panel && g_sf_r[SF_AFTER + i].right > g_sf_r[SF_AFTER + i].left);
 }
 
 
@@ -33069,6 +33166,155 @@ static void search_submit(void) {
     oc_client_search_in(g_client, q, g_search_sort, g_top_scope);
 }
 
+/* A panel control writes its operator into the field's text and runs the
+ * search again, in its order and its conversation (REQ-081). */
+static void sf_apply(const char *op, const char *value) {
+    if (!g_srch) return;
+    char nq[256];
+    if (oc_searchq_set(g_srch->buf, op, value, nq, sizeof nq) != 0) {
+        fb_failed("That filter does not fit the search. Shorten the words first.");
+        return;
+    }
+    field_set(g_srch, nq);
+    search_submit();
+}
+
+/* The author: everyone by display name, Anyone first. */
+static void sf_pick_author(oc_win *hwnd) {
+    const oc_model *m = model();
+    if (!m) return;
+    static char opts[16384];
+    static const char *names[1024];
+    size_t used = 0; int n = 0;
+    used += (size_t)snprintf(opts, sizeof opts, "Anyone");
+    names[n++] = "";
+    oc_searchq pq; oc_searchq_parse(g_srch ? g_srch->buf : "", &pq);
+    int cur = 0;
+    for (size_t i = 0; i < m->n_users && n < 1024; i++) {
+        const char *nm = m->users[i].name;
+        if (!nm[0] || strchr(nm, '|') || strchr(nm, '"') || used + strlen(nm) + 2 >= sizeof opts) continue;
+        used += (size_t)snprintf(opts + used, sizeof opts - used, "|%s", nm);
+        if (!strcmp(nm, pq.from)) cur = n;
+        names[n++] = nm;
+    }
+    char dflt[8]; snprintf(dflt, sizeof dflt, "%d", cur);
+    oc_field f[1] = { { FF_SELECT, "From", opts, "" } };
+    snprintf(f[0].value, sizeof f[0].value, "%s", dflt);
+    if (!form_dialog(hwnd, "Messages from", f, 1)) return;
+    int pick = atoi(f[0].value);
+    if (pick >= 0 && pick < n) sf_apply("from", names[pick]);
+}
+
+/* The channel: the person's channels by name, Anywhere first. */
+static void sf_pick_channel(oc_win *hwnd) {
+    const oc_model *m = model();
+    if (!m) return;
+    static char opts[16384];
+    static const char *names[1024];
+    size_t used = 0; int n = 0;
+    used += (size_t)snprintf(opts, sizeof opts, "Anywhere");
+    names[n++] = "";
+    oc_searchq pq; oc_searchq_parse(g_srch ? g_srch->buf : "", &pq);
+    int cur = 0;
+    for (size_t i = 0; i < m->n_channels && n < 1024; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind == OC_CHANNEL_KIND_DM || !c->joined || !c->name || !c->name[0]) continue;
+        if (strchr(c->name, '|') || used + strlen(c->name) + 3 >= sizeof opts) continue;
+        used += (size_t)snprintf(opts + used, sizeof opts - used, "|#%s", c->name);
+        if (!strcmp(c->name, pq.in)) cur = n;
+        names[n++] = c->name;
+    }
+    oc_field f[1] = { { FF_SELECT, "In", opts, "" } };
+    snprintf(f[0].value, sizeof f[0].value, "%d", cur);
+    if (!form_dialog(hwnd, "Messages in", f, 1)) return;
+    int pick = atoi(f[0].value);
+    if (pick >= 0 && pick < n) sf_apply("in", names[pick]);
+}
+
+/* One of "what it has", turned on or off: the whole set is written. */
+static void sf_toggle_has(int i) {
+    static const unsigned HB[4] = { OC_SQ_HAS_FILE, OC_SQ_HAS_LINK, OC_SQ_HAS_IMAGE, OC_SQ_HAS_VIDEO };
+    static const char *const HN[4] = { "file", "link", "image", "video" };
+    oc_searchq pq; oc_searchq_parse(g_srch ? g_srch->buf : "", &pq);
+    unsigned mask = pq.has ^ HB[i];
+    char v[48] = ""; size_t n = 0;
+    for (int k = 0; k < 4; k++)
+        if (mask & HB[k]) n += (size_t)snprintf(v + n, sizeof v - n, "%s%s", n ? "," : "", HN[k]);
+    sf_apply("has", v);
+}
+
+/* A date field's text, applied: a day as YYYY-MM-DD, or nothing to remove it. */
+static void sf_apply_date(int i) {
+    static const char *const OP[3] = { "after", "before", "on" };
+    if (!g_sf_date[i]) return;
+    const char *v = g_sf_date[i]->buf;
+    if (v[0] && !oc_day_start_ms(v)) { fb_failed("Type the date as YYYY-MM-DD, for example 2026-03-04."); return; }
+    sf_apply(OP[i], v);
+}
+
+/* The control at `k` does what it is: a picker opens, a box turns over, a date
+ * field takes the keyboard. */
+static void sf_activate(oc_win *hwnd, int k) {
+    g_sf_focus = k;
+    if (k == SF_FROM) sf_pick_author(hwnd);
+    else if (k == SF_IN) sf_pick_channel(hwnd);
+    else if (k >= SF_FILE && k <= SF_VIDEO) sf_toggle_has(k - SF_FILE);
+    else if (k >= SF_AFTER && k < SF_N && g_sf_date[k - SF_AFTER]) {
+        focus_set(g_sf_date[k - SF_AFTER]);
+        field_select_all(g_sf_date[k - SF_AFTER]);
+    }
+    invalidate();
+}
+
+/* Tab and Shift+Tab through the panel in the order drawn; past either end, back
+ * to the top bar's field. */
+static void sf_step(int dir) {
+    int k = g_sf_focus + dir;
+    if (k < 0 || k >= SF_N) { g_sf_focus = -1; focus_set(g_srch); invalidate(); return; }
+    g_sf_focus = k;
+    if (k >= SF_AFTER && g_sf_date[k - SF_AFTER]) {
+        focus_set(g_sf_date[k - SF_AFTER]);
+        field_select_all(g_sf_date[k - SF_AFTER]);
+    } else {
+        focus_set(NULL);
+    }
+    invalidate();
+}
+
+static void search_close_from_panel(void) {
+    g_sf_focus = -1;
+    if (g_srch) field_set(g_srch, "");
+    if (g_client) oc_client_close_search(g_client);
+    ed_focus(g_main);
+    invalidate();
+}
+
+/* The keys while a picker or a box of the panel has the keyboard (no field):
+ * Space turns a box over, Enter opens a picker or turns a box over, Tab moves,
+ * Escape closes the results. Every key is taken: none reaches the composer. */
+static int sf_key(oc_win *hwnd, int key) {
+    const oc_model *m = model();
+    if (g_sf_focus < 0 || g_sf_focus >= SF_AFTER || !m || !m->search_open) { g_sf_focus = -1; return 0; }
+    if (key == OCK_TAB) { sf_step(mod_down(OCK_SHIFT) ? -1 : 1); return 1; }
+    if (key == OCK_ESCAPE) { search_close_from_panel(); return 1; }
+    if (key == OCK_SPACE && g_sf_focus >= SF_FILE) { sf_activate(hwnd, g_sf_focus); return 1; }
+    if (key == OCK_RETURN) { sf_activate(hwnd, g_sf_focus); return 1; }
+    return 1;
+}
+
+/* A date field's keys: Enter applies it, Tab moves on, Escape closes. */
+static int sf_date_key(field *f, int key, int ctrl, int shift) {
+    (void)ctrl;
+    int i = -1;
+    for (int k = 0; k < 3; k++) if (g_sf_date[k] == f) i = k;
+    if (i < 0) return 0;
+    g_sf_focus = SF_AFTER + i;
+    if (key == OCK_RETURN) { sf_apply_date(i); return 1; }
+    if (key == OCK_TAB) { sf_step(shift ? -1 : 1); return 1; }
+    if (key == OCK_ESCAPE) { search_close_from_panel(); return 1; }
+    return 0;
+}
+
 /* Ctrl+F: the top bar's field takes the keyboard, its text selected, so what
  * is typed replaces it. Nothing opens until Enter. */
 static void search_open(oc_win *hwnd) {
@@ -33104,8 +33350,12 @@ static void pick_changed(field *f) { (void)f; g_pick_scroll = 0; }
 /* Enter runs a message search (Files and People filter as typed); Escape
  * clears the field and closes the results. */
 static int srch_key(field *f, int key, int ctrl, int shift) {
-    (void)ctrl; (void)shift;
+    (void)ctrl;
     if (key == OCK_RETURN) { if (g_top_kind == OC_ST_MESSAGES) search_submit(); return 1; }
+    if (key == OCK_TAB && !shift) {          /* on into the results' filters (REQ-081) */
+        const oc_model *tm = model();
+        if (tm && tm->search_open) { sf_step(1); return 1; }
+    }
     if (key == OCK_ESCAPE) {
         field_set(f, "");
         g_file_q[0] = '\0';
@@ -36065,6 +36315,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
     {
         const oc_model *mm = model();
         if (mm && x > RAIL_W + SIDEBAR_W) {
+            for (int k = 0; mm->search_open && k < SF_AFTER; k++)   /* the filters panel */
+                if (in_rect(g_sf_r[k], x, y)) { sf_activate(hwnd, k); return 1; }
             if (mm->search_open && in_rect(g_srch_more_btn, x, y)) {
                 /* The next page continues from the last hit shown, in the order
                  * the hits are in (the core keeps the cursor). */
@@ -41643,7 +41895,11 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
 /* Every drawn field, made once with the window: its placeholder, its keys and
  * its change hook. */
 static void fields_create(void) {
-    static field find, efind, srch, pal, pick, si[3], csubj;
+    static field find, efind, srch, pal, pick, si[3], csubj, sfd[3];
+    for (int i = 0; i < 3; i++) {
+        field_init(&sfd[i], "YYYY-MM-DD", 0, 0);
+        sfd[i].key = sf_date_key; sfd[i].maxlen = 10; g_sf_date[i] = &sfd[i];
+    }
     field_init(&csubj, "What is the call about? (optional)", 0, 0);
     csubj.maxlen = OC_CALL_SUBJECT_MAX; g_cpick_subject = &csubj;
     static field cq;
@@ -42790,6 +43046,7 @@ static int on_dblclk(oc_win *hwnd, int mx, int my) {
 }
 
 static int on_lbutton_down(oc_win *hwnd, int mx, int my) {
+    g_sf_focus = -1;                    /* a press anywhere: the panel lets the keys go */
     if (pastechoice_click(hwnd, (float)mx, (float)my)) { invalidate(); return 0; }
     if (fields_mouse(0, (float)mx, (float)my)) { invalidate(); return 0; }
         /* The members pane's picker keeps the keys only while the pointer stays
@@ -43531,6 +43788,7 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             }
             break;
         case AT_TOPSEARCH: search_open(hwnd); break;
+        case AT_SFILTER:   if (arg < SF_N) sf_activate(hwnd, (int)arg); break;
         case AT_NAVPREF:
             if (g_prefs_open) nav_pref_act((int)(arg / 4), (int)(arg % 4));
             break;
@@ -43895,6 +44153,7 @@ static void handle_event(const SDL_Event *e) {
             invalidate(); g_claimed_text = 1; return;
         }
         if (g_form_open && g_form_focus >= 0 && form_focus_key(hwnd, key)) { invalidate(); g_claimed_text = 1; return; }
+        if (!g_focus && !modal_open() && g_sf_focus >= 0 && sf_key(hwnd, key)) { invalidate(); g_claimed_text = 1; return; }
         if (g_focus) {
             /* Tab between the sign-in fields: the dialog manager's job, once. */
             if (key == OCK_TAB && g_view == VIEW_SIGNIN) {

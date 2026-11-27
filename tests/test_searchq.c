@@ -122,12 +122,70 @@ static void test_describe(void) {
     CHECK(strstr(out, "standup") != NULL);
 }
 
+/* The filters panel's writer: one operator set, replaced or removed, the free
+ * text and the others kept, and what it writes parses back to exactly that. */
+static void test_set(void) {
+    char out[256];
+    oc_searchq q;
+    /* Added to a query without it; the text stays. */
+    CHECK(oc_searchq_set("deploy plan", "from", "alice", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.from, "alice") && !strcmp(q.text, "deploy plan") && q.n_filters == 1);
+    /* Replaced, the others kept. */
+    CHECK(oc_searchq_set("from:alice in:design deploy", "from", "bob", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.from, "bob") && !strcmp(q.in, "design") && !strcmp(q.text, "deploy"));
+    /* Removed by an empty value. */
+    CHECK(oc_searchq_set("from:alice in:design deploy", "in", "", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(q.in[0] == '\0' && !strcmp(q.from, "alice") && !strcmp(q.text, "deploy") && q.n_filters == 1);
+    /* A channel's sigil is dropped, as the parser drops it. */
+    CHECK(oc_searchq_set("deploy", "in", "#general", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.in, "general"));
+    /* A name with a space is quoted and parses back whole. */
+    CHECK(oc_searchq_set("deploy", "from", "Ada Lovelace", out, sizeof out) == 0);
+    CHECK(strstr(out, "from:\"Ada Lovelace\"") != NULL);   /* contract: the operator's quoted form, as the parser reads it */
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.from, "Ada Lovelace") && !strcmp(q.text, "deploy"));
+    /* has: is the whole set: one operator per kind, and clearing one keeps the rest. */
+    CHECK(oc_searchq_set("deploy has:link", "has", "file,image", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(q.has == (OC_SQ_HAS_FILE | OC_SQ_HAS_IMAGE) && !strcmp(q.text, "deploy"));
+    CHECK(oc_searchq_set(out, "has", "file", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(q.has == OC_SQ_HAS_FILE);
+    CHECK(oc_searchq_set(out, "has", "", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(q.has == 0 && q.n_filters == 0);
+    CHECK(oc_searchq_set("deploy", "has", "spreadsheet", out, sizeof out) == -1);
+    /* on: and before:/after: exclude each other. */
+    CHECK(oc_searchq_set("after:2026-01-01 before:2026-02-01 x", "on", "2026-03-04", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.after, "2026-03-04") && !strcmp(q.before, "2026-03-04") && q.n_filters == 1);
+    CHECK(strstr(out, "on:2026-03-04") != NULL);
+    CHECK(oc_searchq_set(out, "after", "2026-03-01", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.after, "2026-03-01") && q.before[0] == '\0' && !strcmp(q.text, "x"));
+    CHECK(oc_searchq_set(out, "before", "2026-03-31", out, sizeof out) == 0);
+    oc_searchq_parse(out, &q);
+    CHECK(!strcmp(q.after, "2026-03-01") && !strcmp(q.before, "2026-03-31") && q.n_filters == 2);
+    /* Too long for `cap`, or a value that cannot be written: refused, `out`
+     * untouched; and an op that does not exist. */
+    char small[12] = "untouched";
+    CHECK(oc_searchq_set("a long enough query", "from", "alice", small, sizeof small) == -1);
+    CHECK(!strcmp(small, "untouched"));
+    CHECK(oc_searchq_set("deploy", "from", "say \"hi\"", out, sizeof out) == -1);
+    CHECK(oc_searchq_set("deploy", "sort", "x", out, sizeof out) == -1);
+}
+
 int run_searchq_tests(void) {
     failures = 0;
     test_plain();
     test_operators();
     test_not_swallowed();
     test_describe();
-    printf("test_searchq: plain text, operators, quoting, unknown values kept, describe round-trip\n");
+    test_set();
+    printf("test_searchq: plain text, operators, quoting, unknown values kept, describe round-trip, the panel's writer\n");
     return failures;
 }

@@ -49,6 +49,18 @@ void oc_searchq_parse(const char *q, oc_searchq *out);
  * client to show what it understood. Truncates safely. */
 void oc_searchq_describe(const oc_searchq *sq, char *out, size_t cap);
 
+/* Set, replace or remove one operator in the query `q`, keeping the free text
+ * and the others, into `out`: what a filters panel writes, so the query text
+ * stays the one model and the panel a view of it. `op` is "from", "in", "has",
+ * "before", "after" or "on"; an empty `value` removes it. For "has" the value
+ * is the whole set, comma-separated ("file,image"), every has: rewritten. "on"
+ * replaces before: and after:, and either of those replaces on:. A value with
+ * a space is written quoted. The operators are written first, in
+ * oc_searchq_describe's order, then the text. Returns 0, or -1 when the op is
+ * unknown, a value cannot be written (a '"' in it), or the result would not
+ * fit `cap` -- and then `out` is left as it was. */
+int oc_searchq_set(const char *q, const char *op, const char *value, char *out, size_t cap);
+
 /* "YYYY-MM-DD" -> epoch ms at LOCAL midnight (start) or 23:59:59.999 (end); 0 when
  * unparseable. Local, not UTC, because "after:2026-01-01" means the user's day — and
  * that is why the client resolves dates rather than shipping the string to a daemon
