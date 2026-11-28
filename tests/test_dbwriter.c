@@ -14390,8 +14390,8 @@ static uint64_t wall_ms(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 /* The UI harness's barrier, at the writer (test hooks on): a connection's job
- * is counted while outstanding, and by the time its result can be taken the
- * count is back to 0 -- the decrement and the result are one step. A sweep
+ * is counted while outstanding, and so is its result until it is taken: the
+ * count is 0 only once the result is out of the queue. A sweep
  * run now is counted as the daemon's own work (connection 0) and leaves
  * nothing outstanding once done. With the hooks off nothing is counted. */
 static void test_sync_outstanding(void) {
@@ -14419,8 +14419,26 @@ static void test_sync_outstanding(void) {
             CHECK(oc_dbwriter_outstanding(w, 77) == 0);   /* answered: nothing left */
             oc_dbres_free(r);
         }
+        /* Queued is not delivered: the result waiting for the net thread keeps
+         * the connection outstanding until it is taken. */
+        {
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 77);
+            j->user_id = alice;
+            struct pollfd pf = { oc_dbwriter_eventfd(w), POLLIN, 0 };
+            while (poll(&pf, 1, 0) == 1) {                 /* nothing signalled yet */
+                uint64_t v; ssize_t rd = read(pf.fd, &v, sizeof v); (void)rd;
+            }
+            oc_dbwriter_submit(w, j);
+            CHECK(poll(&pf, 1, 30000) == 1);              /* queued, not taken */
+            CHECK(oc_dbwriter_outstanding(w, 77) != 0);
+            oc_dbres *r = wait_result(w);
+            CHECK(r && r->conn_id == 77);
+            CHECK(oc_dbwriter_outstanding(w, 77) == 0);
+            oc_dbres_free(r);
+        }
         oc_dbwriter_sweep_now(w);
-        CHECK(WAIT_UNTIL(oc_dbwriter_outstanding(w, 0) == 0, 30000));
+        /* What the sweep queued is taken, as the net thread would. */
+        CHECK(WAIT_UNTIL_DO(oc_dbres_free(next_answer(w)), oc_dbwriter_outstanding(w, 0) == 0, 30000));
         oc_dbwriter_stop(w);
     }
     unsetenv("OPENCHIME_DEV_TEST_HOOKS");

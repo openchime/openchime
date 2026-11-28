@@ -80,7 +80,7 @@ struct oc_dbwriter {
      * submitted and not yet answered, conn 0 the daemon's own (the sweeps), so
      * the net thread can tell when one is done with everything sent before a
      * SYNC (oc_dbwriter_outstanding). Under `mu`, changed in the step that
-     * queues a job's results, so a count of 0 means they are queued. */
+     * queues a job's results; the queue itself counts until it is taken. */
     struct { uint64_t conn; uint32_t n; } work[256];
     /* The auth pool (AUTH.md §2): a password's key derivation -- deliberately
      * the slowest thing a sign-in does -- runs here, so a burst of sign-ins
@@ -10429,9 +10429,9 @@ static void work_sub(oc_dbwriter *w, uint64_t conn) {
 }
 
 /* A job is done: its results queued and, with test hooks on, its count taken
- * off in the same locked step -- so a count the net thread reads as 0 after
- * draining the queue means every result of that connection's earlier jobs has
- * been delivered. The net thread is woken even for a job with no result, so a
+ * off in the same locked step. oc_dbwriter_outstanding also counts the queue
+ * until the net thread has taken every result, so a count of 0 means every
+ * result of that connection's earlier jobs has been delivered. The net thread is woken even for a job with no result, so a
  * SYNC waiting only on it is answered. */
 static void push_result_done(oc_dbwriter *w, oc_dbres *r, uint64_t conn, int counted) {
     oc_dbres *last = r;
@@ -10452,9 +10452,13 @@ static void push_result_done(oc_dbwriter *w, oc_dbres *r, uint64_t conn, int cou
 
 uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn) {
     uint32_t n = 0;
+    int hooks = oc_config_get()->dev.test_hooks;
     pthread_mutex_lock(&w->mu);
     for (int i = 0; i < 256; i++)
         if (w->work[i].n && (w->work[i].conn == conn || w->work[i].conn == 0)) n += w->work[i].n;
+    /* A result queued is not yet sent: until the net thread has taken it --
+     * and with it the answer and the fan-out -- the work behind it is not done. */
+    if (hooks && w->res_head) n++;
     pthread_mutex_unlock(&w->mu);
     return n;
 }

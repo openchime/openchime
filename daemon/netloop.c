@@ -1320,7 +1320,9 @@ static uint64_t call_grace_ms(void) {
 }
 /* Test hooks: SYNCs waiting, and the answer to one once every job its
  * connection submitted before it -- and the daemon's own sweeps -- is done and
- * its results delivered (oc_dbwriter_outstanding). Through out_append, so it
+ * its results delivered: oc_dbwriter_outstanding counts a result until it is
+ * taken from the queue, so neither where a SYNC is read nor after the drain
+ * answers ahead of a result still queued. Through out_append, so it
  * goes after everything already sent or held for that connection. */
 static int g_syncs_pending;
 static int sync_try(conn *c, oc_dbwriter *dbw) {

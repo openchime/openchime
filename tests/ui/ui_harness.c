@@ -22,7 +22,7 @@ static void ui_harness_port(void) {
     ui_client_stop(c);
 }
 
-/* One command, one frame. */
+/* One command, one frame: a sync too. */
 static void ui_harness_frames(void) {
     ui_client *c = ui_client_start(&UI_DEFAULT, T0);
     CHECK(c != NULL);
@@ -39,6 +39,22 @@ static void ui_harness_frames(void) {
     CHECK(ui_cmd(c, "{\"cmd\":\"frame\"}", NULL, 0) == 0);
     CHECK(ui_frame(c) == f + 4);
     ui_client_stop(c);
+
+    /* A sync is one command, one frame, whatever its rounds took in. */
+    ui_daemon *d = ui_daemon_start("ui-frames.db", T0);
+    CHECK(d != NULL);
+    if (!d) return;
+    c = ui_client_start(&UI_DEFAULT, T0);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK(ui_signin(c, d, "alice", "pw-alice") == 0);
+        CHECK(ui_sync(c) == 0);
+        uint64_t g = ui_frame(c);
+        CHECK(ui_sync(c) == 0);
+        CHECK(ui_frame(c) == g + 1);
+        ui_client_stop(c);
+    }
+    ui_daemon_stop(d);
 }
 
 static int same_shot(ui_client *c, const uint8_t *px, int w, int h) {

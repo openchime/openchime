@@ -7192,6 +7192,8 @@ static int send_sync(client *c, uint64_t token) {
     if (oc_encode_sync(&w, OC_PROTOCOL_VERSION, &s) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
 }
+/* The message id the last SEND_ACK read by saw_before_sync named. */
+static uint64_t g_sync_acked;
 /* Read up to SYNC_DONE `token`; whether a frame of `want` came before it. */
 static int saw_before_sync(client *c, uint64_t token, uint16_t want) {
     int saw = 0;
@@ -7199,6 +7201,10 @@ static int saw_before_sync(client *c, uint64_t token, uint16_t want) {
         oc_header hdr; oc_rbuf p;
         if (read_frame(c, &hdr, &p) != 0) return -1;
         if (hdr.msg_type == want) saw = 1;
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK) g_sync_acked = ack.message_id;
+        }
         if (hdr.msg_type == OC_MSG_SYNC_DONE) {
             oc_sync d; if (oc_decode_sync(&p, &d) != OC_OK) return -1;
             if (d.token == token) return saw;
@@ -7238,11 +7244,24 @@ static void test_sync_barrier(int port, const uint8_t *pin) {
     oc_send s = {0}; s.channel_id = OC_DEFAULT_CHANNEL; memset(s.idem, 0xEB, OC_IDEM_SIZE);
     s.body = oc_slice_str("before the barrier");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    g_sync_acked = 0;
     CHECK(send_sync(&a, 12) == 0);
     CHECK(saw_before_sync(&a, 12, OC_MSG_BROADCAST) == 1);
     /* The fan-out reached bob before his own barrier's answer. */
     CHECK(send_sync(&b, 13) == 0);
     CHECK(saw_before_sync(&b, 13, OC_MSG_BROADCAST) == 1);
+
+    /* An edit and the barrier right behind it: the edit reaches the editor, and
+     * its fan-out reaches bob, before either barrier is answered. */
+    const uint64_t mid = g_sync_acked;           /* the send's, read before barrier 12 */
+    CHECK(mid != 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e = { OC_DEFAULT_CHANNEL, mid, oc_slice_str("edited before the barrier") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(send_sync(&a, 14) == 0);
+    CHECK(saw_before_sync(&a, 14, OC_MSG_MSG_EDITED) == 1);
+    CHECK(send_sync(&b, 15) == 0);
+    CHECK(saw_before_sync(&b, 15, OC_MSG_MSG_EDITED) == 1);
 
     client_close(&b);
     client_close(&a);

@@ -290,6 +290,7 @@ static float g_scene_dy;
  * driver asks for them (`shot`, `tree`). */
 static int       g_harness;
 static uint64_t  g_frames;
+static int       g_rehearse;    /* paint draws without showing or counting (paint_rehearse) */
 static uint8_t  *g_shot;
 static int       g_shot_w, g_shot_h;
 static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs need it */
@@ -26469,6 +26470,10 @@ static void paint(oc_win *hwnd) {
      * relayout and so never reached it. */
     layout_natives(hwnd);
     a11y_publish_scene(m);   /* describe what was just drawn (ARCH-99) */
+    if (g_rehearse) {              /* a sync round's: drawn, never shown or counted */
+        gfx_set_origin(rt, 0, 0);
+        return;
+    }
     g_frames++;
     if (g_harness) {               /* the frame as drawn, before it is shown */
         SDL_Surface *sf = SDL_RenderReadPixels(g_ren, NULL);
@@ -44318,6 +44323,9 @@ static void pump(void) {
 
 /* Paint now, for the few places that need the frame before they go on. */
 static void paint_now(void) { g_dirty = 0; paint(g_main); }
+/* The harness's sync rounds: the scene drawn, so a panel asks for what it
+ * shows, but neither shown nor counted -- the command's one frame comes after. */
+static void paint_rehearse(void) { g_rehearse = 1; paint(g_main); g_rehearse = 0; }
 
 /* ==== the test harness (--harness) =========================================
  *
@@ -44493,12 +44501,13 @@ static int hs_signin(const oc_hcmd *c) {
  * the client to ask for more -- on a tick, or when a panel is drawn (a
  * conversation's members) -- so each round is taken in, ticked and drawn, and
  * rounds repeat until one prompted no request: then the screen is what the
- * daemon holds. */
+ * daemon holds. The rounds draw without showing or counting a frame
+ * (paint_rehearse): the command's one frame is harness_step's, after. */
 #define HS_SYNC_ROUNDS 64
 static int hs_sync(void) {
     if (!g_client) return 0;
     on_tick(g_main);                           /* what the screen asks for now */
-    paint_now();
+    paint_rehearse();
     for (int round = 0; round < HS_SYNC_ROUNDS; round++) {
         uint64_t tok = ++g_sync_next;
         oc_client_sync(g_client, tok);
@@ -44510,7 +44519,7 @@ static int hs_sync(void) {
             SDL_Delay(0);   /* the network thread's turn; no time is waited for */
         }
         on_tick(g_main);                       /* the answers, reacted to */
-        paint_now();
+        paint_rehearse();
         if (oc_client_cmds_sent(g_client) == after_sync) return 1;
     }
     return 0;                                  /* never settled: a loop of requests */

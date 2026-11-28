@@ -2205,8 +2205,9 @@ void   oc_dbwriter_advance_clock_ms(uint64_t ms);
  * (the UI harness, docs/details/TESTING.md). Any thread. */
 void   oc_dbwriter_hold_clock_ms(uint64_t wall_ms);
 /* Test hooks (OPENCHIME_DEV_TEST_HOOKS). How many jobs of connection `conn`,
- * and of the daemon's own (conn 0), are submitted and not yet answered: 0 once
- * every result of them is queued for the net thread. */
+ * and of the daemon's own (conn 0), are submitted and not yet answered, plus
+ * one while any result waits in the queue: 0 only once every result of them
+ * has been taken by the net thread, and so sent. */
 uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn);
 /* Run the timed sweeps now -- scheduled messages, reminders, expiring mutes --
  * as the net thread's tick would; counted as the daemon's own work, so a SYNC
