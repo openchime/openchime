@@ -90,7 +90,7 @@ typedef struct {
     int    fd;
     answer answers[FAKE_MAX];
     int    n_answers;
-    int    seen;
+    int    seen;          /* requests answered; read by the test's thread (fake_seen) */
     char   path[FAKE_MAX][96];
     char   aud[FAKE_MAX][128];
     long   ts[FAKE_MAX];
@@ -110,12 +110,13 @@ static void header_value(const char *req, const char *name, char *out, size_t ca
     out[n] = '\0';
 }
 
-/* Answer requests in turn until none comes for 400 ms. */
+/* Answer the requests a case expects, in turn, then stop. The wait for each is
+ * only a guard against a hang, never what ends a case. */
 static void *fake_central_thread(void *arg) {
     fake_central *f = arg;
-    while (f->seen < FAKE_MAX) {
+    while (f->seen < f->n_answers) {
         struct pollfd pfd = { f->fd, POLLIN, 0 };
-        if (poll(&pfd, 1, 400) <= 0) break;
+        if (poll(&pfd, 1, 30000) <= 0) break;
         int c = accept(f->fd, NULL, NULL);
         if (c < 0) break;
         char buf[4096];
@@ -137,7 +138,7 @@ static void *fake_central_thread(void *arg) {
             }
             if (head_end && clen >= 0 && total >= head_end + (size_t)clen) break;
         }
-        int i = f->seen++;
+        int i = f->seen;
         if (strncmp(buf, "POST ", 5) == 0) {
             size_t pl = strcspn(buf + 5, " ");
             if (pl >= sizeof f->path[i]) pl = sizeof f->path[i] - 1;
@@ -163,9 +164,12 @@ static void *fake_central_thread(void *arg) {
             (void)wr;
         }
         close(c);
+        __atomic_store_n(&f->seen, i + 1, __ATOMIC_RELEASE);   /* recorded, then counted */
     }
     return NULL;
 }
+
+static int fake_seen(fake_central *f) { return __atomic_load_n(&f->seen, __ATOMIC_ACQUIRE); }
 
 static int fake_listen(int *port) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -235,9 +239,13 @@ static const char TAKEN[] =
     "{\"invitations\":[{\"id\":\"0123456789abcdef0123456789abcdef\",\"address\":\"alex@example.com\"},"
     "{\"id\":\"fedcba9876543210fedcba9876543210\",\"address\":\"sam@example.com\"}]}";
 
-/* A worker against central answering `answers` in turn. When `outcomes` is set,
- * once both invitations were handed over, one is reported made and one refused.
- * Returns how many requests central saw. */
+/* What a case hands back once both invitations were handed over: nothing; ID1
+ * made; or ID1 made and, once central has its report, ID2 refused -- one after
+ * the other, so no case rests on how the worker happens to batch them. */
+enum { OUT_NONE, OUT_ONE, OUT_TWO };
+
+/* A worker against central answering `answers` in turn, `n` requests and no
+ * more. Returns how many requests central saw. */
 static int run(fake_central *f, const answer *answers, int n, made_log *m, int outcomes,
                const char *pk, const char *aud) {
     memset(f, 0, sizeof *f);
@@ -256,12 +264,15 @@ static int run(fake_central *f, const answer *answers, int n, made_log *m, int o
     oc_central_invites_timing t = { .idle_ms = 60000, .fail_min_ms = 5, .fail_max_ms = 40 };
     oc_central_invites *ci = oc_central_invites_start_timed(url, aud, pk, record_make, m, &t);
     CHECK(ci != NULL);
-    if (outcomes) {
+    if (outcomes != OUT_NONE) {
         CHECK(WAIT_UNTIL(made_count(m) == 2, 3000));
         oc_central_invites_outcome(ci, ID1, 1, NULL);
+    }
+    if (outcomes == OUT_TWO) {
+        CHECK(WAIT_UNTIL(fake_seen(f) >= 2, 3000));      /* ID1's report taken */
         oc_central_invites_outcome(ci, ID2, 0, "already a member");
     }
-    pthread_join(th, NULL);           /* central has had no request for 400 ms */
+    pthread_join(th, NULL);           /* central has answered all `n` */
     oc_central_invites_stop(ci);
     close(f->fd);
     return f->seen;
@@ -283,30 +294,33 @@ static void test_against_central(void) {
     pthread_mutex_init(&m->mu, NULL);
 
     /* Two waiting, then the pace central names: both handed over to be made, and
-     * their outcomes reported in one signed request. Nothing more: the next take
-     * is thirty seconds away. */
+     * each outcome reported, signed, as it comes. (Several in one body:
+     * test_report_body.) */
     {
-        const answer A[] = { { 200, TAKEN, 30 }, { 204, NULL, 0 } };
-        CHECK(run(f, A, 2, m, 1, pk, aud) == 2);
+        const answer A[] = { { 200, TAKEN, 30 }, { 204, NULL, 0 }, { 204, NULL, 0 } };
+        CHECK(run(f, A, 3, m, OUT_TWO, pk, aud) == 3);
         CHECK(strcmp(m->id[0], ID1) == 0 && strcmp(m->address[0], "alex@example.com") == 0);
         CHECK(strcmp(m->id[1], ID2) == 0 && strcmp(m->address[1], "sam@example.com") == 0);
         CHECK(strcmp(f->path[0], "/v1/workspace/machine/invitations/take") == 0);
         CHECK(strcmp(f->path[1], "/v1/workspace/machine/invitations/report") == 0);
-        for (int i = 0; i < 2; i++) {
+        CHECK(strcmp(f->path[2], "/v1/workspace/machine/invitations/report") == 0);
+        for (int i = 0; i < 3; i++) {
             CHECK(strcmp(f->aud[i], aud) == 0);
             CHECK(signature_holds(pk, f->path[i], aud, f->ts[i], f->body[i], f->sig[i]));
         }
         CHECK(strcmp(f->body[0], "{}") == 0);
         CHECK(has_outcome(f->body[1], ID1, "\"made\":true,\"reason\":null"));
-        CHECK(has_outcome(f->body[1], ID2, "\"made\":false,\"reason\":\"already a member\""));
+        CHECK(strstr(f->body[1], ID2) == NULL);
+        CHECK(has_outcome(f->body[2], ID2, "\"made\":false,\"reason\":\"already a member\""));
+        CHECK(strstr(f->body[2], ID1) == NULL);
     }
 
     /* A report central could not take is sent again, the same outcomes under the
-     * same ids; once taken, nothing more. */
+     * same ids. */
     m->n = 0;
     {
         const answer A[] = { { 200, TAKEN, 30 }, { 503, NULL, 0 }, { 204, NULL, 0 } };
-        CHECK(run(f, A, 3, m, 1, pk, aud) == 3);
+        CHECK(run(f, A, 3, m, OUT_ONE, pk, aud) == 3);
         CHECK(strcmp(f->path[1], "/v1/workspace/machine/invitations/report") == 0);
         CHECK(strcmp(f->path[2], "/v1/workspace/machine/invitations/report") == 0);
         CHECK(strcmp(f->body[1], f->body[2]) == 0);
@@ -318,7 +332,7 @@ static void test_against_central(void) {
     m->n = 0;
     {
         const answer A[] = { { 503, NULL, 0 }, { 0, NULL, 0 }, { 200, "{\"invitations\":[]}", 30 } };
-        CHECK(run(f, A, 3, m, 0, pk, aud) == 3);
+        CHECK(run(f, A, 3, m, OUT_NONE, pk, aud) == 3);
         for (int i = 0; i < 3; i++)
             CHECK(strcmp(f->path[i], "/v1/workspace/machine/invitations/take") == 0);
         CHECK(made_count(m) == 0);
