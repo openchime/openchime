@@ -227,9 +227,101 @@ static void ui_harness_daemon_clock(void) {
     ui_daemon_stop(d);
 }
 
+/* An item's rect from the tree, in the frame's pixels; 0 when not there. */
+static int tree_rect(ui_client *c, const char *id, int *l, int *t, int *r, int *b) {
+    char *tr = ui_tree(c);
+    if (!tr) return 0;
+    char key[160];
+    snprintf(key, sizeof key, "\"id\":\"%s\",", id);
+    char *p = strstr(tr, key);
+    char *pl = p ? strstr(p, "\"l\":") : NULL;
+    int ok = pl && sscanf(pl, "\"l\":%d,\"t\":%d,\"r\":%d,\"b\":%d", l, t, r, b) == 4;
+    free(tr);
+    return ok;
+}
+
+static int tree_focus_is(ui_client *c, const char *focus) {
+    char *tr = ui_tree(c), key[96];
+    snprintf(key, sizeof key, "\"focus\":\"%s\"", focus);
+    int is = tr && strstr(tr, key) != NULL;
+    free(tr);
+    return is;
+}
+
+/* The top bar as light chrome: 40 px (60 at 144 DPI) with the field inside
+ * it, the field 46 % of the window and centred, a clear button only while the
+ * field holds text, and help's menu of three existing actions. */
+static void ui_topbar(void) {
+    ui_daemon *d = ui_daemon_start("ui-topbar.db", T0);
+    CHECK(d != NULL);
+    if (!d) return;
+    ui_client *c = ui_client_start(&UI_DEFAULT, T0);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK(ui_signin(c, d, "alice", "pw-alice") == 0);
+        CHECK(ui_sync(c) == 0);
+        int l, t, r, b;
+        CHECK(tree_rect(c, "topbar.search", &l, &t, &r, &b));
+        CHECK(t >= 0 && b <= 40);                               /* inside the 40 px bar */
+        CHECK(r - l >= 514 && r - l <= 516);                    /* 46 % of 1120 */
+        CHECK(l + r >= 1118 && l + r <= 1122);                  /* centred */
+        CHECK(tree_rect(c, "topbar.help", &l, &t, &r, &b) && r <= 1120 && r >= 1100 && b <= 40);
+        CHECK(!tree_rect(c, "topbar.clear", &l, &t, &r, &b));   /* no text, no clear */
+        CHECK(ui_check(c, "topbar", "home", &UI_DEFAULT) == 0);
+
+        ui_settings light = UI_DEFAULT;
+        light.theme = "light";
+        CHECK(ui_settings_apply(c, &light) == 0);
+        CHECK(ui_check(c, "topbar", "home", &light) == 0);
+
+        ui_settings hi = UI_DEFAULT;
+        hi.dpi = 144;
+        CHECK(ui_settings_apply(c, &hi) == 0);
+        CHECK(tree_rect(c, "topbar.search", &l, &t, &r, &b));
+        CHECK(t >= 0 && b <= 60);                               /* the bar at 144 DPI */
+        CHECK(r - l >= 514 && r - l <= 516);
+        CHECK(ui_check(c, "topbar", "home", &hi) == 0);
+        hi.theme = "light";
+        CHECK(ui_settings_apply(c, &hi) == 0);
+        CHECK(ui_check(c, "topbar", "home", &hi) == 0);
+
+        ui_settings wide = UI_DEFAULT;
+        wide.w = 1600;
+        CHECK(ui_settings_apply(c, &wide) == 0);
+        CHECK(tree_rect(c, "topbar.search", &l, &t, &r, &b));
+        CHECK(r - l >= 735 && r - l <= 737);                    /* 46 % of 1600 */
+        CHECK(l + r >= 1598 && l + r <= 1602);
+        CHECK(ui_settings_apply(c, &UI_DEFAULT) == 0);
+
+        /* Clear: shown with text; a click empties the field and keeps the keyboard. */
+        CHECK(ui_click_id(c, "topbar.search") == 0);
+        CHECK(ui_text(c, "hello") == 0);
+        CHECK(tree_rect(c, "topbar.clear", &l, &t, &r, &b));
+        CHECK(ui_check(c, "topbar", "search-text", &UI_DEFAULT) == 0);
+        CHECK(ui_click_id(c, "topbar.clear") == 0);
+        CHECK(!tree_rect(c, "topbar.clear", &l, &t, &r, &b));
+        CHECK(tree_focus_is(c, "topbar.search"));
+        CHECK(ui_key(c, "Escape", 0, 0) == 0);
+
+        /* Help: its menu, and one of its actions. */
+        CHECK(ui_click_id(c, "topbar.help") == 0);
+        /* Its three items, by command: Keyboard shortcuts, What's new, About. */
+        CHECK(ui_tree_has(c, "menu.72", NULL, 0));
+        CHECK(ui_tree_has(c, "menu.2704", NULL, 0));
+        CHECK(ui_tree_has(c, "menu.89", NULL, 0));
+        CHECK(ui_check(c, "topbar", "help-menu", &UI_DEFAULT) == 0);
+        CHECK(ui_click_id(c, "menu.72") == 0);
+        CHECK(!ui_tree_has(c, "menu.72", NULL, 0));
+        CHECK(ui_tree_has(c, "modal.button.close", NULL, 0));      /* the shortcuts sheet is up */
+        CHECK(ui_check(c, "topbar", "shortcuts", &UI_DEFAULT) == 0);
+        ui_client_stop(c);
+    }
+    ui_daemon_stop(d);
+}
+
 int run_ui_harness_tests(void) {
     printf("ui_harness: the token, one frame per command, the held clock, settings per run, "
-           "input by id and position, two clients through the barrier, the daemon's clock stepped\n");
+           "input by id and position, two clients through the barrier, the daemon's clock stepped, the top bar\n");
     ui_harness_port();
     ui_harness_frames();
     ui_harness_clock();
@@ -237,5 +329,6 @@ int run_ui_harness_tests(void) {
     ui_harness_input();
     ui_harness_two_clients();
     ui_harness_daemon_clock();
+    ui_topbar();
     return failures;
 }

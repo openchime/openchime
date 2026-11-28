@@ -248,6 +248,7 @@ typedef struct field {
     int  (*key)(struct field *, int key, int ctrl, int shift);   /* the owner's keys; 1 = taken */
     void (*changed)(struct field *);
     struct fmtw *fmt;               /* NULL: the UI token */
+    uint32_t ph_ink; int ph_ink_on; /* the placeholder's colour, when not OC_COL_FAINT */
     char   comp[128]; int comp_len; /* an IME composition in progress */
     uint64_t blink;                 /* the caret's phase reference */
     int    dragging;
@@ -285,6 +286,7 @@ static int mod_down(int key);
  * the window size the scene is told are moved to match. So the scene keeps its
  * own coordinates, and the bar lives above its zero, at negative y. */
 static float g_scene_dy;
+static float g_scene_inset;    /* FRAME_INSET while the frame is drawn, else 0 */
 /* The test harness (--harness, docs/details/TESTING.md "The UI harness"): on;
  * frames drawn; and the last frame's pixels and accessibility items, as the
  * driver asks for them (`shot`, `tree`). */
@@ -303,6 +305,9 @@ static void client_rect(oc_win *w, irect *rc) {
     rc->left = rc->top = 0; rc->right = pw; rc->bottom = ph;
     int bar = (int)(g_scene_dy * (float)g_dpi / 96.0f + 0.5f);
     if (bar > 0 && bar < ph) rc->bottom = ph - bar;
+    /* The frame's margin, right and bottom: the scene's origin is unmoved. */
+    int in = (int)(g_scene_inset * (float)g_dpi / 96.0f + 0.5f);
+    if (in > 0 && rc->right - in > 0 && rc->bottom - in > 0) { rc->right -= in; rc->bottom -= in; }
 }
 
 /* UTF-16 units a UTF-8 byte range needs (surrogate pairs count two). */
@@ -408,8 +413,13 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
 #define SIDEBAR_W   UISW(250.0f)
 #define HEADER_H    UIS(56.0f)
 /* The window-wide bar above the rail, the sidebar and the view (g_scene_dy):
- * back and forward at its left, the one search field in its middle. */
-#define TOPBAR_H    UIS(44.0f)
+ * back and forward at its left, the one search field in its middle, help at
+ * its right. With the rail it is one frame of one colour around the scene. */
+#define TOPBAR_H    UIS(40.0f)
+/* The frame's margin at the scene's right and bottom, and the rounding of the
+ * scene's top-left corner: the scene is a panel set into the frame. */
+#define FRAME_INSET UIS(4.0f)
+#define FRAME_R     UIS(8.0f)
 /* A scene y to device pixels in the window: the bar above it counted. */
 #define PXY(v)      PX((float)(v) + g_scene_dy)
 /* The channel tab strip under the header. Slack's shape: the channel
@@ -22849,7 +22859,8 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
     float ox = box.left - (f->multi ? 0 : f->scroll), oy = text_y - (f->multi ? f->scroll : 0);
     if (!f->len && !f->comp_len) {
         if (f->placeholder && f->placeholder[0])
-            draw_text(rt, f->placeholder, fm, rf(box.left, text_y, box.right + 4000, text_y + (f->multi ? lh : lh)), OC_COL_FAINT);
+            draw_text(rt, f->placeholder, fm, rf(box.left, text_y, box.right + 4000, text_y + (f->multi ? lh : lh)),
+                      f->ph_ink_on ? f->ph_ink : OC_COL_FAINT);
     } else if (l) {
         if (focused && fld_has_sel(f)) {
             st_rect rr[64];
@@ -26153,12 +26164,28 @@ static void draw_pastechoice(gfx *rt, float W, float H);   /* fwd */
  * negative y (g_scene_dy): back and forward at the left, the search field in
  * the middle (topbar_field_draw), room on the right for what comes later. */
 static void topbar_field_draw(gfx *rt, const oc_model *m, float W);   /* fwd */
+static void topbar_help_draw(gfx *rt, float W);   /* fwd */
 static void draw_topbar(gfx *rt, const oc_model *m, float W) {
     rectf bar = rf(0, -TOPBAR_H, W, 0);
     fill(rt, bar, OC_COL_RAIL);
-    fill(rt, rf(0, -1, W, 0), OC_COL_BORDER);
     topbar_hist_buttons(rt, RAIL_W + UIS(8));
     topbar_field_draw(rt, m, W);
+    topbar_help_draw(rt, W);
+}
+
+/* The frame around the scene's panel: its margin at the right and the bottom,
+ * and the panel's top-left corner rounded by masking it, row by device row, in
+ * the frame's colour. Drawn after the scene, in its coordinates. */
+static void frame_draw(gfx *rt, float W, float H) {
+    if (g_scene_inset <= 0) return;
+    float in = g_scene_inset;
+    fill(rt, rf(W, -TOPBAR_H, W + in, H + in), OC_COL_RAIL);
+    fill(rt, rf(0, H, W + in, H + in), OC_COL_RAIL);
+    float r = FRAME_R, step = 96.0f / (float)g_dpi;   /* one device row */
+    for (float y = 0; y < r; y += step) {
+        float cy = r - (y + step / 2), dx = r - sqrtf(r * r - cy * cy);
+        if (dx > 0) fill(rt, rf(RAIL_W, y, RAIL_W + dx, y + step), OC_COL_RAIL);
+    }
 }
 
 /* The view's search: messages in a conversation (limited to it) or anywhere
@@ -26182,15 +26209,76 @@ static void top_target_update(const oc_model *m) {
     if (g_srch) g_srch->placeholder = g_top_ph;
 }
 
+/* The bar's field: a tint of the frame's own colour, no border, a small icon.
+ * The rail is dark in every scheme (theme.c, "A scheme is"), so the tint is
+ * white and the text the rail's own near-white. */
+#define TOPBAR_BOX_H UIS(26.0f)
+static void topbar_box_draw(gfx *rt, rectf box) {
+    fill_round_a(rt, box, OC_R_CONTROL, 0xFFFFFF, 0.16f);
+    float ic = UIS(14.0f), top = box.top + (box.bottom - box.top - ic) / 2.0f;
+    draw_lucide(rt, OC_ICON_SEARCH, rf(box.left + UIS(9), top, box.left + UIS(9) + ic, top + ic),
+                OC_COL_RAIL_ICON);
+}
+
+static rectf g_top_clear;      /* the field's clear button, while it holds text */
+
 static void topbar_field_draw(gfx *rt, const oc_model *m, float W) {
     top_target_update(m);
-    float bw = UIS(560.0f), room = W - 2 * (RAIL_W + UIS(80.0f));
+    g_top_clear = rf(0, 0, 0, 0);
+    float bw = W * 0.46f;
+    if (bw > UIS(880.0f)) bw = UIS(880.0f);
+    float room = W - 2 * (RAIL_W + UIS(80.0f));
     if (bw > room) bw = room;
     if (bw < UIS(160.0f)) { g_top_box = rf(0, 0, 0, 0); return; }
-    float by = -TOPBAR_H + (TOPBAR_H - SEARCH_BOX_H) / 2;
-    g_top_box = rf((W - bw) / 2, by, (W + bw) / 2, by + SEARCH_BOX_H);
-    search_box_draw(rt, g_top_box, OC_COL_INPUT);
-    if (g_srch) field_draw(rt, g_srch, search_text_box(g_top_box), OC_COL_TEXT);
+    float by = -TOPBAR_H + (TOPBAR_H - TOPBAR_BOX_H) / 2;
+    g_top_box = rf((W - bw) / 2, by, (W + bw) / 2, by + TOPBAR_BOX_H);
+    topbar_box_draw(rt, g_top_box);
+    rectf tb = search_text_box(g_top_box);
+    if (g_srch && g_srch->len > 0) {
+        float cs = TOPBAR_BOX_H - UIS(6);
+        g_top_clear = rf(g_top_box.right - UIS(3) - cs, g_top_box.top + UIS(3),
+                         g_top_box.right - UIS(3), g_top_box.bottom - UIS(3));
+        if (in_rect(g_top_clear, g_mouse_x, g_mouse_y)) fill_round_a(rt, g_top_clear, OC_R_CONTROL, 0xFFFFFF, 0.14f);
+        float ic = UIS(12.0f), cx = (g_top_clear.left + g_top_clear.right) / 2, cy = (g_top_clear.top + g_top_clear.bottom) / 2;
+        draw_lucide(rt, OC_ICON_CLOSE, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2), OC_COL_RAIL_ICON);
+        tb.right = g_top_clear.left - UIS(4);
+    }
+    if (g_srch) {
+        g_srch->ph_ink = OC_COL_RAIL_ICON; g_srch->ph_ink_on = 1;
+        field_draw(rt, g_srch, tb, 0xFFFFFF);
+    }
+}
+
+/* Help, at the bar's right end: a menu of the keyboard shortcuts, what is new
+ * and about, each the existing action. */
+static rectf g_top_help;
+static void topbar_help_draw(gfx *rt, float W) {
+    float bs = UIS(28), by = -TOPBAR_H + (TOPBAR_H - bs) / 2;
+    g_top_help = rf(W - UIS(8) - bs, by, W - UIS(8), by + bs);
+    if (in_rect(g_top_help, g_mouse_x, g_mouse_y)) fill_round_a(rt, g_top_help, OC_R_CONTROL, 0xFFFFFF, 0.12f);
+    /* A circled question mark: the ring, and the glyph centred in it. */
+    float ic = UIS(18.0f), cx = (g_top_help.left + g_top_help.right) / 2, cy = (g_top_help.top + g_top_help.bottom) / 2;
+    gfx_ellipse_stroke(rt, cx, cy, ic / 2, ic / 2, UIS(1.5f), OC_COL_RAIL_ICON, 1.0f);
+    float qw = text_width("?", g_ui);
+    draw_text(rt, "?", g_ui, rf(cx - qw / 2, g_top_help.top, g_top_help.right, g_top_help.bottom), OC_COL_RAIL_ICON);
+}
+
+static void topbar_help_open(void) {
+    g_n_mi = 0;
+    mi_item(72, "Keyboard shortcuts");
+    mi_item(ABOUT_CMD_WHATSNEW, "What's new");
+    mi_item(89, "About OpenChime");
+    g_menu = MENU_WS; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 220;
+    g_menu_x = (int)(g_top_help.right - 220); g_menu_y = 4;
+    invalidate();
+}
+
+static void topbar_clear(oc_win *hwnd) {
+    if (!g_srch) return;
+    field_set(g_srch, "");
+    if (g_srch->changed) g_srch->changed(g_srch);
+    search_open(hwnd);              /* the keyboard stays in the field */
+    invalidate();
 }
 
 static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
@@ -26257,8 +26345,8 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     if (!m) return;
     ensure_selection(m);
-    if (g_scene_dy > 0) draw_topbar(rt, m, W);   /* above the scene's zero */
-    draw_rail(rt, m, H);
+    if (g_scene_dy > 0) draw_topbar(rt, m, W + g_scene_inset);   /* above the scene's zero, the frame's width */
+    draw_rail(rt, m, H + g_scene_inset);
 
     if (shell_visible()) {
         float main_x = RAIL_W + SIDEBAR_W;
@@ -26433,6 +26521,7 @@ static void paint(oc_win *hwnd) {
      * card (which, over a live shell, dims it anyway). Decided before the size
      * is read, since the scene is told the window less the bar. */
     g_scene_dy = (g_client && g_view != VIEW_SIGNIN) ? TOPBAR_H : 0.0f;
+    g_scene_inset = g_scene_dy > 0 ? FRAME_INSET : 0.0f;
     gfx_set_origin(rt, 0, g_scene_dy);
     irect rc; client_rect(hwnd, &rc);
     /* DIPs, not pixels — the scene is authored device-independent and the
@@ -26463,6 +26552,7 @@ static void paint(oc_win *hwnd) {
     g_n_snip_hits = 0;
     g_n_todohits = 0;
     render_scene(rt, m, W, H);
+    frame_draw(rt, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
      * positioned after the scene is laid out. `layout_find` is here for a
@@ -29905,6 +29995,8 @@ enum {
     AT_ALSO,          /* the thread composer's "Also send to #channel" -- toggle it */
     AT_NAVPREF,       /* payload: a Navigation row's index in g_rail * 4 + 0 show/hide, 1 up, 2 down */
     AT_TOPSEARCH,     /* the top bar's search field -- the keyboard to it */
+    AT_TOPCLEAR,      /* the field's clear button */
+    AT_TOPHELP,       /* the bar's help menu */
     AT_SFILTER        /* payload: a filters-panel control (SF_*) -- do what it does */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
@@ -30310,6 +30402,10 @@ static void a11y_publish_scene(const oc_model *m) {
     /* The top bar's one search field, named for what it searches now. */
     if (g_srch && g_srch->visible && g_top_box.right > g_top_box.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_COMPOSER, "topbar.search", g_top_ph, g_top_box, ATOK(AT_TOPSEARCH, 0));
+    if (g_top_clear.right > g_top_clear.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "topbar.clear", "Clear search", g_top_clear, ATOK(AT_TOPCLEAR, 0));
+    if (g_scene_dy > 0 && g_top_help.right > g_top_help.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "topbar.help", "Help", g_top_help, ATOK(AT_TOPHELP, 0));
     if (g_mem_addppl.right > g_mem_addppl.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "members.addperson", "Add person", g_mem_addppl, ATOK(AT_MEMADDPPL, 0));
     if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
@@ -34890,11 +34986,12 @@ static void view_go(oc_win *hwnd, int act) {
  * the window meanwhile; an open menu closes, as a press anywhere outside it
  * does. */
 static int topbar_click(oc_win *hwnd, int x, int y) {
-    (void)hwnd;
     if (modal_open() || g_pal_open) return 1;
     if (g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; submenu_close(); invalidate(); return 1; }
     if (in_rect(g_hist_back_btn, x, y)) { hist_go(-1); invalidate(); return 1; }
     if (in_rect(g_hist_fwd_btn, x, y))  { hist_go( 1); invalidate(); return 1; }
+    if (in_rect(g_top_clear, x, y))     { topbar_clear(hwnd); return 1; }
+    if (in_rect(g_top_help, x, y))      { topbar_help_open(); return 1; }
     return 1;
 }
 
@@ -43854,6 +43951,8 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
             }
             break;
         case AT_TOPSEARCH: search_open(hwnd); break;
+        case AT_TOPCLEAR:  topbar_clear(hwnd); break;
+        case AT_TOPHELP:   topbar_help_open(); break;
         case AT_SFILTER:   if (arg < SF_N) sf_activate(hwnd, (int)arg); break;
         case AT_NAVPREF:
             if (g_prefs_open) nav_pref_act((int)(arg / 4), (int)(arg % 4));
