@@ -344,6 +344,10 @@ typedef struct conn_s {
     size_t       bf_phase, bf_i;
     uint8_t     *dq;
     size_t       dq_len, dq_cap;
+    /* A test harness's SYNC waiting (test hooks): its token, answered with
+     * SYNC_DONE once the connection's earlier work is done (sync_try). */
+    uint64_t     sync_token;
+    uint8_t      sync_pending;
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
@@ -1314,6 +1318,21 @@ static uint64_t call_grace_ms(void) {
     uint64_t v = __atomic_load_n(&g_call_grace_ms, __ATOMIC_RELAXED);
     return v ? v : OC_CALL_REJOIN_GRACE_MS;
 }
+/* Test hooks: SYNCs waiting, and the answer to one once every job its
+ * connection submitted before it -- and the daemon's own sweeps -- is done and
+ * its results delivered (oc_dbwriter_outstanding). Through out_append, so it
+ * goes after everything already sent or held for that connection. */
+static int g_syncs_pending;
+static int sync_try(conn *c, oc_dbwriter *dbw) {
+    if (!c || !c->sync_pending || oc_dbwriter_outstanding(dbw, c->conn_id) != 0) return 0;
+    uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_sync sd = { c->sync_token };
+    c->sync_pending = 0;
+    if (g_syncs_pending > 0) g_syncs_pending--;
+    if (oc_encode_sync_done(&w, c->version, &sd) != OC_OK) return -1;
+    return out_append(c, buf, w.len);
+}
+
 void oc_netloop_set_call_grace_ms(uint64_t ms) {
     __atomic_store_n(&g_call_grace_ms, ms, __ATOMIC_RELAXED);
 }
@@ -5886,6 +5905,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             continue;
         }
 #endif
+        /* A test harness's barrier (protocol 54), with test hooks on only: off,
+         * it is no type this daemon knows, and falls to the refusal below. */
+        if (hdr.msg_type == OC_MSG_SYNC && oc_config_get()->dev.test_hooks) {
+            oc_sync sy;
+            if (oc_decode_sync(&p, &sy) != OC_OK) return -1;
+            if (!c->sync_pending) g_syncs_pending++;
+            c->sync_pending = 1;
+            c->sync_token = sy.token;
+            if (sync_try(c, dbw) != 0) return -1;
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
             oc_transfer_cancel tc;
             if (oc_decode_transfer_cancel(&p, &tc) != OC_OK) return -1;
@@ -12717,6 +12747,12 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 oc_dbres_free(r);
             }
             db_more = k == OC_RESULT_BUDGET;
+            /* Every result queued is delivered: a SYNC whose connection has
+             * nothing left outstanding is answered (test hooks). */
+            if (!db_more && g_syncs_pending)
+                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+                    if (conns[fd] && conns[fd]->sync_pending && sync_try(conns[fd], dbw) != 0)
+                        conn_close(ep, conns, fd);
         }
         if (xfer_more) {
             int k = 0;

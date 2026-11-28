@@ -1666,6 +1666,34 @@ static void test_admin_frames(void) {
     }
 }
 
+/* A test harness's barrier (54): the token crosses both ways intact, and a
+ * frame cut short is refused. */
+static void test_sync_frames(void) {
+    CHECK(OC_PROTOCOL_VERSION == 54);
+    {
+        oc_sync in = { 0xA1B2C3D4E5F60718ull };
+        ROUNDTRIP(oc_encode_sync(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SYNC, h, p);
+        oc_sync out = { 0 };
+        CHECK(oc_decode_sync(&p, &out) == OC_OK && out.token == in.token);
+    }
+    {
+        oc_sync in = { 42 };
+        ROUNDTRIP(oc_encode_sync_done(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SYNC_DONE, h, p);
+        oc_sync out = { 0 };
+        CHECK(oc_decode_sync(&p, &out) == OC_OK && out.token == 42);
+    }
+    {
+        oc_sync in = { 7 };
+        uint8_t fr[64];
+        oc_wbuf w2; oc_wbuf_init(&w2, fr, sizeof fr);
+        CHECK(oc_encode_sync(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2; oc_sync out;
+        CHECK(oc_parse_frame(fr, w2.len, &h2, &p2) == OC_OK);
+        p2.len -= 1;
+        CHECK(oc_decode_sync(&p2, &out) == OC_E_MALFORMED);
+    }
+}
+
 static void test_search_frames(void) {
     {
         oc_search in = { .query = oc_slice_str("deploy pipeline"), .limit = 25 };
@@ -1686,7 +1714,7 @@ static void test_search_frames(void) {
     }
     /* One conversation by id (53, REQ-080): nonzero and 0 cross intact, and a
      * frame cut off before the id is refused rather than read as unscoped. */
-    CHECK(OC_PROTOCOL_VERSION == 53);
+    CHECK(OC_PROTOCOL_VERSION >= 53);   /* a conversation's id since 53 */
     {
         oc_search in = { .query = oc_slice_str("deploy"), .limit = 25, .channel_id = 0x1122334455667788ull };
         ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
@@ -3849,6 +3877,7 @@ int run_protocol_tests(void) {
     test_channel_frames();
     test_admin_frames();
     test_search_frames();
+    test_sync_frames();
     test_presence_frames();
     test_attachment_frames();
     test_file_frames();

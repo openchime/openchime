@@ -52,6 +52,7 @@
 #include "model.h"
 #include "notify.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
+#include "harness.h"    /* the test harness's line to its driver (--harness) */
 #include "scopes.h"     /* the scope catalog an agent's token is minted from */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
@@ -135,8 +136,28 @@ typedef struct oc_win {
 /* The tick, in ms: the GUI analogue of the TUI's poll loop. */
 #define TICK_MS 30
 
-/* The clock every age and debounce in this file is measured against. */
-static uint64_t now_ms(void) { return SDL_GetTicks(); }
+/* THE CLIENT'S ONE CLOCK. Every age, debounce, blink, animation and "5 min
+ * ago" in this file is measured against these two, never the system's directly,
+ * so a test harness can set and step them (--harness): with the clock held,
+ * nothing on screen changes until the harness says time has passed.
+ *
+ * now_ms() is the monotonic clock (SDL_GetTicks), app_time() the wall clock
+ * (app_time()). Held, both read what the harness set. */
+static int      g_clock_held;
+static uint64_t g_clock_mono_ms, g_clock_wall_ms;
+static uint64_t now_ms(void) { return g_clock_held ? g_clock_mono_ms : SDL_GetTicks(); }
+static time_t   app_time(void) { return g_clock_held ? (time_t)(g_clock_wall_ms / 1000u) : time(NULL); }
+/* Held from now on, at `wall_ms` on the wall clock. */
+static void clock_hold(uint64_t wall_ms) {
+    g_clock_held = 1;
+    g_clock_wall_ms = wall_ms;
+    if (!g_clock_mono_ms) g_clock_mono_ms = 1000000u;   /* clear of 0, which several timers mean "never" */
+    oc_model_clock_hold(g_clock_mono_ms, g_clock_wall_ms);   /* and the core's, the same */
+}
+static void clock_advance(uint64_t ms) {
+    g_clock_mono_ms += ms; g_clock_wall_ms += ms;
+    oc_model_clock_hold(g_clock_mono_ms, g_clock_wall_ms);
+}
 
 /* The window needs painting. Coalesced: the loop paints once when the queue
  * is empty, however many places asked. */
@@ -264,6 +285,13 @@ static int mod_down(int key);
  * the window size the scene is told are moved to match. So the scene keeps its
  * own coordinates, and the bar lives above its zero, at negative y. */
 static float g_scene_dy;
+/* The test harness (--harness, docs/details/TESTING.md "The UI harness"): on;
+ * frames drawn; and the last frame's pixels and accessibility items, as the
+ * driver asks for them (`shot`, `tree`). */
+static int       g_harness;
+static uint64_t  g_frames;
+static uint8_t  *g_shot;
+static int       g_shot_w, g_shot_h;
 static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs need it */
 
 /* The window's client area in device pixels (what the scene is laid out in,
@@ -1448,7 +1476,7 @@ static int  g_quitting;
  * replaced, one for the tray and one for the header. */
 static int dnd_active(const oc_model *m) {
     if (!m || m->dnd_mode == OC_DND_OFF) return 0;
-    time_t now = time(NULL); struct tm tv;
+    time_t now = app_time(); struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
     int local_min = tv.tm_hour * 60 + tv.tm_min, weekday = tv.tm_wday;
     int present = 0, enabled = 0, ds = 0, de = 0;
@@ -1717,7 +1745,7 @@ static void taskbar_badge_apply(oc_win *hwnd, int count) {
  * next window -- read as no keyboard or mouse input for thirty seconds. */
 static void taskbar_flash(oc_win *hwnd) {
     if (g_pref_flash == FLASH_NEVER) return;
-    if (g_pref_flash == FLASH_IDLE && oc_plat_idle_ms() < 30000) return;
+    if (g_pref_flash == FLASH_IDLE && !g_harness && oc_plat_idle_ms() < 30000) return;
     SDL_FlashWindow(hwnd->sdl, SDL_FLASH_UNTIL_FOCUSED);
 }
 
@@ -5368,7 +5396,7 @@ static void draw_call_tile(gfx *rt, const oc_model *m, const oc_call_stats *st, 
     }
 }
 
-static uint64_t wall_ms(void) { return (uint64_t)time(NULL) * 1000u; }
+static uint64_t wall_ms(void) { return (uint64_t)app_time() * 1000u; }
 
 static void call_duration(uint64_t started_at, char *out, size_t cap) {
     uint64_t now = wall_ms(), s = started_at && now > started_at ? (now - started_at) / 1000 : 0;
@@ -6560,7 +6588,7 @@ static uint64_t mlay_sig(const oc_msg *msg) {
     /* A time token's text (and so its box) follows the clock preference, the
      * zone and what "today" is: any of them changing lays the body out again. */
     if (strstr(b, "<time:")) {
-        time_t now = time(NULL);
+        time_t now = app_time();
         struct tm lt;
         int yday = oc_localtime_r(&now, &lt) ? lt.tm_year * 400 + lt.tm_yday : 0;
         oc_rt_clock k;
@@ -8479,7 +8507,7 @@ static int same_day(uint64_t a_ms, uint64_t b_ms) {
 
 /* "Today" / "Yesterday" / "Friday, July 25" for a date divider. */
 static void day_label(uint64_t ms, char *out, size_t cap) {
-    time_t t = (time_t)(ms / 1000), now = time(NULL), yst = now - 86400;
+    time_t t = (time_t)(ms / 1000), now = app_time(), yst = now - 86400;
     struct tm tv, nv, yv;
     if (!oc_localtime_r(&t, &tv)) { if (cap) out[0] = 0; return; }
     if (oc_localtime_r(&now, &nv) &&
@@ -10379,8 +10407,11 @@ static void show_and_focus(oc_win *hwnd) {
 /* "Can the user see this right now?": the window is in front, shown and not
  * minimised. A hidden window can still hold the focus, which is why visible
  * is asked separately. */
+static int g_hs_front = 1;   /* driven: the window in front of a person, or not (the driver's `front`) */
+
 static int win_visible(const oc_win *w) {
     if (!w || !w->sdl) return 0;
+    if (g_harness) return g_hs_front;       /* the driver's, not the desktop's: the same on every run */
     SDL_WindowFlags fl = SDL_GetWindowFlags(w->sdl);
     return !(fl & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
 }
@@ -10442,6 +10473,7 @@ static int bc_gate(int path, uint64_t cid, uint64_t at, const char *text) {
 }
 
 static int win_front(const oc_win *w) {
+    if (g_harness) return w && w->sdl && g_hs_front;
     return win_visible(w) && (SDL_GetWindowFlags(w->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
 
@@ -14572,7 +14604,7 @@ static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
     sum_where(m, where, sizeof where);
     if (src->parent) snprintf(place, sizeof place, "Thread in %s", where);
     else snprintf(place, sizeof place, "%s", where);
-    oc_summary_when(src->at, (uint64_t)time(NULL) * 1000u, g_pref_time24, when, sizeof when);
+    oc_summary_when(src->at, (uint64_t)app_time() * 1000u, g_pref_time24, when, sizeof when);
     float bh = text_height(body, g_body, tw);
     float ch = pad + 40 + 10 + bh + 10 + 18 + pad;
     float y0 = a.bottom + 6;
@@ -15830,9 +15862,9 @@ static const char *STATUS_CLEARS[5] = { "Never", "30 minutes", "1 hour", "4 hour
 /* Chip index -> absolute expiry, the arithmetic the old form used verbatim. */
 static uint64_t status_expiry_ms(int pick) {
     static const uint64_t MINS[5] = { 0, 30, 60, 240, 0 };
-    if (pick >= 1 && pick <= 3) return (uint64_t)time(NULL) * 1000ull + MINS[pick] * 60000ull;
+    if (pick >= 1 && pick <= 3) return (uint64_t)app_time() * 1000ull + MINS[pick] * 60000ull;
     if (pick == 4) {
-        time_t now = time(NULL); struct tm tv;
+        time_t now = app_time(); struct tm tv;
         if (oc_localtime_r(&now, &tv)) {
             tv.tm_hour = 23; tv.tm_min = 59; tv.tm_sec = 59;
             return (uint64_t)mktime(&tv) * 1000ull;
@@ -15861,7 +15893,7 @@ static void status_open(oc_win *hwnd) {
             /* Bucket the live expiry back onto a chip — the old form always
              * reopened on "Never" whatever was actually set. */
             if (sm->users[i].status_expires) {
-                uint64_t now = (uint64_t)time(NULL) * 1000ull;
+                uint64_t now = (uint64_t)app_time() * 1000ull;
                 uint64_t rem = sm->users[i].status_expires > now
                              ? sm->users[i].status_expires - now : 0;
                 g_status_clear = rem <= 45ull * 60000ull ? 1
@@ -16754,7 +16786,7 @@ static int      g_ooo_note_dirty = 1;
 static uint64_t g_ooo_note_sel, g_ooo_note_at;
 static const oc_member *tgt_ooo_member(const oc_model *m, uint64_t now);   /* fwd: the new message's people */
 static void ooo_note_refresh(void) {
-    uint64_t now = (uint64_t)time(NULL) * 1000u;
+    uint64_t now = (uint64_t)app_time() * 1000u;
     if (!g_ooo_note_dirty && g_ooo_note_sel == g_sel && now - g_ooo_note_at < 1000) return;
     g_ooo_note_dirty = 0; g_ooo_note_sel = g_sel; g_ooo_note_at = now;
     g_ooo_note[0] = '\0';
@@ -18290,7 +18322,7 @@ static uint64_t sch_ms(int y, int m, int d, int min) {
  * every few seconds, so anything nearer would effectively go out at once. */
 static int sch_future(uint64_t at) {
     if (g_sch_insert) return at > 0;          /* a time to write about may be past */
-    return at > (uint64_t)time(NULL) * 1000ULL + 60000ULL;
+    return at > (uint64_t)app_time() * 1000ULL + 60000ULL;
 }
 
 static int sch_days_in(int y, int m) {
@@ -18318,7 +18350,7 @@ static int cal_rows(int yr, int mon) {
 
 static void cal_month_draw(gfx *rt, float cx, float y, int yr, int mon, const char *const ini[7],
                            calday_fn look, void *ctx, calday *out, int *n_out) {
-    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0, td = 0;
+    time_t nowt = app_time(); struct tm nv; int ty = 0, tm_ = 0, td = 0;
     if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; td = nv.tm_mday; }
     int oa = g_meta->align;
     g_meta->align = ST_ALIGN_CENTER;
@@ -18392,7 +18424,7 @@ static int sch_first_future_slot(void) {
 /* Open on a sensible slot: the first half-hour at least thirty minutes away,
  * which rolls to tomorrow's midnight slot late at night. */
 static void sched_custom_open(oc_win *hwnd) {
-    time_t t = time(NULL) + 30 * 60; struct tm tv;
+    time_t t = app_time() + 30 * 60; struct tm tv;
     if (!oc_localtime_r(&t, &tv)) return;
     int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
     if (min >= 1440) {
@@ -18413,7 +18445,7 @@ static void sched_custom_open(oc_win *hwnd) {
  * person's own zone, opened on the next half hour; any day may be picked, and
  * Insert puts the moment's token at the caret. */
 static void time_insert_open(oc_win *hwnd) {
-    time_t t = time(NULL); struct tm tv;
+    time_t t = app_time(); struct tm tv;
     if (!oc_localtime_r(&t, &tv)) return;
     int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
     if (min >= 1440) min = 1410;
@@ -18451,7 +18483,7 @@ static int sch_look(int y, int m, int d, int *on, void *ctx) {
 
 static void draw_sched_custom(gfx *rt, rectf body) {
     g_n_sch_days = 0; g_n_sch_times = 0;
-    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0;
+    time_t nowt = app_time(); struct tm nv; int ty = 0, tm_ = 0;
     if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; }
 
     /* The calendar: month title with previous/next, weekday initials, six rows. */
@@ -18631,7 +18663,7 @@ static int sr_key(field *f, int key, int ctrl, int shift) {
 static void sr_changed(field *f) { (void)f; sr_fields_read(); }
 
 static void sumrange_open(oc_win *hwnd, uint64_t cid) {
-    oc_sumcal_init(&g_sr_cal, (uint64_t)time(NULL) * 1000u);
+    oc_sumcal_init(&g_sr_cal, (uint64_t)app_time() * 1000u);
     oc_sumcal_shift(&g_sr_cal, -1);          /* this month on the right, as Slack's */
     g_sr_cid = cid;
     g_sr_err = NULL;
@@ -18804,7 +18836,7 @@ static void date_jump(uint64_t cid, uint64_t parent, uint64_t day_ms);  /* fwd *
 
 /* Today's local midnight, and today's month. */
 static uint64_t jc_today(int *y, int *m) {
-    time_t t = time(NULL); struct tm tv;
+    time_t t = app_time(); struct tm tv;
     if (!oc_localtime_r(&t, &tv)) return 0;
     if (y) *y = tv.tm_year + 1900;
     if (m) *m = tv.tm_mon;
@@ -19240,7 +19272,7 @@ static void poll_compose_open(oc_win *hwnd, uint64_t cid, uint64_t mid) {
     g_pc_time->placeholder = g_pref_time24 ? "15:45" : "3:45 PM";
     /* The deadline offered when there is none yet: this time tomorrow, on the
      * next half hour. */
-    time_t t = time(NULL) + 24 * 60 * 60; struct tm tv;
+    time_t t = app_time() + 24 * 60 * 60; struct tm tv;
     if (!oc_localtime_r(&t, &tv)) return;
     int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
     if (min >= 1440) {
@@ -19465,7 +19497,7 @@ static void draw_poll_compose(gfx *rt, rectf body) {
     ry += UIS(28.0f) + UIS(16.0f);
     /* The month, with its arrows; no earlier than this month, every day before
      * it having passed. */
-    time_t nowt = time(NULL); struct tm nv; int ty = 0, tmo = 0;
+    time_t nowt = app_time(); struct tm nv; int ty = 0, tmo = 0;
     if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tmo = nv.tm_mon; }
     char title[40]; snprintf(title, sizeof title, "%s %d", SCH_MONTHS[g_pc_vm], g_pc_vy);
     draw_text(rt, title, g_ui_b, rf(rx + UIS(4.0f), ry, rx + rw - UIS(60.0f), ry + UIS(26.0f)), OC_COL_TEXT);
@@ -21064,7 +21096,7 @@ static void draw_invites(gfx *rt, const oc_model *m, rectf body) {
          * server timestamp is epoch-ms. Comparing the two showed "expires in 20666d"
          * — 56 years, which is the epoch offset, and it was only caught because the
          * number was absurd rather than subtly wrong. */
-        uint64_t now = (uint64_t)time(NULL) * 1000u;
+        uint64_t now = (uint64_t)app_time() * 1000u;
         if (iv->expires_at > now) {
             uint64_t left = (iv->expires_at - now) / 1000;
             if (left >= 86400)     snprintf(when, sizeof when, "expires in %llud", (unsigned long long)(left / 86400));
@@ -21134,7 +21166,7 @@ static void draw_alerts_admin(gfx *rt, const oc_model *m, rectf body) {
     ovl_use(OVL_ALERTS);
     float rowh = UIS(76);
     float y = ovl_begin(rt, body, (float)m->n_srvalerts * rowh + 8);
-    uint64_t now = (uint64_t)time(NULL) * 1000u;      /* wall clock: the times are epoch-ms */
+    uint64_t now = (uint64_t)app_time() * 1000u;      /* wall clock: the times are epoch-ms */
     for (size_t i = 0; i < m->n_srvalerts; i++) {
         const oc_srvalert_view *a = &m->srvalerts[i];
         if (y + rowh < body.top) { y += rowh; continue; }
@@ -21718,7 +21750,7 @@ static const oc_channel *group_dm_with(const oc_model *m, const uint64_t *ids, i
 /* "Today" / "Yesterday" / a date — the grouping Slack's Sent list uses, and the
  * only thing a list spanning days needs to say about when. */
 static void rel_day(uint64_t ms, char *out, size_t cap) {
-    time_t t = (time_t)(ms / 1000), now = time(NULL);
+    time_t t = (time_t)(ms / 1000), now = app_time();
     struct tm tv, nv;
     if (!oc_localtime_r(&t, &tv) || !oc_localtime_r(&now, &nv)) { if (cap) out[0] = '\0'; return; }
     int dt = tv.tm_yday, dn = nv.tm_yday;
@@ -21730,7 +21762,7 @@ static void rel_day(uint64_t ms, char *out, size_t cap) {
 static void rel_time(uint64_t ms, char *out, size_t cap) {
     out[0] = '\0';
     if (!ms) return;
-    time_t t = (time_t)(ms / 1000), now = time(NULL);
+    time_t t = (time_t)(ms / 1000), now = app_time();
     double d = difftime(now, t);
     if (d < 60)         snprintf(out, cap, "now");
     else if (d < 3600)  snprintf(out, cap, "%d min", (int)(d / 60));
@@ -22213,7 +22245,7 @@ static void draw_sessions(gfx *rt, const oc_model *m, rectf body) {
                   sr->current ? OC_COL_TEXT : OC_COL_MUTED);
         char sub[160], seen[48] = "", exp[48] = "";
         if (sr->last_seen) rel_time(sr->last_seen, seen, sizeof seen);
-        uint64_t now = (uint64_t)time(NULL) * 1000ull;   /* wall clock, not the monotonic one */
+        uint64_t now = (uint64_t)app_time() * 1000ull;   /* wall clock, not the monotonic one */
         if (sr->expires_at > now) {
             uint64_t d = (sr->expires_at - now) / 86400000ull;
             snprintf(exp, sizeof exp, "expires in %llud", (unsigned long long)d);
@@ -22922,7 +22954,7 @@ static rectf g_tgt_chip_r[TGT_CHIPS_MAX];   /* each chip's whole rect, wrapped *
 static void tgt_chip_label(int i, char *out, size_t cap) {
     const oc_model *m = model();
     const oc_member *u = (!g_tgt_chip[i].is_channel && m)
-                       ? oc_model_ooo_active(m, g_tgt_chip[i].id, (uint64_t)time(NULL) * 1000u) : NULL;
+                       ? oc_model_ooo_active(m, g_tgt_chip[i].id, (uint64_t)app_time() * 1000u) : NULL;
     char ol[96] = "";
     if (u) oc_model_ooo_label(u, ol, sizeof ol);
     /* The same words as everywhere else: "Out of office until 3 Dec". */
@@ -24355,7 +24387,7 @@ static float call_faces(gfx *rt, const oc_model *m, const uint64_t *faces, int n
 /* Where a call falls among the Past list's headings (CALLS.md §2): Today,
  * Yesterday, This week, then its month. */
 static void call_day_heading(uint64_t ms, char *out, size_t cap) {
-    time_t now = time(NULL), t = (time_t)(ms / 1000);
+    time_t now = app_time(), t = (time_t)(ms / 1000);
     struct tm a, b;
     if (!oc_localtime_r(&now, &a) || !oc_localtime_r(&t, &b)) { snprintf(out, cap, "Earlier"); return; }
     long dn = (long)a.tm_year * 400 + a.tm_yday, dt = (long)b.tm_year * 400 + b.tm_yday;
@@ -24686,7 +24718,7 @@ static void call_page_region(gfx *rt, const oc_model *m, rectf reg) {
      * call's length, and the recording's span marked over them. */
     if (p->n_stays) {
         PAGE_HEAD("Who was there when");
-        uint64_t t0 = p->started_at, t1 = p->ended_at ? p->ended_at : (uint64_t)time(NULL) * 1000;
+        uint64_t t0 = p->started_at, t1 = p->ended_at ? p->ended_at : (uint64_t)app_time() * 1000;
         for (uint16_t i = 0; i < p->n_stays; i++) if (p->stays[i].left_at > t1) t1 = p->stays[i].left_at;
         if (t1 <= t0) t1 = t0 + 1;
         float lx = x0 + UIS(120), rx = x1, bh = UIS(12), rowh = UIS(20);
@@ -26437,6 +26469,23 @@ static void paint(oc_win *hwnd) {
      * relayout and so never reached it. */
     layout_natives(hwnd);
     a11y_publish_scene(m);   /* describe what was just drawn (ARCH-99) */
+    g_frames++;
+    if (g_harness) {               /* the frame as drawn, before it is shown */
+        SDL_Surface *sf = SDL_RenderReadPixels(g_ren, NULL);
+        SDL_Surface *cv = sf ? SDL_ConvertSurface(sf, SDL_PIXELFORMAT_RGBA32) : NULL;
+        if (cv) {
+            size_t need = (size_t)cv->w * (size_t)cv->h * 4u;
+            uint8_t *nb = realloc(g_shot, need);
+            if (nb) {
+                g_shot = nb; g_shot_w = cv->w; g_shot_h = cv->h;
+                for (int y = 0; y < cv->h; y++)
+                    memcpy(g_shot + (size_t)y * (size_t)cv->w * 4u,
+                           (const uint8_t *)cv->pixels + (size_t)y * (size_t)cv->pitch, (size_t)cv->w * 4u);
+            }
+        }
+        if (cv) SDL_DestroySurface(cv);
+        if (sf) SDL_DestroySurface(sf);
+    }
     gfx_end(rt);
     gfx_set_origin(rt, 0, 0);   /* the scene's origin is this paint's alone */
     oc_plat_frame_shown();
@@ -28059,7 +28108,7 @@ static int clip_paste_attach(oc_win *hwnd) {
         uint8_t *d = oc_plat_clipboard_image(&n, ext);
         if (d && n) {
             char name[64];
-            time_t now = time(NULL); struct tm t;
+            time_t now = app_time(); struct tm t;
             if (!oc_localtime_r(&now, &t)) memset(&t, 0, sizeof t);
             snprintf(name, sizeof name, "pasted-image-%04d%02d%02d-%02d%02d%02d.%s",
                      t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, ext);
@@ -28289,7 +28338,7 @@ static void pastechoice_pick(oc_win *hwnd, int k) {
             }
         }
         char name[64];
-        time_t now = time(NULL); struct tm tv;
+        time_t now = app_time(); struct tm tv;
         if (!oc_localtime_r(&now, &tv)) memset(&tv, 0, sizeof tv);
         snprintf(name, sizeof name, "pasted-table-%04d%02d%02d-%02d%02d%02d.%s",
                  tv.tm_year + 1900, tv.tm_mon + 1, tv.tm_mday, tv.tm_hour, tv.tm_min, tv.tm_sec,
@@ -29873,6 +29922,16 @@ static int g_acc_layer;
 static rectf g_acc_surface;
 
 /* Clip `r` to the current surface. Returns 0 when nothing of it is left. */
+/* What was last published, for the harness's `tree` and click-by-id. */
+static oc_acc_item g_acc_last[OC_ACC_MAX];
+static int         g_acc_last_n;
+static void acc_keep(const oc_acc_item *items, int n) {
+    if (!g_harness) return;
+    if (n > OC_ACC_MAX) n = OC_ACC_MAX;
+    memcpy(g_acc_last, items, (size_t)n * sizeof *items);
+    g_acc_last_n = n;
+}
+
 static int acc_on_surface(rectf *r) {
     if (g_acc_surface.right <= g_acc_surface.left) return 1;   /* no surface set */
     if (r->top    < g_acc_surface.top)    r->top    = g_acc_surface.top;
@@ -29968,6 +30027,7 @@ static void a11y_publish_scene(const oc_model *m) {
                         g_sub_panel.right, g_subrows[i].bot),
                      ATOK(AT_MENU, g_subrows[i].cmd));
         }
+        acc_keep(items, n);
         oc_a11y_publish(items, n, NULL, 0, 0);
         return;
     }
@@ -30962,6 +31022,7 @@ modal_items:
         }
     }
 
+    acc_keep(items, n);
     oc_a11y_publish(items, n, ctext, caret, anchor);
 }
 
@@ -31031,7 +31092,7 @@ static void sched_at(oc_win *hwnd, uint64_t at);   /* fwd */
 static void sched_menu_run(oc_win *hwnd, int cmd) {
     if (!g_client || !g_sel || ed_len() <= 0) return;
     if (cmd == 303) { sched_custom_open(hwnd); return; }
-    uint64_t now = (uint64_t)time(NULL) * 1000ULL, at = now;
+    uint64_t now = (uint64_t)app_time() * 1000ULL, at = now;
     if (cmd == 300) at = now + 30ULL * 60 * 1000;
     else if (cmd == 301) at = now + 60ULL * 60 * 1000;
     else if (cmd == 302) {
@@ -33927,7 +33988,7 @@ static void channel_menu_run(oc_win *hwnd, int cmd);   /* fwd */
 /* The reader's local time `days` days from today at hh:mm, in ms; 0 if the
  * clock cannot be read. */
 static uint64_t local_at(int days, int hh, int mm) {
-    time_t now = time(NULL);
+    time_t now = app_time();
     struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
     tv.tm_mday += days; tv.tm_hour = hh; tv.tm_min = mm; tv.tm_sec = 0; tv.tm_isdst = -1;
@@ -33948,7 +34009,7 @@ static uint64_t parse_when(const char *s) {
     }
     if (sscanf(s, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
         uint64_t at = local_at(0, hh, mm);
-        if (at && at <= (uint64_t)time(NULL) * 1000u) at = local_at(1, hh, mm);
+        if (at && at <= (uint64_t)app_time() * 1000u) at = local_at(1, hh, mm);
         return at;
     }
     return 0;
@@ -34005,12 +34066,12 @@ static void msg_menu_run(oc_win *hwnd, int cmd) {
      * saved one that is not loaded. */
     if (cmd >= 115 && cmd <= 120) {
         uint64_t rid = g_menu_target;
-        uint64_t now = (uint64_t)time(NULL) * 1000u;
+        uint64_t now = (uint64_t)app_time() * 1000u;
         if (cmd == 115) remind_set(rid, now + 20u * 60u * 1000u);
         else if (cmd == 116) remind_set(rid, now + 60u * 60u * 1000u);
         else if (cmd == 117) remind_set(rid, local_at(1, 9, 0));
         else if (cmd == 118) {
-            time_t tn = time(NULL); struct tm tv;
+            time_t tn = app_time(); struct tm tv;
             int wd = oc_localtime_r(&tn, &tv) ? tv.tm_wday : 1;
             int ahead = (8 - wd) % 7; if (ahead == 0) ahead = 7;   /* Monday is 1 */
             remind_set(rid, local_at(ahead, 9, 0));
@@ -37366,7 +37427,7 @@ static int have_stored_token(const char *ws) {
     char key[288]; ws_key(ws, key, sizeof key);
     ws_adopt(s, key, ws, &ep);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    int has = oc_store_load_session(s, key, tok, NULL, (uint64_t)time(NULL) * 1000);
+    int has = oc_store_load_session(s, key, tok, NULL, (uint64_t)app_time() * 1000);
     oc_store_close(s);
     return has;
 }
@@ -37382,7 +37443,7 @@ static void remember_workspace(const char *ws, const char *user) {
     ws_adopt(s, key, ws, NULL);
     /* The label is what the person typed; a reconnect from the book passes the key
      * itself, and NULL keeps the label already there. */
-    oc_store_workspace_remember(s, key, strcmp(key, ws) ? ws : NULL, user, (uint64_t)time(NULL) * 1000);
+    oc_store_workspace_remember(s, key, strcmp(key, ws) ? ws : NULL, user, (uint64_t)app_time() * 1000);
     oc_store_close(s);
 }
 
@@ -37642,7 +37703,7 @@ static uint64_t wsu_day(void) {
     if (!t[0]) { g_wsu_err = "Enter a day first."; return 0; }
     uint64_t day = parse_day(t);
     if (!day) { g_wsu_err = "That is not a date OpenChime can read. Try 2026-05-03."; return 0; }
-    if (day > (uint64_t)time(NULL) * 1000) { g_wsu_err = "That day has not happened yet."; return 0; }
+    if (day > (uint64_t)app_time() * 1000) { g_wsu_err = "That day has not happened yet."; return 0; }
     return day;
 }
 
@@ -38814,7 +38875,7 @@ static void snooze_until_sentence(uint64_t until_ms, char *out, size_t cap) {
  * today. The wire takes minutes precisely so this arithmetic happens where the
  * timezone is known (REQ-278) — the daemon would have to guess. */
 static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
-    time_t now = time(NULL);
+    time_t now = app_time();
     struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
     return oc_minutes_until_local(tv.tm_hour, tv.tm_min, hh, mm, force_tomorrow);   /* the core's, shared */
@@ -39475,7 +39536,7 @@ static void call_open_home(oc_win *hwnd) {
     if (g_client) oc_client_call_history(g_client, 0);
     /* The missed calls are seen: the sidebar's mark goes, and stays gone. */
     if (g_client) {
-        g_calls_seen_ms = (uint64_t)time(NULL) * 1000;
+        g_calls_seen_ms = (uint64_t)app_time() * 1000;
         oc_client_calls_seen(g_client, g_calls_seen_ms);
         prefs_save();
     }
@@ -40848,7 +40909,7 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         /* Open on the next slot after now, which is the likeliest answer. */
         int first = 0;
         {
-            time_t now = time(NULL); struct tm tv;
+            time_t now = app_time(); struct tm tv;
             if (oc_localtime_r(&now, &tv)) first = ((tv.tm_hour * 60 + tv.tm_min) / 30 + 1) % 48;
         }
         oc_field f[1] = { { FF_SELECT, "Pause until", opts, "" } };
@@ -40865,7 +40926,7 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         {
             char lbl[16], msg[96];
             sched_time_label((uint16_t)(slot * 30), lbl, sizeof lbl);
-            time_t now = time(NULL); struct tm tv;
+            time_t now = app_time(); struct tm tv;
             int tomorrow = oc_localtime_r(&now, &tv) && (hh * 60 + mm) <= (tv.tm_hour * 60 + tv.tm_min);
             snprintf(msg, sizeof msg, "Notifications paused until %s%s.", lbl, tomorrow ? " tomorrow" : "");
             fb_confirm(msg);
@@ -41387,7 +41448,7 @@ static void jump_menu_open(oc_win *hwnd, uint64_t cid, uint64_t parent, float x,
 
 /* The reader's local midnight `days_back` days before today, in ms. */
 static uint64_t local_day_start(int days_back) {
-    time_t now = time(NULL);
+    time_t now = app_time();
     struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
     tv.tm_mday -= days_back;
@@ -41403,7 +41464,7 @@ static uint64_t parse_day(const char *s) {
                                          "jul", "aug", "sep", "oct", "nov", "dec" };
     int y = 0, mo = 0, d = 0;
     char w[16] = "";
-    time_t now = time(NULL);
+    time_t now = app_time();
     struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
     if (sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) {
@@ -42263,7 +42324,7 @@ static int on_tick(oc_win *hwnd) {
                    * reconnect. The rail's dot may lag; the gate must not. */
                   int ws_quiet  = dnd_active(wm);
                   int ws_paused = wm->snooze_until_ms != 0 &&
-                                  wm->snooze_until_ms > (uint64_t)time(NULL) * 1000ull;
+                                  wm->snooze_until_ms > (uint64_t)app_time() * 1000ull;
                   for (size_t ci = 0; ci < wm->n_channels; ci++) {
                     const oc_channel *c = &wm->channels[ci];
                     int slot = -1;
@@ -44230,7 +44291,9 @@ static uint64_t g_next_tick;
 /* One turn of the loop: wait for an event or the tick, whichever is first,
  * handle everything queued, tick if due, paint if asked. The nested loop a
  * form runs is this same turn, so re-entrancy is what it always was. */
+static int harness_step(void);   /* fwd */
 static void pump(void) {
+    if (g_harness) { if (harness_step() < 0) g_quit = 1; return; }
     SDL_Event e;
     uint64_t now = now_ms();
     int wait = g_next_tick > now ? (int)(g_next_tick - now) : 0;
@@ -44256,6 +44319,331 @@ static void pump(void) {
 /* Paint now, for the few places that need the frame before they go on. */
 static void paint_now(void) { g_dirty = 0; paint(g_main); }
 
+/* ==== the test harness (--harness) =========================================
+ *
+ * docs/details/TESTING.md, "The UI harness". The driver sends one command per
+ * line; each is applied, the client takes in what its core has (on_tick), ONE
+ * frame is drawn, and the answer goes back with the frame's number. Nothing
+ * here waits on a clock: time moves only by `clock`, and a step that needs
+ * the daemon ends on `sync`, its barrier. */
+
+static uint64_t g_sync_next;
+/* The settings the driver chose, kept over whatever a workspace's stored
+ * preferences say once it signs in: -1 where it chose none. */
+static int g_hs_theme = -1, g_hs_textsize = -1, g_hs_motion = -1, g_hs_density = -1;
+
+static void hs_assert_settings(void) {
+    if (g_hs_theme >= 0 && oc_theme_mode() != g_hs_theme) theme_set(g_hs_theme);
+    if (g_hs_textsize >= 0 && g_pref_textsize != g_hs_textsize) { g_pref_textsize = g_hs_textsize; scale_apply(g_main); }
+    if (g_hs_motion >= 0) g_pref_motion = g_hs_motion;
+    if (g_hs_density >= 0) { g_pref_density = g_hs_density; g_density = g_hs_density ? 1.0f : 0.6f; }
+}
+
+/* Points from window pixels: the driver speaks the frame's pixels, SDL's
+ * events carry points (wc_px converts them back). */
+static float hs_pt(double px) {
+    float d = g_win ? SDL_GetWindowPixelDensity(g_win) : 1.0f;
+    return (float)(px / (d > 0 ? d : 1.0f));
+}
+
+static void hs_mouse(int type, double x, double y, int button) {
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = (Uint32)type;
+    if (type == SDL_EVENT_MOUSE_MOTION) {
+        e.motion.windowID = SDL_GetWindowID(g_win);
+        e.motion.x = hs_pt(x); e.motion.y = hs_pt(y);
+    } else {
+        e.button.windowID = SDL_GetWindowID(g_win);
+        e.button.button = (Uint8)button;
+        e.button.down = type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        e.button.clicks = 1;
+        e.button.x = hs_pt(x); e.button.y = hs_pt(y);
+    }
+    on_event(&e);
+}
+
+static void hs_click_at(double x, double y, int button, int clicks) {
+    hs_mouse(SDL_EVENT_MOUSE_MOTION, x, y, 0);
+    for (int k = 1; k <= clicks; k++) {
+        SDL_Event e;
+        memset(&e, 0, sizeof e);
+        e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+        e.button.windowID = SDL_GetWindowID(g_win);
+        e.button.button = (Uint8)button; e.button.down = 1; e.button.clicks = (Uint8)k;
+        e.button.x = hs_pt(x); e.button.y = hs_pt(y);
+        on_event(&e);
+        e.type = SDL_EVENT_MOUSE_BUTTON_UP; e.button.down = 0;
+        on_event(&e);
+    }
+}
+
+/* One key, pressed and let go, with its modifiers held for it. */
+static int hs_key(const char *name, int ctrl, int shift, int alt) {
+    SDL_Keycode k = SDL_GetKeyFromName(name);
+    if (k == SDLK_UNKNOWN) return 0;
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = SDL_EVENT_KEY_DOWN;
+    e.key.windowID = SDL_GetWindowID(g_win);
+    e.key.key = k; e.key.down = 1;
+    e.key.mod = (SDL_Keymod)((ctrl ? SDL_KMOD_LCTRL : 0) | (shift ? SDL_KMOD_LSHIFT : 0) | (alt ? SDL_KMOD_LALT : 0));
+    on_event(&e);
+    /* The text SDL sends for the same press, when it types any: a printable
+     * key with no Ctrl or Alt. */
+    if (!ctrl && !alt && k >= 0x20 && k < 0x7f) {
+        char ch[2] = { (char)k, 0 };
+        if (shift && ch[0] >= 'a' && ch[0] <= 'z') ch[0] = (char)(ch[0] - 'a' + 'A');
+        SDL_Event t;
+        memset(&t, 0, sizeof t);
+        t.type = SDL_EVENT_TEXT_INPUT;
+        t.text.windowID = e.key.windowID;
+        t.text.text = ch;
+        on_event(&t);
+    }
+    g_claimed_text = 0;          /* the press is over: nothing more of it to drop */
+    e.type = SDL_EVENT_KEY_UP; e.key.down = 0;
+    on_event(&e);
+    return 1;
+}
+
+/* The keyboard's place, by automation id where it has one. */
+static const char *hs_focus(void) {
+    if (g_focus == g_srch && g_srch) return "topbar.search";
+    if (g_ed_focus) return "composer";
+    return "";
+}
+
+static void hs_tree_reply(void) {
+    size_t cap = 1024 + (size_t)g_acc_last_n * 900, o = 0;
+    char *out = malloc(cap);
+    if (!out) { oc_harness_reply("{\"ok\":false,\"error\":\"memory\"}", NULL, 0); return; }
+    o += (size_t)snprintf(out + o, cap - o, "{\"ok\":true,\"frame\":%llu,\"focus\":\"%s\",\"items\":[",
+                          (unsigned long long)g_frames, hs_focus());
+    for (int i = 0; i < g_acc_last_n; i++) {
+        const oc_acc_item *it = &g_acc_last[i];
+        char nm[700], id[140];
+        oc_json_escape(it->name, nm, sizeof nm);
+        oc_json_escape(it->aid, id, sizeof id);
+        o += (size_t)snprintf(out + o, cap - o, "%s{\"kind\":%d,\"id\":\"%s\",\"name\":\"%s\",\"l\":%d,\"t\":%d,\"r\":%d,\"b\":%d}",
+                              i ? "," : "", (int)it->kind, id, nm, it->l, it->t, it->r, it->b);
+    }
+    snprintf(out + o, cap - o, "]}");
+    oc_harness_reply(out, NULL, 0);
+    free(out);
+}
+
+/* Settings a run chooses: DPI, window size, timezone, theme, text size. */
+static void hs_settings(const oc_hcmd *c) {
+    double v;
+    char sv[64];
+    if (oc_hcmd_num(c, "dpi", &v) && v >= 48 && v <= 480) dpi_set(g_main, (unsigned)v);
+    double w = 0, h = 0;
+    if (oc_hcmd_num(c, "w", &w) && oc_hcmd_num(c, "h", &h) && w >= 320 && h >= 240)
+        SDL_SetWindowSize(g_win, (int)hs_pt(w), (int)hs_pt(h));
+    if (oc_hcmd_str(c, "tz", sv, sizeof sv)) {
+#ifdef _WIN32
+        _putenv_s("TZ", sv);
+        _tzset();
+#else
+        setenv("TZ", sv, 1);
+        tzset();
+#endif
+    }
+    if (oc_hcmd_str(c, "theme", sv, sizeof sv)) g_hs_theme = !strcmp(sv, "light") ? OC_THEME_LIGHT : OC_THEME_DARK;
+    if (oc_hcmd_num(c, "textsize", &v) && v >= 0 && v <= 3) g_hs_textsize = (int)v;
+    if (oc_hcmd_num(c, "density", &v) && (v == 0 || v == 1)) g_hs_density = (int)v;
+    if (oc_hcmd_num(c, "front", &v)) g_hs_front = v != 0;
+    if (oc_hcmd_str(c, "motion", sv, sizeof sv))
+        /* "reduced" is the preference's ON (reduce motion); "on" is motion
+         * as designed, the preference's OFF. */
+        g_hs_motion = !strcmp(sv, "reduced") ? OC_MOTION_ON : !strcmp(sv, "system") ? OC_MOTION_SYSTEM : OC_MOTION_OFF;
+    hs_assert_settings();
+    layout_composer(g_main);
+}
+
+/* Signed in as a driver's sign-in gave (oc_test_signin): straight into the
+ * shell, the sign-in card's browser step being the driver's already. */
+static int hs_signin(const oc_hcmd *c) {
+    char ws[256], host[256], src[64], ver[160], tok[2048], fp[160];
+    double port = 0;
+    if (!oc_hcmd_str(c, "ws", ws, sizeof ws) || !oc_hcmd_str(c, "host", host, sizeof host) ||
+        !oc_hcmd_num(c, "port", &port) || !oc_hcmd_str(c, "token", tok, sizeof tok)) return 0;
+    if (!oc_hcmd_str(c, "source", src, sizeof src)) snprintf(src, sizeof src, "local");
+    if (!oc_hcmd_str(c, "verifier", ver, sizeof ver)) ver[0] = '\0';
+    if (!oc_hcmd_str(c, "fp", fp, sizeof fp)) fp[0] = '\0';    /* the daemon's certificate, pinned */
+    snprintf(g_host, sizeof g_host, "%s", host);
+    g_port = (int)port;
+    ws_key(ws, g_cur_ws, sizeof g_cur_ws);
+    g_cred[0] = '\0';
+    oc_signin_result res = { src, ver, tok, NULL };
+    oc_client *cl = oc_client_start_signin_result(g_cur_ws, g_host, g_port, &res, NULL, NULL, 0, fp[0] ? fp : NULL);
+    if (!cl) return 0;
+    if (g_client) ws_save_active();
+    g_client = cl; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_prefs_read = 0; g_n_backfilled = 0;
+    ws_register();
+    g_view = VIEW_HOME;
+    layout_composer(g_main);
+    return 1;
+}
+
+/* The barrier: the daemon answers once everything this client sent before is
+ * done, and the answer is folded in after every event ahead of it. What is
+ * waited on is that answer, never a time. What the answers bring can prompt
+ * the client to ask for more -- on a tick, or when a panel is drawn (a
+ * conversation's members) -- so each round is taken in, ticked and drawn, and
+ * rounds repeat until one prompted no request: then the screen is what the
+ * daemon holds. */
+#define HS_SYNC_ROUNDS 64
+static int hs_sync(void) {
+    if (!g_client) return 0;
+    on_tick(g_main);                           /* what the screen asks for now */
+    paint_now();
+    for (int round = 0; round < HS_SYNC_ROUNDS; round++) {
+        uint64_t tok = ++g_sync_next;
+        oc_client_sync(g_client, tok);
+        uint64_t after_sync = oc_client_cmds_sent(g_client);
+        for (;;) {
+            oc_client_tick(g_client);
+            const oc_model *m = oc_client_model(g_client);
+            if (m && m->sync_done == tok) break;
+            SDL_Delay(0);   /* the network thread's turn; no time is waited for */
+        }
+        on_tick(g_main);                       /* the answers, reacted to */
+        paint_now();
+        if (oc_client_cmds_sent(g_client) == after_sync) return 1;
+    }
+    return 0;                                  /* never settled: a loop of requests */
+}
+
+/* One command, answered: the harness's turn of the loop, which pump() takes
+ * in place of its own (so a modal form's nested loop is driven by the driver
+ * too). -1 when the driver has gone or said quit. */
+static int *g_hs_open;           /* the command being carried out still owes its answer */
+
+static int harness_step(void) {
+    static char line[65536];
+    /* Called from inside a command: it opened something modal, whose loop
+     * turns here. That command is answered now, with the modal drawn, so the
+     * driver can go on to drive it. */
+    if (g_hs_open && *g_hs_open) {
+        *g_hs_open = 0;
+        if (g_client) oc_client_tick(g_client);
+        on_tick(g_main);
+        hs_assert_settings();
+        paint_now();
+        char out[96]; snprintf(out, sizeof out, "{\"ok\":true,\"frame\":%llu}", (unsigned long long)g_frames);
+        if (oc_harness_reply(out, NULL, 0) != 0) return -1;
+    }
+    int open = 1, *outer = g_hs_open;
+    g_hs_open = &open;
+    int rc = 0;
+    {
+        if (oc_harness_read_line(line, sizeof line) < 0) { oc_harness_close(); g_hs_open = outer; return -1; }
+        oc_hcmd *c = oc_hcmd_parse(line);
+        char cmd[32] = "", err[96] = "";
+        if (!c || !oc_hcmd_str(c, "cmd", cmd, sizeof cmd)) snprintf(err, sizeof err, "not a command");
+        double x = 0, y = 0, v = 0;
+        char sv[512];
+        int draw = 1;
+        if (err[0]) {
+        } else if (!strcmp(cmd, "quit")) {
+            oc_harness_reply("{\"ok\":true}", NULL, 0);
+            oc_hcmd_free(c);
+            oc_harness_close();
+            g_hs_open = outer;
+            return -1;
+        } else if (!strcmp(cmd, "settings")) {
+            hs_settings(c);
+        } else if (!strcmp(cmd, "clock")) {
+            if (oc_hcmd_num(c, "set_ms", &v)) clock_hold((uint64_t)v);
+            else if (oc_hcmd_num(c, "advance_ms", &v) && g_clock_held) clock_advance((uint64_t)v);
+            else snprintf(err, sizeof err, "clock: set_ms, or advance_ms once set");
+        } else if (!strcmp(cmd, "signin")) {
+            if (!hs_signin(c)) snprintf(err, sizeof err, "signin: could not start");
+        } else if (!strcmp(cmd, "sync")) {
+            if (!hs_sync()) snprintf(err, sizeof err, "sync: no connection");
+        } else if (!strcmp(cmd, "click")) {
+            double bt = 1, n = 1;
+            oc_hcmd_num(c, "clicks", &n);
+            if (oc_hcmd_str(c, "button", sv, sizeof sv)) bt = !strcmp(sv, "right") ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+            if (oc_hcmd_str(c, "id", sv, sizeof sv)) {
+                int found = -1;
+                for (int i = 0; i < g_acc_last_n && found < 0; i++) if (!strcmp(g_acc_last[i].aid, sv)) found = i;
+                if (found < 0) snprintf(err, sizeof err, "click: no such id");
+                else if (g_acc_last[found].invoke && bt == SDL_BUTTON_LEFT && n == 1)
+                    on_a11y_invoke(g_main, g_acc_last[found].invoke);   /* as a click would */
+                else
+                    hs_click_at((g_acc_last[found].l + g_acc_last[found].r) / 2.0,
+                                (g_acc_last[found].t + g_acc_last[found].b) / 2.0, (int)bt, (int)n);
+            } else if (oc_hcmd_num(c, "x", &x) && oc_hcmd_num(c, "y", &y)) {
+                hs_click_at(x, y, (int)bt, (int)n);
+            } else snprintf(err, sizeof err, "click: id, or x and y");
+        } else if (!strcmp(cmd, "move")) {
+            if (oc_hcmd_num(c, "x", &x) && oc_hcmd_num(c, "y", &y)) hs_mouse(SDL_EVENT_MOUSE_MOTION, x, y, 0);
+            else snprintf(err, sizeof err, "move: x and y");
+        } else if (!strcmp(cmd, "key")) {
+            double ct = 0, sh = 0, al = 0;
+            oc_hcmd_num(c, "ctrl", &ct); oc_hcmd_num(c, "shift", &sh); oc_hcmd_num(c, "alt", &al);
+            if (!oc_hcmd_str(c, "key", sv, sizeof sv) || !hs_key(sv, ct != 0, sh != 0, al != 0))
+                snprintf(err, sizeof err, "key: an SDL key name");
+        } else if (!strcmp(cmd, "text")) {
+            if (oc_hcmd_str(c, "s", sv, sizeof sv)) {
+                SDL_Event e;
+                memset(&e, 0, sizeof e);
+                e.type = SDL_EVENT_TEXT_INPUT;
+                e.text.windowID = SDL_GetWindowID(g_win);
+                e.text.text = sv;
+                on_event(&e);
+            } else snprintf(err, sizeof err, "text: s");
+        } else if (!strcmp(cmd, "wheel")) {
+            if (oc_hcmd_num(c, "x", &x) && oc_hcmd_num(c, "y", &y) && oc_hcmd_num(c, "dy", &v)) {
+                SDL_Event e;
+                memset(&e, 0, sizeof e);
+                e.type = SDL_EVENT_MOUSE_WHEEL;
+                e.wheel.windowID = SDL_GetWindowID(g_win);
+                e.wheel.mouse_x = hs_pt(x); e.wheel.mouse_y = hs_pt(y);
+                e.wheel.y = (float)v; e.wheel.integer_y = (int)v;
+                on_event(&e);
+            } else snprintf(err, sizeof err, "wheel: x, y and dy");
+        } else if (!strcmp(cmd, "frame")) {
+            /* nothing but the frame */
+        } else if (!strcmp(cmd, "tree") || !strcmp(cmd, "shot")) {
+            draw = 0;                         /* of the frame already drawn */
+        } else {
+            snprintf(err, sizeof err, "unknown command");
+        }
+        oc_hcmd_free(c);
+        g_hs_open = outer;
+        if (!open) return 0;             /* answered already, by the modal's turn */
+        if (draw) {
+            /* What the core has, taken in; the tick's work; one frame. */
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) on_event(&ev);   /* a visible window's own */
+            if (g_client) oc_client_tick(g_client);
+            on_tick(g_main);
+            hs_assert_settings();
+            paint_now();
+        }
+        if (err[0]) {
+            char out[160]; snprintf(out, sizeof out, "{\"ok\":false,\"error\":\"%s\"}", err);
+            if (oc_harness_reply(out, NULL, 0) != 0) rc = -1;
+        } else if (!strcmp(cmd, "tree")) {
+            hs_tree_reply();
+        } else if (!strcmp(cmd, "shot")) {
+            char out[128];
+            size_t n = g_shot ? (size_t)g_shot_w * (size_t)g_shot_h * 4u : 0;
+            snprintf(out, sizeof out, "{\"ok\":true,\"frame\":%llu,\"w\":%d,\"h\":%d,\"bytes\":%zu}",
+                     (unsigned long long)g_frames, g_shot ? g_shot_w : 0, g_shot ? g_shot_h : 0, n);
+            if (oc_harness_reply(out, g_shot, n) != 0) rc = -1;
+        } else {
+            char out[96]; snprintf(out, sizeof out, "{\"ok\":true,\"frame\":%llu}", (unsigned long long)g_frames);
+            if (oc_harness_reply(out, NULL, 0) != 0) rc = -1;
+        }
+    }
+    return rc;
+}
+
 /* ==== main ================================================================== */
 
 int main(int argc, char *argv[]) {
@@ -44265,6 +44653,28 @@ int main(int argc, char *argv[]) {
         printf("openchime %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
         return 0;
     }
+    /* `--harness <port> --harness-token <t> [--harness-headless]`: driven by a
+     * test over a local connection (docs/details/TESTING.md, "The UI harness"),
+     * with nothing of a person's installation touched: no remembered
+     * workspace, no stored session, no tray, toast or link registration. */
+    int harness_port = 0, harness_headless = 0;
+    const char *harness_token = NULL, *harness_host = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--harness") && i + 1 < argc) harness_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--harness-token") && i + 1 < argc) harness_token = argv[++i];
+        else if (!strcmp(argv[i], "--harness-host") && i + 1 < argc) harness_host = argv[++i];
+        else if (!strcmp(argv[i], "--harness-headless")) harness_headless = 1;
+    }
+    if (harness_port) {
+        if (!harness_token || !harness_token[0]) return 2;
+        g_harness = 1;
+        g_geom_applied = 1;          /* the window's size is the driver's, not a stored one */
+        /* SDL's software renderer whatever the window, so the same settings
+         * draw the same pixels; headless, the offscreen video driver. */
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+        if (harness_headless) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+        argc = 1;
+    }
     /* Before anything else, so a crash during startup is reported too. */
     oc_plat_boot();
 
@@ -44273,7 +44683,7 @@ int main(int argc, char *argv[]) {
     crumbs_start();
     crumb("start");
 
-    g_secret = oc_secret_open_os(oc_env_secret_service());
+    g_secret = g_harness ? NULL : oc_secret_open_os(oc_env_secret_service());
     oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:
@@ -44325,7 +44735,7 @@ int main(int argc, char *argv[]) {
         char key[288]; ws_key(aws, key, sizeof key);
         if (have_stored_token(key)) direct = 1;
         else snprintf(pre_ws, sizeof pre_ws, "%s", aws);
-    } else {
+    } else if (!g_harness) {
         int have_last = pick_last_workspace(pre_ws, sizeof pre_ws, pre_user, sizeof pre_user);
         if (have_last && have_stored_token(pre_ws)) {
             snprintf(aws, sizeof aws, "%s", pre_ws);   /* silent reconnect: cred stays "" */
@@ -44349,6 +44759,8 @@ int main(int argc, char *argv[]) {
     }
     if (direct) {
         if (!acred[0]) boot_other_workspaces(aws);
+    } else if (g_harness) {
+        g_view = VIEW_SIGNIN;              /* until the driver signs in */
     } else {
         boot_other_workspaces(NULL);
         int first = ws_first_live(-1);
@@ -44404,6 +44816,7 @@ int main(int argc, char *argv[]) {
     oc_a11y_init(g_win);
     fields_create();
     composer_create(g_main);
+    if (!g_harness) {
     g_tray_live = oc_plat_tray_init(g_win, "OpenChime");
     snprintf(g_aumid, sizeof g_aumid, "%s", OC_AUMID);
     {
@@ -44415,6 +44828,7 @@ int main(int argc, char *argv[]) {
      * than at install time only: a developer build, a portable copy and an
      * upgraded path all need it to point at THIS executable. */
     oc_plat_url_scheme_register(OC_URL_SCHEME);
+    }
 
     if (direct) g_geom_deadline = now_ms() + 1500;
     else { g_geom_applied = 1; show_and_focus(g_main); }
@@ -44430,6 +44844,13 @@ int main(int argc, char *argv[]) {
     oc_signin_wipe(rtoken, sizeof rtoken);
     invalidate();
     g_next_tick = now_ms() + TICK_MS;
+    if (g_harness) {
+        /* Driven: the window as a person would see it unless headless, and
+         * one frame per command from here on, no loop of its own. */
+        if (harness_headless) SDL_HideWindow(g_win);
+        paint_now();
+        if (oc_harness_dial(harness_host, harness_port, harness_token) != 0) g_quit = 1;
+    }
     while (!g_quit) pump();
 
     on_destroy(g_main);

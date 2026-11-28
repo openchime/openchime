@@ -14389,6 +14389,54 @@ static uint64_t wall_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
+/* The UI harness's barrier, at the writer (test hooks on): a connection's job
+ * is counted while outstanding, and by the time its result can be taken the
+ * count is back to 0 -- the decrement and the result are one step. A sweep
+ * run now is counted as the daemon's own work (connection 0) and leaves
+ * nothing outstanding once done. With the hooks off nothing is counted. */
+static void test_sync_outstanding(void) {
+    const char *mode = getenv("OPENCHIME_MODE");
+    char mode_was[32];
+    snprintf(mode_was, sizeof mode_was, "%s", mode ? mode : "");
+    setenv("OPENCHIME_MODE", "development", 1);
+    setenv("OPENCHIME_DEV_TEST_HOOKS", "on", 1);
+    char err[160];
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    const char *path = tdb("syncout.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (w) {
+        uint64_t alice = reg(w, "so-alice", "pw", OC_ROLE_OWNER);
+        CHECK(alice != 0);
+        CHECK(oc_dbwriter_outstanding(w, 77) == 0);
+        for (int i = 0; i < 20; i++) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 77);
+            j->user_id = alice;
+            oc_dbwriter_submit(w, j);
+            oc_dbres *r = wait_result(w);
+            CHECK(r && r->conn_id == 77);
+            CHECK(oc_dbwriter_outstanding(w, 77) == 0);   /* answered: nothing left */
+            oc_dbres_free(r);
+        }
+        oc_dbwriter_sweep_now(w);
+        CHECK(WAIT_UNTIL(oc_dbwriter_outstanding(w, 0) == 0, 30000));
+        oc_dbwriter_stop(w);
+    }
+    unsetenv("OPENCHIME_DEV_TEST_HOOKS");
+    if (mode_was[0]) setenv("OPENCHIME_MODE", mode_was, 1); else unsetenv("OPENCHIME_MODE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);                                /* hooks off: not counted */
+    if (w) {
+        oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 78);
+        j->user_id = 1;
+        oc_dbwriter_submit(w, j);
+        CHECK(oc_dbwriter_outstanding(w, 78) == 0);
+        oc_dbres_free(wait_result(w));
+        oc_dbwriter_stop(w);
+    }
+}
+
 static void test_timed_mute(void) {
     const char *path = tdb("timedmute.db");
     cleanup_db(path);
@@ -14474,6 +14522,7 @@ int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_sync_outstanding();
     test_timed_mute();
     test_search_conversation_scope();
     test_call_recordings();

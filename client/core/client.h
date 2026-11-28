@@ -184,6 +184,14 @@ void oc_client_search_in(oc_client *c, const char *query, uint8_t sort, uint64_t
 void oc_client_search_more(oc_client *c);
 void oc_client_close_search(oc_client *c);
 
+/* A test harness's barrier (protocol 54): ask the daemon to answer once
+ * everything this client sent before is done; its answer sets the model's
+ * `sync_done` to `token` (non-zero), after every earlier event is folded. */
+void oc_client_sync(oc_client *c, uint64_t token);
+/* How many commands this client has ever handed its network thread: a
+ * harness's sync repeats until a round's answers prompted none. */
+uint64_t oc_client_cmds_sent(oc_client *c);
+
 /* Channel management: create a public channel, join / leave one. The server
  * answers with a CHANNEL_INFO that folds into the channel list. */
 void oc_client_create_channel(oc_client *c, const char *name);          /* public */

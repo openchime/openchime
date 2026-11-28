@@ -117,6 +117,7 @@ int run_e2e_tests(void);
 int run_pdm_crypto_tests(void);
 int run_call_media_tests(void);
 int run_share_media_tests(void);
+int run_ui_harness_tests(void);
 
 /* ---- when the binary itself dies ---------------------------------------------
  *
@@ -288,7 +289,10 @@ static void print_times(void) {
  *            daemon or the client, or real-time media, whose sanitizer run
  *            would cost minutes against the pass's 30 seconds; the suites that
  *            test those threads directly keep theirs. */
-enum suite_tier { FAST, FULL };
+/* UI is the UI harness (tests/ui/, docs/details/TESTING.md "The UI harness"):
+ * it drives the desktop build on a desktop, so it is in neither suite and runs
+ * only when named (`make test-ui`). */
+enum suite_tier { FAST, FULL, UI };
 enum { PLAIN = 0, THREADS = 1, TIMED = 2, WALK = 3 };
 #define S(fn, tier, threads) { #fn, fn, tier, threads }
 static const struct suite {
@@ -386,9 +390,16 @@ static const struct suite {
     S(run_pdm_crypto_tests,      FAST, PLAIN),
     S(run_call_media_tests,      FAST, PLAIN),
     S(run_share_media_tests,     FAST, THREADS),
+    S(run_ui_harness_tests,      UI,   WALK),
 };
 #undef S
 enum { N_SUITES = sizeof SUITES / sizeof SUITES[0] };
+
+/* A suite this run takes: a UI suite only when OC_TEST_ONLY names it. */
+static int suite_runs(const struct suite *s) {
+    if (s->tier == UI && !(g_only && *g_only && listed(g_only, s->name))) return 0;
+    return suite_wanted(s->name);
+}
 
 /* Which suites start threads (TESTING.md §2.4). Only those marked THREADS in
  * SUITES[] run under ThreadSanitizer, and whether a suite starts one depends
@@ -506,7 +517,7 @@ static int run_parallel(int max_jobs) {
     if (max_jobs > (int)(sizeof jobs / sizeof jobs[0])) max_jobs = (int)(sizeof jobs / sizeof jobs[0]);
     int n = 0, total = 0;
     for (int i = 0; i < N_SUITES; i++) {
-        if (!suite_wanted(SUITES[i].name)) continue;
+        if (!suite_runs(&SUITES[i])) continue;
         g_ran++;
         if (n == max_jobs) total += job_reap(jobs, &n);
         if (job_start(&jobs[n], &SUITES[i]) == 0) n++;
@@ -528,8 +539,8 @@ static int list_suites(const char *which) {
         return 2;
     }
     for (int i = 0; i < N_SUITES; i++)
-        if (full || (fast && SUITES[i].tier == FAST) || (plain && SUITES[i].threads != THREADS) ||
-            (threads && SUITES[i].threads != PLAIN && SUITES[i].threads != WALK))
+        if (SUITES[i].tier != UI && (full || (fast && SUITES[i].tier == FAST) || (plain && SUITES[i].threads != THREADS) ||
+            (threads && SUITES[i].threads != PLAIN && SUITES[i].threads != WALK)))
             printf("%s\n", SUITES[i].name);
     return 0;
 }
@@ -561,7 +572,7 @@ int main(int argc, char **argv) {
         if (rounds > 1) printf("=== round %d of %d\n", round + 1, rounds);
         if (max_jobs > 1) { total += run_parallel(max_jobs); continue; }
         for (int i = 0; i < N_SUITES; i++)
-            if (suite_wanted(SUITES[i].name)) { g_ran++; total += run_here(&SUITES[i]); }
+            if (suite_runs(&SUITES[i])) { g_ran++; total += run_here(&SUITES[i]); }
     }
     if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
     print_times();

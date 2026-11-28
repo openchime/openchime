@@ -444,6 +444,8 @@ enum {
     /* A build's release notes (PROTOCOL.md §5.16r): `size` central's status
      * (200, 404), or 0 when they could not be fetched; `body` its body. */
     OC_EV_RELEASE_NOTES,
+    /* A test harness's barrier answered (SYNC_DONE): `message_id` the token. */
+    OC_EV_SYNC_DONE,
     /* A person's AI clients (AUTH.md §8.13). CONNECTION_REQUEST: what a code
      * names -- `preview` the code, `body` the client's name, `topic` where it
      * returns. CONNECTION_DECIDED: `status` 1 approved, 0 declined, `body` the
@@ -874,6 +876,8 @@ enum {
     OC_CMD_REVOKE_AGENT_TOKEN,
     /* RELEASE_NOTES: body = the build id (PROTOCOL.md §5.16r). */
     OC_CMD_RELEASE_NOTES,
+    /* SYNC, a test harness's barrier: message_id = the token. */
+    OC_CMD_SYNC,
     /* A person's AI clients: CONNECTION_CODE body = the code; CONNECTION_DECIDE
      * body = the code, op = approve, message_id = the lifetime in days;
      * LIST_CONNECTIONS op = everyone's; REVOKE_CONNECTION message_id = the

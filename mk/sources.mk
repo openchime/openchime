@@ -122,7 +122,7 @@ FUZZ_RUNS_webauthn := 33000
 FUZZ_RUNS_idtoken  := 20000
 FUZZ_RUNS_image    := 6000
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/linux_gui_test.c,$(wildcard tests/*.c)) \
-            $(FUZZ_HARNESS_SRC)
+            $(FUZZ_HARNESS_SRC) $(wildcard tests/ui/*.c)
 TEST_BIN := build/tests
 
 # --- Client app-core (ARCH-74) ------------------------------------------------

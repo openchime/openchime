@@ -7182,6 +7182,75 @@ static void test_search_conversation_scope_vertical(int port, const uint8_t *pin
     client_close(&a);
 }
 
+/* A test harness's barrier (protocol 54): with the test hooks off a SYNC is
+ * no type this daemon knows; with them on, SYNC_DONE comes after every frame
+ * the connection's earlier work produced, and a second connection's SYNC after
+ * the fan-out of that work to it. */
+static int send_sync(client *c, uint64_t token) {
+    uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_sync s = { token };
+    if (oc_encode_sync(&w, OC_PROTOCOL_VERSION, &s) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+/* Read up to SYNC_DONE `token`; whether a frame of `want` came before it. */
+static int saw_before_sync(client *c, uint64_t token, uint16_t want) {
+    int saw = 0;
+    for (int i = 0; i < 400; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == want) saw = 1;
+        if (hdr.msg_type == OC_MSG_SYNC_DONE) {
+            oc_sync d; if (oc_decode_sync(&p, &d) != OC_OK) return -1;
+            if (d.token == token) return saw;
+        }
+    }
+    return -1;
+}
+
+static void test_sync_barrier(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    /* Off: refused, as a frame this daemon does not define. */
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(send_sync(&a, 1) == 0);
+    {
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
+        oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_UNEXPECTED_MSG_TYPE);
+    }
+    client_close(&a);
+
+    char cfgerr[128];
+    /* The mode as it was, put back after: the tests around this one set it. */
+    const char *was = getenv("OPENCHIME_MODE");
+    char mode_was[32]; snprintf(mode_was, sizeof mode_was, "%s", was ? was : "");
+    setenv("OPENCHIME_MODE", "development", 1);
+    setenv("OPENCHIME_DEV_TEST_HOOKS", "on", 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    /* Settled first: whatever signing in queued is behind each barrier. */
+    CHECK(send_sync(&a, 10) == 0); CHECK(saw_before_sync(&a, 10, 0) >= 0);
+    CHECK(send_sync(&b, 11) == 0); CHECK(saw_before_sync(&b, 11, 0) >= 0);
+
+    /* A send and the barrier right behind it: the echo comes first. */
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = OC_DEFAULT_CHANNEL; memset(s.idem, 0xEB, OC_IDEM_SIZE);
+    s.body = oc_slice_str("before the barrier");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(send_sync(&a, 12) == 0);
+    CHECK(saw_before_sync(&a, 12, OC_MSG_BROADCAST) == 1);
+    /* The fan-out reached bob before his own barrier's answer. */
+    CHECK(send_sync(&b, 13) == 0);
+    CHECK(saw_before_sync(&b, 13, OC_MSG_BROADCAST) == 1);
+
+    client_close(&b);
+    client_close(&a);
+    unsetenv("OPENCHIME_DEV_TEST_HOOKS");
+    if (mode_was[0]) setenv("OPENCHIME_MODE", mode_was, 1); else unsetenv("OPENCHIME_MODE");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+}
+
 static void test_call_chat(int port, const uint8_t *pin) {
     client a, b, c;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -10861,6 +10930,7 @@ int run_netloop_tests(void) {
         test_call_message(arg.port, pin);
         test_call_chat(arg.port, pin);
         test_search_conversation_scope_vertical(arg.port, pin);
+        test_sync_barrier(arg.port, pin);
         test_call_history(arg.port, pin, dbw);
         test_call_recording(arg.port, pin);
         test_calls_closed_at_start();

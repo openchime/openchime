@@ -574,6 +574,8 @@ typedef struct {
     /* The open search view (REQ-080): the query and its hits. */
     uint8_t   search_open;
     char      search_query[128];
+    /* The last SYNC_DONE token a test harness's barrier was answered with. */
+    uint64_t  sync_done;
     uint8_t   search_sort;       /* OC_SEARCH_*: the order the hits are in */
     uint64_t  search_scope;      /* one conversation by id, 0 for none (REQ-080) */
     oc_search_result *search_results;
@@ -1380,6 +1382,10 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms);
  * from HERE rather than its own source, or the two disagree and the countdown
  * jumps. */
 uint64_t oc_model_now_ms(void);
+/* Hold the model's clocks at these (monotonic and wall, ms) until called again;
+ * 0 and 0 give them back to the system. For a test harness, which steps time
+ * rather than waiting for it. */
+void oc_model_clock_hold(uint64_t mono_ms, uint64_t wall_ms);
 
 /* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */

@@ -221,8 +221,10 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 53** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 54** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 54 added `SYNC` and `SYNC_DONE`, a test harness's barrier, answered only by a
+> daemon with its test hooks on (§5.16s). Version
 > 53 appended `channel_id` (u64) to `SEARCH`, after `cursor_rank`: a search
 > limited to one conversation by id, a DM's included (REQ-080, §5.11). Version
 > 52 appended `minutes` (u32) to `SET_MUTE`, after `muted`, and
@@ -3840,6 +3842,34 @@ OpenChime services, or one central did not answer, gets
 **`RELEASE_NOTES_UNAVAILABLE` 3088**; the client then offers the notes page.
 New frames: no version bump.
 
+### 5.16s A test harness's barrier (TESTING.md, "The UI harness")
+
+A test that drives a client against a real daemon ends each step on the
+daemon's word that it has finished, never on a time.
+
+```
+SYNC (0x015C), C → S
+  token  u64     non-zero, the test's name for this barrier
+
+SYNC_DONE (0x015D), S → C
+  token  u64     as sent
+```
+
+`SYNC_DONE` is sent once everything the connection sent before the `SYNC` has
+been done: every job of it the writer took is answered, its results are sent
+in order ahead of `SYNC_DONE` on this connection, and their fan-out to every
+other connection is queued ahead of anything those connections are sent
+next. Work the daemon starts on its own -- the timed sweeps a test runs with
+`oc_dbwriter_sweep_now` -- is counted too, so a `SYNC` after a sweep is
+answered only once it is done. A second `SYNC` before the first is answered
+replaces it: only the later token is answered.
+
+It is answered only when the daemon's test hooks are on
+(`OPENCHIME_DEV_TEST_HOOKS`, a development setting, off by default, CONFIG.md);
+otherwise `SYNC` is a type the daemon does not know, and refused as one (§8).
+Work done off the writer -- a link's preview, a push to a phone -- is not
+waited for.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -4424,6 +4454,8 @@ this table cannot silently gain a shared value.
 | `0x0159` | `DELETE_OUTGOING_WEBHOOK` | C → S | delete one (§5.15a) |
 | `0x015A` | `RELEASE_NOTES_GET` | C → S | a build's release notes (§5.16r) |
 | `0x015B` | `RELEASE_NOTES` | S → C | central's answer: status and body (§5.16r) |
+| `0x015C` | `SYNC` | C → S | a test harness's barrier, test hooks only (§5.16s) |
+| `0x015D` | `SYNC_DONE` | S → C | everything sent before it is done (§5.16s) |
 
 ## 10. Connection state machine
 

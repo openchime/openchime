@@ -782,6 +782,102 @@ GUI"):
     make build/sdltext_test && build/sdltext_test
     make build/linux_gui_test && dbus-run-session build/linux_gui_test
 
+### 2.2d The UI harness
+
+The desktop client, driven by a test against a real daemon, step by step,
+with every screen and its accessibility tree compared exactly against a
+reference. `make test-ui` runs it, here only: it needs `build/openchime.exe`
+and a machine that runs Windows programs (WSL), so it is in neither suite.
+Its suite, `run_ui_harness_tests` (`tests/ui/ui_harness.c`), is in
+`build/tests` marked `UI`, which `--list` never names and a run takes only
+when `OC_TEST_ONLY` names it.
+
+**Nothing in it waits.** No step sleeps, polls a time or has a timeout: a
+step ends when its command is answered, and one that needs the daemon ends on
+the daemon's barrier (`sync`). A harness test that needs a wait is wrong.
+
+**The pieces.**
+
+- The **driver** (`tests/ui/driver.c`, `driver.h`) starts a daemon in the
+  test binary's process (`oc_netloop_run_ex`) on a fresh database and data
+  directory, with its test hooks on (`OPENCHIME_DEV_TEST_HOOKS`), its writer's
+  clock held (`oc_dbwriter_hold_clock_ms`), a workspace name, and alice
+  (owner), bob and carol. It listens for each client, launches it, signs it
+  in through the daemon's page (`oc_test_signin`) and hands it the result.
+- The **client** with `--harness <port> --harness-token <t>` connects to the
+  driver (`--harness-host`, an IPv4 address; 127.0.0.1 unless given) and
+  presents the token; a wrong one is refused and the client ends. It then
+  takes one JSON command per line and answers each with one JSON line. Its
+  transport is `client/gui/app/harness.c`; the commands are `app.c`'s
+  (`harness_step`), because it is the app's state they change. It touches
+  nothing of a person's installation: no remembered workspace, no stored
+  session, no tray, toast or link registration. It draws with SDL's software
+  renderer, and with `--harness-headless` on SDL's offscreen video driver.
+- **One command, one frame.** The loop is the client's own `pump()`: in
+  harness mode each turn reads one command, applies it, takes in what the
+  core has, ticks, draws exactly one frame, and answers with that frame's
+  number. A command that opens something modal (a form, with its own loop) is
+  answered once it is drawn, and the driver drives the modal next.
+- **The clocks are held.** Every clock the client reads -- `now_ms()`, its
+  wall clock, the core's -- is one source the driver sets (`clock
+  {set_ms}`) and steps (`clock {advance_ms}`); outside harness mode it reads
+  the system's. The daemon's writer clock is held too; `ui_daemon_advance`
+  steps it and `ui_daemon_sweep` runs its timed sweeps (scheduled messages,
+  reminders, expiring mutes) now.
+- **The barrier.** `sync` sends `SYNC` (PROTOCOL.md §5.16s) and answers once
+  `SYNC_DONE` is folded into the model: everything the client sent before is
+  done and its results and fan-out taken in. What arrives can prompt the
+  client to ask for more (a conversation drawn asks for its members), so a
+  round is taken in, ticked and drawn, and rounds repeat until one prompted
+  no request. Not covered: work off the daemon's writer, such as a link's
+  preview or a push to a phone.
+
+**Settings are the run's.** `settings` takes `dpi` (the display scale: 96 is
+100 %, 144 is 150 %), `w` and `h` (the window, in pixels), `tz`, `theme`
+(`dark`, `light`), `textsize` (0-3), `density` (0 compact, 1 cozy), `motion`
+(`on` as designed, `reduced`, `system`) and `front` (whether the window is in
+front of a person: 1 unless set). They are kept over whatever a workspace's
+stored preferences say once it signs in. Nothing is read from the desktop:
+not its scale, its reduced-motion setting, nor which window has the
+keyboard, so a run is the same headless or visible.
+
+**The commands.**
+
+| Command | Members | Does |
+|---|---|---|
+| `settings` | as above | sets them |
+| `clock` | `set_ms`, or `advance_ms` once set | holds or steps the clock |
+| `signin` | `ws`, `host`, `port`, `fp`, `source`, `verifier`, `token` | signs in with a browser sign-in's result; `fp` pins the daemon's certificate |
+| `sync` | | the barrier, above |
+| `click` | `id`, or `x` and `y`; `button` (`left`, `right`), `clicks` | by automation id runs what the accessibility invoke runs (a left single click), else a click at the item's centre; by position, in the frame's pixels |
+| `move` | `x`, `y` | the pointer |
+| `key` | `key` (an SDL key name), `ctrl`, `shift`, `alt` | one press, its text with it when it types one |
+| `text` | `s` | typed text |
+| `wheel` | `x`, `y`, `dy` | the wheel |
+| `frame` | | one frame, nothing else |
+| `tree` | | the accessibility items of the last frame (kind, id, name, rect in pixels) and the keyboard's place (`focus`); no frame |
+| `shot` | | the last frame's pixels: `{w, h, bytes}`, then that many bytes of RGBA; no frame |
+| `quit` | | the client ends |
+
+**References.** `ui_check(client, test, step, settings)` compares the tree
+and the frame with `tests/ui/ref/<test>/<step>@<settings>.tree.json` and
+`.png`, exactly; a reference belongs to its settings, so the same step at 96
+and 144 DPI is two. A difference, or a reference missing, fails naming the
+file, and what was seen is left under `build/ui-out/`. `OC_UI_UPDATE=1`
+writes the references instead; a reference is reviewed like code.
+
+**Running it.**
+
+    make test-ui                        # headless
+    OC_UI_VISIBLE=1 make test-ui        # each client in a window, to watch
+    OC_UI_UPDATE=1 make test-ui         # write the references
+    OC_UI_TRACE=1 make test-ui          # each command and its answer
+
+Under WSL the driver meets the client on WSL's own address, which Windows
+reaches directly: WSL's forwarding of 127.0.0.1 takes up a newly opened port
+only some time later, and a client that connects first is refused.
+`OC_UI_HOST` names another address.
+
 ### 2.3 Determinism rules
 
 Unit tests must be reproducible and independent of wall-clock or environment:

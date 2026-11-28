@@ -271,8 +271,12 @@
  *
  * 53: SEARCH carries `channel_id` (u64) after `cursor_rank`, a search limited
  * to one conversation by id, a DM's included (REQ-080). A field appended to a
- * fixed layout. */
-#define OC_PROTOCOL_VERSION 53u
+ * fixed layout.
+ *
+ * 54: SYNC and SYNC_DONE (0x015C, 0x015D), a test harness's barrier: the daemon
+ * answers SYNC once everything the connection sent before it has been done and
+ * sent, and only with its test hooks enabled. New frames. */
+#define OC_PROTOCOL_VERSION 54u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -758,6 +762,10 @@ typedef enum {
      * frames, so no version bump. */
     OC_MSG_RELEASE_NOTES_GET       = 0x015A, /* C->S, the notes of a build id */
     OC_MSG_RELEASE_NOTES           = 0x015B, /* S->C, central's answer: its status and body */
+    /* A test harness's barrier (protocol 54): answered only with the daemon's
+     * test hooks on, once every earlier frame of the connection is done. */
+    OC_MSG_SYNC                    = 0x015C, /* C->S, a token */
+    OC_MSG_SYNC_DONE               = 0x015D, /* S->C, the same token */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -2207,6 +2215,8 @@ typedef struct { uint64_t webhook_id; oc_slice secret; } oc_outgoing_webhook_sec
 #define OC_RELEASE_NOTES_MAX   60000u
 #define OC_BUILD_ID_MAX        64u
 typedef struct { oc_slice build_id; } oc_release_notes_get;
+/* SYNC and SYNC_DONE: the token the barrier is named by, echoed back. */
+typedef struct { uint64_t token; } oc_sync;
 typedef struct { oc_slice build_id; uint16_t status; oc_slice body; } oc_release_notes;
 typedef struct { uint64_t webhook_id; oc_slice url; oc_slice events; uint8_t enabled; oc_slice disabled_reason;
                  uint64_t created_by; uint64_t created_at_ms; uint16_t n_channels;
@@ -2731,6 +2741,8 @@ oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_rev
 oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m);
 oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m);
 oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m);
+oc_result oc_encode_sync(oc_wbuf *w, uint16_t version, const oc_sync *m);
+oc_result oc_encode_sync_done(oc_wbuf *w, uint16_t version, const oc_sync *m);
 oc_result oc_encode_release_notes(oc_wbuf *w, uint16_t version, const oc_release_notes *m);
 oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m);
@@ -3008,6 +3020,7 @@ oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
 oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m);
 oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m);
 oc_result oc_decode_release_notes_get(oc_rbuf *p, oc_release_notes_get *m);
+oc_result oc_decode_sync(oc_rbuf *p, oc_sync *m);   /* SYNC and SYNC_DONE alike */
 oc_result oc_decode_release_notes(oc_rbuf *p, oc_release_notes *m);
 /* Entries past `cap` are read and dropped; *out_count is the frame's count. */
 oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,

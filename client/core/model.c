@@ -194,7 +194,17 @@ static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
 /* One monotonic millisecond clock, owned by the core so a frontend and the net
  * thread cannot read different ones. mingw has no clock_gettime without linking
  * winpthread, and GetTickCount64 is the platform's monotonic tick anyway. */
+/* A held clock (oc_model_clock_hold): a test harness sets the monotonic and
+ * wall clocks the model reads, and steps them; 0 is the system's. */
+static uint64_t g_held_mono_ms, g_held_wall_ms;
+void oc_model_clock_hold(uint64_t mono_ms, uint64_t wall_ms) {
+    g_held_mono_ms = mono_ms;
+    g_held_wall_ms = wall_ms;
+}
+static time_t model_time(void) { return g_held_wall_ms ? (time_t)(g_held_wall_ms / 1000u) : time(NULL); }
+
 uint64_t oc_model_now_ms(void) {
+    if (g_held_mono_ms) return g_held_mono_ms;
 #ifdef _WIN32
     return (uint64_t)GetTickCount64();
 #else
@@ -292,7 +302,7 @@ void oc_model_clock(const oc_model *m, int64_t at_ms, oc_rt_clock *out) {
     out->tz_min = local_offset_min(at_ms);
     out->time24 = !(m && m->clock12);
     out->utc = 0;
-    out->now_ms = (int64_t)time(NULL) * 1000;
+    out->now_ms = (int64_t)model_time() * 1000;
 }
 
 size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out, size_t cap) {
@@ -313,7 +323,7 @@ static void preview_set(const oc_model *m, char *out, size_t cap, const char *te
     if (!text) { out[0] = '\0'; return; }
     if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler") && !strstr(text, ">!")) { snprintf(out, cap, "%s", text); return; }
     oc_rt_clock k;
-    oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
+    oc_model_clock(m, (int64_t)model_time() * 1000, &k);
     oc_rt_flatten_at(text, strlen(text), &k, out, cap);
 }
 
@@ -853,7 +863,7 @@ void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap) {
                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     /* The last moment it holds, so an end at midnight reads as the day before. */
     time_t t = (time_t)((mem->ooo_end - 1) / 1000);
-    time_t nowt = time(NULL);
+    time_t nowt = model_time();
     struct tm lt, nt;
     oc_localtime_r(&t, &lt);
     oc_localtime_r(&nowt, &nt);
@@ -1665,7 +1675,7 @@ static void attach_to_msg(oc_model *m, const oc_ev *e) {
  * One mark per person per conversation -- someone types in one place at a time,
  * so a mark from them elsewhere in it moves it there. */
 static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uint64_t thread_root) {
-    long long now = (long long)time(NULL);
+    long long now = (long long)model_time();
     size_t w = 0, found = (size_t)-1;
     for (size_t i = 0; i < m->n_typing; i++) {
         if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;   /* drop expired */
@@ -1689,7 +1699,7 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uin
 
 size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap) {
-    long long now = (long long)time(NULL);
+    long long now = (long long)model_time();
     size_t n = 0;
     for (size_t i = 0; i < m->n_typing && n < cap; i++) {
         if (m->typing[i].channel_id != channel_id) continue;
@@ -3701,6 +3711,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_SYNC_DONE:
+        m->sync_done = e->message_id;
         break;
     case OC_EV_RELEASE_NOTES:
         free(m->rn_body);

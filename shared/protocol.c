@@ -3190,6 +3190,23 @@ oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const 
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_sync(oc_wbuf *w, uint16_t version, const oc_sync *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SYNC);
+    oc_w_u64(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_sync_done(oc_wbuf *w, uint16_t version, const oc_sync *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SYNC_DONE);
+    oc_w_u64(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_sync(oc_rbuf *p, oc_sync *m) {
+    m->token = oc_r_u64(p);
+    return r_done(p);
+}
+
 oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_RELEASE_NOTES_GET);
     oc_w_str(w, m->build_id);

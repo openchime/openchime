@@ -76,6 +76,12 @@ struct oc_dbwriter {
     db_reader       readers[OC_DB_READERS];
     unsigned        next_reader;              /* for jobs no connection owns */
     oc_dbres      *res_head,  *res_tail;     /* writer|readers -> net */
+    /* With test hooks on (OPENCHIME_DEV_TEST_HOOKS): each connection's jobs
+     * submitted and not yet answered, conn 0 the daemon's own (the sweeps), so
+     * the net thread can tell when one is done with everything sent before a
+     * SYNC (oc_dbwriter_outstanding). Under `mu`, changed in the step that
+     * queues a job's results, so a count of 0 means they are queued. */
+    struct { uint64_t conn; uint32_t n; } work[256];
     /* The auth pool (AUTH.md §2): a password's key derivation -- deliberately
      * the slowest thing a sign-in does -- runs here, so a burst of sign-ins
      * does not hold the writer, and with it everyone's sends. */
@@ -157,11 +163,18 @@ void oc_dbwriter_advance_clock_ms(uint64_t ms) {
     else    __atomic_store_n(&g_dbw_clock_ahead_ms, 0, __ATOMIC_RELAXED);
 }
 
+static uint64_t g_dbw_clock_held_ms;   /* a test's held clock, 0 when it runs (dbwriter.h) */
+void oc_dbwriter_hold_clock_ms(uint64_t wall_ms) {
+    __atomic_store_n(&g_dbw_clock_held_ms, wall_ms, __ATOMIC_RELAXED);
+}
+
 static uint64_t dbw_now_ms(void) {
+    uint64_t held = __atomic_load_n(&g_dbw_clock_held_ms, __ATOMIC_RELAXED);
+    uint64_t ahead = __atomic_load_n(&g_dbw_clock_ahead_ms, __ATOMIC_RELAXED);
+    if (held) return held + ahead;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u +
-           __atomic_load_n(&g_dbw_clock_ahead_ms, __ATOMIC_RELAXED);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + ahead;
 }
 
 /* --- audit log (REQ-251, ARCH-79) ----------------------------------------- */
@@ -3755,7 +3768,7 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (j->enroll_quiet) { free(r); return NULL; }   /* push_result ignores NULL */
+    if (j->enroll_quiet) { free(r); return NULL; }   /* push_result_done queues nothing for NULL */
     if (rc == SQLITE_DONE) r->type = OC_RES_OK;
     else { r->err_code = OC_ERR_INTERNAL; }
     return r;
@@ -9943,7 +9956,7 @@ static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
  *
  * Only channels that actually MOVE produce a result, for the reason the single
  * ack has: a replayed catch-up must not fan a cursor nobody advanced. The
- * results are chained and the whole chain is queued at once (push_result), so
+ * results are chained and the whole chain is queued at once (push_result_done), so
  * sixty channels are one job and one wake rather than sixty of each. */
 static oc_dbres *process_mark_all_read(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
@@ -10403,22 +10416,57 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
 
 /* --- Queue plumbing ----------------------------------------------------- */
 
-static void push_result(oc_dbwriter *w, oc_dbres *r) {
-    if (!r) return;
-    /* A CHAIN, not a result: one job may answer with many (catch-up advances
-     * every channel at once). This used to clear `next` and take the head,
-     * which silently dropped the rest -- fine while every processor returned
-     * exactly one, and a leak plus a lost fan-out the moment one did not. */
-    oc_dbres *last = r;
-    while (last->next) last = last->next;
-    pthread_mutex_lock(&w->mu);
-    if (w->res_tail) w->res_tail->next = r; else w->res_head = r;
-    w->res_tail = last;
-    pthread_mutex_unlock(&w->mu);
-    uint64_t one = 1;
-    ssize_t wr = write(w->evfd, &one, sizeof one);
-    (void)wr;
+/* A job counted in (test hooks): one more outstanding for its connection. */
+static void work_add(oc_dbwriter *w, uint64_t conn) {
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && w->work[i].conn == conn) { w->work[i].n++; return; }
+    for (int i = 0; i < 256; i++)
+        if (!w->work[i].n) { w->work[i].conn = conn; w->work[i].n = 1; return; }
 }
+static void work_sub(oc_dbwriter *w, uint64_t conn) {
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && w->work[i].conn == conn) { w->work[i].n--; return; }
+}
+
+/* A job is done: its results queued and, with test hooks on, its count taken
+ * off in the same locked step -- so a count the net thread reads as 0 after
+ * draining the queue means every result of that connection's earlier jobs has
+ * been delivered. The net thread is woken even for a job with no result, so a
+ * SYNC waiting only on it is answered. */
+static void push_result_done(oc_dbwriter *w, oc_dbres *r, uint64_t conn, int counted) {
+    oc_dbres *last = r;
+    while (last && last->next) last = last->next;
+    pthread_mutex_lock(&w->mu);
+    if (r) {
+        if (w->res_tail) w->res_tail->next = r; else w->res_head = r;
+        w->res_tail = last;
+    }
+    if (counted) work_sub(w, conn);
+    pthread_mutex_unlock(&w->mu);
+    if (r || counted) {
+        uint64_t one = 1;
+        ssize_t wr = write(w->evfd, &one, sizeof one);
+        (void)wr;
+    }
+}
+
+uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn) {
+    uint32_t n = 0;
+    pthread_mutex_lock(&w->mu);
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && (w->work[i].conn == conn || w->work[i].conn == 0)) n += w->work[i].n;
+    pthread_mutex_unlock(&w->mu);
+    return n;
+}
+
+void oc_dbwriter_sweep_now(oc_dbwriter *w) {
+    static const int types[3] = { OC_JOB_FIRE_SCHEDULED, OC_JOB_FIRE_REMINDERS, OC_JOB_EXPIRE_MUTES };
+    for (int i = 0; i < 3; i++) {
+        oc_job *j = oc_job_new(types[i], 0);
+        if (j) oc_dbwriter_submit(w, j);
+    }
+}
+
 
 /* Relay a typing signal (REQ-121): resolve the channel's members so the net
  * thread can fan a TYPING_UPDATE to them. Read-only; no state kept. Members are
@@ -14382,7 +14430,7 @@ static oc_dbres *process_prune_device_token(sqlite3 *db, const oc_job *j) {
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
-    return NULL;   /* push_result ignores NULL */
+    return NULL;   /* push_result_done queues nothing for NULL */
 }
 
 /* The caller's full notification settings (REQ-130/131). Read. */
@@ -17499,8 +17547,10 @@ static void *writer_loop(void *arg) {
             r->joined = r->n_ulist != 0;
         }
         for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
-        if (!w->auth_deferred) job_free(j);   /* else the auth pool has it (process_auth) */
-        push_result(w, r);
+        uint64_t done_conn = j->conn_id;
+        int done = !w->auth_deferred, counted = done && j->counted;
+        if (done) job_free(j);   /* else the auth pool has it (process_auth) */
+        push_result_done(w, r, done_conn, counted);
         maybe_prune_idem(w);
     }
     return NULL;
@@ -17527,8 +17577,10 @@ static void *reader_loop(void *arg) {
         }
         oc_dbres *r = process_read(rd->rdb, j);
         for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
+        uint64_t done_conn = j->conn_id;
+        int counted = j->counted;
         job_free(j);
-        push_result(w, r);
+        push_result_done(w, r, done_conn, counted);
     }
     return NULL;
 }
@@ -17641,6 +17693,9 @@ size_t oc_dbwriter_auth_waiting(oc_dbwriter *w) { return oc_authpool_waiting(w->
 void oc_dbwriter_submit(oc_dbwriter *w, oc_job *j) {
     pthread_mutex_lock(&w->mu);
     j->next = NULL;
+    /* Counted once, at its first submission: a job back from the auth pool
+     * is the same job (oc_dbwriter_outstanding). */
+    if (oc_config_get()->dev.test_hooks && !j->counted) { j->counted = 1; work_add(w, j->conn_id); }
     if (is_read_job(j->type)) {                 /* route to a reader (ARCH-66) */
         db_reader *rd = &w->readers[j->conn_id ? j->conn_id % OC_DB_READERS
                                                : w->next_reader++ % OC_DB_READERS];

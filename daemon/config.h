@@ -214,6 +214,7 @@ typedef struct {
     struct {
         const char *users;              /* OPENCHIME_DEV_USERS: accounts made at first start */
         int         loopback;           /* OPENCHIME_DEV_LOOPBACK: listen on 127.0.0.1 only */
+        int         test_hooks;         /* OPENCHIME_DEV_TEST_HOOKS: answer SYNC (a test harness's barrier) */
     } dev;
 } oc_config;
 

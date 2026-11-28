@@ -757,6 +757,7 @@ typedef struct oc_job {
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
     uint8_t        hook_disabled;
+    uint8_t        counted;      /* test hooks: counted in oc_dbwriter_outstanding */
     /* Search filters (REQ-081) and the paging cursor (carried in
      * message_id). Parsed by the CLIENT via shared/searchq.c — the daemon receives
      * predicates, never a grammar to interpret. */
@@ -2199,6 +2200,18 @@ void   oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms);
  * a window closing -- without a test sitting it out. 0 puts it back, which is
  * for when no writer runs. Any thread. */
 void   oc_dbwriter_advance_clock_ms(uint64_t ms);
+/* A test's clock held still: every writer's clock reads `wall_ms` (plus any
+ * advance) until released with 0, so what it stamps is the same on every run
+ * (the UI harness, docs/details/TESTING.md). Any thread. */
+void   oc_dbwriter_hold_clock_ms(uint64_t wall_ms);
+/* Test hooks (OPENCHIME_DEV_TEST_HOOKS). How many jobs of connection `conn`,
+ * and of the daemon's own (conn 0), are submitted and not yet answered: 0 once
+ * every result of them is queued for the net thread. */
+uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn);
+/* Run the timed sweeps now -- scheduled messages, reminders, expiring mutes --
+ * as the net thread's tick would; counted as the daemon's own work, so a SYNC
+ * after this is answered only once they are done. */
+void   oc_dbwriter_sweep_now(oc_dbwriter *w);
 
 /* A critical failure (REQ-263), from any thread: raise `key` with `message` --
  * again on the same entry while it holds -- or clear it, once it has stopped.

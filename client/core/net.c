@@ -2728,6 +2728,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->body = slice_text(rn.body);
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_SYNC_DONE) {
+            /* A test harness's barrier: everything sent before it is done. */
+            oc_sync sd;
+            if (oc_decode_sync(&p, &sd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SYNC_DONE);
+            if (e) { e->message_id = sd.token; oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN) {
             /* A token, shown once: held for the frontend, which takes it. */
             oc_agent_token at;
@@ -4533,6 +4539,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_create_agent m = { oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
                                       oc_slice_str(c->body3 ? c->body3 : "") };
                 if (oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SYNC) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_sync m = { c->message_id };
+                if (oc_encode_sync(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_RELEASE_NOTES && c->body) {

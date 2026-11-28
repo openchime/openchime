@@ -2155,3 +2155,13 @@ void oc_client_stop(oc_client *c) {
     oc_model_free(&c->model);
     free(c);
 }
+
+uint64_t oc_client_cmds_sent(oc_client *c) { return c ? oc_queue_pushed(&c->cmds) : 0; }
+
+void oc_client_sync(oc_client *c, uint64_t token) {
+    if (!c || !token) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SYNC);
+    if (!cmd) return;
+    cmd->message_id = token;
+    oc_queue_push(&c->cmds, cmd);
+}
