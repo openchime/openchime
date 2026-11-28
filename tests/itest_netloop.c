@@ -6493,6 +6493,31 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         read_notify_tail(devs[d]);
     }
 
+    /* A mute for a set time (REQ-137): set on one device, its end reaches both,
+     * the same instant; unmuted again, both hear that it has none. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_mute tm = { OC_DEFAULT_CHANNEL, 1, 30 };
+    CHECK(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    uint64_t mute_until = 0;
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK && n == 1);
+        CHECK(ents[0].muted == 1 && ents[0].muted_until_ms > 0);
+        if (d == 0) mute_until = ents[0].muted_until_ms; else CHECK(ents[0].muted_until_ms == mute_until);
+        read_notify_tail(devs[d]);
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_mute um = { OC_DEFAULT_CHANNEL, 0, 0 };
+    CHECK(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &um) == OC_OK);
+    CHECK(send_frame(&a2, buf, w.len) == 0);
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK && n == 1);
+        CHECK(ents[0].muted == 0 && ents[0].muted_until_ms == 0);
+        read_notify_tail(devs[d]);
+    }
+
     /* --- pausing (REQ-278) ----------------------------------------
      * The pause is the OTHER mechanism, and the vertical is what proves they
      * are separate: setting one must not disturb the other, both of the user's
@@ -7103,6 +7128,146 @@ static int chat_search(client *c, const char *q, uint64_t chat, uint64_t mid) {
     if (oc_decode_search_results(&p, ents, 64, &n, &tr) != OC_OK) return -1;
     for (uint16_t i = 0; i < n; i++) if (ents[i].channel_id == chat && ents[i].message_id == mid) return 1;
     return 0;
+}
+
+/* A search limited to one conversation by id, over the wire (REQ-080): alice
+ * and bob share a DM and the general channel, the same word in each; bob's
+ * search scoped to the DM finds only the DM's message, and carol, who is not
+ * in it, finds nothing with the same scope. */
+static int scoped_search(client *c, const char *q, uint64_t ch, oc_search_result_entry *ents, uint16_t *n) {
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq; memset(&sq, 0, sizeof sq);
+    sq.query = oc_slice_str(q);
+    sq.limit = 50;
+    sq.channel_id = ch;
+    if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p; uint8_t tr = 0;
+    if (read_type(c, OC_MSG_SEARCH_RESULTS, &hdr, &p) != 0) return -1;
+    return oc_decode_search_results(&p, ents, 64, n, &tr) == OC_OK ? 0 : -1;
+}
+
+static void test_search_conversation_scope_vertical(int port, const uint8_t *pin) {
+    client a, b, cc;
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(client_open(&cc, port, pin) == 0 && do_handshake(&cc) == 0 && do_auth(&cc, "carol", "pw", &uc) == 0);
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t dm = ci.channel_id;
+    const char *bodies[2] = { "quillwort in the dm", "quillwort in general" };
+    uint64_t chans[2] = { dm, OC_DEFAULT_CHANNEL }, mids[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s = {0}; s.channel_id = chans[i]; memset(s.idem, 0xE5 + i, OC_IDEM_SIZE); s.body = oc_slice_str(bodies[i]);
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+        oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+        mids[i] = bc.message_id;
+    }
+    static oc_search_result_entry ents[64]; uint16_t n = 0;
+    CHECK(scoped_search(&b, "quillwort", dm, ents, &n) == 0);
+    CHECK(n == 1 && ents[0].channel_id == dm && ents[0].message_id == mids[0]);
+    CHECK(scoped_search(&b, "quillwort", 0, ents, &n) == 0);
+    CHECK(n == 2);
+    CHECK(scoped_search(&cc, "quillwort", dm, ents, &n) == 0);
+    CHECK(n == 0);
+    (void)uc;
+    client_close(&cc);
+    client_close(&b);
+    client_close(&a);
+}
+
+/* A test harness's barrier (protocol 54): with the test hooks off a SYNC is
+ * no type this daemon knows; with them on, SYNC_DONE comes after every frame
+ * the connection's earlier work produced, and a second connection's SYNC after
+ * the fan-out of that work to it. */
+static int send_sync(client *c, uint64_t token) {
+    uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_sync s = { token };
+    if (oc_encode_sync(&w, OC_PROTOCOL_VERSION, &s) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+/* The message id the last SEND_ACK read by saw_before_sync named. */
+static uint64_t g_sync_acked;
+/* Read up to SYNC_DONE `token`; whether a frame of `want` came before it. */
+static int saw_before_sync(client *c, uint64_t token, uint16_t want) {
+    int saw = 0;
+    for (int i = 0; i < 400; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == want) saw = 1;
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK) g_sync_acked = ack.message_id;
+        }
+        if (hdr.msg_type == OC_MSG_SYNC_DONE) {
+            oc_sync d; if (oc_decode_sync(&p, &d) != OC_OK) return -1;
+            if (d.token == token) return saw;
+        }
+    }
+    return -1;
+}
+
+static void test_sync_barrier(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    /* Off: refused, as a frame this daemon does not define. */
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(send_sync(&a, 1) == 0);
+    {
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
+        oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_UNEXPECTED_MSG_TYPE);
+    }
+    client_close(&a);
+
+    char cfgerr[128];
+    /* The mode as it was, put back after: the tests around this one set it. */
+    const char *was = getenv("OPENCHIME_MODE");
+    char mode_was[32]; snprintf(mode_was, sizeof mode_was, "%s", was ? was : "");
+    setenv("OPENCHIME_MODE", "development", 1);
+    setenv("OPENCHIME_DEV_TEST_HOOKS", "on", 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    /* Settled first: whatever signing in queued is behind each barrier. */
+    CHECK(send_sync(&a, 10) == 0); CHECK(saw_before_sync(&a, 10, 0) >= 0);
+    CHECK(send_sync(&b, 11) == 0); CHECK(saw_before_sync(&b, 11, 0) >= 0);
+
+    /* A send and the barrier right behind it: the echo comes first. */
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = OC_DEFAULT_CHANNEL; memset(s.idem, 0xEB, OC_IDEM_SIZE);
+    s.body = oc_slice_str("before the barrier");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    g_sync_acked = 0;
+    CHECK(send_sync(&a, 12) == 0);
+    CHECK(saw_before_sync(&a, 12, OC_MSG_BROADCAST) == 1);
+    /* The fan-out reached bob before his own barrier's answer. */
+    CHECK(send_sync(&b, 13) == 0);
+    CHECK(saw_before_sync(&b, 13, OC_MSG_BROADCAST) == 1);
+
+    /* An edit and the barrier right behind it: the edit reaches the editor, and
+     * its fan-out reaches bob, before either barrier is answered. */
+    const uint64_t mid = g_sync_acked;           /* the send's, read before barrier 12 */
+    CHECK(mid != 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e = { OC_DEFAULT_CHANNEL, mid, oc_slice_str("edited before the barrier") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(send_sync(&a, 14) == 0);
+    CHECK(saw_before_sync(&a, 14, OC_MSG_MSG_EDITED) == 1);
+    CHECK(send_sync(&b, 15) == 0);
+    CHECK(saw_before_sync(&b, 15, OC_MSG_MSG_EDITED) == 1);
+
+    client_close(&b);
+    client_close(&a);
+    unsetenv("OPENCHIME_DEV_TEST_HOOKS");
+    if (mode_was[0]) setenv("OPENCHIME_MODE", mode_was, 1); else unsetenv("OPENCHIME_MODE");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
 }
 
 static void test_call_chat(int port, const uint8_t *pin) {
@@ -10783,6 +10948,8 @@ int run_netloop_tests(void) {
         test_call_vertical(arg.port, pin);
         test_call_message(arg.port, pin);
         test_call_chat(arg.port, pin);
+        test_search_conversation_scope_vertical(arg.port, pin);
+        test_sync_barrier(arg.port, pin);
         test_call_history(arg.port, pin, dbw);
         test_call_recording(arg.port, pin);
         test_calls_closed_at_start();

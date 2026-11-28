@@ -1107,6 +1107,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->server_time = b.server_time;
                 e->msg_kind = b.kind;
                 e->call_id = b.call_id;          /* a call's message: which call (CALLS.md §1) */
+                e->parent_id = b.parent_id;      /* a thread reply also in the main scroll (REQ-062) */
                 e->broadcast_stored = b.broadcast_stored;
                 slice_into(e->via, sizeof e->via, b.via);   /* an AI client's post (AUTH.md §8.13) */
                 if (b.author_name.len) {
@@ -1743,6 +1744,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
                     e->participant = tr.participant;
+                    e->also_channel = tr.also_channel;
                     e->broadcast_stored = tr.broadcast_stored;
                     slice_into(e->via, sizeof e->via, tr.via);
                     e->body = body_for_ui(ctx, tr.channel_id, tr.body);
@@ -1902,6 +1904,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* distinct from the level */
                 e->participant = ne[i].follow_threads;   /* every thread followed (REQ-282) */
+                e->muted_until_ms = ne[i].muted_until_ms; /* a timed mute's end (REQ-137) */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
@@ -2370,6 +2373,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (job->message_id) {
                         oc_send_reply sr; memset(&sr, 0, sizeof sr);
                         sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                        sr.also_channel = job->also_channel;
                         gen_idem(sr.idem);
                         sr.body = oc_slice_str(job->body ? job->body : "");
                         sr.n_attach = job->n_paths;
@@ -2444,6 +2448,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (job->message_id) {
                     oc_send_reply sr; memset(&sr, 0, sizeof sr);
                     sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                    sr.also_channel = job->also_channel;
                     gen_idem(sr.idem);
                     sr.body = oc_slice_str(job->body ? job->body : "");
                     sr.n_attach = 1; sr.attach_ids[0] = mo.attachment_id;
@@ -2723,6 +2728,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->body = slice_text(rn.body);
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_SYNC_DONE) {
+            /* A test harness's barrier: everything sent before it is done. */
+            oc_sync sd;
+            if (oc_decode_sync(&p, &sd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SYNC_DONE);
+            if (e) { e->message_id = sd.token; oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_AGENT_TOKEN) {
             /* A token, shown once: held for the frontend, which takes it. */
             oc_agent_token at;
@@ -3995,6 +4006,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 sr.channel_id = c->channel_id;
                 gen_idem(sr.idem);
                 sr.parent_id = c->message_id;
+                sr.also_channel = c->also_channel;
                 sr.body = oc_slice_str(c->body);
                 if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
@@ -4024,6 +4036,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 s.before_ms  = before_ms;
                 s.sort        = c->op;                  /* OC_SEARCH_* */
                 s.cursor_rank = c->rank;
+                s.channel_id  = sq.in[0] ? 0 : c->channel_id;   /* one conversation; a typed in: wins (53) */
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -4528,6 +4541,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_create_agent(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_SYNC) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_sync m = { c->message_id };
+                if (oc_encode_sync(&w, OC_PROTOCOL_VERSION, &m) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_RELEASE_NOTES && c->body) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_release_notes_get m = { oc_slice_str(c->body) };
@@ -4686,7 +4705,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_SET_MUTE) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_set_mute sm = { c->channel_id, c->op };
+                oc_set_mute sm = { c->channel_id, c->op, (uint32_t)c->message_id };   /* minutes (REQ-137) */
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

@@ -35,6 +35,13 @@ fast-test: fast-build $(TEST_BIN)
 	scripts/test/fast/suites.sh
 	@scripts/test/lib/tested_tree.sh record
 
+# --- The UI harness (docs/details/TESTING.md, "The UI harness") ----------------
+# The Windows client (build/openchime.exe), driven by the test binary against a
+# daemon in its own process, headless unless OC_UI_VISIBLE=1. Local only, on a
+# machine that runs Windows programs (WSL); in neither suite.
+test-ui: $(WIN_GUI_BIN) $(TEST_BIN)
+	scripts/test/ui/harness.sh
+
 TSAN_BIN := build/tests-tsan
 # pthread_create is wrapped in the plain test binary, so the runner sees which
 # suites start threads and fails one SUITES[] does not mark THREADS

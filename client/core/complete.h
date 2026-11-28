@@ -86,6 +86,36 @@ const char     *oc_emoji_by_name(const char *name);
  * catalogue order). Returns how many were written. */
 size_t oc_emoji_search(const char *query, const oc_emoji **out, size_t max);
 
+/* ---- the emoji a person uses (REQ-265) -------------------------------------
+ * What the picker's "Frequently used" section is drawn from: the emoji picked,
+ * most recent first, each with how often. A key is a catalogue shortcode
+ * ("fire") or a workspace emoji as ":name:". No allocation and no clock: the
+ * order is the recency. */
+#define OC_EMOJI_USES_MAX       24   /* tracked */
+#define OC_EMOJI_FREQUENT_SHOW  10   /* shown: one row of the picker */
+#define OC_EMOJI_USE_COUNT_MAX  99   /* past this every count is halved */
+#define OC_EMOJI_USE_KEY        52   /* a key's buffer, its NUL included */
+typedef struct { char key[OC_EMOJI_USE_KEY]; uint8_t count; } oc_emoji_use;
+typedef struct { oc_emoji_use v[OC_EMOJI_USES_MAX]; uint8_t n; } oc_emoji_usage;
+
+/* Note one use of `key`: to the front, its count up by one. New and the list
+ * full, the entry with the lowest count goes, the oldest of those. A count that
+ * would pass OC_EMOJI_USE_COUNT_MAX halves every count first, rounding up, so a
+ * newer favourite can overtake an old one. A key that is empty or too long is
+ * not noted. */
+void   oc_emoji_usage_note(oc_emoji_usage *u, const char *key);
+/* What the picker shows, at most min(max, OC_EMOJI_FREQUENT_SHOW): the emoji
+ * used last, then the rest by count, most first, a tie to the more recently
+ * used. Returns how many keys were written to `out` (pointers into `u`). */
+size_t oc_emoji_usage_rank(const oc_emoji_usage *u, const char **out, size_t max);
+/* As one settings value: "key=count" pairs, most recent first, comma-separated.
+ * Always fits `cap` (OC_SETTING_VALUE_MAX for a setting): the oldest entries
+ * that would not fit are left out. Returns the length written. */
+size_t oc_emoji_usage_encode(const oc_emoji_usage *u, char *out, size_t cap);
+/* Back from that value. A malformed entry is skipped and the rest kept; NULL or
+ * empty is an empty list. */
+void   oc_emoji_usage_parse(oc_emoji_usage *u, const char *s);
+
 /* ---- composer completion --------------------------------------------------
  * `repl` is the text that replaces the trailing token; `disp` is what to show
  * in the list. */

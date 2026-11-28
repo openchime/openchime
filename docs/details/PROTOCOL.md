@@ -221,8 +221,15 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 51** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 54** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Version
+> 54 added `SYNC` and `SYNC_DONE`, a test harness's barrier, answered only by a
+> daemon with its test hooks on (§5.16s). Version
+> 53 appended `channel_id` (u64) to `SEARCH`, after `cursor_rank`: a search
+> limited to one conversation by id, a DM's included (REQ-080, §5.11). Version
+> 52 appended `minutes` (u32) to `SET_MUTE`, after `muted`, and
+> `muted_until_ms` (u64) to each `NOTIFY_PREFS` entry, after `follow_threads`:
+> a mute for a set time (REQ-137, §5.16, §5.16d). Version
 > 51 put `via` in `BROADCAST` (after `call_id`) and `THREAD_REPLY` (after
 > `also_channel`), each ahead of the body: the AI client a person posted
 > through (AUTH.md §8.13, §5.16q). Version
@@ -1597,6 +1604,7 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 | `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
 | `sort`        | u8   | `0` newest first (by id, descending), `1` oldest first (by id, ascending), `2` by relevance (best match first, ties by id ascending). Relevance with no `query` text falls back to newest first: nothing ranks a filters-only search. Since protocol 28. |
 | `cursor_rank` | i64  | Relevance paging: the last row's `rank`, with its id in `before_id`. A message posted since moves every bm25 score, so the daemon measures that row's rank afresh and uses `cursor_rank` only when the row no longer matches (edited or deleted). Ignored by the other orders. Since protocol 28. |
+| `channel_id`  | u64  | One conversation, by id — a channel, a DM or a group DM, a renamed channel included; `0` for no conversation scope. The daemon limits results to it under the same read rule as every other search: a conversation the searcher cannot read gives no results and no error. With `in_channel` too, both apply. An end-to-end DM is never searched, scoped or not (PRIVATE-DM.md). Required: a frame without it is malformed. Since protocol 53. |
 
 The operator grammar is parsed by `shared/searchq.c`, which the daemon and both
 frontends link, so the filter line a client shows and the `WHERE` clause the
@@ -2203,10 +2211,13 @@ differently.
 settings.
 
 **`NOTIFY_PREFS` (S → C), `0x0093`** `{ notify_default: u8, count: u16,
-count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+count × { channel_id: u64, level: u8, muted: u8, follow_threads: u8, muted_until_ms: u64 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
 device updates the others. `follow_threads` (since version 37) is `1` when the
-person follows every thread in the conversation (REQ-282).
+person follows every thread in the conversation (REQ-282). `muted_until_ms`
+(since version 52) is when a timed mute ends, `0` for a mute with no end or
+none; an entry whose instant has already passed reports `muted` `0` and
+`muted_until_ms` `0`, as a passed pause reports none (REQ-137).
 
 **`SET_CHANNEL_THREAD_FOLLOW` (C → S), `0x011B`** `{ channel_id: u64, on: u8 }` —
 follow every thread in a conversation the caller can read, or stop (REQ-282);
@@ -2513,7 +2524,18 @@ A level above `2` (none) is refused with a non-fatal `ERROR MALFORMED_FRAME` (10
 
 **`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137)
 
-    channel_id (u64), muted (u8)
+    channel_id (u64), muted (u8), minutes (u32)
+
+`minutes` (since version 52) times a mute: with `muted` `1`, the mute ends that
+many minutes from now, cut to a week (10,080) as `SET_SNOOZE`'s are; `0` mutes
+until unmuted. As with the pause, the wire carries minutes from now because
+only the client knows the timezone that turns "until tomorrow" into an
+instant; the daemon resolves the instant once and stores it
+(`notification_prefs.muted_until_ms`). Unmuting clears both. **A timed mute
+ends on the daemon's clock, for every device:** on the tick that fires
+reminders the daemon clears each mute whose instant has passed and sends that
+person's `NOTIFY_PREFS`, with its trailer, to all of their connections. Push
+treats a mute whose instant has passed as over even before that tick.
 
 **`SET_READ_CURSOR` (C → S), `0x006E`** — Set my read cursor for a channel deliberately, including BACKWARDS (mark unread). (REQ-235)
 
@@ -3820,6 +3842,34 @@ OpenChime services, or one central did not answer, gets
 **`RELEASE_NOTES_UNAVAILABLE` 3088**; the client then offers the notes page.
 New frames: no version bump.
 
+### 5.16s A test harness's barrier (TESTING.md, "The UI harness")
+
+A test that drives a client against a real daemon ends each step on the
+daemon's word that it has finished, never on a time.
+
+```
+SYNC (0x015C), C → S
+  token  u64     non-zero, the test's name for this barrier
+
+SYNC_DONE (0x015D), S → C
+  token  u64     as sent
+```
+
+`SYNC_DONE` is sent once everything the connection sent before the `SYNC` has
+been done: every job of it the writer took is answered, its results are sent
+in order ahead of `SYNC_DONE` on this connection, and their fan-out to every
+other connection is queued ahead of anything those connections are sent
+next. Work the daemon starts on its own -- the timed sweeps a test runs with
+`oc_dbwriter_sweep_now` -- is counted too, so a `SYNC` after a sweep is
+answered only once it is done. A second `SYNC` before the first is answered
+replaces it: only the later token is answered.
+
+It is answered only when the daemon's test hooks are on
+(`OPENCHIME_DEV_TEST_HOOKS`, a development setting, off by default, CONFIG.md);
+otherwise `SYNC` is a type the daemon does not know, and refused as one (§8).
+Work done off the writer -- a link's preview, a push to a phone -- is not
+waited for.
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -4404,6 +4454,8 @@ this table cannot silently gain a shared value.
 | `0x0159` | `DELETE_OUTGOING_WEBHOOK` | C → S | delete one (§5.15a) |
 | `0x015A` | `RELEASE_NOTES_GET` | C → S | a build's release notes (§5.16r) |
 | `0x015B` | `RELEASE_NOTES` | S → C | central's answer: status and body (§5.16r) |
+| `0x015C` | `SYNC` | C → S | a test harness's barrier, test hooks only (§5.16s) |
+| `0x015D` | `SYNC_DONE` | S → C | everything sent before it is done (§5.16s) |
 
 ## 10. Connection state machine
 

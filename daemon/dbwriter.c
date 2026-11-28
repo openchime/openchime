@@ -76,6 +76,12 @@ struct oc_dbwriter {
     db_reader       readers[OC_DB_READERS];
     unsigned        next_reader;              /* for jobs no connection owns */
     oc_dbres      *res_head,  *res_tail;     /* writer|readers -> net */
+    /* With test hooks on (OPENCHIME_DEV_TEST_HOOKS): each connection's jobs
+     * submitted and not yet answered, conn 0 the daemon's own (the sweeps), so
+     * the net thread can tell when one is done with everything sent before a
+     * SYNC (oc_dbwriter_outstanding). Under `mu`, changed in the step that
+     * queues a job's results; the queue itself counts until it is taken. */
+    struct { uint64_t conn; uint32_t n; } work[256];
     /* The auth pool (AUTH.md §2): a password's key derivation -- deliberately
      * the slowest thing a sign-in does -- runs here, so a burst of sign-ins
      * does not hold the writer, and with it everyone's sends. */
@@ -157,11 +163,18 @@ void oc_dbwriter_advance_clock_ms(uint64_t ms) {
     else    __atomic_store_n(&g_dbw_clock_ahead_ms, 0, __ATOMIC_RELAXED);
 }
 
+static uint64_t g_dbw_clock_held_ms;   /* a test's held clock, 0 when it runs (dbwriter.h) */
+void oc_dbwriter_hold_clock_ms(uint64_t wall_ms) {
+    __atomic_store_n(&g_dbw_clock_held_ms, wall_ms, __ATOMIC_RELAXED);
+}
+
 static uint64_t dbw_now_ms(void) {
+    uint64_t held = __atomic_load_n(&g_dbw_clock_held_ms, __ATOMIC_RELAXED);
+    uint64_t ahead = __atomic_load_n(&g_dbw_clock_ahead_ms, __ATOMIC_RELAXED);
+    if (held) return held + ahead;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u +
-           __atomic_load_n(&g_dbw_clock_ahead_ms, __ATOMIC_RELAXED);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + ahead;
 }
 
 /* --- audit log (REQ-251, ARCH-79) ----------------------------------------- */
@@ -3215,17 +3228,33 @@ static void invite_report_id(const uint8_t hash[OC_SHA256_LEN], char out[33]) {
     out[32] = '\0';
 }
 
+/* Whether a user already holds `email`, compared case-blind. */
+static int user_with_email(sqlite3 *db, const char *email) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE lower(email)=lower(?) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_STATIC);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
 static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    /* An invitation central queued for this workspace (central_invites.h): no
+     * inviting user, a member, one use, bound to its address. Its outcome goes
+     * back to central under central's id; a refusal says why. */
+    int central = j->central_id[0] != '\0';
+    if (central) memcpy(r->central_id, j->central_id, sizeof r->central_id);
 
     uint8_t actor_role = OC_ROLE_MEMBER;
-    if (!user_role(db, j->user_id, &actor_role) || !oc_role_can_manage_members(actor_role)) {
+    if (!central && (!user_role(db, j->user_id, &actor_role) || !oc_role_can_manage_members(actor_role))) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    uint8_t want = j->role > OC_ROLE_OWNER ? OC_ROLE_MEMBER : j->role;
+    uint8_t want = central || j->role > OC_ROLE_OWNER ? OC_ROLE_MEMBER : j->role;
     if (want != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
@@ -3233,8 +3262,9 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
      * address it is spent by that address's verified sign-in (AUTH.md §8.4), and
      * the token that comes back is zeros — there is nothing to hand anybody. */
     const char *email = (j->email && j->email[0]) ? j->email : NULL;
-    if (email && !oc_email_plausible(email)) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    if ((central && !email) || (email && !oc_email_plausible(email))) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        r->central_why = "not an email address"; return r;
     }
     /* How many may redeem it (REQ-026): 1 is an invitation to one person; N, or
      * 0 for no limit, is a link to pass around. One address spends its invite
@@ -3250,11 +3280,18 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
      * it, and minting it anyway would hand the inviter a row that sits there
      * until it expires. */
     if (email && !(w->auth_methods & OC_AUTH_OIDC) && w->n_direct_iss == 0) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE;
+        r->central_why = "this workspace signs nobody in by email address"; return r;
+    }
+    /* Central's invitation to somebody already here has nothing to do. */
+    if (central && user_with_email(db, email)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        r->central_why = "already a member"; return r;
     }
     uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;
     if (mint_invite_for(db, j->user_id, want, email, uses, token, &expiry, hash) != 0) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL;
+        r->central_why = "could not be made"; return r;
     }
     if (email) {
         memset(token, 0, sizeof token);
@@ -3280,7 +3317,9 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
 static void spend_setup_tokens(sqlite3 *db) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "UPDATE invites SET consumed_at_ms=? WHERE created_by IS NULL AND consumed_at_ms IS NULL;",
+        /* A setup token has no inviter and no address; an invitation central
+         * queued has no inviter either, but is bound to one, and stands. */
+        "UPDATE invites SET consumed_at_ms=? WHERE created_by IS NULL AND email IS NULL AND consumed_at_ms IS NULL;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
     sqlite3_step(st);
@@ -3729,7 +3768,7 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (j->enroll_quiet) { free(r); return NULL; }   /* push_result ignores NULL */
+    if (j->enroll_quiet) { free(r); return NULL; }   /* push_result_done queues nothing for NULL */
     if (rc == SQLITE_DONE) r->type = OC_RES_OK;
     else { r->err_code = OC_ERR_INTERNAL; }
     return r;
@@ -9618,6 +9657,12 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     if (j->sq_in && j->sq_in[0])
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND LOWER(COALESCE(c.name,''))=LOWER(?6) ");
+    /* One conversation by id (REQ-080): a DM's too, which has no name for in:
+     * to match. Inside the read rule above, so one the searcher cannot read
+     * gives nothing, as any other unreadable message does. A scope alone is
+     * not a search: it needs text or a filter, as before. */
+    if (j->sq_channel)
+        k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.channel_id = ?10 ");
     if (j->sq_has & 0x01u)   /* file: any attachment */
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id) ");
@@ -9659,6 +9704,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     if (j->sq_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)j->sq_before);
     if (j->message_id && sort == OC_SEARCH_RELEVANCE)
         sqlite3_bind_int64(st, 9, (sqlite3_int64)j->search_cursor_rank);
+    if (j->sq_channel) sqlite3_bind_int64(st, 10, (sqlite3_int64)j->sq_channel);
 
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
@@ -9694,7 +9740,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
      * the first page of a plain text search, newest first, after the message
      * hits and without repeating one; a filtered or later page is the
      * messages' alone, since those filters and cursors are the messages'. */
-    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+    if (arr && have_text && !have_filter && !j->sq_channel && !j->message_id && n < lim &&
         sqlite3_prepare_v2(db,
             "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, md.title "
             "  FROM snippets_fts s JOIN attachments a ON a.id = s.rowid "
@@ -9737,7 +9783,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
      * people, joining the first page of a plain text search as snippets do,
      * newest call first. A hit names the call and the line, which its page
      * opens at. */
-    if (arr && have_text && !have_filter && !j->message_id && n < lim &&
+    if (arr && have_text && !have_filter && !j->sq_channel && !j->message_id && n < lim &&
         sqlite3_prepare_v2(db,
             "SELECT l.id, t.call_id, COALESCE((SELECT ch.id FROM channels ch WHERE ch.call_id=t.call_id),0),"
             "       COALESCE(l.speaker,0), c.started_at_ms + l.start_ms,"
@@ -9910,7 +9956,7 @@ static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
  *
  * Only channels that actually MOVE produce a result, for the reason the single
  * ack has: a replayed catch-up must not fan a cursor nobody advanced. The
- * results are chained and the whole chain is queued at once (push_result), so
+ * results are chained and the whole chain is queued at once (push_result_done), so
  * sixty channels are one job and one wake rather than sixty of each. */
 static oc_dbres *process_mark_all_read(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
@@ -10370,22 +10416,61 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
 
 /* --- Queue plumbing ----------------------------------------------------- */
 
-static void push_result(oc_dbwriter *w, oc_dbres *r) {
-    if (!r) return;
-    /* A CHAIN, not a result: one job may answer with many (catch-up advances
-     * every channel at once). This used to clear `next` and take the head,
-     * which silently dropped the rest -- fine while every processor returned
-     * exactly one, and a leak plus a lost fan-out the moment one did not. */
-    oc_dbres *last = r;
-    while (last->next) last = last->next;
-    pthread_mutex_lock(&w->mu);
-    if (w->res_tail) w->res_tail->next = r; else w->res_head = r;
-    w->res_tail = last;
-    pthread_mutex_unlock(&w->mu);
-    uint64_t one = 1;
-    ssize_t wr = write(w->evfd, &one, sizeof one);
-    (void)wr;
+/* A job counted in (test hooks): one more outstanding for its connection. */
+static void work_add(oc_dbwriter *w, uint64_t conn) {
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && w->work[i].conn == conn) { w->work[i].n++; return; }
+    for (int i = 0; i < 256; i++)
+        if (!w->work[i].n) { w->work[i].conn = conn; w->work[i].n = 1; return; }
 }
+static void work_sub(oc_dbwriter *w, uint64_t conn) {
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && w->work[i].conn == conn) { w->work[i].n--; return; }
+}
+
+/* A job is done: its results queued and, with test hooks on, its count taken
+ * off in the same locked step. oc_dbwriter_outstanding also counts the queue
+ * until the net thread has taken every result, so a count of 0 means every
+ * result of that connection's earlier jobs has been delivered. The net thread is woken even for a job with no result, so a
+ * SYNC waiting only on it is answered. */
+static void push_result_done(oc_dbwriter *w, oc_dbres *r, uint64_t conn, int counted) {
+    oc_dbres *last = r;
+    while (last && last->next) last = last->next;
+    pthread_mutex_lock(&w->mu);
+    if (r) {
+        if (w->res_tail) w->res_tail->next = r; else w->res_head = r;
+        w->res_tail = last;
+    }
+    if (counted) work_sub(w, conn);
+    pthread_mutex_unlock(&w->mu);
+    if (r || counted) {
+        uint64_t one = 1;
+        ssize_t wr = write(w->evfd, &one, sizeof one);
+        (void)wr;
+    }
+}
+
+uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn) {
+    uint32_t n = 0;
+    int hooks = oc_config_get()->dev.test_hooks;
+    pthread_mutex_lock(&w->mu);
+    for (int i = 0; i < 256; i++)
+        if (w->work[i].n && (w->work[i].conn == conn || w->work[i].conn == 0)) n += w->work[i].n;
+    /* A result queued is not yet sent: until the net thread has taken it --
+     * and with it the answer and the fan-out -- the work behind it is not done. */
+    if (hooks && w->res_head) n++;
+    pthread_mutex_unlock(&w->mu);
+    return n;
+}
+
+void oc_dbwriter_sweep_now(oc_dbwriter *w) {
+    static const int types[3] = { OC_JOB_FIRE_SCHEDULED, OC_JOB_FIRE_REMINDERS, OC_JOB_EXPIRE_MUTES };
+    for (int i = 0; i < 3; i++) {
+        oc_job *j = oc_job_new(types[i], 0);
+        if (j) oc_dbwriter_submit(w, j);
+    }
+}
+
 
 /* Relay a typing signal (REQ-121): resolve the channel's members so the net
  * thread can fan a TYPING_UPDATE to them. Read-only; no state kept. Members are
@@ -13245,7 +13330,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, level, muted, follow_threads FROM notification_prefs WHERE user_id=? "
+        "SELECT channel_id, level, muted, follow_threads, muted_until_ms FROM notification_prefs WHERE user_id=? "
         "ORDER BY channel_id LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
@@ -13258,6 +13343,11 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
         r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
         r->nprefs[r->n_nprefs].muted = (uint8_t)sqlite3_column_int(st, 2);
         r->nprefs[r->n_nprefs].follow_threads = (uint8_t)sqlite3_column_int(st, 3);
+        /* A timed mute whose instant has passed is no mute, even before the
+         * sweep has cleared it (REQ-137), as a passed pause is none. */
+        uint64_t until = (uint64_t)sqlite3_column_int64(st, 4);
+        if (until && until <= dbw_now_ms()) { r->nprefs[r->n_nprefs].muted = 0; until = 0; }
+        r->nprefs[r->n_nprefs].muted_until_ms = r->nprefs[r->n_nprefs].muted ? until : 0;
         r->n_nprefs++;
     }
     sqlite3_finalize(st);
@@ -13323,15 +13413,23 @@ static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
     if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
     }
+    /* For a set time (REQ-137): the minutes from now, cut to a week as the
+     * pause's are, resolved to an instant once, here; 0 is a mute with no end.
+     * Unmuting clears both. */
+    int muted = j->hook_disabled ? 1 : 0;                 /* reused: the mute flag */
+    uint32_t mins = j->snooze_minutes > 7u * 24u * 60u ? 7u * 24u * 60u : j->snooze_minutes;
+    uint64_t until = (muted && mins) ? dbw_now_ms() + (uint64_t)mins * 60000ull : 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO notification_prefs(user_id, channel_id, level, muted) "
-        "VALUES(?1, ?2, 0, ?3) "
-        "ON CONFLICT(user_id, channel_id) DO UPDATE SET muted=excluded.muted;",
+        "INSERT INTO notification_prefs(user_id, channel_id, level, muted, muted_until_ms) "
+        "VALUES(?1, ?2, 0, ?3, ?4) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET muted=excluded.muted, "
+        "muted_until_ms=excluded.muted_until_ms;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int  (st, 3, j->hook_disabled ? 1 : 0);   /* reused: the mute flag */
+    sqlite3_bind_int  (st, 3, muted);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)until);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
@@ -14336,7 +14434,7 @@ static oc_dbres *process_prune_device_token(sqlite3 *db, const oc_job *j) {
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
-    return NULL;   /* push_result ignores NULL */
+    return NULL;   /* push_result_done queues nothing for NULL */
 }
 
 /* The caller's full notification settings (REQ-130/131). Read. */
@@ -14863,6 +14961,49 @@ static oc_dbres *process_fire_reminders(sqlite3 *db, const oc_job *j) {
     if (!head) {                                /* nothing due: a benign no-op */
         head = calloc(1, sizeof *head);
         if (head) head->type = OC_RES_REMINDER_DUE;
+    }
+    return head;
+}
+
+/* Timed mutes come to their end (REQ-137): on the reminder tick, every mute
+ * whose instant has passed is cleared (muted = 0, muted_until_ms = 0), so every
+ * reader of `muted` stays as it was, and each person whose mute it was gets
+ * their NOTIFY_PREFS, to all their connections. A batch of people at a time;
+ * the rest on the next tick. Nothing due: one result for nobody. */
+static oc_dbres *process_expire_mutes(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    uint64_t now = dbw_now_ms();
+    uint64_t users[64]; size_t nu = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(db,
+            "SELECT DISTINCT user_id FROM notification_prefs "
+            " WHERE muted = 1 AND muted_until_ms > 0 AND muted_until_ms <= ?1 LIMIT 64;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        while (nu < 64 && sqlite3_step(st) == SQLITE_ROW) users[nu++] = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    for (size_t i = 0; i < nu; i++) {
+        if (sqlite3_prepare_v2(db,
+                "UPDATE notification_prefs SET muted = 0, muted_until_ms = 0 "
+                " WHERE user_id = ?1 AND muted_until_ms > 0 AND muted_until_ms <= ?2;",
+                -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)users[i]);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    oc_dbres *head = NULL, **tail = &head;
+    for (size_t i = 0; i < nu; i++) {
+        oc_dbres *r = calloc(1, sizeof *r);
+        if (!r) break;
+        build_notify_prefs(db, users[i], r);
+        *tail = r; tail = &r->next;
+    }
+    if (!head) {                                /* nothing due: a benign no-op */
+        head = calloc(1, sizeof *head);
+        if (head) head->type = OC_RES_NOTIFY_PREFS;   /* user_id 0: sent to nobody */
     }
     return head;
 }
@@ -16172,6 +16313,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
     if (j->type == OC_JOB_FIRE_REMINDERS)    return process_fire_reminders(w->db, j);
+    if (j->type == OC_JOB_EXPIRE_MUTES)      return process_expire_mutes(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
     if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
     if (j->type == OC_JOB_CANCEL_SCHEDULED)  return process_cancel_scheduled(w->db, j);
@@ -17409,8 +17551,10 @@ static void *writer_loop(void *arg) {
             r->joined = r->n_ulist != 0;
         }
         for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
-        if (!w->auth_deferred) job_free(j);   /* else the auth pool has it (process_auth) */
-        push_result(w, r);
+        uint64_t done_conn = j->conn_id;
+        int done = !w->auth_deferred, counted = done && j->counted;
+        if (done) job_free(j);   /* else the auth pool has it (process_auth) */
+        push_result_done(w, r, done_conn, counted);
         maybe_prune_idem(w);
     }
     return NULL;
@@ -17437,8 +17581,10 @@ static void *reader_loop(void *arg) {
         }
         oc_dbres *r = process_read(rd->rdb, j);
         for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
+        uint64_t done_conn = j->conn_id;
+        int counted = j->counted;
         job_free(j);
-        push_result(w, r);
+        push_result_done(w, r, done_conn, counted);
     }
     return NULL;
 }
@@ -17551,6 +17697,9 @@ size_t oc_dbwriter_auth_waiting(oc_dbwriter *w) { return oc_authpool_waiting(w->
 void oc_dbwriter_submit(oc_dbwriter *w, oc_job *j) {
     pthread_mutex_lock(&w->mu);
     j->next = NULL;
+    /* Counted once, at its first submission: a job back from the auth pool
+     * is the same job (oc_dbwriter_outstanding). */
+    if (oc_config_get()->dev.test_hooks && !j->counted) { j->counted = 1; work_add(w, j->conn_id); }
     if (is_read_job(j->type)) {                 /* route to a reader (ARCH-66) */
         db_reader *rd = &w->readers[j->conn_id ? j->conn_id % OC_DB_READERS
                                                : w->next_reader++ % OC_DB_READERS];

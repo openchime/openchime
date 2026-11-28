@@ -12,6 +12,7 @@
 #include "config.h"
 #include "push.h"
 #include "invite_mail.h"
+#include "central_invites.h"
 #include "webhooks_out.h"
 #include "release_notes.h"
 #include "enroll.h"    /* the address proof (AUTH.md §3.6) */
@@ -343,6 +344,10 @@ typedef struct conn_s {
     size_t       bf_phase, bf_i;
     uint8_t     *dq;
     size_t       dq_len, dq_cap;
+    /* A test harness's SYNC waiting (test hooks): its token, answered with
+     * SYNC_DONE once the connection's earlier work is done (sync_try). */
+    uint64_t     sync_token;
+    uint8_t      sync_pending;
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
@@ -1313,6 +1318,23 @@ static uint64_t call_grace_ms(void) {
     uint64_t v = __atomic_load_n(&g_call_grace_ms, __ATOMIC_RELAXED);
     return v ? v : OC_CALL_REJOIN_GRACE_MS;
 }
+/* Test hooks: SYNCs waiting, and the answer to one once every job its
+ * connection submitted before it -- and the daemon's own sweeps -- is done and
+ * its results delivered: oc_dbwriter_outstanding counts a result until it is
+ * taken from the queue, so neither where a SYNC is read nor after the drain
+ * answers ahead of a result still queued. Through out_append, so it
+ * goes after everything already sent or held for that connection. */
+static int g_syncs_pending;
+static int sync_try(conn *c, oc_dbwriter *dbw) {
+    if (!c || !c->sync_pending || oc_dbwriter_outstanding(dbw, c->conn_id) != 0) return 0;
+    uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_sync sd = { c->sync_token };
+    c->sync_pending = 0;
+    if (g_syncs_pending > 0) g_syncs_pending--;
+    if (oc_encode_sync_done(&w, c->version, &sd) != OC_OK) return -1;
+    return out_append(c, buf, w.len);
+}
+
 void oc_netloop_set_call_grace_ms(uint64_t ms) {
     __atomic_store_n(&g_call_grace_ms, ms, __ATOMIC_RELAXED);
 }
@@ -1409,6 +1431,13 @@ void oc_netloop_set_push(struct oc_push *push) {
 
 void oc_netloop_set_invite_mail(struct oc_invite_mail *m) {
     __atomic_store_n(&g_invite_mail, m, __ATOMIC_RELEASE);
+}
+
+/* The invitations central queues (central_invites.h), NULL = off; published like push. */
+static oc_central_invites *g_central_invites;
+
+void oc_netloop_set_central_invites(struct oc_central_invites *ci) {
+    __atomic_store_n(&g_central_invites, ci, __ATOMIC_RELEASE);
 }
 
 /* Outgoing webhooks' delivery worker (webhooks_out.h), NULL = none: without a
@@ -4088,6 +4117,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->message_id = sq.before_id;
             j->sq_from   = sq.from_name.len  ? strndup((const char *)sq.from_name.ptr, sq.from_name.len)   : NULL;
             j->sq_in     = sq.in_channel.len ? strndup((const char *)sq.in_channel.ptr, sq.in_channel.len) : NULL;
+            j->sq_channel = sq.channel_id;                  /* 53 */
             j->sq_has    = sq.has_mask;
             j->sq_after  = sq.after_ms;
             j->sq_before = sq.before_ms;
@@ -4479,6 +4509,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id; j->channel_id = sm.channel_id;
             j->hook_disabled = sm.muted;      /* the flag field, reused */
+            j->snooze_minutes = sm.minutes;   /* how long, from now (REQ-137) */
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -5876,6 +5907,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             continue;
         }
 #endif
+        /* A test harness's barrier (protocol 54), with test hooks on only: off,
+         * it is no type this daemon knows, and falls to the refusal below. */
+        if (hdr.msg_type == OC_MSG_SYNC && oc_config_get()->dev.test_hooks) {
+            oc_sync sy;
+            if (oc_decode_sync(&p, &sy) != OC_OK) return -1;
+            if (!c->sync_pending) g_syncs_pending++;
+            c->sync_pending = 1;
+            c->sync_token = sy.token;
+            if (sync_try(c, dbw) != 0) return -1;
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
             oc_transfer_cancel tc;
             if (oc_decode_transfer_cancel(&p, &tc) != OC_OK) return -1;
@@ -8988,6 +9030,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         if (r->invite_email && r->invite_id[0] && demo_ok(OC_DL_MAIL, 0))
             oc_invite_mail_report(__atomic_load_n(&g_invite_mail, __ATOMIC_ACQUIRE),
                                   r->invite_id, r->invite_email, r->session_expiry / 1000u);
+        /* One central asked for: made, so central stops offering it. */
+        if (r->central_id[0]) {
+            oc_central_invites_outcome(__atomic_load_n(&g_central_invites, __ATOMIC_ACQUIRE),
+                                       r->central_id, 1, NULL);
+            return;
+        }
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
@@ -9011,6 +9059,12 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
     case OC_RES_INVITE_ERR:
     case OC_RES_SETROLE_ERR:
     case OC_RES_USER_ERR: {
+        /* One central asked for and refused: central hears why, and stops offering it. */
+        if (r->type == OC_RES_INVITE_ERR && r->central_id[0]) {
+            oc_central_invites_outcome(__atomic_load_n(&g_central_invites, __ATOMIC_ACQUIRE),
+                                       r->central_id, 0, r->central_why ? r->central_why : "refused");
+            return;
+        }
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -10634,6 +10688,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
         break;
     }
     case OC_RES_NOTIFY_PREFS: {
+        if (!r->user_id) break;          /* the mute sweep found nothing (REQ-137) */
         /* Sync the settings snapshot to *all* of the user's connections, so a
          * change on one device updates the others (REQ-130/131). */
         static __thread oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
@@ -10643,6 +10698,7 @@ static void deliver_result_to(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *
             ents[n].level = r->nprefs[i].level;
             ents[n].muted = r->nprefs[i].muted;      /* */
             ents[n].follow_threads = r->nprefs[i].follow_threads;   /* REQ-282 */
+            ents[n].muted_until_ms = r->nprefs[i].muted_until_ms;   /* REQ-137 */
             n++;
         }
         /* Designated, not positional: adding `notify_default` before `count` silently
@@ -11397,6 +11453,9 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     /* Reminders on the same tick (REQ-283): within it of their time. */
     oc_job *rj = oc_job_new(OC_JOB_FIRE_REMINDERS, 0);
     if (rj) oc_dbwriter_submit(dbw, rj);
+    /* And timed mutes that have run out (REQ-137), on the same tick. */
+    oc_job *mj = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    if (mj) oc_dbwriter_submit(dbw, mj);
 }
 
 /* Do-not-disturb changing with no frame to hang it on.
@@ -12690,6 +12749,12 @@ static int netloop_serve(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 oc_dbres_free(r);
             }
             db_more = k == OC_RESULT_BUDGET;
+            /* Every result queued is delivered: a SYNC whose connection has
+             * nothing left outstanding is answered (test hooks). */
+            if (!db_more && g_syncs_pending)
+                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+                    if (conns[fd] && conns[fd]->sync_pending && sync_try(conns[fd], dbw) != 0)
+                        conn_close(ep, conns, fd);
         }
         if (xfer_more) {
             int k = 0;

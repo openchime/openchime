@@ -61,6 +61,7 @@ struct tb_event {
 #define TB_KEY_CTRL_O     0x0f
 #define TB_KEY_CTRL_Q     0x11
 #define TB_KEY_CTRL_R     0x12
+#define TB_KEY_CTRL_T     0x14
 #define TB_KEY_CTRL_W     0x17
 #define TB_KEY_ESC        0x1b
 #define TB_KEY_SPACE      0x20

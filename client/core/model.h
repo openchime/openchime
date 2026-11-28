@@ -153,6 +153,12 @@ typedef struct {
     /* A call's message in the conversation it was started from (CALLS.md §1):
      * the call. 0 for any other, and for a missed call stored before. */
     uint64_t        call_id;
+    /* A thread reply also posted to the main scroll (REQ-062): its thread's
+     * parent. 0 for a top-level message. */
+    uint64_t        parent_id;
+    /* Such a reply already queued as a thread notice (notice_push): the
+     * channel's notification scan leaves it alone, so it notifies once. */
+    uint8_t         thread_noticed;
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -266,6 +272,9 @@ typedef struct {
      * unread badge, so a conversation can be quiet but still countable, or
      * countable but silent. */
     uint8_t  muted;
+    /* When a timed mute ends (REQ-137), as the last NOTIFY_PREFS said; 0 for a
+     * mute with no end, or none. The daemon ends it; the client keeps no clock. */
+    uint64_t muted_until_ms;
     /* Every thread in it followed (REQ-282): a reply anywhere in it counts as a
      * reply in a thread this reader is in, unless that thread is unfollowed. */
     uint8_t  follow_threads;
@@ -565,7 +574,10 @@ typedef struct {
     /* The open search view (REQ-080): the query and its hits. */
     uint8_t   search_open;
     char      search_query[128];
+    /* The last SYNC_DONE token a test harness's barrier was answered with. */
+    uint64_t  sync_done;
     uint8_t   search_sort;       /* OC_SEARCH_*: the order the hits are in */
+    uint64_t  search_scope;      /* one conversation by id, 0 for none (REQ-080) */
     oc_search_result *search_results;
     size_t    n_search, cap_search;
     /* The server said it had more hits than it sent. The wire gained a keyset
@@ -1206,6 +1218,52 @@ void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
  * Format is a compact "c:s,f,x;d:s,f,x" so one setting key carries all of it. */
 void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
+
+/* The graphical client's rail, as a person arranges it: its views in their
+ * order, each shown or hidden. Views are named by stable short names the
+ * frontend gives (`home`, `dms`, `activity`, ...), never by position, so a
+ * later build that reorders its table reorders nobody's rail. `home` is always
+ * first and shown: it is where the client opens. */
+#define OC_RAIL_MAX   16
+#define OC_RAIL_NAME  16
+typedef struct { char name[OC_RAIL_NAME]; uint8_t shown; } oc_rail_view;
+typedef struct { oc_rail_view v[OC_RAIL_MAX]; uint8_t n; } oc_rail_opts;
+/* The frontend's views in its own order, all shown. */
+void oc_rail_opts_default(oc_rail_opts *o, const char *const *known, size_t n_known);
+/* As one setting value: the names in order, comma-separated, a hidden one
+ * after a '-' ("home,dms,-files,later"). */
+void oc_rail_opts_encode(const oc_rail_opts *o, char *out, size_t cap);
+/* Back from that value, forgiving across builds: a name this build does not
+ * know is dropped, a known view the value does not name is added at the end,
+ * shown, `home` is put first and shown whatever the value says, and an empty,
+ * NULL or malformed value gives the default. */
+void oc_rail_opts_parse(oc_rail_opts *o, const char *s, const char *const *known, size_t n_known);
+
+/* A person's own channel colours: a dot before a channel's name, to tell
+ * channels apart. Personal and synced, each client type in its own settings
+ * bucket under the key `colors`; nobody else sees them. A colour is an index,
+ * 1 to OC_CHAN_COLOR_COUNT, into the frontend's palette; 0 is none. */
+#define OC_CHAN_COLORS_MAX   64
+#define OC_CHAN_COLOR_COUNT  8
+typedef struct { uint64_t channel_id; uint8_t color; } oc_chan_color;
+typedef struct { oc_chan_color v[OC_CHAN_COLORS_MAX]; uint8_t n; } oc_chan_colors;
+enum {
+    OC_CHAN_COLOR_OK = 0,
+    OC_CHAN_COLOR_FULL,       /* a 65th channel */
+    OC_CHAN_COLOR_TOO_LONG,   /* the value would not fit OC_SETTING_VALUE_MAX */
+    OC_CHAN_COLOR_BAD         /* no such colour, or no channel */
+};
+uint8_t oc_chan_color_of(const oc_chan_colors *c, uint64_t channel_id);
+/* Set a channel's colour (0 clears it). Refused with OC_CHAN_COLOR_FULL,
+ * _TOO_LONG or _BAD, and then the map is unchanged. */
+int     oc_chan_color_set(oc_chan_colors *c, uint64_t channel_id, uint8_t color);
+/* The map as one setting value, grouped by colour: the colour once, then its
+ * channels ("1:12,45,301;2:7,88"). Returns the length the whole value needs;
+ * it is written only when that fits `cap`, and `out` is "" otherwise. */
+size_t  oc_chan_colors_encode(const oc_chan_colors *c, char *out, size_t cap);
+/* Back from that value: a malformed group or id is skipped and the rest kept;
+ * NULL or empty is an empty map. */
+void    oc_chan_colors_parse(oc_chan_colors *c, const char *s);
 /* A conversation's badge, two tiers as every chat client draws it: a COUNT of
  * what is about you -- mentions, keywords, priority people, and in a direct
  * message every message, since all of it is to you -- and a DOT for any other
@@ -1214,6 +1272,11 @@ void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot
 
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
+/* Minutes from a local time (`now_hour`:`now_min`) to `hh`:`mm`: later today, or
+ * tomorrow when that has passed or `force_tomorrow` is set. "Until tomorrow"
+ * in the pause and mute menus is (9, 0, force_tomorrow 1): 09:00 the next day.
+ * Pure, so both clients' menus answer the same. */
+uint32_t oc_minutes_until_local(int now_hour, int now_min, int hh, int mm, int force_tomorrow);
 /* Put this user's read position in a channel at `message_id`, backwards included
  * (mark unread, REQ-235), and recount its unread badge from the loaded messages. */
 void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id);
@@ -1224,6 +1287,21 @@ void oc_model_close_thread(oc_model *m);
 
 /* Begin a search (clears prior hits, records the query) / close the search view. */
 void oc_model_search_begin(oc_model *m, const char *query);
+/* The same, limited to one conversation (`scope`, 0 for none). A typed `in:`
+ * in the query wins: the scope is then 0, so `in:` keeps its meaning by name. */
+void oc_model_search_begin_scoped(oc_model *m, const char *query, uint64_t scope);
+
+/* What a graphical client's one search field searches, and what it says, in a
+ * view (REQ-080): in a channel, "Search #name", messages scoped to it by id; in
+ * a DM or group DM, "Search <its names>", scoped the same way; in an
+ * end-to-end DM, which the server cannot search, "Search messages" with no
+ * scope; in Files, "Search files"; in People, "Search people"; anywhere else,
+ * "Search messages", unscoped. `view` is OC_SV_*; `conv` the open conversation
+ * in OC_SV_CONVERSATION. */
+enum { OC_SV_CONVERSATION = 0, OC_SV_FILES, OC_SV_PEOPLE, OC_SV_OTHER };
+enum { OC_ST_MESSAGES = 0, OC_ST_FILES, OC_ST_PEOPLE };
+typedef struct { uint8_t kind; uint64_t scope; char placeholder[160]; } oc_search_target;
+void oc_model_search_target(const oc_model *m, int view, uint64_t conv, oc_search_target *out);
 void oc_model_close_search(oc_model *m);
 
 /* Begin a "who reacted" inspection (clears prior reactors, records the message)
@@ -1304,6 +1382,10 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms);
  * from HERE rather than its own source, or the two disagree and the countdown
  * jumps. */
 uint64_t oc_model_now_ms(void);
+/* Hold the model's clocks at these (monotonic and wall, ms) until called again;
+ * 0 and 0 give them back to the system. For a test harness, which steps time
+ * rather than waiting for it. */
+void oc_model_clock_hold(uint64_t mono_ms, uint64_t wall_ms);
 
 /* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */

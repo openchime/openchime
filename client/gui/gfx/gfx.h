@@ -31,6 +31,10 @@ typedef struct { float x, y, w, h; } gfx_rect;
 gfx  *gfx_create(SDL_Renderer *);
 void  gfx_destroy(gfx *);
 void  gfx_set_scale(gfx *, float scale);
+/* Where (0,0) is, in DIPs: every shape, clip, texture and icon after this is
+ * drawn that far from the target's own origin. The graphical client draws its
+ * scene below its top bar this way, so the scene keeps its own coordinates. */
+void  gfx_set_origin(gfx *, float x, float y);
 float gfx_scale(const gfx *);
 
 /* One frame: clear, draw, present. */

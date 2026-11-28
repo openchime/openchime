@@ -1666,6 +1666,34 @@ static void test_admin_frames(void) {
     }
 }
 
+/* A test harness's barrier (54): the token crosses both ways intact, and a
+ * frame cut short is refused. */
+static void test_sync_frames(void) {
+    CHECK(OC_PROTOCOL_VERSION == 54);
+    {
+        oc_sync in = { 0xA1B2C3D4E5F60718ull };
+        ROUNDTRIP(oc_encode_sync(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SYNC, h, p);
+        oc_sync out = { 0 };
+        CHECK(oc_decode_sync(&p, &out) == OC_OK && out.token == in.token);
+    }
+    {
+        oc_sync in = { 42 };
+        ROUNDTRIP(oc_encode_sync_done(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SYNC_DONE, h, p);
+        oc_sync out = { 0 };
+        CHECK(oc_decode_sync(&p, &out) == OC_OK && out.token == 42);
+    }
+    {
+        oc_sync in = { 7 };
+        uint8_t fr[64];
+        oc_wbuf w2; oc_wbuf_init(&w2, fr, sizeof fr);
+        CHECK(oc_encode_sync(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2; oc_sync out;
+        CHECK(oc_parse_frame(fr, w2.len, &h2, &p2) == OC_OK);
+        p2.len -= 1;
+        CHECK(oc_decode_sync(&p2, &out) == OC_E_MALFORMED);
+    }
+}
+
 static void test_search_frames(void) {
     {
         oc_search in = { .query = oc_slice_str("deploy pipeline"), .limit = 25 };
@@ -1683,6 +1711,32 @@ static void test_search_frames(void) {
         oc_search out;
         CHECK(oc_decode_search(&p, &out) == OC_OK);
         CHECK(out.sort == OC_SEARCH_RELEVANCE && out.cursor_rank == -4321987 && out.before_id == 990);
+    }
+    /* One conversation by id (53, REQ-080): nonzero and 0 cross intact, and a
+     * frame cut off before the id is refused rather than read as unscoped. */
+    CHECK(OC_PROTOCOL_VERSION >= 53);   /* a conversation's id since 53 */
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25, .channel_id = 0x1122334455667788ull };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK && out.channel_id == 0x1122334455667788ull);
+        CHECK(slice_eq_str(out.query, "deploy"));
+    }
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out = { .channel_id = 9 };
+        CHECK(oc_decode_search(&p, &out) == OC_OK && out.channel_id == 0);
+    }
+    {
+        oc_search in = { .query = oc_slice_str("deploy"), .limit = 25, .channel_id = 7 };
+        uint8_t fr[256];
+        oc_wbuf w2; oc_wbuf_init(&w2, fr, sizeof fr);
+        CHECK(oc_encode_search(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2; oc_search out;
+        CHECK(oc_parse_frame(fr, w2.len, &h2, &p2) == OC_OK);
+        p2.len -= 8;                                     /* the id missing */
+        CHECK(oc_decode_search(&p2, &out) == OC_E_MALFORMED);
     }
     {
         oc_search_result_entry ents[2] = {
@@ -1885,7 +1939,7 @@ static void test_notify_frames(void) {
     {
         oc_notify_pref_entry ents[2] = {
             { .channel_id = 7, .level = OC_NOTIFY_MENTIONS, .follow_threads = 1 },
-            { .channel_id = 9, .level = OC_NOTIFY_NONE },
+            { .channel_id = 9, .level = OC_NOTIFY_NONE, .muted = 1, .muted_until_ms = 1700000123456ull },
         };
         oc_notify_prefs in;
         in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
@@ -1896,6 +1950,22 @@ static void test_notify_frames(void) {
         CHECK(dflt == OC_NOTIFY_MENTIONS);
         CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS && got[0].follow_threads == 1);
         CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE && got[1].follow_threads == 0);
+        CHECK(got[0].muted == 0 && got[0].muted_until_ms == 0);              /* REQ-137 */
+        CHECK(got[1].muted == 1 && got[1].muted_until_ms == 1700000123456ull);
+    }
+    /* A mute for a set time (REQ-137): the minutes travel, and 0 is no end. */
+    CHECK(OC_PROTOCOL_VERSION >= 52);   /* timed mutes since 52 */
+    {
+        oc_set_mute in = { 7, 1, 120 };
+        ROUNDTRIP(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_MUTE, h, p);
+        oc_set_mute out = { 0, 0, 0 };
+        CHECK(oc_decode_set_mute(&p, &out) == OC_OK && out.channel_id == 7 && out.muted == 1 && out.minutes == 120);
+    }
+    {
+        oc_set_mute in = { 9, 0, 0 };
+        ROUNDTRIP(oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_MUTE, h, p);
+        oc_set_mute out = { 1, 1, 1 };
+        CHECK(oc_decode_set_mute(&p, &out) == OC_OK && out.channel_id == 9 && out.muted == 0 && out.minutes == 0);
     }
     /* Follow every thread in a conversation (REQ-282). */
     {
@@ -3097,7 +3167,7 @@ static void test_agent_frames(void) {
  * `via` on BROADCAST and THREAD_REPLY at version 51. */
 static void test_connection_frames(void) {
     static uint8_t frame[4096];
-    CHECK(OC_PROTOCOL_VERSION == 51);
+    CHECK(OC_PROTOCOL_VERSION >= 51);   /* `via` since 51 */
     {
         oc_connection_code in = { oc_slice_str("bcdf-ghjk") };
         ROUNDTRIP(oc_encode_connection_code(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CONNECTION_CODE, h, p);
@@ -3807,6 +3877,7 @@ int run_protocol_tests(void) {
     test_channel_frames();
     test_admin_frames();
     test_search_frames();
+    test_sync_frames();
     test_presence_frames();
     test_attachment_frames();
     test_file_frames();

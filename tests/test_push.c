@@ -778,6 +778,32 @@ static void test_default_and_mute(void) {
     CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
     sqlite3_close(rdb);
 
+    /* A mute for a set time (REQ-137): carol is left out before its instant
+     * and in after it, whether or not the sweep has run. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 0);
+        j->user_id = carol; j->channel_id = 1; j->hook_disabled = 1; j->snooze_minutes = 60;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    {
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        sqlite3_stmt *q = NULL;
+        uint64_t until = 0;
+        char sql[160];
+        snprintf(sql, sizeof sql, "SELECT muted_until_ms FROM notification_prefs WHERE user_id=%llu AND channel_id=1;",
+                 (unsigned long long)carol);
+        if (sqlite3_prepare_v2(rdb, sql, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+            until = (uint64_t)sqlite3_column_int64(q, 0);
+        sqlite3_finalize(q);
+        CHECK(until > 0);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until - 1000, t, 8);
+        CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);            /* carol still muted */
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until + 1000, t, 8);
+        CHECK(n == 2);                                                 /* and after: in */
+        sqlite3_close(rdb);
+    }
+
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }

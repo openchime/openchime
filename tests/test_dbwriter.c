@@ -1274,6 +1274,71 @@ static void test_direct_identities(void) {
 
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
+/* An invitation central queued (central_invites.h): made with no inviting user,
+ * as a member, for one use, bound to its address, its result carrying central's
+ * id and what the invitation mail report needs; a setup token's sweep leaves it
+ * standing, and the address's verified sign-in spends it. Central asking again for
+ * somebody already here, or for something not an address, is refused, saying why. */
+static oc_dbres *central_invite(oc_dbwriter *w, const char *id, const char *address) {
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 0);
+    j->role = OC_ROLE_MEMBER; j->uses = 1;
+    oc_job_set_email(j, address, strlen(address));
+    snprintf(j->central_id, sizeof j->central_id, "%s", id);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_central_invite(void) {
+    const char *path = tdb("central-invite.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-central") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    static const char ID[] = "0123456789abcdef0123456789abcdef";
+    const char *LEE = "\"email\":\"lee@partner.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    oc_dbres *r = central_invite(w, ID, "Lee@Partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    if (r) {
+        CHECK(strcmp(r->central_id, ID) == 0);
+        CHECK(r->role == OC_ROLE_MEMBER && r->invite_uses == 1);
+        CHECK(r->invite_id[0] != '\0');
+        CHECK(r->invite_email && strcmp(r->invite_email, "lee@partner.example") == 0);
+    }
+    oc_dbres_free(r);
+
+    /* No owner yet: a setup token is minted, and the sweep of older ones leaves
+     * central's invitation, which has no inviter either, standing. */
+    oc_dbwriter_submit(w, oc_job_new(OC_JOB_SETUP_INVITE, 0));
+    oc_dbres_free(wait_result(w));
+
+    uint8_t role; int err;
+    uint64_t lee = oidc_signin(w, &is, 90, "g|lee", "c1", LEE, &role, &err);
+    CHECK(lee != 0 && role == OC_ROLE_MEMBER);
+
+    /* Somebody already here: nothing to do, and central is told why. */
+    r = central_invite(w, ID, "lee@partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_ERR);
+    if (r) {
+        CHECK(strcmp(r->central_id, ID) == 0);
+        /* contract: the reason reported to central, which records it */
+        CHECK(r->central_why && strcmp(r->central_why, "already a member") == 0);
+    }
+    oc_dbres_free(r);
+
+    r = central_invite(w, ID, "not an address");
+    CHECK(r && r->type == OC_RES_INVITE_ERR);
+    /* contract: the reason reported to central, which records it */
+    if (r) CHECK(r->central_why && strcmp(r->central_why, "not an email address") == 0);
+    oc_dbres_free(r);
+
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_oidc_join_rules(void) {
     const char *path = tdb("join.db");
     cleanup_db(path);
@@ -14222,10 +14287,262 @@ static void test_connections(void) {
     cleanup_db(path);
 }
 
+/* A search limited to one conversation by id (REQ-080): a DM, a group DM and a
+ * channel, which in: cannot name; a conversation the searcher cannot read gives
+ * nothing; 0 is every conversation; in: and the id apply together; a scope alone
+ * is not a search. */
+static oc_dbres *search_in_conv(oc_dbwriter *w, uint64_t uid, const char *text, const char *in, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 141);
+    j->user_id = uid;
+    j->search_limit = 50;
+    if (text && text[0]) oc_job_set_body(j, text, strlen(text));
+    if (in && in[0]) j->sq_in = strdup(in);
+    j->sq_channel = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_search_conversation_scope(void) {
+    const char *path = tdb("searchconv.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sc-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "sc-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "sc-carol", "pw", OC_ROLE_MEMBER);
+    uint64_t dave  = reg(w, "sc-dave",  "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol && dave);
+
+    oc_dbres *r = open_dm(w, alice, bob);
+    uint64_t dm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 142);
+    j->user_id = alice; j->group_uids[0] = bob; j->group_uids[1] = carol; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    uint64_t gdm = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = create_channel(w, alice, "vault", 0);
+    uint64_t priv = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(dm && gdm && priv);
+
+    uint64_t m_dm  = send_id(w, alice, dm,  "marmalade in the dm");
+    uint64_t m_gdm = send_id(w, alice, gdm, "marmalade in the group");
+    uint64_t m_ch  = send_id(w, alice, OC_DEFAULT_CHANNEL, "marmalade in general");
+    uint64_t m_pv  = send_id(w, alice, priv, "marmalade in the vault");
+    CHECK(m_dm && m_gdm && m_ch && m_pv);
+
+    r = search_in_conv(w, alice, "marmalade", NULL, dm);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 1 && r->search[0].message_id == m_dm);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, gdm);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_gdm);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_ch);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", NULL, 0);                 /* unscoped: all four */
+    CHECK(r && r->n_search == 4);
+    oc_dbres_free(r);
+
+    /* Someone who cannot read it gets nothing, and no error. */
+    r = search_in_conv(w, dave, "marmalade", NULL, dm);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search_in_conv(w, dave, "marmalade", NULL, priv);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* in: and the id both apply. */
+    r = search_in_conv(w, alice, "marmalade", "general", OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_search == 1);
+    oc_dbres_free(r);
+    r = search_in_conv(w, alice, "marmalade", "general", dm);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* A scope alone is not a search. */
+    r = search_in_conv(w, alice, NULL, NULL, dm);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A mute for a set time (REQ-137): stored as now plus the minutes, cut to a
+ * week; a mute with no end stores none; unmuting clears both; and a snapshot
+ * reports a passed instant as unmuted. */
+static const oc_notify_pref_row *pref_of(const oc_dbres *r, uint64_t ch) {
+    for (size_t i = 0; r && i < r->n_nprefs; i++) if (r->nprefs[i].channel_id == ch) return &r->nprefs[i];
+    return NULL;
+}
+static oc_dbres *set_mute_for(oc_dbwriter *w, uint64_t uid, uint64_t ch, int muted, uint32_t minutes) {
+    oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 931);
+    j->user_id = uid; j->channel_id = ch;
+    j->hook_disabled = (uint8_t)muted;     /* the field SET_MUTE reuses for it */
+    j->snooze_minutes = minutes;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static uint64_t wall_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+/* The UI harness's barrier, at the writer (test hooks on): a connection's job
+ * is counted while outstanding, and so is its result until it is taken: the
+ * count is 0 only once the result is out of the queue. A sweep
+ * run now is counted as the daemon's own work (connection 0) and leaves
+ * nothing outstanding once done. With the hooks off nothing is counted. */
+static void test_sync_outstanding(void) {
+    const char *mode = getenv("OPENCHIME_MODE");
+    char mode_was[32];
+    snprintf(mode_was, sizeof mode_was, "%s", mode ? mode : "");
+    setenv("OPENCHIME_MODE", "development", 1);
+    setenv("OPENCHIME_DEV_TEST_HOOKS", "on", 1);
+    char err[160];
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    const char *path = tdb("syncout.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    if (w) {
+        uint64_t alice = reg(w, "so-alice", "pw", OC_ROLE_OWNER);
+        CHECK(alice != 0);
+        CHECK(oc_dbwriter_outstanding(w, 77) == 0);
+        for (int i = 0; i < 20; i++) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 77);
+            j->user_id = alice;
+            oc_dbwriter_submit(w, j);
+            oc_dbres *r = wait_result(w);
+            CHECK(r && r->conn_id == 77);
+            CHECK(oc_dbwriter_outstanding(w, 77) == 0);   /* answered: nothing left */
+            oc_dbres_free(r);
+        }
+        /* Queued is not delivered: the result waiting for the net thread keeps
+         * the connection outstanding until it is taken. */
+        {
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 77);
+            j->user_id = alice;
+            struct pollfd pf = { oc_dbwriter_eventfd(w), POLLIN, 0 };
+            while (poll(&pf, 1, 0) == 1) {                 /* nothing signalled yet */
+                uint64_t v; ssize_t rd = read(pf.fd, &v, sizeof v); (void)rd;
+            }
+            oc_dbwriter_submit(w, j);
+            CHECK(poll(&pf, 1, 30000) == 1);              /* queued, not taken */
+            CHECK(oc_dbwriter_outstanding(w, 77) != 0);
+            oc_dbres *r = wait_result(w);
+            CHECK(r && r->conn_id == 77);
+            CHECK(oc_dbwriter_outstanding(w, 77) == 0);
+            oc_dbres_free(r);
+        }
+        oc_dbwriter_sweep_now(w);
+        /* What the sweep queued is taken, as the net thread would. */
+        CHECK(WAIT_UNTIL_DO(oc_dbres_free(next_answer(w)), oc_dbwriter_outstanding(w, 0) == 0, 30000));
+        oc_dbwriter_stop(w);
+    }
+    unsetenv("OPENCHIME_DEV_TEST_HOOKS");
+    if (mode_was[0]) setenv("OPENCHIME_MODE", mode_was, 1); else unsetenv("OPENCHIME_MODE");
+    CHECK(oc_config_load(err, sizeof err) == 0);
+    w = start_db(path);                                /* hooks off: not counted */
+    if (w) {
+        oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 78);
+        j->user_id = 1;
+        oc_dbwriter_submit(w, j);
+        CHECK(oc_dbwriter_outstanding(w, 78) == 0);
+        oc_dbres_free(wait_result(w));
+        oc_dbwriter_stop(w);
+    }
+}
+
+static void test_timed_mute(void) {
+    const char *path = tdb("timedmute.db");
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "tm-alice", "pw", OC_ROLE_OWNER);
+    CHECK(alice != 0);
+
+    uint64_t before = wall_ms();
+    oc_dbres *r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 60);
+    uint64_t after = wall_ms();
+    const oc_notify_pref_row *pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && pr && pr->muted == 1);
+    CHECK(pr && pr->muted_until_ms >= before + 60u * 60000u && pr->muted_until_ms <= after + 60u * 60000u);
+    oc_dbres_free(r);
+
+    before = wall_ms();                    /* past a week: cut to a week */
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 20000);
+    after = wall_ms();
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 1 && pr->muted_until_ms >= before + 10080ull * 60000u &&
+          pr->muted_until_ms <= after + 10080ull * 60000u);
+    oc_dbres_free(r);
+
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 0);   /* no end */
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 1 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    r = set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 0, 30);  /* unmute clears both */
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    /* A passed instant reads as unmuted in the snapshot, before any sweep. */
+    oc_dbres_free(set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 1));
+    oc_dbwriter_advance_clock_ms(2u * 60000u);
+    oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 932);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(0);
+
+    /* The sweep: nothing before the instant; after it, the row is cleared and
+     * that person answered once; then nothing again. */
+    oc_dbres_free(set_mute_for(w, alice, OC_DEFAULT_CHANNEL, 1, 60));
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == 0 && !r->next);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(61u * 60000u);
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == alice);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_EXPIRE_MUTES, 0);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->user_id == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_advance_clock_ms(0);
+    /* Cleared in the row, not only reported: the clock back, still unmuted. */
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 933);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    pr = pref_of(r, OC_DEFAULT_CHANNEL);
+    CHECK(pr && pr->muted == 0 && pr->muted_until_ms == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     CHECK(oc_test_mkdtemp("dbwriter", g_dir, sizeof g_dir) == 0);
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
+    test_sync_outstanding();
+    test_timed_mute();
+    test_search_conversation_scope();
     test_call_recordings();
     test_mcp_audit();
     test_retention_off();
@@ -14258,6 +14575,7 @@ int run_dbwriter_tests(void) {
     test_demo_mode();
     test_e2e_dms();
     test_oidc_join_rules();
+    test_central_invite();
     test_direct_identities();
     test_relay_published_keys();
     test_oidc_no_downgrade();

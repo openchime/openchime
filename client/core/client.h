@@ -165,9 +165,11 @@ void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
 void oc_client_typing(oc_client *c, uint64_t channel_id, uint64_t thread_root);
 
 /* Open a thread on `parent_id` (requests its replies), post a reply to it, or
- * close the thread view. Replies stream into the model's thread buffer. */
+ * close the thread view. Replies stream into the model's thread buffer. A reply
+ * with `also_channel` set is posted to the channel's main scroll too (REQ-062). */
 void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id);
-void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body);
+void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body,
+                     int also_channel);
 void oc_client_close_thread(oc_client *c);
 
 /* Run a full-text search (results stream into the model's search buffer) / close
@@ -175,9 +177,20 @@ void oc_client_close_thread(oc_client *c);
 void oc_client_open_search(oc_client *c);
 /* `sort` is OC_SEARCH_NEWEST, _OLDEST or _RELEVANCE (protocol.h). */
 void oc_client_search(oc_client *c, const char *query, uint8_t sort);
+/* The same, limited to one conversation by id (REQ-080), 0 for none. A typed
+ * `in:` in the query wins: no id is sent, and `in:` works by name. */
+void oc_client_search_in(oc_client *c, const char *query, uint8_t sort, uint64_t channel_id);
 /* Next page of the current search, in its order, from the last hit shown. */
 void oc_client_search_more(oc_client *c);
 void oc_client_close_search(oc_client *c);
+
+/* A test harness's barrier (protocol 54): ask the daemon to answer once
+ * everything this client sent before is done; its answer sets the model's
+ * `sync_done` to `token` (non-zero), after every earlier event is folded. */
+void oc_client_sync(oc_client *c, uint64_t token);
+/* How many commands this client has ever handed its network thread: a
+ * harness's sync repeats until a round's answers prompted none. */
+uint64_t oc_client_cmds_sent(oc_client *c);
 
 /* Channel management: create a public channel, join / leave one. The server
  * answers with a CHANNEL_INFO that folds into the channel list. */
@@ -476,7 +489,9 @@ void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
 void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled);
 void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
 /* Mute a conversation (REQ-137) and mark it unread from a message (REQ-235). */
-void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
+/* Mute a conversation (REQ-137) for `minutes` from now, or until unmuted with
+ * 0; `muted` 0 unmutes. The daemon resolves the end and ends it. */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted, uint32_t minutes);
 
 /* The global notification default (REQ-134): the level for every channel without a
  * per-channel override. The daemon answers with a full NOTIFY_PREFS sync. */
@@ -645,7 +660,8 @@ uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
  * (oc_model_xfer's `file`), and one failure or a cancel posts nothing. Returns
  * the tag, or 0 if nothing was queued. */
 uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
-                              const char *const *paths, size_t n_paths, const char *text);
+                              const char *const *paths, size_t n_paths, const char *text,
+                              int also_channel);
 /* One file of a post: a local file (`path`), or bytes held in memory (`data`,
  * `len`) uploaded under `name` -- an image pasted from the clipboard, which is
  * never written to disk (ARCH-88). The core copies the bytes. */
@@ -655,9 +671,11 @@ typedef struct {
     size_t         len;
     const char    *name;
 } oc_post_item;
-/* oc_client_post_files, for files and in-memory items alike. */
+/* oc_client_post_files, for files and in-memory items alike. `also_channel`, with
+ * a `thread_root`, posts the reply to the channel's main scroll too (REQ-062). */
 uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
-                              const oc_post_item *items, size_t n_items, const char *text);
+                              const oc_post_item *items, size_t n_items, const char *text,
+                              int also_channel);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
 /* Save the playable copy of video message `attachment_id` -- H.264 and MP3,
  * made by the daemon (ARCH-135) -- to `dest_path`. Queued as a download is,
@@ -736,7 +754,7 @@ void oc_client_delete_outgoing_webhook(oc_client *c, uint64_t webhook_id);
 uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
                               uint32_t duration_ms, uint16_t width, uint16_t height,
-                              const char *caption);
+                              const char *caption, int also_channel);
 /* Post a snippet (REQ-226): `text` (copied; at most OC_SNIPPET_MAX_SIZE) as a
  * text/plain attachment with a title and a language (lexer.h names; "" for
  * none), into the channel or the thread `thread_root`. Returns the job's tag,

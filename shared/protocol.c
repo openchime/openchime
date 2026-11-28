@@ -1551,6 +1551,7 @@ oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_p
         oc_w_u8(w, m->entries[i].level);
         oc_w_u8(w, m->entries[i].muted);
         oc_w_u8(w, m->entries[i].follow_threads);   /* REQ-282 */
+        oc_w_u64(w, m->entries[i].muted_until_ms);  /* REQ-137, protocol 52 */
     }
     return oc_frame_end(w, off);
 }
@@ -1746,8 +1747,10 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
         uint8_t level = oc_r_u8(p);
         uint8_t muted = oc_r_u8(p);
         uint8_t follow = oc_r_u8(p);
+        uint64_t until = oc_r_u64(p);
         if (i < cap) { entries[i].channel_id = cid; entries[i].level = level;
-                       entries[i].muted = muted; entries[i].follow_threads = follow; }
+                       entries[i].muted = muted; entries[i].follow_threads = follow;
+                       entries[i].muted_until_ms = until; }
     }
     return r_done(p);
 }
@@ -3187,6 +3190,23 @@ oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const 
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_sync(oc_wbuf *w, uint16_t version, const oc_sync *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SYNC);
+    oc_w_u64(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_sync_done(oc_wbuf *w, uint16_t version, const oc_sync *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SYNC_DONE);
+    oc_w_u64(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_sync(oc_rbuf *p, oc_sync *m) {
+    m->token = oc_r_u64(p);
+    return r_done(p);
+}
+
 oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_RELEASE_NOTES_GET);
     oc_w_str(w, m->build_id);
@@ -3462,6 +3482,7 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     oc_w_u64(w, m->before_ms);
     oc_w_u8(w, m->sort);                            /* 28 */
     oc_w_u64(w, (uint64_t)m->cursor_rank);
+    oc_w_u64(w, m->channel_id);                     /* 53 */
     return oc_frame_end(w, off);
 }
 
@@ -5038,6 +5059,7 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
     m->before_ms  = oc_r_u64(p);
     m->sort        = oc_r_u8(p);
     m->cursor_rank = (int64_t)oc_r_u64(p);
+    m->channel_id  = oc_r_u64(p);
     return r_done(p);
 }
 
@@ -5214,12 +5236,14 @@ oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m)
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_MUTE);
     oc_w_u64(w, m->channel_id);
     oc_w_u8(w, m->muted);
+    oc_w_u32(w, m->minutes);            /* REQ-137, protocol 52 */
     return oc_frame_end(w, off);
 }
 
 oc_result oc_decode_set_mute(oc_rbuf *p, oc_set_mute *m) {
     m->channel_id = oc_r_u64(p);
     m->muted      = oc_r_u8(p);
+    m->minutes    = oc_r_u32(p);
     return r_done(p);
 }
 

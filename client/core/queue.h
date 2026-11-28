@@ -10,6 +10,8 @@
 #ifndef OC_QUEUE_H
 #define OC_QUEUE_H
 
+#include <stdint.h>
+
 #include "oc_thread.h"
 
 typedef struct oc_qnode { void *item; struct oc_qnode *next; } oc_qnode;
@@ -18,6 +20,7 @@ typedef struct {
     oc_mutex_t mu;
     oc_cond_t  cv;
     oc_qnode       *head, *tail;
+    uint64_t        pushed;      /* items ever pushed (oc_queue_pushed) */
 } oc_queue;
 
 void  oc_queue_init(oc_queue *q);
@@ -25,5 +28,6 @@ void  oc_queue_destroy(oc_queue *q);      /* frees remaining nodes (not items) *
 void  oc_queue_push(oc_queue *q, void *item);
 void *oc_queue_pop(oc_queue *q);          /* blocks until an item is available */
 void *oc_queue_try_pop(oc_queue *q);      /* NULL if empty */
+uint64_t oc_queue_pushed(oc_queue *q);    /* how many items were ever pushed */
 
 #endif /* OC_QUEUE_H */

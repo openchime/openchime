@@ -2091,6 +2091,13 @@ static const char MIGRATION_0092[] =
     "CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at_ms);"
     "CREATE INDEX webhook_deliveries_webhook ON webhook_deliveries(webhook_id);";
 
+static const char MIGRATION_0093[] =
+    /* A mute for a set time (REQ-137): when it ends, as the daemon resolved it
+     * from the minutes the client asked for; 0 is a mute with no end. The
+     * reminder tick clears a lapsed one (OC_JOB_EXPIRE_MUTES), so every reader
+     * of `muted` stays as it was. */
+    "ALTER TABLE notification_prefs ADD COLUMN muted_until_ms INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -2184,6 +2191,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 90, MIGRATION_0090 },
     { 91, MIGRATION_0091 },
     { 92, MIGRATION_0092 },
+    { 93, MIGRATION_0093 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

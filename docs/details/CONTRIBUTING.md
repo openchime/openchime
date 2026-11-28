@@ -26,6 +26,12 @@ setting).
 - **Every feature has exactly one GitHub issue**, and its branch is named for
   it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
   current `staging` ("Starting a feature").
+- **A fix to an issue that has not shipped is that issue's own:** a further
+  pull request under the same number (`OC-<n>: …`, on a new
+  `feature/oc-<n>-…` branch), a release grading's gaps included, with the
+  issue back at `in-review` while it is open. A new issue is filed only for
+  something already shipped; one filed to carry a fix to an unshipped issue
+  splits one change across two numbers.
 - **Land by pull request to `staging`,** squashed to a **single** house-format
   commit whose subject names the issue. The issue **closes when its release
   ships**: the release reads the issue from each shipped commit's subject, and

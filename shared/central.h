@@ -21,6 +21,10 @@
 #define OC_CENTRAL_PUSH_NOTIFY    OC_CENTRAL_WORKSPACE "/machine/push/notify"
 #define OC_CENTRAL_TLS_NAMES      OC_CENTRAL_WORKSPACE "/machine/tls/names"
 #define OC_CENTRAL_TLS_CERTIFICATE OC_CENTRAL_WORKSPACE "/machine/tls/certificate"
+/* The invitations central queued for this workspace (ARCH-85): taken on a
+ * lease, then reported, made or refused. */
+#define OC_CENTRAL_INVITATIONS_TAKE   OC_CENTRAL_WORKSPACE "/machine/invitations/take"
+#define OC_CENTRAL_INVITATIONS_REPORT OC_CENTRAL_WORKSPACE "/machine/invitations/report"
 
 /* A build's release notes, followed by the build id; a signed GET. */
 #define OC_CENTRAL_RELEASE_BUILD  OC_CENTRAL_WORKSPACE "/releases/build/"

@@ -262,8 +262,21 @@
  *
  * 48: the export of a video message (ARCH-135). EXPORT_GET, EXPORT_INFO,
  * EXPORT_CHUNK and EXPORT_END (0x013E-0x0141) are new, as is the error
- * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`. */
-#define OC_PROTOCOL_VERSION 51u
+ * EXPORT_UNAVAILABLE (3074) and the capability `h264-export`.
+ *
+ * 52: a mute for a set time (REQ-137). SET_MUTE carries `minutes` (u32) after
+ * `muted`, and each NOTIFY_PREFS entry `muted_until_ms` (u64) after
+ * `follow_threads`: a field appended to a fixed layout and one to a repeated
+ * entry.
+ *
+ * 53: SEARCH carries `channel_id` (u64) after `cursor_rank`, a search limited
+ * to one conversation by id, a DM's included (REQ-080). A field appended to a
+ * fixed layout.
+ *
+ * 54: SYNC and SYNC_DONE (0x015C, 0x015D), a test harness's barrier: the daemon
+ * answers SYNC once everything the connection sent before it has been done and
+ * sent, and only with its test hooks enabled. New frames. */
+#define OC_PROTOCOL_VERSION 54u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -749,6 +762,10 @@ typedef enum {
      * frames, so no version bump. */
     OC_MSG_RELEASE_NOTES_GET       = 0x015A, /* C->S, the notes of a build id */
     OC_MSG_RELEASE_NOTES           = 0x015B, /* S->C, central's answer: its status and body */
+    /* A test harness's barrier (protocol 54): answered only with the daemon's
+     * test hooks on, once every earlier frame of the connection is done. */
+    OC_MSG_SYNC                    = 0x015C, /* C->S, a token */
+    OC_MSG_SYNC_DONE               = 0x015D, /* S->C, the same token */
     /* To-do lists in messages: made by a "/todo" body, worked by
      * these, and told as TODO, a list's whole state in one or more frames. */
     OC_MSG_TODO_ADD             = 0x0122, /* C->S, a task added to a list */
@@ -1696,7 +1713,9 @@ typedef struct { uint64_t session_id; uint64_t created_at; uint64_t last_seen;
 typedef struct { uint16_t count; const oc_session_entry *entries; } oc_session_list;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_file_channel_entry;
 typedef struct { uint16_t count; const oc_file_channel_entry *entries; } oc_file_channels;
-typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
+/* `minutes` (REQ-137): with `muted` 1, how long from now, cut to a week as
+ * SET_SNOOZE's are; 0 mutes until unmuted. Since protocol 52. */
+typedef struct { uint64_t channel_id; uint8_t muted; uint32_t minutes; } oc_set_mute;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
 typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
@@ -1816,7 +1835,10 @@ typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
 /* `follow_threads` (REQ-282): every thread in the conversation is followed, as
  * if each were, unless muted or one is unfollowed by itself. Appended per entry:
  * a layout change, so protocol 37. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_entry;
+/* `muted_until_ms` (REQ-137): when a timed mute ends, 0 for a mute with no end
+ * or none. Appended per entry: protocol 52. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads;
+                 uint64_t muted_until_ms; } oc_notify_pref_entry;
 /* SET_CHANNEL_THREAD_FOLLOW: follow every thread in a conversation, or stop. */
 typedef struct { uint64_t channel_id; uint8_t on; } oc_set_channel_thread_follow;
 typedef struct { uint8_t level; } oc_set_notify_default;
@@ -2193,6 +2215,8 @@ typedef struct { uint64_t webhook_id; oc_slice secret; } oc_outgoing_webhook_sec
 #define OC_RELEASE_NOTES_MAX   60000u
 #define OC_BUILD_ID_MAX        64u
 typedef struct { oc_slice build_id; } oc_release_notes_get;
+/* SYNC and SYNC_DONE: the token the barrier is named by, echoed back. */
+typedef struct { uint64_t token; } oc_sync;
 typedef struct { oc_slice build_id; uint16_t status; oc_slice body; } oc_release_notes;
 typedef struct { uint64_t webhook_id; oc_slice url; oc_slice events; uint8_t enabled; oc_slice disabled_reason;
                  uint64_t created_by; uint64_t created_at_ms; uint16_t n_channels;
@@ -2342,6 +2366,8 @@ typedef struct {
                                      * knows the user's timezone */
     uint8_t  sort;           /* OC_SEARCH_*; 0 = newest first */
     int64_t  cursor_rank;    /* relevance paging: the last row's rank */
+    uint64_t channel_id;     /* one conversation, by id; 0 = no conversation scope.
+                              * Since protocol 53 (REQ-080) */
 } oc_search;
 /* `action` 1: the message is an action and the snippet is cut from its action
  * text (REQ-058). */
@@ -2715,6 +2741,8 @@ oc_result oc_encode_revoke_connection(oc_wbuf *w, uint16_t version, const oc_rev
 oc_result oc_encode_create_outgoing_webhook(oc_wbuf *w, uint16_t version, const oc_create_outgoing_webhook *m);
 oc_result oc_encode_outgoing_webhook_secret(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_secret *m);
 oc_result oc_encode_release_notes_get(oc_wbuf *w, uint16_t version, const oc_release_notes_get *m);
+oc_result oc_encode_sync(oc_wbuf *w, uint16_t version, const oc_sync *m);
+oc_result oc_encode_sync_done(oc_wbuf *w, uint16_t version, const oc_sync *m);
 oc_result oc_encode_release_notes(oc_wbuf *w, uint16_t version, const oc_release_notes *m);
 oc_result oc_encode_list_outgoing_webhooks(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_outgoing_webhook_list(oc_wbuf *w, uint16_t version, const oc_outgoing_webhook_list *m);
@@ -2992,6 +3020,7 @@ oc_result oc_decode_revoke_connection(oc_rbuf *p, oc_revoke_connection *m);
 oc_result oc_decode_create_outgoing_webhook(oc_rbuf *p, oc_create_outgoing_webhook *m);
 oc_result oc_decode_outgoing_webhook_secret(oc_rbuf *p, oc_outgoing_webhook_secret *m);
 oc_result oc_decode_release_notes_get(oc_rbuf *p, oc_release_notes_get *m);
+oc_result oc_decode_sync(oc_rbuf *p, oc_sync *m);   /* SYNC and SYNC_DONE alike */
 oc_result oc_decode_release_notes(oc_rbuf *p, oc_release_notes *m);
 /* Entries past `cap` are read and dropped; *out_count is the frame's count. */
 oc_result oc_decode_outgoing_webhook_list(oc_rbuf *p, oc_outgoing_webhook_entry *entries, uint16_t cap,

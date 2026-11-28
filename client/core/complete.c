@@ -1161,3 +1161,110 @@ size_t oc_complete(const oc_model *m, const char *text,
 
     return 0;
 }
+
+/* ---- the emoji a person uses (REQ-265) ------------------------------------ */
+
+/* A shortcode's characters, or ":name:" around them. */
+static int use_key_ok(const char *k, size_t n) {
+    if (n == 0 || n >= OC_EMOJI_USE_KEY) return 0;
+    size_t a = 0, b = n;
+    if (k[0] == ':') {
+        if (n < 3 || k[n - 1] != ':') return 0;
+        a = 1; b = n - 1;
+    }
+    for (size_t i = a; i < b; i++) {
+        unsigned char c = (unsigned char)k[i];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '+')) return 0;
+    }
+    return 1;
+}
+
+void oc_emoji_usage_note(oc_emoji_usage *u, const char *key) {
+    if (!u || !key) return;
+    size_t kn = strlen(key);
+    if (!use_key_ok(key, kn)) return;
+    int at = -1;
+    for (int i = 0; i < u->n; i++) if (strcmp(u->v[i].key, key) == 0) { at = i; break; }
+    oc_emoji_use e;
+    if (at >= 0) {
+        if (u->v[at].count >= OC_EMOJI_USE_COUNT_MAX)
+            for (int i = 0; i < u->n; i++) u->v[i].count = (uint8_t)((u->v[i].count + 1) / 2);
+        e = u->v[at];
+        e.count++;
+        memmove(&u->v[1], &u->v[0], (size_t)at * sizeof u->v[0]);
+    } else {
+        if (u->n == OC_EMOJI_USES_MAX) {
+            /* The lowest count goes; of a tie, the oldest (the furthest back). */
+            int out = u->n - 1;
+            for (int i = u->n - 1; i >= 0; i--) if (u->v[i].count < u->v[out].count) out = i;
+            memmove(&u->v[out], &u->v[out + 1], (size_t)(u->n - 1 - out) * sizeof u->v[0]);
+            u->n--;
+        }
+        memset(&e, 0, sizeof e);
+        memcpy(e.key, key, kn + 1);
+        e.count = 1;
+        memmove(&u->v[1], &u->v[0], (size_t)u->n * sizeof u->v[0]);
+        u->n++;
+    }
+    u->v[0] = e;
+}
+
+size_t oc_emoji_usage_rank(const oc_emoji_usage *u, const char **out, size_t max) {
+    if (!u || !out || !u->n || !max) return 0;
+    if (max > OC_EMOJI_FREQUENT_SHOW) max = OC_EMOJI_FREQUENT_SHOW;
+    size_t k = 0;
+    out[k++] = u->v[0].key;
+    uint8_t taken[OC_EMOJI_USES_MAX] = { 1 };
+    while (k < max && k < u->n) {
+        int best = -1;
+        /* Ascending index is recency, so a strict > keeps a tie's more recent. */
+        for (int i = 1; i < u->n; i++)
+            if (!taken[i] && (best < 0 || u->v[i].count > u->v[best].count)) best = i;
+        if (best < 0) break;
+        taken[best] = 1;
+        out[k++] = u->v[best].key;
+    }
+    return k;
+}
+
+size_t oc_emoji_usage_encode(const oc_emoji_usage *u, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    size_t len = 0;
+    for (int i = 0; u && i < u->n; i++) {
+        char one[OC_EMOJI_USE_KEY + 8];
+        int w = snprintf(one, sizeof one, "%s%s=%u", len ? "," : "", u->v[i].key, (unsigned)u->v[i].count);
+        if (w < 0 || len + (size_t)w + 1 > cap) break;          /* the older ones do not fit */
+        memcpy(out + len, one, (size_t)w + 1);
+        len += (size_t)w;
+    }
+    return len;
+}
+
+void oc_emoji_usage_parse(oc_emoji_usage *u, const char *s) {
+    if (!u) return;
+    memset(u, 0, sizeof *u);
+    if (!s) return;
+    while (*s && u->n < OC_EMOJI_USES_MAX) {
+        const char *e = strchr(s, ',');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        const char *eq = memchr(s, '=', n);
+        if (eq) {
+            size_t kn = (size_t)(eq - s);
+            const char *c = eq + 1, *end = s + n;
+            unsigned v = 0; int digits = 0;
+            while (c < end && *c >= '0' && *c <= '9' && digits < 3) { v = v * 10u + (unsigned)(*c - '0'); c++; digits++; }
+            int dup = 0;
+            for (int i = 0; i < u->n; i++)
+                if (strlen(u->v[i].key) == kn && memcmp(u->v[i].key, s, kn) == 0) dup = 1;
+            if (c == end && digits && v >= 1 && v <= OC_EMOJI_USE_COUNT_MAX && use_key_ok(s, kn) && !dup) {
+                memcpy(u->v[u->n].key, s, kn);
+                u->v[u->n].key[kn] = '\0';
+                u->v[u->n].count = (uint8_t)v;
+                u->n++;
+            }
+        }
+        if (!e) break;
+        s = e + 1;
+    }
+}

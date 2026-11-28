@@ -123,6 +123,7 @@ static void unlink_db(const char *db) {
 #define T_DESCR     "What this channel is for."
 #define T_DISPLAY   "Dana Q"
 #define T_REPLY     "a threaded reply"
+#define T_ALSO      "a threaded reply, also to the channel"
 #define T_EDIT_BODY "edited body"
 
 /* Read-aloud with a stub voice (ARCH-111): the core's half is the queue, the
@@ -2842,6 +2843,187 @@ static void test_notify_scan(void) {
     oc_model_free(&m);
 }
 
+/* A person's own channel colours: set, change, clear, the cap, the value's
+ * size, and the setting's round trip. */
+static void test_chan_colors(void) {
+    oc_chan_colors c; memset(&c, 0, sizeof c);
+    CHECK(oc_chan_color_of(&c, 12) == 0);
+    CHECK(oc_chan_color_set(&c, 12, 3) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 3);
+    CHECK(oc_chan_color_set(&c, 12, 5) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 5 && c.n == 1);
+    CHECK(oc_chan_color_set(&c, 12, 0) == OC_CHAN_COLOR_OK && oc_chan_color_of(&c, 12) == 0 && c.n == 0);
+    CHECK(oc_chan_color_set(&c, 12, 0) == OC_CHAN_COLOR_OK);                   /* clearing none */
+    CHECK(oc_chan_color_set(&c, 12, OC_CHAN_COLOR_COUNT + 1) == OC_CHAN_COLOR_BAD && c.n == 0);
+    CHECK(oc_chan_color_set(&c, 0, 1) == OC_CHAN_COLOR_BAD);
+
+    /* 64 channels across all 8 colours fit, and the 65th is refused, the map
+     * as it was. */
+    for (uint64_t id = 1; id <= OC_CHAN_COLORS_MAX; id++)
+        CHECK(oc_chan_color_set(&c, id, (uint8_t)(1 + id % OC_CHAN_COLOR_COUNT)) == OC_CHAN_COLOR_OK);
+    CHECK(c.n == OC_CHAN_COLORS_MAX);
+    oc_chan_colors before = c;
+    CHECK(oc_chan_color_set(&c, 999, 2) == OC_CHAN_COLOR_FULL);
+    CHECK(memcmp(&before, &c, sizeof c) == 0);
+    char enc[OC_SETTING_VALUE_MAX];
+    size_t need = oc_chan_colors_encode(&c, enc, sizeof enc);
+    CHECK(need < OC_SETTING_VALUE_MAX && need == strlen(enc));
+    CHECK(strncmp(enc, "1:8,16,", 7) == 0);                 /* grouped: the colour once */
+    oc_chan_colors back; oc_chan_colors_parse(&back, enc);
+    CHECK(back.n == c.n);
+    for (uint64_t id = 1; id <= OC_CHAN_COLORS_MAX; id++)
+        CHECK(oc_chan_color_of(&back, id) == oc_chan_color_of(&c, id));
+    char enc2[OC_SETTING_VALUE_MAX];
+    oc_chan_colors_encode(&back, enc2, sizeof enc2);
+    CHECK(strcmp(enc, enc2) == 0);
+
+    /* Long ids: the colour whose value would not fit a setting is refused. */
+    memset(&c, 0, sizeof c);
+    int refused = 0, set = 0;
+    for (uint64_t k = 0; k < OC_CHAN_COLORS_MAX; k++) {
+        int r = oc_chan_color_set(&c, 18000000000000000000ull + k, (uint8_t)(1 + k % 2));
+        if (r == OC_CHAN_COLOR_TOO_LONG) { refused = 1; break; }
+        if (r == OC_CHAN_COLOR_OK) set++;
+    }
+    CHECK(refused && set > 0 && c.n == set);
+    CHECK(oc_chan_colors_encode(&c, enc, sizeof enc) < OC_SETTING_VALUE_MAX);
+
+    /* Malformed groups and ids are skipped, the rest kept; nothing crashes. */
+    oc_chan_colors_parse(&back, NULL);
+    CHECK(back.n == 0);
+    oc_chan_colors_parse(&back, "");
+    CHECK(back.n == 0);
+    oc_chan_colors_parse(&back, "9:4;x:5;2:7,,0,abc,88;:3;1:12,12;3");
+    CHECK(back.n == 3);
+    CHECK(oc_chan_color_of(&back, 7) == 2 && oc_chan_color_of(&back, 88) == 2 && oc_chan_color_of(&back, 12) == 1);
+    CHECK(oc_chan_color_of(&back, 4) == 0 && oc_chan_color_of(&back, 5) == 0);
+}
+
+/* The graphical client's rail as a person arranges it: the order and what is
+ * shown survive the setting, and an older or newer build's value is read
+ * without losing a view. */
+static void test_rail_opts(void) {
+    static const char *const K[] = { "home", "dms", "activity", "files", "later", "admin" };
+    const size_t NK = sizeof K / sizeof K[0];
+    oc_rail_opts o, b;
+    char enc[OC_SETTING_VALUE_MAX];
+    oc_rail_opts_default(&o, K, NK);
+    CHECK(o.n == NK);
+    for (size_t i = 0; i < NK; i++) CHECK(!strcmp(o.v[i].name, K[i]) && o.v[i].shown);
+
+    /* Reordered and partly hidden: encode then parse is the identity. */
+    oc_rail_opts_parse(&o, "home,later,-dms,activity,-admin,files", K, NK);
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(!strcmp(enc, "home,later,-dms,activity,-admin,files"));
+    oc_rail_opts_parse(&b, enc, K, NK);
+    CHECK(b.n == o.n && !memcmp(&b, &o, sizeof b));
+
+    /* A view this build does not know is dropped; one it has that the value
+     * does not name is added at the end, shown. */
+    oc_rail_opts_parse(&o, "home,calls,files,-later", K, NK);
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(!strcmp(enc, "home,files,-later,dms,activity,admin"));
+
+    /* Home is first and shown whatever the value says. */
+    oc_rail_opts_parse(&o, "dms,-home,files", K, NK);
+    CHECK(o.n == NK && !strcmp(o.v[0].name, "home") && o.v[0].shown);
+    CHECK(!strcmp(o.v[1].name, "dms") && !strcmp(o.v[2].name, "files"));
+
+    /* Empty, NULL and malformed: the default order, all shown. */
+    const char *bad[] = { NULL, "", ",,,", "nonsense", "-", "home;dms" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        oc_rail_opts_parse(&o, bad[i], K, NK);
+        CHECK(o.n == NK);
+        for (size_t k = 0; k < NK && k < o.n; k++) CHECK(!strcmp(o.v[k].name, K[k]) && o.v[k].shown);
+    }
+    /* Duplicates count once. */
+    oc_rail_opts_parse(&o, "home,dms,dms,-dms", K, NK);
+    CHECK(o.n == NK && o.v[1].shown && !strcmp(o.v[1].name, "dms"));
+
+    /* Every view, hidden, fits one setting. */
+    oc_rail_opts_default(&o, K, NK);
+    for (uint8_t i = 0; i < o.n; i++) o.v[i].shown = 0;
+    oc_rail_opts_encode(&o, enc, sizeof enc);
+    CHECK(strlen(enc) > 0 && strlen(enc) < OC_SETTING_VALUE_MAX);
+    oc_rail_opts_parse(&b, enc, K, NK);
+    CHECK(b.n == NK && b.v[0].shown && !b.v[1].shown);
+}
+
+/* A mute for a set time (REQ-137): the model keeps the end NOTIFY_PREFS
+ * says, and clears it when a later one says none; and "until tomorrow" is one
+ * pure function both clients' menus call. */
+static void test_timed_mute_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DND; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 10; e.status = 1; e.muted_until_ms = 1700000000000ull;
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->muted == 1 && c->muted_until_ms == 1700000000000ull);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DND; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 10; e.status = 0; e.muted_until_ms = 0;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 10);
+    CHECK(c && c->muted == 0 && c->muted_until_ms == 0);
+    oc_model_free(&m);
+
+    CHECK(oc_minutes_until_local(8, 0, 9, 0, 1) == 1500);
+    CHECK(oc_minutes_until_local(9, 0, 9, 0, 1) == 1440);
+    CHECK(oc_minutes_until_local(23, 30, 9, 0, 1) == 570);
+    CHECK(oc_minutes_until_local(8, 0, 9, 0, 0) == 60);
+    CHECK(oc_minutes_until_local(9, 30, 9, 0, 0) == 1410);
+}
+
+/* One search field (REQ-080): what it searches in each view and kind of
+ * conversation, and a search's scope as it begins, pages and widens, a typed
+ * in: winning over it. */
+static void test_search_target(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 20; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.body = strdup(""); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 30; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.e2e = 1; e.body = strdup(""); oc_model_apply(&m, &e);
+
+    oc_search_target t;
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 10, &t);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 10 && !strcmp(t.placeholder, "Search #general"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 20, &t);
+    char dmt[128] = ""; oc_model_dm_title(&m, oc_model_channel(&m, 20), dmt, sizeof dmt);
+    char want[160]; snprintf(want, sizeof want, "Search %s", dmt);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 20 && dmt[0] && !strcmp(t.placeholder, want));
+    oc_model_search_target(&m, OC_SV_CONVERSATION, 30, &t);           /* end to end: unscoped */
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 0 && !strcmp(t.placeholder, "Search messages"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_FILES, 10, &t);
+    CHECK(t.kind == OC_ST_FILES && t.scope == 0 && !strcmp(t.placeholder, "Search files"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_PEOPLE, 0, &t);
+    CHECK(t.kind == OC_ST_PEOPLE && !strcmp(t.placeholder, "Search people"));   /* contract: the field's words for each view are the plan's */
+    oc_model_search_target(&m, OC_SV_OTHER, 10, &t);
+    CHECK(t.kind == OC_ST_MESSAGES && t.scope == 0 && !strcmp(t.placeholder, "Search messages"));   /* contract: the field's words for each view are the plan's */
+
+    oc_model_search_begin_scoped(&m, "deploy", 20);
+    CHECK(m.search_open && m.search_scope == 20);
+    oc_model_search_begin_scoped(&m, "deploy in:general", 20);       /* typed in: wins */
+    CHECK(m.search_scope == 0);
+    oc_model_search_begin_scoped(&m, "deploy", 0);                   /* widened */
+    CHECK(m.search_scope == 0);
+    oc_model_search_begin_scoped(&m, "deploy", 10);
+    oc_model_close_search(&m);
+    CHECK(m.search_scope == 0);
+    oc_model_free(&m);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -4078,6 +4260,101 @@ static void feed_reply(oc_model *m, uint64_t message_id, uint64_t author,
     e.body = strdup(body);
     oc_model_apply(m, &e);
     free(e.body);
+}
+
+/* A thread reply also posted to the main scroll (REQ-062): the model puts it in
+ * the channel's scroll as well as the thread, once, with its thread, and counts
+ * and notifies it once. */
+static void feed_also(oc_model *m, uint64_t message_id, uint64_t author, int participant,
+                      int also, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_THREAD_REPLY;
+    e.channel_id = 10; e.parent_id = 500; e.message_id = message_id;
+    e.author_id = author; e.server_time = 1000 + message_id; e.count = 1;
+    e.participant = (uint8_t)participant;
+    e.also_channel = (uint8_t)also;
+    e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+static void also_fixture(oc_model *m) {
+    notice_fixture(m);
+    oc_ev e;                                     /* the thread's parent, alice's */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 500; e.author_id = 1;
+    e.server_time = 500; e.body = strdup("the parent");
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+static size_t copies_of(const oc_channel *c, uint64_t mid) {
+    size_t n = 0;
+    for (size_t i = 0; c && i < c->n_msgs; i++) if (c->msgs[i].message_id == mid) n++;
+    return n;
+}
+static void test_also_channel_replies(void) {
+    oc_thread_notice out[OC_MAX_THREAD_NOTICES];
+    {   /* In the scroll with its thread, in the open thread, the parent's count
+         * bumped and the preview moved; the replay's BROADCAST adds no copy. */
+        oc_model m; also_fixture(&m);
+        oc_model_open_thread(&m, 10, 500);
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_THREAD_END; e.parent_id = 500; oc_model_apply(&m, &e);
+        feed_also(&m, 700, 2, 0, 1, "to the channel too");
+        const oc_channel *c = oc_model_channel(&m, 10);
+        const oc_msg *r = find_msg(&m, 10, 700), *p = find_msg(&m, 10, 500);
+        CHECK(r && r->parent_id == 500 && r->body && strcmp(r->body, "to the channel too") == 0);
+        CHECK(p && p->reply_count == 1);
+        CHECK(m.n_thread_msgs == 1 && m.thread_msgs[0].message_id == 700);
+        CHECK(c && strcmp(c->preview, "to the channel too") == 0);
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 700; e.author_id = 2;
+        e.parent_id = 500; e.server_time = 1700; e.body = strdup("to the channel too");
+        oc_model_apply(&m, &e);
+        free(e.body);
+        CHECK(copies_of(oc_model_channel(&m, 10), 700) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Without the flag the scroll is as it was. */
+        oc_model m; also_fixture(&m);
+        feed_also(&m, 701, 2, 0, 0, "only in the thread");
+        const oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c && c->n_msgs == 1 && find_msg(&m, 10, 701) == NULL);
+        oc_model_free(&m);
+    }
+    {   /* In a thread I take part in: one unread, one thread notice, and the
+         * channel's scan leaves it to that notice. */
+        oc_model m; also_fixture(&m);
+        int before = oc_model_channel(&m, 10)->unread;
+        feed_also(&m, 702, 2, 1, 1, "you were in this thread");
+        const oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c && c->unread == before + 1);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(oc_model_notify_scan(&m, c, 500, 0, 0, NULL, NULL, NULL) == NULL);
+        oc_model_free(&m);
+    }
+    {   /* In a thread I am not in: no thread notice, and the scan takes it as a
+         * channel message. */
+        oc_model m; also_fixture(&m);
+        feed_also(&m, 703, 2, 0, 1, "a thread you never joined");
+        const oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        const oc_msg *pick = oc_model_notify_scan(&m, c, 500, 0, 0, NULL, NULL, NULL);
+        CHECK(pick && pick->message_id == 703);
+        oc_model_free(&m);
+    }
+    {   /* A BROADCAST carrying a thread keeps it on the message. */
+        oc_model m; also_fixture(&m);
+        oc_ev e; memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 704; e.author_id = 2;
+        e.parent_id = 500; e.server_time = 1704; e.body = strdup("from the replay");
+        oc_model_apply(&m, &e);
+        free(e.body);
+        const oc_msg *r = find_msg(&m, 10, 704);
+        CHECK(r && r->parent_id == 500);
+        CHECK(find_msg(&m, 10, 500) && find_msg(&m, 10, 500)->parent_id == 0);
+        oc_model_free(&m);
+    }
 }
 
 /* WHICH thread replies the client considers at all (REQ-061).
@@ -7099,7 +7376,7 @@ static void test_export_client(int on) {
         CHECK(oc_mp4_writer_finish(mw, &video, &vlen, &ms) == 0);
         uint8_t *poster = malloc(500);
         if (poster) memset(poster, 0x33, 500);
-        uint64_t tag = video && poster ? oc_client_post_video(a, 1, 0, video, vlen, poster, 500, ms, 320, 240, "") : 0;
+        uint64_t tag = video && poster ? oc_client_post_video(a, 1, 0, video, vlen, poster, 500, ms, 320, 240, "", 0) : 0;
         video = poster = NULL;                          /* the core owns them */
         CHECK(tag != 0);
         CHECK(WAIT_FOR_MS(a, m->media_posted_tag == tag, 30000));
@@ -7181,6 +7458,10 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_chanmem_overlap();
     test_sidebar();
+    test_search_target();
+    test_timed_mute_model();
+    test_rail_opts();
+    test_chan_colors();
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
     test_srvalerts_model();
@@ -7209,6 +7490,7 @@ int run_client_core_tests(void) {
     test_feedback();
     test_notify_scan();
     test_thread_notices();
+    test_also_channel_replies();
     test_unread_counts_what_notifies();
     test_capabilities();
     test_emoji_aliases();
@@ -7815,8 +8097,45 @@ int run_client_core_tests(void) {
 
         /* erik replies to dana's message in a thread: both see the parent's reply
          * count rise, and opening the thread streams the reply into the buffer. */
-        oc_client_reply(b, 1, mid, T_REPLY);
+        oc_client_reply(b, 1, mid, T_REPLY, 0);
         CHECK(WAIT_FOR(a, find_msg(m, 1, mid) && find_msg(m, 1, mid)->reply_count == 1));
+        CHECK(!channel_has_body(oc_client_model(a), 1, T_REPLY));   /* a thread's alone */
+        /* ...and one also sent to the channel (REQ-062): dana gets it in the
+         * main scroll, with its thread, and a new connection's history brings
+         * it back there once. */
+        oc_client_reply(b, 1, mid, T_ALSO, 1);
+        CHECK(WAIT_FOR(a, find_msg(m, 1, mid) && find_msg(m, 1, mid)->reply_count == 2 &&
+                          channel_has_body(m, 1, T_ALSO)));
+        {
+            const oc_channel *ac = oc_model_channel((oc_model *)oc_client_model(a), 1);
+            uint64_t rid = 0;
+            for (size_t j = 0; ac && j < ac->n_msgs; j++)
+                if (ac->msgs[j].body && strcmp(ac->msgs[j].body, T_ALSO) == 0) {
+                    rid = ac->msgs[j].message_id;
+                    CHECK(ac->msgs[j].parent_id == mid);
+                }
+            CHECK(rid != 0);
+            oc_client *a2 = start_as(NULL, "127.0.0.1", arg.port, "dana:meadow-cobalt-thunder", NULL, NULL, 1, NULL);
+            CHECK(a2 != NULL);
+            if (a2) {
+                CHECK(WAIT_FOR(a2, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_backfill(a2, 1);
+                CHECK(WAIT_FOR(a2, find_msg(m, 1, rid) != NULL));
+                const oc_msg *r = find_msg(oc_client_model(a2), 1, rid);
+                CHECK(r && r->parent_id == mid);
+                const oc_channel *c2 = oc_model_channel((oc_model *)oc_client_model(a2), 1);
+                size_t copies = 0;
+                for (size_t j = 0; c2 && j < c2->n_msgs; j++) if (c2->msgs[j].message_id == rid) copies++;
+                CHECK(copies == 1);
+                CHECK(!channel_has_body(oc_client_model(a2), 1, T_REPLY));
+                oc_client_stop(a2);
+            }
+            /* It counted as unread for dana, as a message there would; read
+             * now, so the checks below start from her own messages alone. */
+            CHECK(channel_unread(oc_client_model(a), 1) == 1);
+            oc_client_mark_read(a, 1);
+            oc_client_tick(a);
+        }
         oc_client_open_thread(b, 1, mid);
         CHECK(WAIT_FOR(b, m->thread_open && m->n_thread_msgs >= 1));
         {
@@ -7843,6 +8162,23 @@ int run_client_core_tests(void) {
         }
         oc_client_close_search(a);
         CHECK(!oc_client_model(a)->search_open && oc_client_model(a)->n_search == 0);
+        /* ... limited to channel 1 by id (REQ-080): every hit is there, the
+         * model keeps the scope, and the next page asks for the same one. */
+        oc_client_search_in(a, "core", OC_SEARCH_NEWEST, 1);
+        CHECK(oc_client_model(a)->search_scope == 1);
+        CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int elsewhere = 0, found = 0;
+            for (size_t j = 0; j < am->n_search; j++) {
+                if (am->search_results[j].channel_id != 1) elsewhere = 1;
+                if (am->search_results[j].message_id == mid) found = 1;
+            }
+            CHECK(found && !elsewhere);
+        }
+        oc_client_search_more(a);
+        CHECK(oc_client_model(a)->search_scope == 1);
+        oc_client_close_search(a);
 
         /* dana creates a public channel — it shows up joined in her list — and
          * erik joins it by id, seeing it joined too. */
@@ -8067,7 +8403,7 @@ int run_client_core_tests(void) {
             if (jf) { fwrite(jpg, 1, jn, jf); fclose(jf); }
             if (pf) { fwrite(png, 1, pn, pf); fclose(pf); }
             const char *paths[2] = { jpath, ppath };
-            CHECK(oc_client_post_files(a, 1, 0, paths, 2, "two pictures") != 0);
+            CHECK(oc_client_post_files(a, 1, 0, paths, 2, "two pictures", 0) != 0);
             const oc_msg *pm = NULL;
             CHECK(WAIT_FOR(b, (pm = channel_msg_by_body(m, 1, "two pictures")) != NULL && pm->n_attach == 2));
             pm = channel_msg_by_body(oc_client_model(b), 1, "two pictures");
@@ -8120,7 +8456,7 @@ int run_client_core_tests(void) {
 
                 oc_client_fetch_attachment(a, earlier);
                 uint64_t tag = oc_client_post_video(a, 1, 0, video, VN, poster, PN,
-                                                    65000, 1280, 720, "");
+                                                    65000, 1280, 720, "", 0);
                 video = poster = NULL;                          /* the core owns them */
                 CHECK(tag != 0);
                 int posted = 0;
@@ -8171,8 +8507,8 @@ int run_client_core_tests(void) {
                 if (v2 && p2 && v3 && p3) {
                     memset(v2, 2, 2 * 1024 * 1024); memset(p2, 2, 100);
                     memset(v3, 3, 1000); memset(p3, 3, 100);
-                    uint64_t t2 = oc_client_post_video(a, 1, 0, v2, 2 * 1024 * 1024, p2, 100, 1000, 640, 360, "first");
-                    uint64_t t3 = oc_client_post_video(a, 1, 0, v3, 1000, p3, 100, 1000, 640, 360, "second");
+                    uint64_t t2 = oc_client_post_video(a, 1, 0, v2, 2 * 1024 * 1024, p2, 100, 1000, 640, 360, "first", 0);
+                    uint64_t t3 = oc_client_post_video(a, 1, 0, v3, 1000, p3, 100, 1000, 640, 360, "second", 0);
                     oc_client_cancel_transfer(a, t2);
                     int second = 0;
                     second = WAIT_FOR_MS(a, m->media_posted_tag == t3, 30000);
@@ -8202,7 +8538,7 @@ int run_client_core_tests(void) {
                 CHECK(f != NULL);
                 if (f) { for (size_t i2 = 0; i2 < fsz[k]; i2++) fputc('a' + k, f); fclose(f); }
             }
-            uint64_t tag = oc_client_post_files(a, 1, 0, fp3, 3, "three files");
+            uint64_t tag = oc_client_post_files(a, 1, 0, fp3, 3, "three files", 0);
             CHECK(tag != 0);
             CHECK(WAIT_FOR(a, ({ const oc_xfer_state *xs = oc_model_xfer(m, tag); xs && xs->phase == 1; })));
             const oc_xfer_state *xs = oc_model_xfer(oc_client_model(a), tag);
@@ -8219,7 +8555,7 @@ int run_client_core_tests(void) {
             /* Into a thread: the root gains a reply, and the channel no message. */
             if (pm) {
                 uint64_t root = pm->message_id;
-                uint64_t rt = oc_client_post_files(a, 1, root, fp3, 1, "one in the thread");
+                uint64_t rt = oc_client_post_files(a, 1, root, fp3, 1, "one in the thread", 0);
                 CHECK(rt != 0);
                 CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, rt); r && r->phase == 1; })));
                 CHECK(WAIT_FOR(b, ({ const oc_msg *r = channel_msg_by_body(m, 1, "three files");
@@ -8229,7 +8565,7 @@ int run_client_core_tests(void) {
 
             /* A file missing from the middle: a failure, and no message. */
             const char *bad[3] = { fp3[0], tpath("itest_core_pf_missing.txt"), fp3[2] };
-            uint64_t bt = oc_client_post_files(a, 1, 0, bad, 3, "never posted");
+            uint64_t bt = oc_client_post_files(a, 1, 0, bad, 3, "never posted", 0);
             CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, bt); r && r->phase == 2; })));
             CHECK(oc_model_xfer(oc_client_model(a), bt)->file == 1);
 
@@ -8242,10 +8578,10 @@ int run_client_core_tests(void) {
             /* No more than the wire carries, and nothing empty. */
             const char *many[OC_MAX_ATTACH + 1];
             for (size_t i2 = 0; i2 <= OC_MAX_ATTACH; i2++) many[i2] = fp3[0];
-            CHECK(oc_client_post_files(a, 1, 0, many, OC_MAX_ATTACH + 1, "") == 0);
-            CHECK(oc_client_post_files(a, 1, 0, many, 0, "") == 0);
+            CHECK(oc_client_post_files(a, 1, 0, many, OC_MAX_ATTACH + 1, "", 0) == 0);
+            CHECK(oc_client_post_files(a, 1, 0, many, 0, "", 0) == 0);
             const char *blank[1] = { "" };
-            CHECK(oc_client_post_files(a, 1, 0, blank, 1, "") == 0);
+            CHECK(oc_client_post_files(a, 1, 0, blank, 1, "", 0) == 0);
 
             /* An image pasted from the clipboard (REQ-140): bytes held in memory
              * beside a file on disk, posted as one message under the name given,
@@ -8260,7 +8596,7 @@ int run_client_core_tests(void) {
                     memset(items, 0, sizeof items);
                     items[0].data = img; items[0].len = 150000; items[0].name = "pasted-image-1.png";
                     items[1].path = fp3[0];
-                    uint64_t it = oc_client_post_items(a, 1, 0, items, 2, "pasted");
+                    uint64_t it = oc_client_post_items(a, 1, 0, items, 2, "pasted", 0);
                     CHECK(it != 0);
                     free(img);
                     CHECK(WAIT_FOR(b, channel_has_body(m, 1, "pasted")));
@@ -8278,9 +8614,9 @@ int run_client_core_tests(void) {
                 oc_post_item both = { fp3[0], &one, 1, "x.png" };
                 oc_post_item unnamed = { NULL, &one, 1, NULL };
                 oc_post_item neither = { NULL, NULL, 0, "x.png" };
-                CHECK(oc_client_post_items(a, 1, 0, &both, 1, "") == 0);
-                CHECK(oc_client_post_items(a, 1, 0, &unnamed, 1, "") == 0);
-                CHECK(oc_client_post_items(a, 1, 0, &neither, 1, "") == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &both, 1, "", 0) == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &unnamed, 1, "", 0) == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &neither, 1, "", 0) == 0);
             }
 
             for (int k = 0; k < 3; k++) unlink(fp3[k]);

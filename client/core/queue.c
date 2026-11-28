@@ -6,6 +6,7 @@ void oc_queue_init(oc_queue *q) {
     oc_mutex_init(&q->mu);
     oc_cond_init(&q->cv);
     q->head = q->tail = NULL;
+    q->pushed = 0;
 }
 
 void oc_queue_destroy(oc_queue *q) {
@@ -23,8 +24,16 @@ void oc_queue_push(oc_queue *q, void *item) {
     oc_mutex_lock(&q->mu);
     if (q->tail) q->tail->next = n; else q->head = n;
     q->tail = n;
+    q->pushed++;
     oc_cond_signal(&q->cv);
     oc_mutex_unlock(&q->mu);
+}
+
+uint64_t oc_queue_pushed(oc_queue *q) {
+    oc_mutex_lock(&q->mu);
+    uint64_t n = q->pushed;
+    oc_mutex_unlock(&q->mu);
+    return n;
 }
 
 static void *pop_locked(oc_queue *q) {

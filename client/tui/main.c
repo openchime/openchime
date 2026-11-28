@@ -277,6 +277,38 @@ static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int
     } while (off < len);
 }
 
+/* View source: a message's body exactly as stored, unrendered, wrapped to the
+ * screen from row `top`, over the screen; the title and keys on the first row.
+ * Copying is the terminal's own selection. Returns the row count. */
+static int tui_src_view_draw(const char *body, int top) {
+    int W = tb_width(), H = tb_height();
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, TB_DEFAULT);
+    tk_text(0, 0, W, " Message source    j/k scroll, space page, q close", TB_BOLD, TB_DEFAULT);
+    rows_t rows = {0};
+    const char *s = body ? body : "";
+    for (;;) {
+        const char *e = strchr(s, '\n');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        char *line = malloc(n * 4 + 1);
+        if (!line) break;
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {        /* a tab as four columns; a CR is not drawn */
+            if (s[i] == '\t') { memcpy(line + k, "    ", 4); k += 4; }
+            else if (s[i] != '\r') line[k++] = s[i];
+        }
+        line[k] = '\0';
+        wrap_push(&rows, line, TB_DEFAULT, W - 2, 0);
+        free(line);
+        if (!e) break;
+        s = e + 1;
+    }
+    for (int r = 0; top + r < (int)rows.n && 2 + r < H; r++)
+        tk_text(1, 2 + r, W - 1, rows.v[top + r].s, TB_DEFAULT, TB_DEFAULT);
+    int count = (int)rows.n;
+    rows_free(&rows);
+    return count;
+}
+
 /* wrap_push, breaking between words: for prose a person reads and copies out,
  * where a word cut in two is a word mistyped. A word longer than a row is cut. */
 static void wrap_words_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
@@ -690,9 +722,34 @@ static void append_msg_rows(rows_t *r, const oc_model *mdl, const oc_msg *m, uin
 /* Build the wrapped rows for a channel's messages (oldest→newest), then a
  * "seen by …" footer (REQ-090) naming the other members whose read cursor has
  * reached the last message. */
+/* "Also send to #channel" (REQ-062): toggled with Ctrl+T while the composer
+ * replies in a thread, off by default, and off again after each send and in
+ * another thread. */
+static int      g_also_chan;
+static uint64_t g_also_for;
+
 static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
-    for (size_t i = 0; i < ch->n_msgs; i++)
+    for (size_t i = 0; i < ch->n_msgs; i++) {
+        /* A thread reply also posted here: which thread, above it, with the
+         * parent's first words when the parent is loaded. Part of the message,
+         * so selecting it selects this. */
+        if (ch->msgs[i].parent_id) {
+            const oc_msg *par = NULL;
+            for (size_t k = 0; k < ch->n_msgs && !par; k++)
+                if (ch->msgs[k].message_id == ch->msgs[i].parent_id) par = &ch->msgs[k];
+            char ex[96] = "", line[160];
+            if (par && !par->deleted && par->body) {
+                size_t k = 0;
+                for (const char *q = par->body; *q && *q != '\n' && k + 1 < sizeof ex; q++) ex[k++] = *q;
+                ex[k] = '\0';
+            }
+            snprintf(line, sizeof line, "    \xe2\x86\xb3 replied to a thread%s%s", ex[0] ? ": " : "", ex);   /* ↳ */
+            size_t first = r->n;
+            wrap_push(r, line, TB_BLACK | TB_BOLD, width, 6);
+            for (size_t k = first; k < r->n; k++) r->v[k].mi = (int)i;
+        }
         append_msg_rows(r, m, &ch->msgs[i], me, width, ch, 1, (int)i);
+    }
     if (ch->n_msgs == 0 || !oc_model_receipts_on(m)) return;   /* the workspace has none (REQ-090) */
     uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
     char names[192]; size_t p = 0; int shown = 0;
@@ -1219,6 +1276,7 @@ static void draw_help(int W, int H) {
     static const hrow R[] = {
         { NULL, "Basics" },
         { "Enter",      "send the typed message" },
+        { "Ctrl+T",     "in a thread: also send the reply to the channel" },
         { "Tab · Esc",  "move between the panes and the composer" },
         { "Ctrl+K · :", "action menu: reach everything" },
         { "Ctrl+F",     "search messages" },
@@ -1412,6 +1470,13 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_JUMP_DATE, ACT_JUMP_DATE_THREAD,
        /* move a message to another channel (REQ-053) */
        ACT_MOVE,
+       /* the message's body as stored, unrendered */
+       ACT_SOURCE,
+       /* a person's own colour for a channel: the menu, then a colour (0 none) */
+       ACT_COLOR, ACT_COLOR0, ACT_COLOR_LAST = ACT_COLOR0 + OC_CHAN_COLOR_COUNT,
+       /* a conversation muted for a set time (REQ-137): the menu, its choices,
+        * and Unmute */
+       ACT_MUTE, ACT_MUTE_30, ACT_MUTE_60, ACT_MUTE_120, ACT_MUTE_TOMORROW, ACT_MUTE_FOREVER, ACT_UNMUTE,
        /* a reminder on a message, which saves it (REQ-283): the choices, as
         * the desktop client's reminder menu has them, and a time typed */
        ACT_REMIND, ACT_REMIND_20M, ACT_REMIND_1H, ACT_REMIND_TOMORROW, ACT_REMIND_MONDAY,
@@ -1964,6 +2029,56 @@ static void sidebar_opts_load(const oc_model *m) {
     if (v && v[0]) oc_sidebar_opts_parse(&g_sb, v);
 }
 
+/* A person's channel colours (oc_chan_colors): this client's own, under
+ * `colors` in its own bucket, so the GUI's are not these. Read whenever the
+ * stored value changes (colors_sync). Drawn as the 256-colour cell nearest each
+ * of the GUI's eight: blue, indigo, violet, pink, teal, cyan, slate, brown. */
+#define COLORS_SETTING_KEY "colors"
+static oc_chan_colors g_colors;
+static char           g_colors_seen[OC_SETTING_VALUE_MAX];
+static const uintattr_t TUI_CHAN_COLOR[OC_CHAN_COLOR_COUNT] = { 75, 105, 141, 211, 43, 45, 103, 173 };
+static const char *const TUI_CHAN_COLOR_NAME[OC_CHAN_COLOR_COUNT] = {
+    "Blue", "Indigo", "Violet", "Pink", "Teal", "Cyan", "Slate", "Brown" };
+static char g_color_labels[OC_CHAN_COLOR_COUNT + 1][32];
+
+static void colors_sync(const oc_model *m) {
+    const char *v = m ? oc_model_setting((oc_model *)m, COLORS_SETTING_KEY) : NULL;
+    if (!v) v = "";
+    if (!strcmp(v, g_colors_seen)) return;
+    snprintf(g_colors_seen, sizeof g_colors_seen, "%s", v);
+    oc_chan_colors_parse(&g_colors, v);
+}
+static uint8_t chan_color(const oc_channel *c) {
+    return (c && c->kind != OC_CHANNEL_KIND_DM) ? oc_chan_color_of(&g_colors, c->channel_id) : 0;
+}
+/* "Mute...": the "Pause notifications" durations, and a mute with no end
+ * (REQ-137), labelled and timed as the desktop client's. */
+static void menu_build_mute(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "For 30 minutes",          ACT_MUTE_30 };
+    g_menu[g_nmenu++] = (menuitem){ "For 1 hour",              ACT_MUTE_60 };
+    g_menu[g_nmenu++] = (menuitem){ "For 2 hours",             ACT_MUTE_120 };
+    g_menu[g_nmenu++] = (menuitem){ "Until tomorrow",          ACT_MUTE_TOMORROW };
+    g_menu[g_nmenu++] = (menuitem){ "Until I turn it back on", ACT_MUTE_FOREVER };
+}
+/* 09:00 tomorrow, from the local clock, through the core's one function. */
+static uint32_t tui_mute_until_tomorrow(void) {
+    time_t now = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 24u * 60u;
+    return oc_minutes_until_local(tv.tm_hour, tv.tm_min, 9, 0, 1);
+}
+
+/* The Colour menu: the eight, then None, the one in force marked. */
+static void menu_build_colors(uint8_t now) {
+    g_nmenu = 0;
+    for (int k = 1; k <= OC_CHAN_COLOR_COUNT; k++) {
+        snprintf(g_color_labels[k], sizeof g_color_labels[k], "%s%s", TUI_CHAN_COLOR_NAME[k - 1], now == k ? "  \xe2\x9c\x93" : "");
+        g_menu[g_nmenu++] = (menuitem){ g_color_labels[k], ACT_COLOR0 + k };
+    }
+    snprintf(g_color_labels[0], sizeof g_color_labels[0], "None%s", now ? "" : "  \xe2\x9c\x93");
+    g_menu[g_nmenu++] = (menuitem){ g_color_labels[0], ACT_COLOR0 };
+}
+
 static int chan_group(const oc_channel *c) {
     return c->kind == OC_CHANNEL_KIND_DM ? OC_SB_DMS : OC_SB_CHANNELS;
 }
@@ -2255,6 +2370,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                 else        snprintf(label, sizeof label, "  %s", title);
                 if ((bn > 0 || bdot) && !sel) fg |= TB_BOLD;
                 tk_text(1, iy, ch_w - 1, label, fg, bg);
+                uint8_t cc = chan_color(c);                 /* its colour, before the name */
+                if (cc && ch_w > 4) tb_set_cell(2, iy, 0x25CF, TUI_CHAN_COLOR[cc - 1], bg);
             }
         }
     }
@@ -2277,10 +2394,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         if (om) { char ol[96]; oc_model_ooo_label(om, ol, sizeof ol); snprintf(oo, sizeof oo, " \xc2\xb7 %s", ol); }
         snprintf(mt, sizeof mt, "%s@%s%s", fc->e2e ? "\xf0\x9f\x94\x92 " : "", pn[0] ? pn : "dm", oo);
     } else if (fc && !fc->is_public)
-        snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
-    else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
+        snprintf(mt, sizeof mt, "%s\xf0\x9f\x94\x92 %s", chan_color(fc) ? "  " : "",
+                 fc->name ? fc->name : "…");  /* 🔒 private */
+    else if (fc)                 snprintf(mt, sizeof mt, "%s#%s", chan_color(fc) ? "  " : "", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
     tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
+    {   /* The channel's colour before its name, in the two cells left for it. */
+        int plain = !(m->roster_open || m->search_open || m->reactlist_open || m->voterlist_open ||
+                      m->prefs_open || m->weblist_open || m->thread_open);
+        uint8_t cc = plain ? chan_color(fc) : 0;
+        if (cc && msg_w > 8) tb_set_cell(msg_x + 3, panels_top, 0x25CF, TUI_CHAN_COLOR[cc - 1], th->bg);
+    }
     /* Summarize, at the right of the conversation's title (REQ-310): a click
      * offers the spans, as the launcher's "Summarize" does. */
     g_sumbtn_x0 = g_sumbtn_x1 = 0;
@@ -2483,6 +2607,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     tk_fill(H - 2, 0, W, TB_DEFAULT);
     int cx = editing ? tk_text(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
                      : tk_text(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
+    if (m->thread_open && g_also_chan && !editing) {
+        const oc_channel *ac = oc_model_channel((oc_model *)m, m->thread_channel);
+        char also[96];
+        if (ac && ac->kind != OC_CHANNEL_KIND_DM && ac->name && ac->name[0]) snprintf(also, sizeof also, "[also #%s] ", ac->name);
+        else snprintf(also, sizeof also, "[also to the conversation] ");
+        cx = tk_text(cx, H - 2, W, also, th->accent | TB_BOLD, TB_DEFAULT);
+    }
     cx = tk_text(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
     if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
 
@@ -2492,6 +2623,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     static const tk_binding KB_COMPOSER[] = {
         { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_ESC, 0, "Esc", "navigate", 1 },
         { TB_KEY_CTRL_F, 0, "Ctrl+F", "search", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
+        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
+    };
+    static const tk_binding KB_COMPOSER_THREAD[] = {
+        { TB_KEY_ENTER, 0, "Enter", "reply", 1 }, { TB_KEY_CTRL_T, 0, "Ctrl+T", "also send to the channel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "navigate", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
         { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
     };
     static const tk_binding KB_CHANNELS[] = {
@@ -2518,6 +2654,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         if      (panel == 1) { label = " Channels"; kb = KB_CHANNELS; kn = (int)(sizeof KB_CHANNELS / sizeof *KB_CHANNELS); }
         else if (panel == 2) { label = " Messages"; kb = KB_MESSAGES; kn = (int)(sizeof KB_MESSAGES / sizeof *KB_MESSAGES); }
         else if (panel == 3) { label = " Members";  kb = KB_MEMBERS;  kn = (int)(sizeof KB_MEMBERS  / sizeof *KB_MEMBERS);  }
+        else if (m->thread_open) { label = "";      kb = KB_COMPOSER_THREAD; kn = (int)(sizeof KB_COMPOSER_THREAD / sizeof *KB_COMPOSER_THREAD); }
         else                 { label = "";          kb = KB_COMPOSER; kn = (int)(sizeof KB_COMPOSER / sizeof *KB_COMPOSER); }
         int hx = label[0] ? tk_text(0, H - 1, W, label, th->accent | TB_BOLD, th->footer_bg) : 0;
         tk_help_footer(H - 1, hx, W, kb, kn, th->muted, th->footer_bg);
@@ -4085,6 +4222,9 @@ int main(int argc, char **argv) {
     /* The snippet open over the screen (REQ-226): which, its title and
      * language, and the first line shown. */
     uint64_t sv_id = 0; int sv_top = 0, sv_lang = 0, sv_lines = 0;
+    /* A message's source open over the screen: its body, copied when it
+     * opened, and the first row shown. */
+    char *src_text = NULL; int src_top = 0, src_lines = 0;
     /* A snippet's title, or its file name when it has none: room for either. */
     char sv_title[sizeof ((oc_attachment *)0)->filename > sizeof ((oc_attachment *)0)->title
                   ? sizeof ((oc_attachment *)0)->filename : sizeof ((oc_attachment *)0)->title] = "";
@@ -4215,6 +4355,7 @@ int main(int argc, char **argv) {
             sidebar_opts_load(m);
             g_sb_loaded = 1;
         }
+        colors_sync(m);                   /* this client's channel colours */
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
         /* Encrypted DMs: say what changed, and select the DM just asked for. */
         e2e_watch((oc_model *)m, &focus);
@@ -4328,6 +4469,7 @@ int main(int argc, char **argv) {
             if (!tui_snip_text(sv_id, &(size_t){0})) tui_snip_want(sv_id);
             sv_lines = tui_snip_view_draw(sv_id, sv_title, sv_lang, sv_top);
         }
+        if (src_text) src_lines = tui_src_view_draw(src_text, src_top);
         if (deactivate_ask)
             tk_modal_confirm(tb_width(), tb_height(),
                              "Deactivate your account? You will be signed out everywhere and "
@@ -4627,6 +4769,19 @@ int main(int argc, char **argv) {
             else if (ev.ch == 'G') sv_top = sv_lines - page;
             if (sv_top > sv_lines - page) sv_top = sv_lines - page;
             if (sv_top < 0) sv_top = 0;
+            continue;
+        }
+        if (src_text) {                        /* a message's source */
+            int page = tb_height() - 3; if (page < 1) page = 1;
+            if (ev.ch == 'q' || ev.key == TB_KEY_ESC) { free(src_text); src_text = NULL; continue; }
+            else if (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN) src_top++;
+            else if (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP) src_top--;
+            else if (ev.ch == ' ' || ev.key == TB_KEY_PGDN) src_top += page;
+            else if (ev.key == TB_KEY_PGUP) src_top -= page;
+            else if (ev.ch == 'g') src_top = 0;
+            else if (ev.ch == 'G') src_top = src_lines - page;
+            if (src_top > src_lines - page) src_top = src_lines - page;
+            if (src_top < 0) src_top = 0;
             continue;
         }
         if (cpage_id) {                        /* a call's page: c its chat, m more lines, any other key back */
@@ -5006,7 +5161,15 @@ int main(int argc, char **argv) {
                 action_open = 0;
                 if (ai >= 0) {
                     int id = g_menu[ai].id;
-                    if      (id == ACT_THREAD)      oc_client_open_thread(cl, act_cid, act_mid);
+                    if      (id == ACT_THREAD) {
+                        /* A reply also posted to the main scroll opens its own
+                         * thread (REQ-062), not one of its own. */
+                        const oc_channel *tc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        uint64_t root = act_mid;
+                        for (size_t k = 0; tc && k < tc->n_msgs; k++)
+                            if (tc->msgs[k].message_id == act_mid && tc->msgs[k].parent_id) root = tc->msgs[k].parent_id;
+                        oc_client_open_thread(cl, act_cid, root);
+                    }
                     else if (id == ACT_REACTORS)    oc_client_list_reactions(cl, act_cid, act_mid);
                     else if (id == ACT_VOTERS)      oc_client_list_poll_voters(cl, act_cid, act_mid);
                     else if (id == ACT_POLL_CLOSE) {
@@ -5034,6 +5197,22 @@ int main(int argc, char **argv) {
                         }
                     }
                     else if (id == ACT_SPOILERS) spoilers_toggle(act_mid);
+                    else if (id == ACT_SOURCE) {
+                        /* In the conversation, or the open thread's replies. */
+                        const oc_model *sm = oc_client_model(cl);
+                        const oc_channel *sc = oc_model_channel((oc_model *)sm, act_cid);
+                        const oc_msg *smsg = NULL;
+                        if (sc) for (size_t k = 0; k < sc->n_msgs && !smsg; k++)
+                            if (sc->msgs[k].message_id == act_mid) smsg = &sc->msgs[k];
+                        if (!smsg && sm->thread_open)
+                            for (size_t k = 0; k < sm->n_thread_msgs && !smsg; k++)
+                                if (sm->thread_msgs[k].message_id == act_mid) smsg = &sm->thread_msgs[k];
+                        if (smsg && !smsg->deleted) {
+                            free(src_text);
+                            src_text = strdup(smsg->body ? smsg->body : "");
+                            src_top = 0;
+                        }
+                    }
                     else if (id == ACT_COLLAPSE) { tui_expand(act_mid, 0); oc_client_set_collapsed(cl, act_mid, 1); }
                     else if (id == ACT_EXPAND)   { tui_expand(act_mid, 1); oc_client_set_collapsed(cl, act_mid, 0); }
                     else if (id == ACT_UNREAD) {
@@ -5053,6 +5232,34 @@ int main(int argc, char **argv) {
                     else if (id == ACT_TODO_ADD) { prompt_kind = PROMPT_TODO_ADD; prompt_title = "Add a task (name, or name: description)"; tk_input_init(&prompt_input, 0, "task"); }
                     else if (id == ACT_TODO_RENAME) { prompt_kind = PROMPT_TODO_RENAME; prompt_title = "Rename the list"; tk_input_init(&prompt_input, 0, "title"); }
                     else if (id == ACT_MOVE) { prompt_kind = PROMPT_MOVE; prompt_title = "Move to channel (name)"; tk_input_init(&prompt_input, 0, "#channel"); }
+                    else if (id == ACT_MUTE) {
+                        menu_build_mute();
+                        act_title = "Mute";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_MUTE_30)       oc_client_set_mute(cl, act_cid, 1, 30);
+                    else if (id == ACT_MUTE_60)       oc_client_set_mute(cl, act_cid, 1, 60);
+                    else if (id == ACT_MUTE_120)      oc_client_set_mute(cl, act_cid, 1, 120);
+                    else if (id == ACT_MUTE_TOMORROW) oc_client_set_mute(cl, act_cid, 1, tui_mute_until_tomorrow());
+                    else if (id == ACT_MUTE_FOREVER)  oc_client_set_mute(cl, act_cid, 1, 0);
+                    else if (id == ACT_UNMUTE)        oc_client_set_mute(cl, act_cid, 0, 0);
+                    else if (id == ACT_COLOR) {
+                        menu_build_colors(oc_chan_color_of(&g_colors, act_cid));
+                        act_title = "Colour";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id >= ACT_COLOR0 && id <= ACT_COLOR_LAST) {
+                        const oc_model *cm = oc_client_model(cl);
+                        if (!cm->settings_synced) {
+                            snprintf(g_closed_note, sizeof g_closed_note, "Your settings are still loading. Try again in a moment.");
+                        } else if (oc_chan_color_set(&g_colors, act_cid, (uint8_t)(id - ACT_COLOR0)) == OC_CHAN_COLOR_OK) {
+                            char enc[OC_SETTING_VALUE_MAX];
+                            oc_chan_colors_encode(&g_colors, enc, sizeof enc);
+                            oc_client_set_setting(cl, COLORS_SETTING_KEY, enc);
+                        } else {
+                            snprintf(g_closed_note, sizeof g_closed_note, "You have coloured as many channels as you can. Take the colour off one first.");
+                        }
+                    }
                     else if (id == ACT_REMIND) {
                         /* The choices, then: Clear among them when one is set. */
                         int reminded = 0;
@@ -5357,6 +5564,11 @@ int main(int argc, char **argv) {
                         menu_build_channel(mc->joined, oc_model_summarize_available(mm), mc->e2e, e2e_state(mm, mc),
                                            mc->follow_threads,
                                            mm->thread_open && mm->thread_channel == mc->channel_id);
+                        if (mc->kind != OC_CHANNEL_KIND_DM && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "Colour", ACT_COLOR };
+                        if (mc->joined && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = mc->muted ? (menuitem){ "Unmute", ACT_UNMUTE }
+                                                          : (menuitem){ "Mute...", ACT_MUTE };
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
@@ -5423,6 +5635,10 @@ int main(int argc, char **argv) {
                         menu_build_msg(own, may_edit, may_del, sel->deleted || locked, has_attach && !ch->e2e, sel->poll,   /* no files in an encrypted DM */
                                        has_spoilers(sel->body) ? 1 + spoilers_shown(mid) : 0, sel->collapsed, blk,
                                        sel->saved && sel->remind_at);
+                        /* The body as stored, unrendered: anyone's message, not
+                         * a deleted one. */
+                        if (!sel->deleted && g_nmenu < (int)(sizeof g_menu / sizeof g_menu[0]))
+                            g_menu[g_nmenu++] = (menuitem){ "View source", ACT_SOURCE };
                         /* Move (REQ-053): one's own, or anything for an admin or
                          * owner, out of a channel that is not archived. */
                         uint8_t role = OC_ROLE_MEMBER;
@@ -5446,7 +5662,8 @@ int main(int argc, char **argv) {
                         act_cid = cid; act_mid = mid; act_uid = sel->author_id; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
-                    else if (ev.ch == 't' && !locked) oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 't' && !locked)   /* a reply also here opens its own thread */
+                        oc_client_open_thread(cl, cid, sel->parent_id ? sel->parent_id : mid);
                     else if (ev.ch == 'D' && sel->todo && !sel->deleted && !locked && !ch->archived) {
                         act_cid = cid; act_mid = mid;   /* mark a task of this list */
                         prompt_kind = PROMPT_TODO_MARK; prompt_title = "Mark task (its number)";
@@ -5558,8 +5775,10 @@ int main(int argc, char **argv) {
                     char conv[COMPOSER_CAP * 2];
                     const char *body = composer;
                     if (oc_emoticon_send(emoticons_on(mm), composer, clen, conv, sizeof conv) > 0) body = conv;
-                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body);
+                    if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, body,
+                                                         g_also_for == mm->thread_parent && g_also_chan);
                     else                 oc_client_send(cl, cid, body);
+                    g_also_chan = 0;                                    /* per send (REQ-062) */
                 }
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
@@ -5589,6 +5808,11 @@ int main(int argc, char **argv) {
         } else if (ev.key == TB_KEY_PGDN) {
             scroll -= (tb_height() - 3) / 2;
             if (scroll < 0) scroll = 0;
+        } else if (ev.key == TB_KEY_CTRL_T && oc_client_model(cl)->thread_open) {
+            /* Also send this reply to the channel (REQ-062), this thread's. */
+            const oc_model *tm = oc_client_model(cl);
+            if (g_also_for != tm->thread_parent) { g_also_chan = 0; g_also_for = tm->thread_parent; }
+            g_also_chan = !g_also_chan;
         } else if (ev.ch == '?' && clen == 0) {
             help_open = 1;                     /* ? on an empty composer opens help */
         } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */

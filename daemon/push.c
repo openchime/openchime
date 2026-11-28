@@ -416,7 +416,11 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * the user's GLOBAL default, not a hardcoded ALL — "notify me only
              * when mentioned, everywhere" has to hold for the channels the user
              * never opened a preference on, which is most of them. */
-            "       COALESCE(np.muted, 0), "
+            /* A timed mute whose instant (?4 is now) has passed is over,
+             * even before the sweep has cleared it: a push lost in those
+             * seconds would be the one the person was waiting for. */
+            "       CASE WHEN COALESCE(np.muted_until_ms, 0) > 0 AND np.muted_until_ms <= ?4 "
+            "            THEN 0 ELSE COALESCE(np.muted, 0) END, "
             "       COALESCE(np.level, u.notify_default), "
             /* MENTIONED: this message names this recipient, personally or by a
              * broadcast audience. @here means "people around right now", but

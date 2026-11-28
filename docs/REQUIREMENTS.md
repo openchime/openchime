@@ -623,6 +623,10 @@ where one exists.
 - **REQ-080.** Full-text search has covered the complete message history
   visible to the searching user (i.e., channels they are a member of, per
   REQ-031), with no retention cutoff, implemented via SQLite FTS5 (ARCH-15).
+  A search has been able to be **limited to one conversation** -- a channel, a
+  DM or a group DM, by its id -- under the same read rule, and a graphical
+  client has offered one always-present search field that limits itself to the
+  open conversation and can widen to everywhere.
 - **REQ-081.** Search has accepted **structured operators** that scope a query —
   at minimum `from:<user>`, `in:<channel>`, `has:<file|link|image|video>`, and a date
   range (`before:`/`after:`/`on:`) — combined with free-text terms, all still
@@ -920,6 +924,13 @@ where one exists.
   Storage is `notification_prefs.muted` (migration 0026), set with `SET_MUTE`;
   push excludes a muted conversation unconditionally, so mute outranks both the
   level and a priority person.
+
+  **A mute may be set to end at a chosen time** — for 30 minutes, 1 hour, 2
+  hours, until 09:00 tomorrow, or until turned off — the durations the pause
+  offers. The client sends minutes from now; the daemon resolves the end once
+  (`notification_prefs.muted_until_ms`, migration 0093), ends the mute on its
+  own clock for every device, and tells each of the person's connections; push
+  treats a mute whose end has passed as over at once.
 
   **What a muted conversation contributes to a badge is nothing**, and every
   badge asks one function for it. A muted conversation's unread is excluded;
@@ -2659,8 +2670,9 @@ choose — which makes each one a per-frontend *obligation*.*
   discoverable list of its shortcuts (the TUI's `?` help overlay, ARCH-83). (ARCH-92: per-frontend.)
 - **REQ-265.** A client's composer has offered **input aids** — inline
   autocomplete for `@user`, `#channel`, and `:emoji:` (REQ-221/072) and a full,
-  searchable **emoji picker** (beyond a hardcoded set) — so mentioning, linking a
-  channel, or reacting has not required typing exact names. (ARCH-92:
+  searchable **emoji picker** (beyond a hardcoded set) that leads with the emoji
+  the user uses most — so mentioning, linking a channel, or reacting has not
+  required typing exact names. (ARCH-92:
   per-frontend, over the shared `client/core/complete.c` catalogue.)
 - **REQ-266.** A client has let a user **view another user's profile** — opening a
   profile pane from a name or avatar anywhere the user appears — showing the fields
@@ -2746,6 +2758,11 @@ choose — which makes each one a per-frontend *obligation*.*
   there, because every rect, menu and model pointer it touches belongs to the UI
   thread. Each token ends in the same call the mouse path makes, so an invoke and
   a click cannot do different things.
+- **REQ-394.** A person has been able to **arrange the graphical client's
+  navigation rail**: hide the views they do not use and put the rest in the
+  order they work in, with Home always first and shown. The arrangement has
+  followed their account to their other graphical clients, and a hidden view
+  has stayed reachable from the command palette. (ARCH-92: per-frontend.)
 
 ---
 

@@ -467,7 +467,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * OC_RES_OUTWH_DUE. OUTWH_DONE: delivery owh_delivery succeeded (owh_ok)
         * or failed with owh_reason, answered OC_RES_OUTWH_DONE. */
        OC_JOB_OUTWH_CREATE = 280, OC_JOB_OUTWH_LIST = 281, OC_JOB_OUTWH_SET = 282,
-       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285 };
+       OC_JOB_OUTWH_DELETE = 283, OC_JOB_OUTWH_TAKE = 284, OC_JOB_OUTWH_DONE = 285,
+       /* Timed mutes come to their end (REQ-137), on the reminder tick: each
+        * lapsed one is cleared, and each person it was theirs answered with an
+        * OC_RES_NOTIFY_PREFS for all their connections; none due, one with
+        * user_id 0, which sends nothing. Write. */
+       OC_JOB_EXPIRE_MUTES = 286 };
 
 /* Outgoing webhooks (docs/details/WEBHOOKS.md). A signing secret is 20 random
  * bytes, shown and used as its 40 hex digits; it is kept sealed under the
@@ -598,6 +603,9 @@ typedef struct oc_job {
     uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
     uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
     char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
+    /* INVITE_USER queued by central (central_invites.h): central's id for it, 32
+     * lower-case hex digits, or empty for one a user asked for. Echoed on the result. */
+    char           central_id[33];
     /* A passkey (AUTH.md §8.6): the trusted name it is for -- its relying party
      * and origin -- the ceremony's challenge, and what the browser answered,
      * each base64url: a credential id, client data, authenticator data, a
@@ -749,11 +757,13 @@ typedef struct oc_job {
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
     uint8_t        hook_disabled;
+    uint8_t        counted;      /* test hooks: counted in oc_dbwriter_outstanding */
     /* Search filters (REQ-081) and the paging cursor (carried in
      * message_id). Parsed by the CLIENT via shared/searchq.c — the daemon receives
      * predicates, never a grammar to interpret. */
     char          *sq_from;      /* heap; "" or NULL = any */
     char          *sq_in;
+    uint64_t       sq_channel;   /* one conversation by id, 0 for none (REQ-080) */
     uint8_t        sq_has;
     uint64_t       sq_after, sq_before;
 
@@ -808,7 +818,9 @@ typedef struct oc_job {
     /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
      * SET_DND uses the dnd_* fields. */
     uint8_t        notify_level;
-    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
+    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause.
+                                      * SET_MUTE: the mute's minutes from now, 0
+                                      * for no end (REQ-137) */
     int16_t        tz_offset_min;    /* SET_TZ_OFFSET: minutes east of UTC */
     /* SET_SCHEDULE (REQ-136). `sched_days` is heap when n_sched_days > 0. */
     uint8_t          sched_mode;
@@ -1360,7 +1372,10 @@ typedef struct {
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
-typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads; } oc_notify_pref_row;
+/* `muted_until_ms`: when a timed mute ends, 0 for a mute with no end or none
+ * (REQ-137); a passed one is reported as no mute at all. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; uint8_t follow_threads;
+                 uint64_t muted_until_ms; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;
@@ -1707,6 +1722,10 @@ typedef struct oc_dbres {
      * invitation mail report carries (ARCH-85). Empty/NULL for a bearer invite. */
     char            invite_id[33];
     char           *invite_email;   /* heap */
+    /* INVITE_OK/ERR for an invitation central queued: central's id for it, and on
+     * ERR why it was refused, as reported to central (a static string). */
+    char            central_id[33];
+    const char     *central_why;
     uint16_t        invite_uses;    /* INVITE_OK: how many may redeem it; 0 = no limit */
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */
@@ -2181,6 +2200,19 @@ void   oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms);
  * a window closing -- without a test sitting it out. 0 puts it back, which is
  * for when no writer runs. Any thread. */
 void   oc_dbwriter_advance_clock_ms(uint64_t ms);
+/* A test's clock held still: every writer's clock reads `wall_ms` (plus any
+ * advance) until released with 0, so what it stamps is the same on every run
+ * (the UI harness, docs/details/TESTING.md). Any thread. */
+void   oc_dbwriter_hold_clock_ms(uint64_t wall_ms);
+/* Test hooks (OPENCHIME_DEV_TEST_HOOKS). How many jobs of connection `conn`,
+ * and of the daemon's own (conn 0), are submitted and not yet answered, plus
+ * one while any result waits in the queue: 0 only once every result of them
+ * has been taken by the net thread, and so sent. */
+uint32_t oc_dbwriter_outstanding(oc_dbwriter *w, uint64_t conn);
+/* Run the timed sweeps now -- scheduled messages, reminders, expiring mutes --
+ * as the net thread's tick would; counted as the daemon's own work, so a SYNC
+ * after this is answered only once they are done. */
+void   oc_dbwriter_sweep_now(oc_dbwriter *w);
 
 /* A critical failure (REQ-263), from any thread: raise `key` with `message` --
  * again on the same entry while it holds -- or clear it, once it has stopped.

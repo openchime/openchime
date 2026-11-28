@@ -362,7 +362,8 @@ model; translate input to intents }, stop.
   channel. On the Messages
   panel, Enter opens an action menu (Reply in thread / Add reaction / on a poll,
   Vote: each option, Who voted and, for its author, Close poll now / Download /
-  Edit / Delete / Who reacted / Mark unread from here -- which holds off the
+  Edit / Delete / Who reacted / View source (§8, "View source") / Mark unread from here --
+  which holds off the
   keep-the-open-conversation-read step until focus moves, or the next frame
   would read it again); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
@@ -398,8 +399,9 @@ model; translate input to intents }, stop.
   frontends never step on each other. The TUI pulls the daemon bucket on connect
   and layers it over the machine-local `~/.config/openchime/config` file. Most
   display prefs are read-only there — editing the file is how they change — but
-  the TUI **does** write one thing back: its sidebar sort, filter and collapse state, persisted
-  through `oc_client_set_setting`. Which server you connect to
+  the TUI **does** write two things back, through `oc_client_set_setting`: its
+  sidebar sort, filter and collapse state, and its channel colours (`colors`,
+  below). Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
   **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
   space, live attachment usage, the active retention/eviction policy, and how
@@ -479,7 +481,12 @@ model; translate input to intents }, stop.
     on the status line.
   - **threads** — the message menu's "Reply in thread" (or `t`) opens a message's
     thread in place of the channel (Enter then posts a reply), with a `↳ N
-    replies` marker on the parent; Esc exits.
+    replies` marker on the parent; Esc exits. In a thread, Ctrl+T toggles "also
+    send to the channel" (REQ-062), shown as `[also #channel]` before the
+    composer and in the hint line; it is off by default and off again after
+    each send. Such a reply shows in the channel too, under a `↳ replied to a
+    thread: <excerpt>` line (the line alone when the parent is not loaded), and
+    the message menu's thread entry (or `t`) on it opens its thread.
   - **search** — Ctrl+F (or the launcher's "Search messages") overlays matching
     messages (channel, author, snippet).
   - **channel management** — `n` in the Channels pane creates a channel; the
@@ -563,8 +570,8 @@ model; translate input to intents }, stop.
     Text-only, so files are never rendered inline (REQ-140/141).
 
   `oc_client_set_setting` **is called by both frontends** — the TUI persists
-  its sidebar sort/filter/collapse through it and the Win32 client its
-  preferences.
+  its sidebar sort/filter/collapse and its channel colours through it and the
+  Win32 client its preferences.
 
   `INVITE_TO_CHANNEL` and
   `REMOVE_FROM_CHANNEL` are core entry points (`oc_client_channel_invite` /
@@ -592,7 +599,20 @@ model; translate input to intents }, stop.
   **Shell layout.** A **global left-nav rail** (Lucide icons stroke-tessellated
   by oc_gfx) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
-  overflow flyout), and a bottom cluster of New (+) / profile avatar.
+  overflow flyout), and a bottom cluster of New (+) / profile avatar. A person
+  arranges the views (REQ-394): Preferences → Appearance → **Navigation** lists
+  them in order, each with a show/hide box and Move up / Move down
+  (`prefs.nav.<view>.show|up|down`), and right-clicking a rail view offers
+  "Hide from navigation" and "Customize navigation…". Home is always first and
+  shown; Admin is listed only for an admin, and while it is hidden its alert
+  badge is drawn nowhere on the rail. The arrangement is kept under its own key,
+  `rail`, in the GUI's synced bucket (`oc_rail_opts`, by the views' stable
+  names, so a build that adds or drops a view reads another's value without
+  losing one), and written only once the account's settings have arrived. A
+  hidden view stays reachable: the command palette has "Go to DMs", "Go to
+  Activity", "Go to Files", "Go to Later" and, for an admin, "Go to Admin",
+  each doing exactly what the rail button does (`view_go`). The terminal client
+  has no rail and is unaffected.
   Three self-drawn dropdowns hang off the rail and the channel header —
   **workspace** (invites, notifications, mark all read, shortcuts, storage/audit,
   reconnect, sign out everywhere), **profile** (status, away, pause
@@ -1064,9 +1084,9 @@ and the web client draws it the same way.
   conversation shell.
 - `main_is_conversation()` -- whether the middle column is something you can type
   into. The DMs view has a sidebar but shows an index until you pick someone;
-  the index has a header of its own ("Direct messages", Back and Forward, New
-  message, which opens the New message pane as the sidebar's compose button
-  does), so a banner -- the demo notice, a lost connection -- sits under a
+  the index has a header of its own ("Direct messages" and New message, which
+  opens the New message pane as the sidebar's compose button does; Back and
+  Forward are in the top bar), so a banner -- the demo notice, a lost connection -- sits under a
   header there as it does over a conversation, never under an empty strip.
 - `window_is_covered()` -- whether a modal, the palette, the lightbox, a menu or
   the sign-in card owns the whole window.
@@ -1089,18 +1109,66 @@ variable. A press outside every field returns the keyboard to the window, as
 clicking a native window did; the shortcuts (`accel_dispatch`) run before any
 field sees a key, as they always have.
 
-**The six search boxes are one control.** Find a conversation, search messages,
-search files, search people, Jump to (Ctrl+K) and search emoji are each a
-field over chrome the client draws, and all six are built the same way:
+**The four search boxes are one control.** Find a conversation, the top bar's
+search (messages, files or people, by view), Jump to (Ctrl+K) and search emoji
+are each a field over chrome the client draws, and all four are built the same
+way:
 `search_box_draw()` draws the chrome -- `SEARCH_BOX_H` tall, following the text
 scale, with the glyph centred -- and `search_text_box()` is where the field's
 text goes, after the glyph, up to the right inset. The field wears the UI
 token (`g_ui`), so it follows the text size and the DPI as everything else
 does.
 
-A new gated field (the Files view's "Search files" box, `g_ffind`, is the
-model) is gated on the view it belongs to -- never on a predicate that merely
-happens to be true there.
+A new gated field (Admin's "Search custom emoji" box, `g_efind`, is the model)
+is gated on the view it belongs to -- never on a predicate that merely happens
+to be true there.
+
+### The top bar and its one search field (REQ-080)
+
+A **top bar** spans the window above the rail, the sidebar and the view,
+`TOPBAR_H` tall (it follows the text scale), with Back and Forward at its left
+(`header.back`, `header.forward`; Alt+Left and Alt+Right as before) and one
+search field in its middle (`topbar.search`), room on the right left for later.
+The scene below it is drawn as it always was: the drawing layer is given an
+origin (`gfx_set_origin`) that far down, the pointer is moved up by as much
+before any handler sees it, and the accessibility rectangles and the
+input-method area are moved down to match, so every view, pane, menu, modal
+and popover keeps its own coordinates and the bar sits above their zero, at
+negative y (`g_scene_dy`). `client_rect` gives the scene the window less the
+bar. The sign-in card has no bar.
+
+The field replaces the Files and People views' own boxes and the search
+overlay's query box. What it searches, and what it says while empty, is one
+function in the client core (`oc_model_search_target`): in a channel, "Search
+#name", its messages only; in a DM or group DM, "Search" and its names, its
+messages only, by the conversation's id (`SEARCH`'s `channel_id`, PROTOCOL.md
+§5.11); in an end-to-end DM, which the server cannot search, "Search messages",
+everywhere; in Files, "Search files", filtering as you type; in People,
+"Search people", the same; anywhere else, "Search messages", everywhere.
+Enter runs a message search and shows its results in the search pane, the
+query kept in the field and the "Filters:" line saying what was understood; a
+search limited to one conversation offers **Search everywhere**, which runs it
+again with no limit. A typed `in:` wins over the conversation: no id is sent,
+and `in:` works by name. Escape clears the field and closes the results.
+Ctrl+F gives the field the keyboard with its text selected.
+
+**The results' filters panel** (REQ-081) sits at the top of the search results,
+under the field: **From** (a picker of everyone by display name, Anyone first),
+**In** (a picker of your channels, Anywhere first), a box each for Files,
+Links, Images and Videos, and **After**, **Before** and **On** date fields
+(YYYY-MM-DD, resolved in your own timezone as typed dates are). The query text
+is the only model: the panel is drawn each frame from `oc_searchq_parse` of the
+field's text, and each control writes its one operator back through
+`oc_searchq_set` (shared/searchq.c) and runs the search again in its order and
+its conversation, so a choice in the panel and the same operator typed give the
+same `SEARCH`. A name with a space is written quoted; On replaces After and
+Before, and either of those replaces On. From the field, Tab moves into the
+panel and on through its controls in the order drawn (Shift+Tab back); Space
+turns a box over, Enter opens a picker, turns a box over or applies a date,
+and Escape closes the results. Each control is published as
+`search.filter.from`, `search.filter.in`, `search.filter.has.file`,
+`.has.link`, `.has.image`, `.has.video`, `search.filter.after`, `.before` and
+`.on`. The "Filters:" line still says what was understood.
 
 ### Shortcuts belong in the message loop, not a window proc
 
@@ -1259,6 +1327,20 @@ picker the status dialog uses, floating over the card that owns it
 never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
+
+**The picker leads with the emoji you use** (REQ-265). With nothing searched,
+it opens on a "Frequently used" row before "This workspace" and the
+catalogue: the emoji used last, then the rest by how often, at most ten
+(`oc_emoji_usage_rank`, `client/core/complete.c`). A pick that goes into the
+composer or adds a reaction counts; taking a reaction back, a status emoji, a
+quick-reaction slot, the quick-reaction strip and a typed `:shortcode:` do
+not. The usage is kept under its own settings key, `emoji.frequent`, in the
+GUI's synced bucket, per account and workspace, as `key=count` pairs, most
+recent first: a catalogue emoji by its base shortcode (it is drawn in the
+reader's skin tone) and a workspace emoji as `:name:`, shown only while the
+workspace still has it and never in a quick-reaction slot's picker. Up to 24
+are kept, counts halve past 99, and nothing is written until the account's
+settings have arrived, so a pick at start cannot overwrite them.
 `Ctrl+Shift+\` opens the emoji picker to react to the conversation's newest
 message (`oc_model_last_reactable`: not a deleted one, not a call event), as
 the reference client binds it.
@@ -1331,7 +1413,8 @@ emoji picker floating *over* the card — the time-dropdown rule: drawn after
 `draw_modal`, clicks claimed ahead of the frame's scrim-cancel, Esc closes it
 before it closes the card, and `modal_finish` closes it with the card. The text
 field offers suggested statuses (five defaults plus recent ones, kept under the
-`status.recents` settings key); choosing one fills emoji, text and its default
+`status.recents` settings key, as the emoji picker's usage is under
+`emoji.frequent`); choosing one fills emoji, text and its default
 clear time in one click. The "Clear after" chips are prefilled by bucketing the
 member's live `status_expires`, so the dialog reopens showing what is actually
 set. The card publishes its buttons, suggestion rows and chips to the a11y
@@ -1782,6 +1865,54 @@ set. Consequences worth knowing before touching it:
   written ([MARKDOWN.md](./MARKDOWN.md) §5), so its message box is already
   what the conversation will show.
 
+### Replies also sent to the channel (REQ-062)
+
+While the composer replies in a thread, an **Also send to #channel** check box
+("Also send to this conversation" in a DM) sits just before Send, published as
+`composer.also_channel`. It is off by default and goes off again after each
+send and in another thread; with it on, the reply, its files or a video
+message go to the thread and to the channel's main scroll (`also_channel` on
+`SEND_REPLY`). In the main scroll such a reply is drawn under a "replied to a
+thread" line, with the parent's first words when the parent is loaded and the
+line alone when it is not; nothing is fetched to fill it in. Clicking the line,
+or the message menu's "Open thread", opens that thread. The client core puts
+the reply in the scroll once, whether it arrives live or with the history,
+counts it toward unread once, and notifies it once: as a thread notice when
+the thread is one of yours, otherwise as a channel message.
+
+### Channel colours
+
+A person can colour a channel to tell it apart: its menu's **Colour…** opens a
+menu of its own with eight colours (blue, indigo, violet, pink, teal, cyan,
+slate, brown, each with its swatch) and None, the one in force ticked. The
+colour is a filled dot before the channel's name in the sidebar and in the
+conversation header. None of the eight is green, amber or red, which mean
+presence and danger, and each clears 3:1 on the sidebar and header in the
+dark, light and both high-contrast palettes (`oc_theme_chan_color`,
+`tests/test_theme.c`). DMs are not coloured.
+
+Colours are the person's own and nobody else sees them. They are kept under the
+settings key `colors`, beside `sidebar`, grouped by colour (`1:12,45;2:7`,
+`oc_chan_colors` in the client core), at most 64 channels and never more than
+fits one setting; a channel past either is refused with a short message. Each
+client type keeps its own bucket, so the graphical client's colours and the
+terminal client's are separate: the terminal client has its own **Colour**
+action in its channel menu and draws the mark as the 256-colour cell nearest
+each colour. Nothing is written before the account's settings have arrived.
+
+### Muting a conversation for a set time (REQ-137)
+
+A conversation's menu offers **Mute…** in both clients, which opens a menu of
+its own with the "Pause notifications" durations: For 30 minutes, For 1 hour,
+For 2 hours, Until tomorrow (09:00 the next day, from the local clock, through
+`oc_minutes_until_local` in the client core, which the pause uses too), and
+Until I turn it back on. A muted conversation's menu offers **Unmute**; in the
+graphical client a timed mute's says when it ends ("Unmute (muted until Tue
+09:00)"). The client sends minutes from now (`SET_MUTE`); the daemon resolves
+the end, ends the mute on its own clock and tells every device with
+`NOTIFY_PREFS`, so the client keeps no timer and shows what the daemon last
+said (`oc_channel.muted_until_ms`). The sidebar row is dimmed as for any mute.
+
 ### Long messages
 
 A message a reader **collapses** (its menu's Collapse, or `c` in the terminal
@@ -1802,6 +1933,26 @@ prefix, so formatting still applies to what shows.
 Both are reachable without a pointer: the message's menu (Ctrl+Up to the
 message, Shift+F10) offers Collapse or Expand, and each "Show …" is a button
 for assistive technology (`message.<id>.expand`).
+
+### View source
+
+Every message that is not deleted, anyone's, offers **View source** in its
+menu: the body exactly as stored, before any formatting, with spoiler markup
+and what it covers shown as written ("Copy text" still keeps covered spoilers
+covered). For an end-to-end message it is the decrypted body, the one the
+client renders. Nothing is fetched: the body the client holds is the stored
+one.
+
+- **Graphical client** — a "Message source" dialog: the text wrapped in the
+  code face, scrolled with the wheel, the arrow keys, Page Up / Page Down and
+  Home / End, and published to assistive technology as `source.body`. Copy
+  (`modal.button.copy`) puts every byte of the body on the
+  clipboard; Close (`modal.button.close`) or Esc dismisses it. It is drawn
+  text, not a field, so there is no partial selection.
+- **Terminal client** — "View source" in the message menu opens the body over
+  the screen, wrapped to its width: `j`/`k` scroll, space and Page Down page,
+  `g`/`G` go to the start and end, `q` or Esc closes it. Copying is the
+  terminal's own selection.
 
 ### Typography (graphical clients) — ARCH-97
 

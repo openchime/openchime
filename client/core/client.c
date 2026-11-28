@@ -519,12 +519,14 @@ void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body) {
+void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body,
+                     int also_channel) {
     if (!c || !body || !body[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_REPLY);
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->message_id = parent_id;
+    cmd->also_channel = also_channel ? 1 : 0;
     cmd->body = strdup(body);
     oc_queue_push(&c->cmds, cmd);
 }
@@ -542,13 +544,18 @@ void oc_client_open_search(oc_client *c) {
 }
 
 void oc_client_search(oc_client *c, const char *query, uint8_t sort) {
+    oc_client_search_in(c, query, sort, 0);
+}
+
+void oc_client_search_in(oc_client *c, const char *query, uint8_t sort, uint64_t channel_id) {
     if (!c || !query || !query[0]) return;
-    oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */
+    oc_model_search_begin_scoped(&c->model, query, channel_id);   /* clears prior hits + records it */
     c->model.search_sort = sort;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
     if (!cmd) return;
     cmd->body = strdup(query);
     cmd->op = sort;
+    cmd->channel_id = c->model.search_scope;      /* 0 when a typed in: won */
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -568,6 +575,7 @@ void oc_client_search_more(oc_client *c) {
     cmd->op = c->model.search_sort;
     cmd->message_id = last->message_id;
     cmd->rank = last->rank;
+    cmd->channel_id = c->model.search_scope;      /* the same conversation, page after page */
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -1471,12 +1479,13 @@ void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
 
 /* Mute (REQ-137). Independent of the notification level: the daemon keeps
  * them in separate columns for the same reason. */
-void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted, uint32_t minutes) {
     if (!c || !channel_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_MUTE);
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->op = muted ? 1 : 0;
+    cmd->message_id = muted ? minutes : 0;   /* the minutes, as SET_SNOOZE carries them */
     oc_queue_push(&c->cmds, cmd);
 }
 
@@ -1770,16 +1779,18 @@ uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
 }
 
 uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
-                              const char *const *paths, size_t n_paths, const char *text) {
+                              const char *const *paths, size_t n_paths, const char *text,
+                              int also_channel) {
     if (!paths || n_paths == 0 || n_paths > OC_MAX_ATTACH) return 0;
     oc_post_item items[OC_MAX_ATTACH];
     memset(items, 0, sizeof items);
     for (size_t i = 0; i < n_paths; i++) items[i].path = paths[i];
-    return oc_client_post_items(c, channel_id, thread_root, items, n_paths, text);
+    return oc_client_post_items(c, channel_id, thread_root, items, n_paths, text, also_channel);
 }
 
 uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
-                              const oc_post_item *items, size_t n_items, const char *text) {
+                              const oc_post_item *items, size_t n_items, const char *text,
+                              int also_channel) {
     if (!c || !channel_id || !items || n_items == 0 || n_items > OC_MAX_ATTACH) return 0;
     for (size_t i = 0; i < n_items; i++) {
         const oc_post_item *it = &items[i];
@@ -1793,6 +1804,7 @@ uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread
     cmd->xfer_tag = next_xfer_tag();
     cmd->channel_id = channel_id;
     cmd->message_id = thread_root;
+    cmd->also_channel = (thread_root && also_channel) ? 1 : 0;
     cmd->body = strdup(text ? text : "");
     if (!cmd->body) { oc_cmd_free(cmd); return 0; }
     for (size_t i = 0; i < n_items; i++) {
@@ -1982,13 +1994,14 @@ void oc_client_fetch_image(oc_client *c, uint64_t attachment_id, uint8_t rung) {
 uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
                               uint32_t duration_ms, uint16_t width, uint16_t height,
-                              const char *caption) {
+                              const char *caption, int also_channel) {
     oc_cmd *cmd = (c && channel_id && video && video_len && poster && poster_len)
                 ? oc_cmd_new(OC_CMD_POST_VIDEO) : NULL;
     if (!cmd) { free(video); free(poster); return 0; }
     cmd->xfer_tag = next_xfer_tag();
     cmd->channel_id = channel_id;
     cmd->message_id = thread_root;
+    cmd->also_channel = (thread_root && also_channel) ? 1 : 0;
     cmd->body = strdup(caption ? caption : "");
     /* A name that says whose and when, unique per recording, so a saved copy
      * does not overwrite the last one: "<DisplayName>-video-<YYYYMMDDHHMMSS>".
@@ -2141,4 +2154,14 @@ void oc_client_stop(oc_client *c) {
     oc_queue_destroy(&c->cmds);
     oc_model_free(&c->model);
     free(c);
+}
+
+uint64_t oc_client_cmds_sent(oc_client *c) { return c ? oc_queue_pushed(&c->cmds) : 0; }
+
+void oc_client_sync(oc_client *c, uint64_t token) {
+    if (!c || !token) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SYNC);
+    if (!cmd) return;
+    cmd->message_id = token;
+    oc_queue_push(&c->cmds, cmd);
 }

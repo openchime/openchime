@@ -444,6 +444,8 @@ enum {
     /* A build's release notes (PROTOCOL.md §5.16r): `size` central's status
      * (200, 404), or 0 when they could not be fetched; `body` its body. */
     OC_EV_RELEASE_NOTES,
+    /* A test harness's barrier answered (SYNC_DONE): `message_id` the token. */
+    OC_EV_SYNC_DONE,
     /* A person's AI clients (AUTH.md §8.13). CONNECTION_REQUEST: what a code
      * names -- `preview` the code, `body` the client's name, `topic` where it
      * returns. CONNECTION_DECIDED: `status` 1 approved, 0 declined, `body` the
@@ -513,6 +515,10 @@ typedef struct {
     char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
                               Its own field because a topic is up to 250 bytes and
                               every fixed buffer here is smaller. */
+    uint64_t muted_until_ms; /* NOTIFY_PREF: when a timed mute ends, 0 for none (REQ-137) */
+    uint8_t  also_channel; /* THREAD_REPLY: the reply is in the channel's main
+                              scroll too (REQ-062); MESSAGE carries such a reply's
+                              thread in `parent_id` */
     uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
@@ -870,6 +876,8 @@ enum {
     OC_CMD_REVOKE_AGENT_TOKEN,
     /* RELEASE_NOTES: body = the build id (PROTOCOL.md §5.16r). */
     OC_CMD_RELEASE_NOTES,
+    /* SYNC, a test harness's barrier: message_id = the token. */
+    OC_CMD_SYNC,
     /* A person's AI clients: CONNECTION_CODE body = the code; CONNECTION_DECIDE
      * body = the code, op = approve, message_id = the lifetime in days;
      * LIST_CONNECTIONS op = everyone's; REVOKE_CONNECTION message_id = the
@@ -952,6 +960,9 @@ typedef struct {
      * relevance, this rank beside it. */
     int64_t  rank;
     uint64_t parent_id;    /* MOVE_MESSAGE: the destination thread, 0 its top level */
+    /* REPLY, and POST_FILES / POST_VIDEO into a thread: the reply is posted to
+     * the channel's main scroll too (SEND_REPLY's `also_channel`, REQ-062). */
+    uint8_t  also_channel;
     /* USAGE: over how many UTC days (1..OC_USAGE_MAX_DAYS). */
     uint16_t usage_days;
     /* SET_USER_MUTE: the person; `op` 1 mutes, 0 unmutes. */

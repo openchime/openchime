@@ -108,6 +108,14 @@ int  oc_high_contrast_on(int pref, int sys);
 void oc_theme_set_high_contrast(int on);
 int  oc_theme_high_contrast(void);
 
+/* A person's channel colours (the dot before a channel's name): colour `idx`,
+ * 1 to OC_CHAN_COLOR_COUNT (model.h), in the palette in force -- dark, light,
+ * or either high-contrast one; 0 for none. Blue, indigo, violet, pink, teal,
+ * cyan, slate and brown: none green, amber or red, which mean presence and
+ * danger. Each clears 3:1 on the sidebar and the header in every palette,
+ * which tests/test_theme.c asserts. */
+uint32_t oc_theme_chan_color(int idx);
+
 /* CORNER RADII, in DIPs.
  *
  * Windows 11 names three and only three. 8 for anything that floats above the

@@ -6,7 +6,8 @@
 #include "releasenotes.h"
 #include "richtext.h"
 #include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
-#include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
+#include "notify.h"
+#include "searchq.h"   /* a typed in: wins over a search's scope */    /* oc_notify_decide — the one notify rule (ARCH-103) */
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
 #include "oc_port.h"    /* oc_localtime_r */
@@ -193,7 +194,17 @@ static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
 /* One monotonic millisecond clock, owned by the core so a frontend and the net
  * thread cannot read different ones. mingw has no clock_gettime without linking
  * winpthread, and GetTickCount64 is the platform's monotonic tick anyway. */
+/* A held clock (oc_model_clock_hold): a test harness sets the monotonic and
+ * wall clocks the model reads, and steps them; 0 is the system's. */
+static uint64_t g_held_mono_ms, g_held_wall_ms;
+void oc_model_clock_hold(uint64_t mono_ms, uint64_t wall_ms) {
+    g_held_mono_ms = mono_ms;
+    g_held_wall_ms = wall_ms;
+}
+static time_t model_time(void) { return g_held_wall_ms ? (time_t)(g_held_wall_ms / 1000u) : time(NULL); }
+
 uint64_t oc_model_now_ms(void) {
+    if (g_held_mono_ms) return g_held_mono_ms;
 #ifdef _WIN32
     return (uint64_t)GetTickCount64();
 #else
@@ -291,7 +302,7 @@ void oc_model_clock(const oc_model *m, int64_t at_ms, oc_rt_clock *out) {
     out->tz_min = local_offset_min(at_ms);
     out->time24 = !(m && m->clock12);
     out->utc = 0;
-    out->now_ms = (int64_t)time(NULL) * 1000;
+    out->now_ms = (int64_t)model_time() * 1000;
 }
 
 size_t oc_model_time_text(const oc_model *m, int64_t at_ms, int form, char *out, size_t cap) {
@@ -312,7 +323,7 @@ static void preview_set(const oc_model *m, char *out, size_t cap, const char *te
     if (!text) { out[0] = '\0'; return; }
     if (!strchr(text, '|') && !strstr(text, "<time:") && !strstr(text, "```spoiler") && !strstr(text, ">!")) { snprintf(out, cap, "%s", text); return; }
     oc_rt_clock k;
-    oc_model_clock(m, (int64_t)time(NULL) * 1000, &k);
+    oc_model_clock(m, (int64_t)model_time() * 1000, &k);
     oc_rt_flatten_at(text, strlen(text), &k, out, cap);
 }
 
@@ -852,7 +863,7 @@ void oc_model_ooo_label(const oc_member *mem, char *out, size_t cap) {
                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     /* The last moment it holds, so an end at midnight reads as the day before. */
     time_t t = (time_t)((mem->ooo_end - 1) / 1000);
-    time_t nowt = time(NULL);
+    time_t nowt = model_time();
     struct tm lt, nt;
     oc_localtime_r(&t, &lt);
     oc_localtime_r(&nowt, &nt);
@@ -969,12 +980,40 @@ void oc_model_close_search(oc_model *m) {
     m->search_open = 0;
     m->search_truncated = 0;
     m->search_query[0] = '\0';
+    m->search_scope = 0;
 }
 
 void oc_model_search_begin(oc_model *m, const char *query) {
+    oc_model_search_begin_scoped(m, query, 0);
+}
+
+void oc_model_search_begin_scoped(oc_model *m, const char *query, uint64_t scope) {
     oc_model_close_search(m);      /* drop any prior hits */
     m->search_open = 1;
     snprintf(m->search_query, sizeof m->search_query, "%s", query ? query : "");
+    oc_searchq sq;
+    oc_searchq_parse(m->search_query, &sq);
+    m->search_scope = sq.in[0] ? 0 : scope;      /* a typed in: wins */
+}
+
+void oc_model_search_target(const oc_model *m, int view, uint64_t conv, oc_search_target *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->kind = OC_ST_MESSAGES;
+    snprintf(out->placeholder, sizeof out->placeholder, "Search messages");
+    if (view == OC_SV_FILES)  { out->kind = OC_ST_FILES;  snprintf(out->placeholder, sizeof out->placeholder, "Search files");  return; }
+    if (view == OC_SV_PEOPLE) { out->kind = OC_ST_PEOPLE; snprintf(out->placeholder, sizeof out->placeholder, "Search people"); return; }
+    if (view != OC_SV_CONVERSATION || !m || !conv) return;
+    const oc_channel *c = oc_model_channel((oc_model *)m, conv);
+    if (!c || c->e2e) return;                    /* the server cannot search it */
+    out->scope = conv;
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        char t[128] = "";
+        oc_model_dm_title(m, c, t, sizeof t);
+        snprintf(out->placeholder, sizeof out->placeholder, "Search %s", t[0] ? t : "this conversation");
+    } else {
+        snprintf(out->placeholder, sizeof out->placeholder, "Search #%s", c->name && c->name[0] ? c->name : "channel");
+    }
 }
 
 void oc_model_close_reactlist(oc_model *m) {
@@ -1636,7 +1675,7 @@ static void attach_to_msg(oc_model *m, const oc_ev *e) {
  * One mark per person per conversation -- someone types in one place at a time,
  * so a mark from them elsewhere in it moves it there. */
 static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uint64_t thread_root) {
-    long long now = (long long)time(NULL);
+    long long now = (long long)model_time();
     size_t w = 0, found = (size_t)-1;
     for (size_t i = 0; i < m->n_typing; i++) {
         if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;   /* drop expired */
@@ -1660,7 +1699,7 @@ static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id, uin
 
 size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t thread_root, uint64_t exclude,
                        uint64_t *out, size_t cap) {
-    long long now = (long long)time(NULL);
+    long long now = (long long)model_time();
     size_t n = 0;
     for (size_t i = 0; i < m->n_typing && n < cap; i++) {
         if (m->typing[i].channel_id != channel_id) continue;
@@ -2035,9 +2074,13 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
-        /* thread_reply is 0: this watches a channel's main scroll, and a thread
-         * reply is deliberately not in it (REQ-060), so it never sees one.
-         * Replies are answered by oc_model_thread_notify_take instead. */
+        /* A reply also posted here (REQ-062) that was queued as a thread
+         * notice has had its notification: oc_model_thread_notify_take answers
+         * it. One that was not is a channel message like any other. */
+        if (msg->thread_noticed) continue;
+        /* thread_reply is 0: this watches a channel's main scroll, where only a
+         * reply also posted to it appears, and is judged as a message there.
+         * Other replies are answered by oc_model_thread_notify_take. */
         if (!oc_notify_decide(oc_model_is_workspace_sender(m, msg->author_id), c->muted,
                               oc_model_is_muted_user(m, msg->author_id), is_vip,
                               c->notify_level, men, kw, 0, quiet, paused)) continue;
@@ -2079,6 +2122,85 @@ static void notice_push(oc_model *m, const oc_ev *e) {
                   e->action_start <= blen && e->action_len <= blen - e->action_start;
         n->action = (uint8_t)act;
         preview_set(m, n->body, sizeof n->body, act ? e->body + e->action_start : e->body);
+    }
+}
+
+/* A message arrives in a channel's main scroll: a BROADCAST, or a thread reply
+ * also posted there (REQ-062). Takes `*body`. Keeps the preview, appends it,
+ * and counts it toward unread and the listening queue, the same rule for both.
+ * `parent_id` is the reply's thread (0 for a top-level message), and
+ * `thread_noticed` says it was already queued as a thread notice, so the
+ * channel's notification scan does not raise it a second time. */
+static void message_arrived(oc_model *m, oc_ev *e, char **body, uint64_t parent_id, int thread_noticed) {
+    oc_channel *c = channel_ensure(m, e->channel_id);
+    /* Keep the list preview live. Taken BEFORE channel_append, which takes
+     * ownership of the body — after it, *body is gone. Only for messages
+     * newer than what we last previewed, so a backfill replaying older
+     * history cannot rewind the sidebar to an old line. */
+    if (c && *body && e->message_id >= c->high_water) {
+        /* An action previews as its action text, flagged, read beside its
+         * author (REQ-058); the net thread paired the two before this. */
+        size_t blen = strlen(*body);
+        int act = e->action_known && e->action && e->action_len &&
+                  e->action_start <= blen && e->action_len <= blen - e->action_start;
+        preview_set(m, c->preview, sizeof c->preview, act ? *body + e->action_start : *body);
+        c->preview_author = e->author_id;
+        c->preview_action = (uint8_t)act;
+    }
+    if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
+                            e->msg_kind, e->broadcast_stored, body)) {
+        msg_set_action(&c->msgs[c->n_msgs - 1], e);
+        c->msgs[c->n_msgs - 1].call_id = e->call_id;
+        /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
+         * in the scroll an older page put it. */
+        for (size_t k = c->n_msgs; k-- > 0;)
+            if (c->msgs[k].message_id == e->message_id) {
+                snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
+                c->msgs[k].parent_id = parent_id;          /* REQ-062 */
+                c->msgs[k].thread_noticed = (uint8_t)(thread_noticed ? 1 : 0);
+                break;
+            }
+        /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
+         * the pause left out — they say when to interrupt you, not whether
+         * a message mattered, and a badge that emptied itself overnight
+         * would hide the morning's backlog. The daemon counts the same
+         * thing the same way, which is what makes the seeded count and this
+         * one the same number rather than two plausible ones.
+         *
+         * Asked of the evaluator rather than restated: the message is in
+         * hand, so there is no reason to guess at what it would have said.
+         * Own messages are excluded by `own`, not by a second test. */
+        const oc_msg *msg = &c->msgs[c->n_msgs - 1];
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        int vip = oc_model_is_priority(m, e->author_id);
+        if (e->message_id > c->read_marker &&
+            oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
+                             c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
+                             men, kw, 0, 0, 0)) {
+            c->unread++;
+            if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
+        }
+        /* Talking mode speaks what arrives from now on (ARCH-111), except
+         * one's own messages: you know what you just typed, and hearing it
+         * read back -- over the next person's reply, since the queue plays
+         * end to end -- is only in the way. A listener too far behind loses
+         * the oldest rather than the newest: what is being said now matters
+         * more than what was said while the queue was backing up. */
+        if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
+            e->msg_kind == OC_MSG_KIND_MESSAGE) {
+            if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
+                memmove(m->listen_queue, m->listen_queue + 1,
+                        (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
+                m->n_listen_queue--;
+                m->listen_skipped++;
+            }
+            m->listen_queue[m->n_listen_queue++] = e->message_id;
+        }
     }
 }
 
@@ -2435,77 +2557,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
-    case OC_EV_MESSAGE: {
-        oc_channel *c = channel_ensure(m, e->channel_id);
-        /* Keep the list preview live. Taken BEFORE channel_append, which takes
-         * ownership of the body — after it, e->body is gone. Only for messages
-         * newer than what we last previewed, so a backfill replaying older
-         * history cannot rewind the sidebar to an old line. */
-        if (c && e->body && e->message_id >= c->high_water) {
-            /* An action previews as its action text, flagged, read beside its
-             * author (REQ-058); the net thread paired the two before this. */
-            size_t blen = strlen(e->body);
-            int act = e->action_known && e->action && e->action_len &&
-                      e->action_start <= blen && e->action_len <= blen - e->action_start;
-            preview_set(m, c->preview, sizeof c->preview, act ? e->body + e->action_start : e->body);
-            c->preview_author = e->author_id;
-            c->preview_action = (uint8_t)act;
-        }
-        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
-                                e->msg_kind, e->broadcast_stored, &e->body)) {
-            msg_set_action(&c->msgs[c->n_msgs - 1], e);
-            c->msgs[c->n_msgs - 1].call_id = e->call_id;
-            /* "via <client>" (AUTH.md §8.13): on the message by its id, wherever
-             * in the scroll an older page put it. */
-            for (size_t k = c->n_msgs; k-- > 0;)
-                if (c->msgs[k].message_id == e->message_id) {
-                    snprintf(c->msgs[k].via, sizeof c->msgs[k].via, "%s", e->via);
-                    break;
-                }
-            /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
-             * the pause left out — they say when to interrupt you, not whether
-             * a message mattered, and a badge that emptied itself overnight
-             * would hide the morning's backlog. The daemon counts the same
-             * thing the same way, which is what makes the seeded count and this
-             * one the same number rather than two plausible ones.
-             *
-             * Asked of the evaluator rather than restated: the message is in
-             * hand, so there is no reason to guess at what it would have said.
-             * Own messages are excluded by `own`, not by a second test. */
-            const oc_msg *msg = &c->msgs[c->n_msgs - 1];
-            int men = 0, kw = 0;
-            if (msg->body) {
-                size_t blen = strlen(msg->body);
-                men = oc_model_mentions_me_in(m, msg->broadcast_stored, msg->body, blen);
-                kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
-            }
-            int vip = oc_model_is_priority(m, e->author_id);
-            if (e->message_id > c->read_marker &&
-                oc_notify_decide(e->author_id == m->user_id || oc_model_is_workspace_sender(m, e->author_id),
-                                 c->muted, oc_model_is_muted_user(m, e->author_id), vip, c->notify_level,
-                                 men, kw, 0, 0, 0)) {
-                c->unread++;
-                if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
-            }
-            /* Talking mode speaks what arrives from now on (ARCH-111), except
-             * one's own messages: you know what you just typed, and hearing it
-             * read back -- over the next person's reply, since the queue plays
-             * end to end -- is only in the way. A listener too far behind loses
-             * the oldest rather than the newest: what is being said now matters
-             * more than what was said while the queue was backing up. */
-            if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
-                e->msg_kind == OC_MSG_KIND_MESSAGE) {
-                if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
-                    memmove(m->listen_queue, m->listen_queue + 1,
-                            (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
-                    m->n_listen_queue--;
-                    m->listen_skipped++;
-                }
-                m->listen_queue[m->n_listen_queue++] = e->message_id;
-            }
-        }
+    case OC_EV_MESSAGE:
+        message_arrived(m, e, &e->body, e->parent_id, 0);
         break;
-    }
     case OC_EV_CAPABILITIES:
         snprintf(m->capabilities, sizeof m->capabilities, "%s", e->body ? e->body : "");
         break;
@@ -3304,14 +3358,22 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         break;
     }
-    case OC_EV_THREAD_REPLY:
+    case OC_EV_THREAD_REPLY: {
         bump_reply_count(m, e->parent_id, e->count);   /* mark the parent in scroll */
+        /* Also posted to the main scroll (REQ-062): a copy of the body for the
+         * channel's, taken now, before the open thread takes this one. Live
+         * replies only: a thread's replay is history, and the main scroll's own
+         * replay brings its copy as a BROADCAST with the thread in `parent_id`. */
+        int to_scroll = e->also_channel && !(m->thread_replay && e->parent_id == m->thread_parent);
+        char *scroll_body = (to_scroll && e->body) ? strdup(e->body) : NULL;
+        int noticed = 0;
         /* Worth interrupting for? Only if the daemon says this thread is one of
          * mine (REQ-061), only if I did not write it, and only if this is news
          * rather than the history I just asked for — a replay's frames are
          * these same frames, and its participation byte is just as true. */
         if (e->participant && e->author_id != m->user_id && !m->thread_replay) {
             notice_push(m, e);
+            noticed = 1;
             /* The Threads view's unread is server-supplied and refreshed only by
              * a list (REQ-062), so move it here too: the badge should follow the
              * toast, not wait for the next LIST_THREADS. A muted person's reply
@@ -3329,7 +3391,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->thread_msgs[m->n_thread_msgs - 1].via, sizeof m->thread_msgs[0].via, "%s", e->via);
             }
         }
+        if (to_scroll) {
+            message_arrived(m, e, &scroll_body, e->parent_id, noticed);
+            free(scroll_body);                       /* not taken: a redelivery */
+        }
         break;
+    }
     case OC_EV_THREAD_END:
         /* The replay is done; anything arriving from here is live. */
         if (e->parent_id == m->thread_parent) m->thread_replay = 0;
@@ -3357,15 +3424,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * the default level; the following OC_EV_NOTIFY_PREF events set the
          * non-default ones. Works for both solicited and pushed syncs. */
         m->notify_default = e->op;                 /* REQ-134 */
-        for (size_t i = 0; i < m->n_channels; i++)
+        for (size_t i = 0; i < m->n_channels; i++) {
             m->channels[i].notify_level = m->notify_default;
+            m->channels[i].muted_until_ms = 0;      /* each entry states its own (REQ-137) */
+        }
         /* The DND window left this frame with REQ-136: the schedule arrives in
          * its own OC_EV_SCHEDULE, right behind this one. */
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
         /* `participant` carries follow_threads here (REQ-282): in every thread. */
-        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant; }
+        if (c) { c->notify_level = e->op; c->muted = e->status; c->follow_threads = e->participant;
+                 c->muted_until_ms = e->status ? e->muted_until_ms : 0; }   /* REQ-137 */
         break;
     }
     case OC_EV_GROUP:
@@ -3641,6 +3711,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_SYNC_DONE:
+        m->sync_done = e->message_id;
         break;
     case OC_EV_RELEASE_NOTES:
         free(m->rn_body);
@@ -3981,6 +4054,171 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
         for (uint8_t k = 0; k < o->custom[i].n_ids && at + 24 < cap; k++)
             at += (size_t)snprintf(out + at, cap - at, "%s%llu", k ? "," : "",
                                    (unsigned long long)o->custom[i].ids[k]);
+    }
+}
+
+/* ---- the graphical client's rail -------------------------------------------- */
+
+static int rail_known(const char *const *known, size_t n_known, const char *name, size_t len) {
+    for (size_t i = 0; i < n_known; i++)
+        if (known[i] && strlen(known[i]) == len && !strncmp(known[i], name, len)) return (int)i;
+    return -1;
+}
+static int rail_has(const oc_rail_opts *o, const char *name) {
+    for (uint8_t i = 0; i < o->n; i++) if (!strcmp(o->v[i].name, name)) return i;
+    return -1;
+}
+
+void oc_rail_opts_default(oc_rail_opts *o, const char *const *known, size_t n_known) {
+    if (!o) return;
+    memset(o, 0, sizeof *o);
+    for (size_t i = 0; known && i < n_known && o->n < OC_RAIL_MAX; i++) {
+        if (!known[i] || !known[i][0] || strlen(known[i]) >= OC_RAIL_NAME) continue;
+        snprintf(o->v[o->n].name, OC_RAIL_NAME, "%s", known[i]);
+        o->v[o->n].shown = 1;
+        o->n++;
+    }
+}
+
+void oc_rail_opts_encode(const oc_rail_opts *o, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    size_t len = 0;
+    for (uint8_t i = 0; o && i < o->n; i++) {
+        int w = snprintf(out + len, cap - len, "%s%s%s", len ? "," : "", o->v[i].shown ? "" : "-", o->v[i].name);
+        if (w < 0 || (size_t)w >= cap - len) { out[len] = '\0'; return; }
+        len += (size_t)w;
+    }
+}
+
+void oc_rail_opts_parse(oc_rail_opts *o, const char *s, const char *const *known, size_t n_known) {
+    if (!o) return;
+    oc_rail_opts r; memset(&r, 0, sizeof r);
+    while (s && *s && r.n < OC_RAIL_MAX) {
+        const char *e = strchr(s, ',');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        const char *nm = s; size_t nl = n; int shown = 1;
+        if (nl && *nm == '-') { shown = 0; nm++; nl--; }
+        int k = nl ? rail_known(known, n_known, nm, nl) : -1;
+        if (k >= 0 && rail_has(&r, known[k]) < 0) {
+            snprintf(r.v[r.n].name, OC_RAIL_NAME, "%s", known[k]);
+            r.v[r.n].shown = (uint8_t)shown;
+            r.n++;
+        }
+        if (!e) break;
+        s = e + 1;
+    }
+    if (r.n == 0) { oc_rail_opts_default(o, known, n_known); return; }
+    for (size_t i = 0; known && i < n_known && r.n < OC_RAIL_MAX; i++)   /* what it does not name */
+        if (known[i] && known[i][0] && strlen(known[i]) < OC_RAIL_NAME && rail_has(&r, known[i]) < 0) {
+            snprintf(r.v[r.n].name, OC_RAIL_NAME, "%s", known[i]);
+            r.v[r.n].shown = 1;
+            r.n++;
+        }
+    int h = rail_has(&r, "home");                                         /* first, and shown */
+    if (h > 0) {
+        oc_rail_view hv = r.v[h];
+        memmove(&r.v[1], &r.v[0], (size_t)h * sizeof r.v[0]);
+        r.v[0] = hv;
+    }
+    if (h >= 0) r.v[0].shown = 1;
+    *o = r;
+}
+
+/* ---- a person's channel colours --------------------------------------------- */
+
+uint8_t oc_chan_color_of(const oc_chan_colors *c, uint64_t channel_id) {
+    for (uint8_t i = 0; c && i < c->n; i++)
+        if (c->v[i].channel_id == channel_id) return c->v[i].color;
+    return 0;
+}
+
+/* The length of the whole encoding, its NUL left out; written into `out`
+ * when `out` is not NULL (the caller has made sure it fits). */
+static size_t chan_colors_write(const oc_chan_colors *c, char *out) {
+    size_t len = 0;
+    int groups = 0;
+    for (uint8_t col = 1; col <= OC_CHAN_COLOR_COUNT; col++) {
+        int any = 0;
+        for (uint8_t i = 0; i < c->n; i++) {
+            if (c->v[i].color != col) continue;
+            char part[32];
+            int w = any ? snprintf(part, sizeof part, ",%llu", (unsigned long long)c->v[i].channel_id)
+                        : snprintf(part, sizeof part, "%s%u:%llu", groups ? ";" : "", (unsigned)col,
+                                   (unsigned long long)c->v[i].channel_id);
+            if (w < 0) continue;
+            if (out) memcpy(out + len, part, (size_t)w);
+            len += (size_t)w;
+            if (!any) groups++;
+            any = 1;
+        }
+    }
+    if (out) out[len] = '\0';
+    return len;
+}
+
+size_t oc_chan_colors_encode(const oc_chan_colors *c, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!c) return 0;
+    size_t need = chan_colors_write(c, NULL);
+    if (out && need < cap) chan_colors_write(c, out);
+    return need;
+}
+
+int oc_chan_color_set(oc_chan_colors *c, uint64_t channel_id, uint8_t color) {
+    if (!c || !channel_id || color > OC_CHAN_COLOR_COUNT) return OC_CHAN_COLOR_BAD;
+    oc_chan_colors t = *c;
+    int at = -1;
+    for (uint8_t i = 0; i < t.n; i++) if (t.v[i].channel_id == channel_id) { at = i; break; }
+    if (color == 0) {
+        if (at >= 0) {
+            memmove(&t.v[at], &t.v[at + 1], (size_t)(t.n - 1 - at) * sizeof t.v[0]);
+            t.n--;
+        }
+    } else if (at >= 0) {
+        t.v[at].color = color;
+    } else {
+        if (t.n == OC_CHAN_COLORS_MAX) return OC_CHAN_COLOR_FULL;
+        t.v[t.n].channel_id = channel_id;
+        t.v[t.n].color = color;
+        t.n++;
+    }
+    if (chan_colors_write(&t, NULL) + 1 > OC_SETTING_VALUE_MAX) return OC_CHAN_COLOR_TOO_LONG;
+    *c = t;
+    return OC_CHAN_COLOR_OK;
+}
+
+void oc_chan_colors_parse(oc_chan_colors *c, const char *s) {
+    if (!c) return;
+    memset(c, 0, sizeof *c);
+    if (!s) return;
+    while (*s) {
+        const char *end = strchr(s, ';');
+        size_t n = end ? (size_t)(end - s) : strlen(s);
+        const char *colon = memchr(s, ':', n);
+        unsigned col = 0; int cd = 0;
+        const char *p = s;
+        while (p < s + n && *p >= '0' && *p <= '9' && cd < 2) { col = col * 10u + (unsigned)(*p - '0'); p++; cd++; }
+        if (colon && p == colon && cd && col >= 1 && col <= OC_CHAN_COLOR_COUNT) {
+            const char *q = colon + 1, *ge = s + n;
+            while (q < ge) {
+                const char *ie = memchr(q, ',', (size_t)(ge - q));
+                if (!ie) ie = ge;
+                uint64_t id = 0; int ok = ie > q && ie - q <= 20;
+                for (const char *d = q; ok && d < ie; d++) {
+                    if (*d < '0' || *d > '9') ok = 0;
+                    else id = id * 10u + (uint64_t)(*d - '0');
+                }
+                if (ok && id && !oc_chan_color_of(c, id) && c->n < OC_CHAN_COLORS_MAX) {
+                    c->v[c->n].channel_id = id;
+                    c->v[c->n].color = (uint8_t)col;
+                    c->n++;
+                }
+                q = ie + 1;
+            }
+        }
+        if (!end) break;
+        s = end + 1;
     }
 }
 
@@ -4394,4 +4632,10 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
         free(tmp);
     }
     return n;
+}
+
+uint32_t oc_minutes_until_local(int now_hour, int now_min, int hh, int mm, int force_tomorrow) {
+    int delta = (hh * 60 + mm) - (now_hour * 60 + now_min);
+    if (force_tomorrow || delta <= 0) delta += 24 * 60;
+    return (uint32_t)delta;
 }
